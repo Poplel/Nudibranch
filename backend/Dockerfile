@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-      chromaprint \
+      libchromaprint-tools \
       ffmpeg \
       curl \
     && rm -rf /var/lib/apt/lists/*
@@ -18,4 +18,3 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY nudibranch ./nudibranch
 
 EXPOSE 8000
-
