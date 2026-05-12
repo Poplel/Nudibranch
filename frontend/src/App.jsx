@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Bell,
@@ -103,20 +103,40 @@ const proposals = [
 function App() {
   const [page, setPage] = useState("Library");
   const [dark, setDark] = useState(false);
-  const [trayOpen, setTrayOpen] = useState(true);
+  const [trayOpen, setTrayOpen] = useState(false);
+  const [toastVisible, setToastVisible] = useState(true);
+  const [tint, setTint] = useState("#356df3");
   const [selected, setSelected] = useState(() => new Set(proposals.filter((item) => item.selected).map((item) => item.id)));
+  const trayRef = useRef(null);
 
   const selectedCount = selected.size;
   const theme = dark ? "app dark" : "app";
 
+  useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (trayRef.current && !trayRef.current.contains(event.target)) {
+        setTrayOpen(false);
+      }
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, []);
+
+  useEffect(() => {
+    if (!toastVisible) return;
+    const timeout = window.setTimeout(() => setToastVisible(false), 5200);
+    return () => window.clearTimeout(timeout);
+  }, [toastVisible]);
+
   return (
-    <main className={theme}>
+    <main className={theme} style={{ "--tint": tint }}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">N</div>
           <div>
             <strong>Nudibranch</strong>
-            <span>music control</span>
+            <span>Nudibranch</span>
           </div>
         </div>
         <nav>
@@ -135,20 +155,16 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="notification-anchor">
+          <div className="search">
+            <Search size={16} />
+            <input placeholder="Search library, proposals, tasks" />
+          </div>
+          <div className="notification-anchor" ref={trayRef}>
             <button className="icon-button" onClick={() => setTrayOpen((value) => !value)} title="Notifications">
               <Bell size={18} />
               <span className="badge">4</span>
             </button>
             {trayOpen && <NotificationTray />}
-          </div>
-          <div className="search">
-            <Search size={16} />
-            <input placeholder="Search library, proposals, tasks" />
-          </div>
-          <div className="server-state">
-            <span className="status-dot" />
-            API connected
           </div>
         </header>
 
@@ -158,7 +174,8 @@ function App() {
             {page === "Library" && <LibraryTree />}
             {page === "Approvals" && <Approvals selected={selected} setSelected={setSelected} />}
             {page === "Import" && <ImportWizard />}
-            {!["Library", "Approvals", "Import"].includes(page) && <Placeholder page={page} />}
+            {page === "Settings" && <SettingsPanel tint={tint} setTint={setTint} />}
+            {!["Library", "Approvals", "Import", "Settings"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <aside className="panel inspector">
@@ -179,6 +196,13 @@ function App() {
             </div>
           </aside>
         </div>
+        {toastVisible && (
+          <Toast
+            title="Approval needed"
+            body="Import folder review has 12 selectable changes."
+            onClose={() => setToastVisible(false)}
+          />
+        )}
       </section>
     </main>
   );
@@ -326,6 +350,43 @@ function Placeholder({ page }) {
       <h2>{page}</h2>
       <p>This section is routed through the REST API and permission model.</p>
     </div>
+  );
+}
+
+function SettingsPanel({ tint, setTint }) {
+  return (
+    <div className="settings-grid">
+      <section className="settings-section">
+        <h2>Appearance</h2>
+        <label className="setting-row">
+          <span>
+            Tint color
+            <small>Used for selected states, buttons, and highlights.</small>
+          </span>
+          <input type="color" value={tint} onChange={(event) => setTint(event.target.value)} />
+        </label>
+      </section>
+      <section className="settings-section">
+        <h2>Status</h2>
+        <div className="status-list">
+          <span>API</span>
+          <strong>Connected</strong>
+          <span>Worker</span>
+          <strong>Running</strong>
+          <span>slskd</span>
+          <strong>Configured</strong>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function Toast({ title, body, onClose }) {
+  return (
+    <button className="toast" onClick={onClose}>
+      <strong>{title}</strong>
+      <span>{body}</span>
+    </button>
   );
 }
 
