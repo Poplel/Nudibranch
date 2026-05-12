@@ -105,7 +105,8 @@ function App() {
   const [dark, setDark] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toastVisible, setToastVisible] = useState(true);
-  const [tint, setTint] = useState("#356df3");
+  const [buttonColor, setButtonColor] = useState("#356df3");
+  const [backgroundTint, setBackgroundTint] = useState("#356df3");
   const [selected, setSelected] = useState(() => new Set(proposals.filter((item) => item.selected).map((item) => item.id)));
   const trayRef = useRef(null);
 
@@ -130,13 +131,12 @@ function App() {
   }, [toastVisible]);
 
   return (
-    <main className={theme} style={{ "--tint": tint }}>
+    <main className={theme} style={{ "--button-color": buttonColor, "--background-tint": backgroundTint }}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">N</div>
           <div>
             <strong>Nudibranch</strong>
-            <span>Nudibranch</span>
           </div>
         </div>
         <nav>
@@ -174,7 +174,14 @@ function App() {
             {page === "Library" && <LibraryTree />}
             {page === "Approvals" && <Approvals selected={selected} setSelected={setSelected} />}
             {page === "Import" && <ImportWizard />}
-            {page === "Settings" && <SettingsPanel tint={tint} setTint={setTint} />}
+            {page === "Settings" && (
+              <SettingsPanel
+                buttonColor={buttonColor}
+                setButtonColor={setButtonColor}
+                backgroundTint={backgroundTint}
+                setBackgroundTint={setBackgroundTint}
+              />
+            )}
             {!["Library", "Approvals", "Import", "Settings"].includes(page) && <Placeholder page={page} />}
           </section>
 
@@ -353,17 +360,24 @@ function Placeholder({ page }) {
   );
 }
 
-function SettingsPanel({ tint, setTint }) {
+function SettingsPanel({ buttonColor, setButtonColor, backgroundTint, setBackgroundTint }) {
   return (
     <div className="settings-grid">
       <section className="settings-section">
         <h2>Appearance</h2>
         <label className="setting-row">
           <span>
-            Tint color
+            Button color
             <small>Used for selected states, buttons, and highlights.</small>
           </span>
-          <input type="color" value={tint} onChange={(event) => setTint(event.target.value)} />
+          <input type="color" value={buttonColor} onChange={(event) => setButtonColor(event.target.value)} />
+        </label>
+        <label className="setting-row">
+          <span>
+            Background tint
+            <small>Mixed into the grey interface in light and dark mode.</small>
+          </span>
+          <input type="color" value={backgroundTint} onChange={(event) => setBackgroundTint(event.target.value)} />
         </label>
       </section>
       <section className="settings-section">

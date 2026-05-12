@@ -27,16 +27,17 @@ button {
 }
 
 .app {
-  --tint: #356df3;
-  --bg: #eef2f0;
-  --panel: #f8faf8;
+  --button-color: #356df3;
+  --background-tint: #356df3;
+  --bg: color-mix(in srgb, var(--background-tint) 7%, #f1f2f4);
+  --panel: color-mix(in srgb, var(--background-tint) 4%, #fafafa);
   --panel-strong: #ffffff;
   --text: #202124;
-  --muted: #68736f;
-  --line: #ced9d4;
-  --accent: var(--tint);
-  --accent-strong: color-mix(in srgb, var(--tint) 72%, #0d1b2a);
-  --soft: color-mix(in srgb, var(--tint) 11%, #ffffff);
+  --muted: #6b7078;
+  --line: color-mix(in srgb, var(--background-tint) 10%, #d6d8dc);
+  --accent: var(--button-color);
+  --accent-strong: color-mix(in srgb, var(--button-color) 72%, #0d1b2a);
+  --soft: color-mix(in srgb, var(--background-tint) 11%, #ffffff);
   --warn: #a75d08;
   --danger: #b3404a;
   display: grid;
@@ -47,15 +48,15 @@ button {
 }
 
 .app.dark {
-  --bg: #101521;
-  --panel: #171d2a;
-  --panel-strong: #20283a;
+  --bg: color-mix(in srgb, var(--background-tint) 10%, #101216);
+  --panel: color-mix(in srgb, var(--background-tint) 8%, #181b20);
+  --panel-strong: color-mix(in srgb, var(--background-tint) 9%, #20242b);
   --text: #f4f2ec;
   --muted: #aab2c4;
-  --line: #303a50;
-  --accent: color-mix(in srgb, var(--tint) 82%, #ffffff);
-  --accent-strong: color-mix(in srgb, var(--tint) 70%, #ffffff);
-  --soft: color-mix(in srgb, var(--tint) 18%, #111827);
+  --line: color-mix(in srgb, var(--background-tint) 13%, #30333a);
+  --accent: color-mix(in srgb, var(--button-color) 82%, #ffffff);
+  --accent-strong: color-mix(in srgb, var(--button-color) 70%, #ffffff);
+  --soft: color-mix(in srgb, var(--background-tint) 18%, #16191e);
   --warn: #ffc15d;
   --danger: #ff7b86;
 }
