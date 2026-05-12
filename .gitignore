@@ -1,0 +1,14 @@
+.env
+.DS_Store
+node_modules/
+dist/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+AuthKey_*.p8
+

@@ -1,0 +1,58 @@
+services:
+  api:
+    image: ${NUDIBRANCH_IMAGE_PREFIX:-ghcr.io/YOUR_GITHUB_OWNER/YOUR_REPOSITORY}-api:${NUDIBRANCH_IMAGE_TAG:-latest}
+    env_file: .env
+    command: ["uvicorn", "nudibranch.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    volumes:
+      - nudibranch-config:/app/config
+      - nudibranch-import:/app/import
+      - nudibranch-staging:/app/staging
+      - nudibranch-library:/app/library
+      - nudibranch-downloads:/app/downloads
+      - nudibranch-trash:/app/trash
+      - nudibranch-backups:/app/backups
+    healthcheck:
+      test: ["CMD", "python", "-m", "nudibranch.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    image: ${NUDIBRANCH_IMAGE_PREFIX:-ghcr.io/YOUR_GITHUB_OWNER/YOUR_REPOSITORY}-api:${NUDIBRANCH_IMAGE_TAG:-latest}
+    env_file: .env
+    command: ["python", "-m", "nudibranch.worker.main"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - nudibranch-config:/app/config
+      - nudibranch-import:/app/import
+      - nudibranch-staging:/app/staging
+      - nudibranch-library:/app/library
+      - nudibranch-downloads:/app/downloads
+      - nudibranch-trash:/app/trash
+      - nudibranch-backups:/app/backups
+    restart: unless-stopped
+
+  web:
+    image: ${NUDIBRANCH_IMAGE_PREFIX:-ghcr.io/YOUR_GITHUB_OWNER/YOUR_REPOSITORY}-web:${NUDIBRANCH_IMAGE_TAG:-latest}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+
+volumes:
+  nudibranch-config:
+  nudibranch-import:
+  nudibranch-staging:
+  nudibranch-library:
+  nudibranch-downloads:
+  nudibranch-trash:
+  nudibranch-backups:
+
