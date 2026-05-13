@@ -777,7 +777,14 @@ function App() {
                 onLookupAlbum={lookupImportAlbum}
               />
             )}
-            {page === "Playlists" && <PlaylistsView favorites={favoritesPlaylist} onQueuePosition={proposePlaylistPosition} />}
+            {page === "Playlists" && (
+              <PlaylistsView
+                favorites={favoritesPlaylist}
+                onQueuePosition={proposePlaylistPosition}
+                onPlay={playTracks}
+                onQueue={addTracksToPlayerQueue}
+              />
+            )}
             {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
           </section>
 
@@ -1382,10 +1389,11 @@ function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
   );
 }
 
-function PlaylistsView({ favorites, onQueuePosition }) {
+function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
   const [draftPositions, setDraftPositions] = useState({});
   const tracks = favorites?.tracks || [];
+  const playableTracks = tracks.map(playlistPlayableTrack);
 
   useEffect(() => {
     setDraftPositions(
@@ -1420,6 +1428,11 @@ function PlaylistsView({ favorites, onQueuePosition }) {
           meta={favorites ? `${favorites.track_count || 0} tracks` : "Created when the first track is favorited"}
           onToggle={() => toggleSet(setOpenPlaylists, "Favorites")}
         />
+        <PlaylistPlayActions
+          disabled={playableTracks.length === 0}
+          onPlay={() => onPlay(playableTracks)}
+          onQueue={() => onQueue(playableTracks)}
+        />
       </div>
       {openPlaylists.has("Favorites") &&
         (tracks.length === 0 ? (
@@ -1433,6 +1446,10 @@ function PlaylistsView({ favorites, onQueuePosition }) {
                   icon={FileAudio}
                   title={track.title}
                   meta={[track.artist, track.album, track.format].filter(Boolean).join(" / ")}
+                />
+                <PlaylistPlayActions
+                  onPlay={() => onPlay([playlistPlayableTrack(track)])}
+                  onQueue={() => onQueue([playlistPlayableTrack(track)])}
                 />
                 <label className="playlist-order-field">
                   <span>Order</span>
@@ -1457,6 +1474,19 @@ function PlaylistsView({ favorites, onQueuePosition }) {
           </div>
         ))}
         </div>
+  );
+}
+
+function PlaylistPlayActions({ disabled = false, onPlay, onQueue }) {
+  return (
+    <div className="playlist-play-actions">
+      <button className="row-icon-button" onClick={onPlay} disabled={disabled} title="Play">
+        <Play size={14} />
+      </button>
+      <button className="row-icon-button" onClick={onQueue} disabled={disabled} title="Add to local queue">
+        <ListPlus size={14} />
+      </button>
+    </div>
   );
 }
 
@@ -2018,6 +2048,16 @@ function hydrateTrack(track, artist, album) {
   };
 }
 
+function playlistPlayableTrack(track) {
+  return {
+    id: track.track_id,
+    title: track.title,
+    format: track.format,
+    _artist: track.artist,
+    _album: track.album,
+  };
+}
+
 function removeKey(type, id) {
   return `${type}:${id}`;
 }
@@ -2292,6 +2332,8 @@ function AudioPlayer({
   const nextTrack = upcomingQueue[0];
   const progress = duration ? (currentTime / duration) * 100 : 0;
   const isFavorite = currentTrack?.id ? favoriteTrackIds.has(currentTrack.id) : false;
+  const nearEndThreshold = duration ? Math.min(30, Math.max(8, duration * 0.15)) : 0;
+  const showUpNext = Boolean(nextTrack && duration && duration - currentTime <= nearEndThreshold);
 
   useEffect(() => {
     setPlaying(false);
@@ -2347,9 +2389,8 @@ function AudioPlayer({
   }
 
   async function openPictureInPicture() {
-    const playerRect = dockRef.current?.getBoundingClientRect();
-    const width = Math.round(Math.max(340, playerRect?.width || 340));
-    const height = Math.round(Math.max(360, playerRect?.height || 420));
+    const width = 980;
+    const height = 486;
     const pipWindow =
       "documentPictureInPicture" in window
         ? await window.documentPictureInPicture.requestWindow({ width, height })
@@ -2358,53 +2399,75 @@ function AudioPlayer({
     pipWindowRef.current = pipWindow;
     pipWindow.document.body.innerHTML = "";
     pipWindow.document.body.style.margin = "0";
+    pipWindow.document.body.style.padding = "0";
+    pipWindow.document.body.style.width = "100vw";
+    pipWindow.document.body.style.minHeight = "100vh";
+    pipWindow.document.body.style.overflow = "hidden";
+    pipWindow.document.documentElement.style.margin = "0";
+    pipWindow.document.documentElement.style.padding = "0";
+    pipWindow.document.documentElement.style.width = "100vw";
+    pipWindow.document.documentElement.style.minHeight = "100vh";
     copyStylesToWindow(pipWindow);
     const container = pipWindow.document.createElement("div");
     container.className = document.querySelector("main")?.className || "app";
     container.style.minHeight = "100vh";
-    container.style.display = "grid";
-    container.style.placeItems = "center";
+    container.style.display = "block";
     pipWindow.document.body.appendChild(container);
+    const handleFullscreenChange = () => setFullscreenPlayer(Boolean(pipWindow.document.fullscreenElement));
     const closePip = () => {
       setFullscreenPlayer(false);
+      pipWindow.document.removeEventListener("fullscreenchange", handleFullscreenChange);
       setPipContainer(null);
     };
+    pipWindow.document.addEventListener("fullscreenchange", handleFullscreenChange);
     pipWindow.addEventListener("pagehide", closePip, { once: true });
     pipWindow.addEventListener("beforeunload", closePip, { once: true });
     setPipContainer(container);
   }
 
-  function toggleFullscreenPlayer() {
-    setFullscreenPlayer((value) => {
-      const nextValue = !value;
-      const pipWindow = pipWindowRef.current;
-      if (pipWindow?.resizeTo) {
-        pipWindow.resizeTo(nextValue ? 960 : 360, nextValue ? 640 : 430);
+  async function toggleFullscreenPlayer() {
+    const pipWindow = pipWindowRef.current;
+    const targetDocument = pipWindow?.document || document;
+    try {
+      if (targetDocument.fullscreenElement) {
+        await targetDocument.exitFullscreen?.();
+        setFullscreenPlayer(false);
+        return;
       }
-      return nextValue;
-    });
+      await targetDocument.documentElement.requestFullscreen?.();
+      setFullscreenPlayer(Boolean(targetDocument.fullscreenElement));
+    } catch {
+      setFullscreenPlayer(Boolean(targetDocument.fullscreenElement));
+    }
   }
 
   function surface({ popped = false } = {}) {
-    const fullscreen = popped && fullscreenPlayer;
+    const pipLayout = popped;
     return (
       <div
-        className={`${popped ? "audio-player popped" : "audio-player"}${fullscreen ? " fullscreen-player" : ""}`}
+        className={`${popped ? "audio-player popped pip-player" : "audio-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${pipLayout && showUpNext ? " has-up-next" : ""}`}
         ref={popped ? null : dockRef}
-        style={fullscreen && currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
+        style={pipLayout && currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
         <div className="player-core" ref={popped ? null : coreRef}>
           <div className="audio-header">
             <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
             <div className="audio-track-copy">
-              {fullscreen && <span className="playing-from">Playing from library</span>}
+              {pipLayout && <span className="playing-from">Playing from library</span>}
               <strong>{currentTrack?.title || "Local player"}</strong>
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
             </div>
+            {pipLayout && showUpNext && (
+              <div className="fullscreen-next">
+                <span>Up next</span>
+                <strong>{nextTrack.title}</strong>
+                <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+              </div>
+            )}
             <div className="player-window-actions">
               {popped ? (
-                <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreen ? "Compact" : "Fullscreen"}>
-                  {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
+                  {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                 </button>
               ) : (
                 <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
@@ -2416,13 +2479,6 @@ function AudioPlayer({
               </button>
             </div>
           </div>
-          {fullscreen && nextTrack && (
-            <div className="fullscreen-next">
-              <span>Up next</span>
-              <strong>{nextTrack.title}</strong>
-              <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
-            </div>
-          )}
           <div className="fullscreen-controls">
             <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
             <div className="player-controls">
