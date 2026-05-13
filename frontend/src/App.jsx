@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Bell,
@@ -11,8 +11,10 @@ import {
   Folder,
   HardDriveUpload,
   ListChecks,
+  LogOut,
   Moon,
   Music,
+  RefreshCw,
   Search,
   Settings,
   Shield,
@@ -21,6 +23,9 @@ import {
   Users,
 } from "lucide-react";
 import "./styles.css";
+
+const API_BASE = "/api/v1";
+const TOKEN_KEY = "nudibranch_api_key";
 
 const navItems = [
   ["Library", Music],
@@ -46,84 +51,29 @@ const pageDescriptions = {
   Settings: "Manage appearance, integrations, and system status.",
 };
 
-const artists = [
-  {
-    name: "Japanese Breakfast",
-    albums: [
-      {
-        name: "Jubilee",
-        tracks: [
-          ["01", "Paprika", "FLAC"],
-          ["02", "Be Sweet", "FLAC"],
-          ["03", "Kokomo, IN", "MP3 warning"],
-        ],
-      },
-    ],
-  },
-  {
-    name: "Alvvays",
-    albums: [
-      {
-        name: "Blue Rev",
-        tracks: [
-          ["01", "Pharmacist", "FLAC"],
-          ["02", "Easy On Your Own?", "FLAC"],
-        ],
-      },
-    ],
-  },
-];
-
-const proposals = [
-  {
-    id: "artist-1",
-    depth: 0,
-    title: "Japanese Breakfast",
-    detail: "3 pending operations",
-    selected: true,
-  },
-  {
-    id: "album-1",
-    depth: 1,
-    title: "Jubilee",
-    detail: "Exact release preferred",
-    selected: true,
-  },
-  {
-    id: "track-1",
-    depth: 2,
-    title: "03-Kokomo, IN.flac",
-    detail: "Replace MP3 with FLAC",
-    selected: true,
-  },
-  {
-    id: "lyrics-1",
-    depth: 2,
-    title: "Kokomo, IN.lrc",
-    detail: "Add synced lyrics",
-    selected: false,
-  },
-  {
-    id: "cover-1",
-    depth: 1,
-    title: "cover.jpg",
-    detail: "Update album art",
-    selected: true,
-  },
-];
-
 function App() {
-  const [page, setPage] = useState("Library");
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
+  const [user, setUser] = useState(null);
+  const [page, setPage] = useState("Import");
   const [dark, setDark] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
-  const [toastVisible, setToastVisible] = useState(true);
+  const [toast, setToast] = useState(null);
   const [accentColor, setAccentColor] = useState("#356df3");
   const [backgroundTint, setBackgroundTint] = useState("#356df3");
-  const [selected, setSelected] = useState(() => new Set(proposals.filter((item) => item.selected).map((item) => item.id)));
+  const [library, setLibrary] = useState([]);
+  const [importFiles, setImportFiles] = useState([]);
+  const [approvals, setApprovals] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [notifications, setNotifications] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const trayRef = useRef(null);
 
-  const selectedCount = selected.size;
   const theme = dark ? "app dark" : "app";
+  const approvalSelectionCount = useMemo(
+    () => approvals.reduce((total, batch) => total + batch.items.filter((item) => item.selected).length, 0),
+    [approvals],
+  );
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -137,10 +87,190 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!toastVisible) return;
-    const timeout = window.setTimeout(() => setToastVisible(false), 5200);
+    if (!toast) return;
+    const timeout = window.setTimeout(() => setToast(null), 5200);
     return () => window.clearTimeout(timeout);
-  }, [toastVisible]);
+  }, [toast]);
+
+  useEffect(() => {
+    if (!token) return;
+    refreshAll();
+    const interval = window.setInterval(() => {
+      refreshTasks();
+      refreshNotifications();
+    }, 10000);
+    return () => window.clearInterval(interval);
+  }, [token]);
+
+  async function api(path, options = {}) {
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        ...(options.headers || {}),
+      },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || `${response.status} ${response.statusText}`);
+    }
+    return response.json();
+  }
+
+  async function login(pin) {
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ pin }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || "Invalid PIN");
+      }
+      const data = await response.json();
+      localStorage.setItem(TOKEN_KEY, data.api_key);
+      setToken(data.api_key);
+      setUser(data);
+      setToast({ title: "Signed in", body: `Welcome, ${data.display_name}.` });
+    } catch (loginError) {
+      setError(loginError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken("");
+    setUser(null);
+  }
+
+  async function refreshAll() {
+    setLoading(true);
+    setError("");
+    try {
+      const [me, libraryTree, approvalData, taskData, notificationData] = await Promise.all([
+        api("/me"),
+        api("/library/tree"),
+        api("/approvals"),
+        api("/tasks"),
+        api("/notifications"),
+      ]);
+      setUser(me);
+      setLibrary(libraryTree);
+      setApprovals(approvalData);
+      setTasks(taskData);
+      setNotifications(notificationData);
+    } catch (refreshError) {
+      setError(refreshError.message);
+      if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
+        logout();
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshTasks() {
+    try {
+      setTasks(await api("/tasks"));
+    } catch {
+      // Task polling should not disrupt the page the user is working in.
+    }
+  }
+
+  async function refreshNotifications() {
+    try {
+      setNotifications(await api("/notifications"));
+    } catch {
+      // Notification polling is best-effort.
+    }
+  }
+
+  async function scanImportFolder() {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api("/imports/scan", {
+        method: "POST",
+        body: JSON.stringify({ path: null }),
+      });
+      setImportFiles(data.files);
+      setToast({ title: "Import scan complete", body: `${data.count} audio files found.` });
+    } catch (scanError) {
+      setError(scanError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function proposeImport() {
+    setLoading(true);
+    setError("");
+    try {
+      const task = await api("/imports/propose", {
+        method: "POST",
+        body: JSON.stringify({ path: null }),
+      });
+      setTasks((current) => [task, ...current]);
+      setToast({ title: "Import review queued", body: "A proposal batch will appear in Approvals." });
+      setPage("Tasks");
+    } catch (proposeError) {
+      setError(proposeError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function setApprovalSelection(batchId, itemIds, selected) {
+    await api(`/approvals/${batchId}/selection`, {
+      method: "POST",
+      body: JSON.stringify({ item_ids: itemIds, selected }),
+    });
+    await refreshApprovals();
+  }
+
+  async function refreshApprovals() {
+    setApprovals(await api("/approvals"));
+  }
+
+  async function approveBatch(batchId) {
+    setLoading(true);
+    try {
+      const task = await api(`/approvals/${batchId}/approve`, { method: "POST" });
+      setTasks((current) => [task, ...current]);
+      setToast({ title: "Approval queued", body: "Selected changes were sent to the task queue." });
+      await refreshApprovals();
+    } catch (approvalError) {
+      setError(approvalError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function rejectSelected(batchId, itemIds) {
+    setLoading(true);
+    try {
+      await api(`/approvals/${batchId}/reject`, {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds, suppress_for: "week" }),
+      });
+      setToast({ title: "Changes rejected", body: "Selected items were suppressed for one week." });
+      await refreshApprovals();
+    } catch (rejectError) {
+      setError(rejectError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  if (!token) {
+    return <LoginScreen loading={loading} error={error} onLogin={login} />;
+  }
 
   return (
     <main className={theme} style={{ "--accent-color": accentColor, "--background-tint": backgroundTint }}>
@@ -171,70 +301,104 @@ function App() {
             <Search size={16} />
             <input placeholder="Search library, proposals, tasks" />
           </div>
+          <button className="icon-button" onClick={refreshAll} title="Refresh">
+            <RefreshCw size={18} />
+          </button>
           <div className="notification-anchor" ref={trayRef}>
             <button className="icon-button" onClick={() => setTrayOpen((value) => !value)} title="Notifications">
               <Bell size={18} />
-              <span className="badge">4</span>
+              {notifications.length > 0 && <span className="badge">{notifications.length}</span>}
             </button>
-            {trayOpen && <NotificationTray />}
+            {trayOpen && <NotificationTray notifications={notifications} />}
           </div>
+          <button className="icon-button" onClick={logout} title="Sign out">
+            <LogOut size={18} />
+          </button>
         </header>
 
         <div className="content-grid">
           <section className="panel main-panel">
-            <PanelHeader page={page} selectedCount={selectedCount} />
-            {page === "Library" && <LibraryTree />}
-            {page === "Approvals" && <Approvals selected={selected} setSelected={setSelected} />}
-            {page === "Import" && <ImportWizard />}
+            <PanelHeader page={page} selectedCount={approvalSelectionCount} />
+            {error && <div className="error-banner">{error}</div>}
+            {loading && <div className="loading-line">Working...</div>}
+            {page === "Library" && <LibraryTree artists={library} />}
+            {page === "Approvals" && (
+              <Approvals
+                approvals={approvals}
+                onSelection={setApprovalSelection}
+                onApprove={approveBatch}
+                onReject={rejectSelected}
+              />
+            )}
+            {page === "Import" && (
+              <ImportWizard files={importFiles} onScan={scanImportFolder} onPropose={proposeImport} loading={loading} />
+            )}
+            {page === "Tasks" && <TasksView tasks={tasks} />}
             {page === "Settings" && (
               <SettingsPanel
                 accentColor={accentColor}
                 setAccentColor={setAccentColor}
                 backgroundTint={backgroundTint}
                 setBackgroundTint={setBackgroundTint}
+                user={user}
               />
             )}
-            {!["Library", "Approvals", "Import", "Settings"].includes(page) && <Placeholder page={page} />}
+            {!["Library", "Approvals", "Import", "Tasks", "Settings"].includes(page) && <Placeholder page={page} />}
           </section>
 
-          <aside className="panel inspector">
-            <h2>Inspector</h2>
-            <div className="diff">
-              <span>Current</span>
-              <p>Artist/Jubilee/03-Kokomo, IN.mp3</p>
-              <span>Proposed</span>
-              <p>Artist/Jubilee/03-Kokomo, IN.flac</p>
-            </div>
-            <div className="metadata-grid">
-              <label>Format</label>
-              <strong>FLAC</strong>
-              <label>Match</label>
-              <strong>Acoustic + MBID</strong>
-              <label>Risk</label>
-              <strong>Low</strong>
-            </div>
-          </aside>
+          <Inspector page={page} importFiles={importFiles} approvals={approvals} tasks={tasks} />
         </div>
-        {toastVisible && (
-          <Toast
-            title="Approval needed"
-            body="Import folder review has 12 selectable changes."
-            onClose={() => setToastVisible(false)}
-          />
-        )}
+        {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
       </section>
     </main>
   );
 }
 
-function NotificationTray() {
+function LoginScreen({ loading, error, onLogin }) {
+  const [pin, setPin] = useState("");
+
+  return (
+    <main className="login-page">
+      <form
+        className="login-panel"
+        onSubmit={(event) => {
+          event.preventDefault();
+          onLogin(pin);
+        }}
+      >
+        <div className="brand login-brand">
+          <div className="brand-mark">N</div>
+          <strong>Nudibranch</strong>
+        </div>
+        <label>
+          PIN
+          <input autoFocus value={pin} onChange={(event) => setPin(event.target.value)} type="password" />
+        </label>
+        {error && <div className="error-banner">{error}</div>}
+        <button className="primary" disabled={loading || pin.length < 4}>
+          {loading ? "Signing in" : "Sign in"}
+        </button>
+      </form>
+    </main>
+  );
+}
+
+function NotificationTray({ notifications }) {
   return (
     <div className="notification-tray">
       <h2>Notifications</h2>
-      <TrayItem tone="urgent" title="Approval needed" body="Import folder review has 12 selectable changes." />
-      <TrayItem title="Wishlist finished" body="3 FLAC candidates found from slskd." />
-      <TrayItem title="Low quality fallback" body="One track only has MP3 candidates." />
-      <TrayItem title="Jellyfin synced" body="Library scan completed successfully." />
+      {notifications.length === 0 ? (
+        <p className="empty-state">No notifications yet.</p>
+      ) : (
+        notifications.map((notification) => (
+          <TrayItem
+            key={notification.id}
+            tone={notification.status === "unread" ? "urgent" : "normal"}
+            title={notification.title}
+            body={notification.body}
+          />
+        ))
+      )}
     </div>
   );
 }
@@ -257,54 +421,49 @@ function PanelHeader({ page, selectedCount }) {
         <h1>{page}</h1>
         <p>{description ?? "Manage this section of Nudibranch."}</p>
       </div>
-      {page === "Approvals" && (
-        <div className="approval-actions">
-          <button className="secondary">Reject selected</button>
-          <button className="primary">
-            <Check size={16} />
-            Approve selected
-          </button>
-        </div>
-      )}
     </div>
   );
 }
 
-function LibraryTree() {
-  const [openArtists, setOpenArtists] = useState(() => new Set(["Japanese Breakfast", "Alvvays"]));
-  const [openAlbums, setOpenAlbums] = useState(() => new Set(["Jubilee", "Blue Rev"]));
+function LibraryTree({ artists }) {
+  const [openArtists, setOpenArtists] = useState(() => new Set());
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+
+  if (artists.length === 0) {
+    return <EmptyState title="No library records" body="Import approved music to populate the managed library." />;
+  }
 
   return (
     <div className="tree">
       {artists.map((artist) => (
-        <div key={artist.name}>
+        <div key={artist.id}>
           <TreeRow
             icon={Folder}
-            open={openArtists.has(artist.name)}
+            open={openArtists.has(artist.id)}
             title={artist.name}
-            meta={`${artist.albums.length} album`}
-            onToggle={() => toggleSet(setOpenArtists, artist.name)}
+            meta={`${artist.albums.length} albums`}
+            onToggle={() => toggleSet(setOpenArtists, artist.id)}
           />
-          {openArtists.has(artist.name) &&
+          {openArtists.has(artist.id) &&
             artist.albums.map((album) => (
-              <div key={album.name}>
+              <div key={album.id}>
                 <TreeRow
                   depth={1}
                   icon={Folder}
-                  open={openAlbums.has(album.name)}
-                  title={album.name}
+                  open={openAlbums.has(album.id)}
+                  title={album.title}
                   meta={`${album.tracks.length} tracks`}
-                  onToggle={() => toggleSet(setOpenAlbums, album.name)}
+                  onToggle={() => toggleSet(setOpenAlbums, album.id)}
                 />
-                {openAlbums.has(album.name) &&
-                  album.tracks.map(([number, title, format]) => (
+                {openAlbums.has(album.id) &&
+                  album.tracks.map((track) => (
                     <TreeRow
-                      key={title}
+                      key={track.id}
                       depth={2}
                       icon={FileAudio}
-                      title={`${number}-${title}`}
-                      meta={format}
-                      warning={format.includes("warning")}
+                      title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
+                      meta={track.format || "audio"}
+                      warning={!track.is_lossless}
                     />
                   ))}
               </div>
@@ -315,49 +474,116 @@ function LibraryTree() {
   );
 }
 
-function Approvals({ selected, setSelected }) {
-  const allSelected = selected.size === proposals.length;
+function Approvals({ approvals, onSelection, onApprove, onReject }) {
+  if (approvals.length === 0) {
+    return <EmptyState title="No pending approvals" body="Import scans and download searches will create review batches here." />;
+  }
 
   return (
     <div className="approval-tree">
-      <div className="bulk-row">
-        <label>
-          <input
-            type="checkbox"
-            checked={allSelected}
-            onChange={(event) => setSelected(event.target.checked ? new Set(proposals.map((item) => item.id)) : new Set())}
-          />
-          Select all visible
-        </label>
-        <span>{selected.size} selected</span>
-      </div>
-      {proposals.map((proposal) => (
-        <label className="proposal-row" style={{ "--depth": proposal.depth }} key={proposal.id}>
-          <input
-            type="checkbox"
-            checked={selected.has(proposal.id)}
-            onChange={(event) => {
-              const next = new Set(selected);
-              if (event.target.checked) next.add(proposal.id);
-              else next.delete(proposal.id);
-              setSelected(next);
-            }}
-          />
-          <span className="proposal-title">{proposal.title}</span>
-          <small>{proposal.detail}</small>
-        </label>
+      {approvals.map((batch) => (
+        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
   );
 }
 
-function ImportWizard() {
+function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
+  const depths = useMemo(() => calculateDepths(batch.items), [batch.items]);
+  const selectedItems = batch.items.filter((item) => item.selected);
+  const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
+
   return (
-    <div className="wizard">
-      {["Scan /app/import", "Fingerprint", "Group", "Preview changes", "Approve import"].map((step, index) => (
-        <div className={index === 0 ? "wizard-step current" : "wizard-step"} key={step}>
-          <span>{index + 1}</span>
-          <strong>{step}</strong>
+    <section className="batch">
+      <div className="batch-header">
+        <div>
+          <h2>{batch.title}</h2>
+          <p>
+            {batch.status} · {selectedItems.length} of {batch.items.length} selected
+          </p>
+        </div>
+        <div className="approval-actions">
+          <button className="secondary" onClick={() => onReject(batch.id, selectedItems.map((item) => item.id))} disabled={selectedItems.length === 0}>
+            Reject selected
+          </button>
+          <button className="primary" onClick={() => onApprove(batch.id)} disabled={selectedItems.length === 0}>
+            <Check size={16} />
+            Approve selected
+          </button>
+        </div>
+      </div>
+      <div className="bulk-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={allSelected}
+            onChange={(event) => onSelection(batch.id, batch.items.map((item) => item.id), event.target.checked)}
+          />
+          Select all visible
+        </label>
+        <span>{selectedItems.length} selected</span>
+      </div>
+      {batch.items.map((item) => (
+        <label className="proposal-row" style={{ "--depth": depths.get(item.id) || 0 }} key={item.id}>
+          <input
+            type="checkbox"
+            checked={item.selected}
+            onChange={(event) => onSelection(batch.id, [item.id], event.target.checked)}
+          />
+          <span className="proposal-title">{item.title}</span>
+          <small>{item.kind}</small>
+        </label>
+      ))}
+    </section>
+  );
+}
+
+function ImportWizard({ files, onScan, onPropose, loading }) {
+  return (
+    <div className="import-view">
+      <div className="action-bar">
+        <button className="primary" onClick={onScan} disabled={loading}>
+          <RefreshCw size={16} />
+          Scan import folder
+        </button>
+        <button className="secondary" onClick={onPropose} disabled={loading || files.length === 0}>
+          Create review batch
+        </button>
+      </div>
+      {files.length === 0 ? (
+        <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
+      ) : (
+        <div className="file-list">
+          {files.map((file) => (
+            <div className="file-row" key={file.path}>
+              <FileAudio size={17} />
+              <div>
+                <strong>{file.metadata?.title || file.relative_path}</strong>
+                <span>
+                  {file.metadata?.artist || "Unknown Artist"} · {file.metadata?.album || "Unknown Album"}
+                </span>
+              </div>
+              <small>{formatBytes(file.size_bytes)}</small>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TasksView({ tasks }) {
+  if (tasks.length === 0) {
+    return <EmptyState title="No tasks" body="Scans, approvals, downloads, and notifications will appear here." />;
+  }
+
+  return (
+    <div className="task-list">
+      {tasks.map((task) => (
+        <div className="task-row" key={task.id}>
+          <strong>{task.type}</strong>
+          <span>{task.status}</span>
+          <small>{task.error || new Date(task.created_at).toLocaleString()}</small>
         </div>
       ))}
     </div>
@@ -374,7 +600,7 @@ function Placeholder({ page }) {
   );
 }
 
-function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint }) {
+function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint, user }) {
   return (
     <div className="settings-grid">
       <section className="settings-section">
@@ -397,15 +623,35 @@ function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgro
       <section className="settings-section">
         <h2>Status</h2>
         <div className="status-list">
+          <span>User</span>
+          <strong>{user?.display_name || "Signed in"}</strong>
+          <span>Role</span>
+          <strong>{user?.is_admin ? "Admin" : "User"}</strong>
           <span>API</span>
           <strong>Connected</strong>
-          <span>Worker</span>
-          <strong>Running</strong>
-          <span>slskd</span>
-          <strong>Configured</strong>
         </div>
       </section>
     </div>
+  );
+}
+
+function Inspector({ page, importFiles, approvals, tasks }) {
+  const selectedApprovalCount = approvals.reduce((total, batch) => total + batch.items.filter((item) => item.selected).length, 0);
+
+  return (
+    <aside className="panel inspector">
+      <h2>Inspector</h2>
+      <div className="metadata-grid">
+        <label>Page</label>
+        <strong>{page}</strong>
+        <label>Imports</label>
+        <strong>{importFiles.length}</strong>
+        <label>Approvals</label>
+        <strong>{selectedApprovalCount} selected</strong>
+        <label>Tasks</label>
+        <strong>{tasks.length}</strong>
+      </div>
+    </aside>
   );
 }
 
@@ -430,6 +676,30 @@ function TreeRow({ depth = 0, icon: Icon, open, title, meta, warning = false, on
   );
 }
 
+function EmptyState({ title, body }) {
+  return (
+    <div className="empty-panel">
+      <h2>{title}</h2>
+      <p>{body}</p>
+    </div>
+  );
+}
+
+function calculateDepths(items) {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const depths = new Map();
+  const depthOf = (item) => {
+    if (!item.parent_id) return 0;
+    if (depths.has(item.id)) return depths.get(item.id);
+    const parent = byId.get(item.parent_id);
+    const depth = parent ? depthOf(parent) + 1 : 0;
+    depths.set(item.id, depth);
+    return depth;
+  };
+  items.forEach((item) => depths.set(item.id, depthOf(item)));
+  return depths;
+}
+
 function toggleSet(setter, value) {
   setter((current) => {
     const next = new Set(current);
@@ -437,6 +707,13 @@ function toggleSet(setter, value) {
     else next.add(value);
     return next;
   });
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
 createRoot(document.getElementById("root")).render(<App />);

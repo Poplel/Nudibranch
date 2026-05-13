@@ -26,6 +26,52 @@ button {
   cursor: pointer;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.login-page {
+  --accent: #356df3;
+  --accent-strong: #1743a8;
+  --soft: #eef3ff;
+  --line: #d6d8dc;
+  --text: #202124;
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  background: color-mix(in srgb, #356df3 7%, #f1f2f4);
+  color: #202124;
+}
+
+.login-panel {
+  display: grid;
+  gap: 14px;
+  width: min(360px, calc(100vw - 32px));
+  padding: 18px;
+  border: 1px solid #d6d8dc;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.12);
+}
+
+.login-brand {
+  padding: 0 0 8px;
+}
+
+.login-panel label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.login-panel input {
+  min-height: 38px;
+  border: 1px solid #d6d8dc;
+  border-radius: 4px;
+  padding: 0 10px;
+}
+
 .app {
   --accent-color: #356df3;
   --background-tint: #356df3;
@@ -286,6 +332,26 @@ nav button:hover,
   font-size: 13px;
 }
 
+.error-banner,
+.loading-line {
+  margin: 10px 12px 0;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.error-banner {
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel-strong));
+  color: var(--danger);
+}
+
+.loading-line {
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  color: var(--muted);
+}
+
 .approval-actions {
   display: flex;
   gap: 8px;
@@ -317,6 +383,119 @@ nav button:hover,
 .approval-tree,
 .wizard {
   padding: 8px;
+}
+
+.import-view,
+.task-list {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.action-bar,
+.batch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.action-bar {
+  justify-content: flex-start;
+}
+
+.batch {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.batch-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.batch-header p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-list {
+  display: grid;
+  gap: 4px;
+}
+
+.file-row,
+.task-row {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--panel-strong);
+}
+
+.file-row {
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+}
+
+.file-row div,
+.task-row {
+  min-width: 0;
+}
+
+.file-row strong,
+.file-row span,
+.task-row strong,
+.task-row span,
+.task-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-row span,
+.file-row small,
+.task-row small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.task-row {
+  grid-template-columns: minmax(0, 1fr) 110px minmax(0, 1fr);
+}
+
+.empty-panel,
+.empty-state {
+  display: grid;
+  gap: 4px;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  padding: 22px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-panel h2,
+.empty-state h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+}
+
+.empty-panel p,
+.empty-state p {
+  max-width: 460px;
+  margin: 0;
 }
 
 .tree-row,
