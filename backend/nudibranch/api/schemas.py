@@ -146,3 +146,4 @@ class ImportAcousticLookupRequest(BaseModel):
 class AlbumLookupRequest(BaseModel):
     artist: str
     album: str
+    release_id: str | None = None

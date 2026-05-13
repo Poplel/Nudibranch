@@ -54,8 +54,26 @@ def lookup_recording_by_fingerprint(file_info: dict) -> list[dict]:
     return sorted(candidates, key=lambda candidate: candidate.get("score") or 0, reverse=True)
 
 
-def lookup_album_tracks(artist: str, album: str) -> dict:
-    release = find_release(artist, album)
+def search_album_releases(artist: str, album: str) -> list[dict]:
+    releases = find_releases(artist, album, limit=10)
+    return [
+        {
+            "id": release.get("id"),
+            "title": release.get("title"),
+            "artist": artist_credit(release.get("artist-credit", [])) or artist,
+            "date": release.get("date"),
+            "country": release.get("country"),
+            "score": release.get("score"),
+            "track_count": release.get("track-count"),
+            "cover_art_url": cover_art_url(release.get("id")),
+        }
+        for release in releases
+        if release.get("id")
+    ]
+
+
+def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) -> dict:
+    release = {"id": release_id} if release_id else find_release(artist, album)
     if not release:
         return {"artist": artist, "album": album, "tracks": [], "source": "musicbrainz"}
 
@@ -91,16 +109,20 @@ def lookup_album_tracks(artist: str, album: str) -> dict:
     }
 
 
-def find_release(artist: str, album: str) -> dict | None:
+def find_releases(artist: str, album: str, limit: int = 5) -> list[dict]:
     query = f'artist:"{escape_query(artist)}" AND release:"{escape_query(album)}"'
     response = httpx.get(
         "https://musicbrainz.org/ws/2/release/",
-        params={"fmt": "json", "query": query, "limit": 5},
+        params={"fmt": "json", "query": query, "limit": limit},
         timeout=20,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
-    releases = response.json().get("releases", [])
+    return response.json().get("releases", [])
+
+
+def find_release(artist: str, album: str) -> dict | None:
+    releases = find_releases(artist, album, limit=5)
     if not releases:
         return None
     normalized_album = normalize(album)
@@ -145,6 +167,12 @@ def parse_track_number(value) -> int | None:
 
 def escape_query(value: str) -> str:
     return value.replace('"', "")
+
+
+def cover_art_url(release_id: str | None) -> str | None:
+    if not release_id:
+        return None
+    return f"https://coverartarchive.org/release/{release_id}/front-250"
 
 
 def normalize(value: str | None) -> str:

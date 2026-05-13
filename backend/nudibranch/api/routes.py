@@ -43,7 +43,7 @@ from nudibranch.db.models import (
 )
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files
-from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint
+from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.tasks import enqueue_task, task_result, task_to_payload
 
@@ -154,9 +154,20 @@ def album_lookup(
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     try:
-        return lookup_album_tracks(payload.artist, payload.album)
+        return lookup_album_tracks(payload.artist, payload.album, payload.release_id)
     except httpx.HTTPError as error:
         raise HTTPException(status_code=502, detail=f"Album lookup failed: {error}") from error
+
+
+@router.post("/imports/album-search", tags=["imports"])
+def album_search(
+    payload: AlbumLookupRequest,
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    try:
+        return {"results": search_album_releases(payload.artist, payload.album)}
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Album search failed: {error}") from error
 
 
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"])

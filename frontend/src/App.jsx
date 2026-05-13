@@ -9,6 +9,7 @@ import {
   Download,
   FileAudio,
   Folder,
+  GripVertical,
   HardDriveUpload,
   ListChecks,
   LogOut,
@@ -90,11 +91,28 @@ function App() {
   const trayRef = useRef(null);
 
   const theme = dark ? "app dark" : "app";
-  const approvalSelectionCount = useMemo(
-    () => approvals.reduce((total, batch) => total + batch.items.filter((item) => item.selected).length, 0),
-    [approvals],
+  const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
+  const queueSelectionCount = useMemo(
+    () => queueGroups.reduce((total, group) => total + group.items.filter((item) => item.selected).length, 0),
+    [queueGroups],
+  );
+  const queueItemCount = useMemo(
+    () => queueGroups.reduce((total, group) => total + group.items.length, 0),
+    [queueGroups],
+  );
+  const queueGroupCount = queueGroups.length;
+  const queueSummary = useMemo(
+    () =>
+      queueItemCount === 0
+        ? "No queued changes."
+        : `${queueSelectionCount} of ${queueItemCount} visible changes selected across ${queueGroupCount} group${queueGroupCount === 1 ? "" : "s"}.`,
+    [queueGroupCount, queueItemCount, queueSelectionCount],
   );
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
+  const activeSeverity = useMemo(
+    () => notifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
+    [notifications],
+  );
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -322,13 +340,13 @@ function App() {
     }
   }
 
-  async function lookupImportAlbum(artist, album) {
+  async function lookupImportAlbum(artist, album, releaseId = null) {
     setLoading(true);
     setError("");
     try {
       const data = await api("/imports/album-lookup", {
         method: "POST",
-        body: JSON.stringify({ artist, album }),
+        body: JSON.stringify({ artist, album, release_id: releaseId }),
       });
       setToast({ title: "Album checked", body: `${data.tracks?.length || 0} tracks found.` });
       return data;
@@ -336,6 +354,24 @@ function App() {
       setError(lookupError.message);
       setToast({ title: "Album lookup failed", body: lookupError.message });
       return null;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function searchImportAlbums(artist, album) {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api("/imports/album-search", {
+        method: "POST",
+        body: JSON.stringify({ artist, album }),
+      });
+      return data.results || [];
+    } catch (lookupError) {
+      setError(lookupError.message);
+      setToast({ title: "Album search failed", body: lookupError.message });
+      return [];
     } finally {
       setLoading(false);
     }
@@ -433,6 +469,7 @@ function App() {
             <button className="icon-button" onClick={() => setTrayOpen((value) => !value)} title="Notifications">
               <Bell size={18} />
               {notifications.length > 0 && <span className="badge">{notifications.length}</span>}
+              {notifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
             </button>
             {trayOpen && <NotificationTray notifications={notifications} />}
           </div>
@@ -443,10 +480,12 @@ function App() {
 
         <div className="content-grid">
           <section className="panel main-panel">
-            <PanelHeader page={page} selectedCount={approvalSelectionCount} />
+            <PanelHeader page={page} queueSummary={queueSummary} />
             {error && <div className="error-banner">{error}</div>}
             {loading && <div className="loading-line">Working...</div>}
-            {page === "Library" && <LibraryTree artists={library} />}
+            {page === "Library" && (
+              <LibraryTree artists={library} onCheckAlbum={lookupImportAlbum} onSearchAlbums={searchImportAlbums} />
+            )}
             {page === "Task Queue" && (
               <Approvals
                 approvals={approvals}
@@ -464,6 +503,7 @@ function App() {
                 library={library}
                 onRecheckTrack={recheckImportTrack}
                 onCheckAlbum={lookupImportAlbum}
+                onSearchAlbums={searchImportAlbums}
                 loading={loading}
                 activeImportTask={activeImportTask}
               />
@@ -483,7 +523,7 @@ function App() {
             {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools"].includes(page) && <Placeholder page={page} />}
           </section>
 
-          <Inspector page={page} importFiles={importFiles} approvals={approvals} tasks={tasks} />
+          <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
       </section>
@@ -524,18 +564,20 @@ function NotificationTray({ notifications }) {
   return (
     <div className="notification-tray">
       <h2>Notifications</h2>
-      {notifications.length === 0 ? (
-        <p className="empty-state">No notifications yet.</p>
-      ) : (
-        notifications.map((notification) => (
-          <TrayItem
-            key={notification.id}
-            tone={notification.status === "unread" ? "urgent" : "normal"}
-            title={notification.title}
-            body={notification.body}
-          />
-        ))
-      )}
+      <div className="notification-list">
+        {notifications.length === 0 ? (
+          <p className="empty-state">No notifications yet.</p>
+        ) : (
+          notifications.map((notification) => (
+            <TrayItem
+              key={notification.id}
+              tone={notificationSeverity(notification)}
+              title={notification.title}
+              body={notification.body}
+            />
+          ))
+        )}
+      </div>
     </div>
   );
 }
@@ -549,8 +591,8 @@ function TrayItem({ title, body, tone = "normal" }) {
   );
 }
 
-function PanelHeader({ page, selectedCount }) {
-  const description = page === "Task Queue" ? `${selectedCount} selected changes are ready to run.` : pageDescriptions[page];
+function PanelHeader({ page, queueSummary }) {
+  const description = page === "Task Queue" ? queueSummary : pageDescriptions[page];
 
   return (
     <div className="panel-header">
@@ -562,51 +604,175 @@ function PanelHeader({ page, selectedCount }) {
   );
 }
 
-function LibraryTree({ artists }) {
+function LibraryTree({ artists, onCheckAlbum, onSearchAlbums }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [openAlbumDetails, setOpenAlbumDetails] = useState(() => new Set());
+  const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
+  const [requestedAlbums, setRequestedAlbums] = useState([]);
+  const visibleArtists = useMemo(
+    () =>
+      artists
+        .map((artist) => ({
+          ...artist,
+          albums: artist.albums.filter((album) => album.tracks.length > 0),
+        }))
+        .filter((artist) => artist.albums.length > 0),
+    [artists],
+  );
+  const requestedArtists = useMemo(() => groupRequestedAlbums(requestedAlbums), [requestedAlbums]);
 
-  if (artists.length === 0) {
-    return <EmptyState title="No library records" body="Import queued music to populate the managed library." />;
+  async function addRequestedAlbum(album) {
+    const record = await onCheckAlbum(album.artist, album.name, album.id);
+    setRequestedAlbums((current) => [
+      ...current,
+      {
+        ...album,
+        tracks: record?.tracks?.length ? record.tracks : album.tracks,
+      },
+    ]);
+    setAlbumSearchOpen(false);
   }
 
   return (
-    <div className="tree">
-      {artists.map((artist) => (
-        <div key={artist.id}>
+    <div className="library-view">
+      <div className="action-bar">
+        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
+          <Plus size={16} />
+          Add album
+        </button>
+      </div>
+      {albumSearchOpen && <AlbumSearchPanel onAdd={addRequestedAlbum} onLookup={onCheckAlbum} onSearch={onSearchAlbums} />}
+      {visibleArtists.length === 0 && requestedArtists.length === 0 && (
+        <EmptyState title="No library records" body="Import queued music to populate the managed library." />
+      )}
+      <div className="tree">
+        {visibleArtists.map((artist) => (
+          <div key={artist.id}>
+            <TreeRow
+              icon={Folder}
+              open={openArtists.has(artist.id)}
+              title={artist.name}
+              meta={`${artist.albums.length} albums`}
+              onToggle={() => toggleSet(setOpenArtists, artist.id)}
+            />
+            {openArtists.has(artist.id) &&
+              artist.albums.map((album) => (
+                <div key={album.id}>
+                  <div className="tree-action-row">
+                    <TreeRow
+                      depth={1}
+                      icon={Folder}
+                      open={openAlbums.has(album.id)}
+                      title={album.title}
+                      meta={`${album.tracks.length} tracks`}
+                      onToggle={() => toggleSet(setOpenAlbums, album.id)}
+                    />
+                    <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Album details">
+                      <Pencil size={15} />
+                    </button>
+                  </div>
+                  {openAlbumDetails.has(album.id) && (
+                    <AlbumDetails
+                      artist={artist.name}
+                      album={album.title}
+                      coverUrl={album.cover_path}
+                      details={{ path: album.path, tracks: album.tracks.length }}
+                    />
+                  )}
+                  {openAlbums.has(album.id) &&
+                    album.tracks.map((track) => (
+                      <TreeRow
+                        key={track.id}
+                        depth={2}
+                        icon={FileAudio}
+                        title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
+                        meta={track.format || "audio"}
+                        warning={!track.is_lossless}
+                      />
+                    ))}
+                </div>
+              ))}
+          </div>
+        ))}
+      {requestedArtists.map((artist) => (
+        <div key={artist.name}>
           <TreeRow
             icon={Folder}
-            open={openArtists.has(artist.id)}
+            open={openArtists.has(artist.name)}
             title={artist.name}
-            meta={`${artist.albums.length} albums`}
-            onToggle={() => toggleSet(setOpenArtists, artist.id)}
+            meta={`${artist.albums.length} requested albums`}
+            onToggle={() => toggleSet(setOpenArtists, artist.name)}
           />
-          {openArtists.has(artist.id) &&
+          {openArtists.has(artist.name) &&
             artist.albums.map((album) => (
               <div key={album.id}>
-                <TreeRow
-                  depth={1}
-                  icon={Folder}
-                  open={openAlbums.has(album.id)}
-                  title={album.title}
-                  meta={`${album.tracks.length} tracks`}
-                  onToggle={() => toggleSet(setOpenAlbums, album.id)}
-                />
+                <div className="tree-action-row">
+                  <TreeRow
+                    depth={1}
+                    icon={Folder}
+                    open={openAlbums.has(album.id)}
+                    title={album.name}
+                    meta={`${album.tracks.length} ghost tracks`}
+                    warning
+                    onToggle={() => toggleSet(setOpenAlbums, album.id)}
+                  />
+                  <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Album details">
+                    <Pencil size={15} />
+                  </button>
+                </div>
+                {openAlbumDetails.has(album.id) && (
+                  <AlbumDetails
+                    artist={artist.name}
+                    album={album.name}
+                    coverUrl={album.cover_art_url}
+                    details={{ status: "Requested", tracks: album.tracks.length }}
+                    onAddGhost={() =>
+                      setRequestedAlbums((current) =>
+                        current.map((currentAlbum) =>
+                          currentAlbum.id === album.id
+                            ? {
+                                ...currentAlbum,
+                                tracks: [
+                                  ...currentAlbum.tracks,
+                                  { track_number: currentAlbum.tracks.length + 1, title: `Track ${currentAlbum.tracks.length + 1}` },
+                                ],
+                              }
+                            : currentAlbum,
+                        ),
+                      )
+                    }
+                  />
+                )}
                 {openAlbums.has(album.id) &&
                   album.tracks.map((track) => (
-                    <TreeRow
-                      key={track.id}
-                      depth={2}
-                      icon={FileAudio}
-                      title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
-                      meta={track.format || "audio"}
-                      warning={!track.is_lossless}
+                    <GhostTrackRow
+                      key={`${album.id}:${track.track_number}:${track.title}`}
+                      slot={{
+                        id: `${album.id}:${track.track_number}:${track.title}`,
+                        track_number: track.track_number,
+                        title: track.title,
+                        reason: "Requested for download",
+                      }}
+                      checked
+                      onChecked={() => {}}
+                      onDismiss={() =>
+                        setRequestedAlbums((current) =>
+                          current.map((currentAlbum) =>
+                            currentAlbum.id === album.id
+                              ? { ...currentAlbum, tracks: currentAlbum.tracks.filter((currentTrack) => currentTrack !== track) }
+                              : currentAlbum,
+                          ),
+                        )
+                      }
+                      onDrop={() => {}}
                     />
                   ))}
               </div>
             ))}
         </div>
       ))}
+      </div>
     </div>
   );
 }
@@ -722,7 +888,18 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
   );
 }
 
-function ImportWizard({ files, onScan, onPropose, onFilesChange, library, onRecheckTrack, onCheckAlbum, loading, activeImportTask }) {
+function ImportWizard({
+  files,
+  onScan,
+  onPropose,
+  onFilesChange,
+  library,
+  onRecheckTrack,
+  onCheckAlbum,
+  onSearchAlbums,
+  loading,
+  activeImportTask,
+}) {
   const [manualAlbums, setManualAlbums] = useState([]);
   const [albumRecords, setAlbumRecords] = useState({});
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
@@ -762,7 +939,7 @@ function ImportWizard({ files, onScan, onPropose, onFilesChange, library, onRech
           {activeImportTask ? "Import review running" : "Add to task queue"}
         </button>
       </div>
-      {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} onLookup={checkAlbum} />}
+      {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} onLookup={checkAlbum} onSearch={onSearchAlbums} />}
       {files.length === 0 && manualAlbums.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
       ) : (
@@ -780,64 +957,79 @@ function ImportWizard({ files, onScan, onPropose, onFilesChange, library, onRech
   );
 }
 
-function AlbumSearchPanel({ onAdd, onLookup }) {
+function AlbumSearchPanel({ onAdd, onLookup, onSearch }) {
   const [artist, setArtist] = useState("");
   const [album, setAlbum] = useState("");
-  const [tracks, setTracks] = useState(10);
+  const [results, setResults] = useState([]);
+  const [searched, setSearched] = useState(false);
 
   async function submit(event) {
     event.preventDefault();
     if (!artist.trim() || !album.trim()) return;
-    const record = await onLookup(artist.trim(), album.trim());
-    if (record?.tracks?.length) {
-      onAdd({
-        id: record.musicbrainz_album_id || `manual:${Date.now()}`,
-        name: record.album || album.trim(),
-        artist: record.artist || artist.trim(),
-        tracks: record.tracks,
-      });
-      return;
-    }
+    setSearched(true);
+    setResults(await onSearch(artist.trim(), album.trim()));
+  }
+
+  async function addResult(result) {
+    const record = await onLookup(result.artist || artist.trim(), result.title || album.trim(), result.id);
     onAdd({
-      id: `manual:${Date.now()}`,
-      name: album.trim(),
-      artist: artist.trim(),
-      tracks: Array.from({ length: Number(tracks) || 10 }, (_, index) => ({
-        track_number: index + 1,
-        title: `Track ${index + 1}`,
-      })),
+      id: record?.musicbrainz_album_id || result.id || `manual:${Date.now()}`,
+      name: record?.album || result.title || album.trim(),
+      artist: record?.artist || result.artist || artist.trim(),
+      cover_art_url: result.cover_art_url,
+      tracks: record?.tracks || [],
     });
   }
 
   return (
-    <form className="album-search-panel" onSubmit={submit}>
-      <label>
-        Artist
-        <input value={artist} onChange={(event) => setArtist(event.target.value)} />
-      </label>
-      <label>
-        Album
-        <input value={album} onChange={(event) => setAlbum(event.target.value)} />
-      </label>
-      <label>
-        Tracks
-        <input type="number" min="1" max="80" value={tracks} onChange={(event) => setTracks(event.target.value)} />
-      </label>
-      <button className="primary">
-        <Plus size={16} />
-        Add
-      </button>
-    </form>
+    <div className="album-search-panel">
+      <form className="album-search-fields" onSubmit={submit}>
+        <label>
+          Artist
+          <input value={artist} onChange={(event) => setArtist(event.target.value)} />
+        </label>
+        <label>
+          Album
+          <input value={album} onChange={(event) => setAlbum(event.target.value)} />
+        </label>
+        <button className="primary">
+          <Search size={16} />
+          Search
+        </button>
+      </form>
+      {searched && (
+        <div className="album-results">
+          {results.length === 0 ? (
+            <p>No album results found.</p>
+          ) : (
+            results.map((result) => (
+              <button className="album-result" key={result.id} onClick={() => addResult(result)}>
+                <img src={result.cover_art_url || ""} alt="" />
+                <span>
+                  <strong>{result.title}</strong>
+                  <small>
+                    {result.artist} {result.date ? `· ${result.date}` : ""} {result.track_count ? `· ${result.track_count} tracks` : ""}
+                  </small>
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
 function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords, onRecheckTrack, onCheckAlbum }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [openAlbumDetails, setOpenAlbumDetails] = useState(() => new Set());
   const [draggedAlbum, setDraggedAlbum] = useState(null);
   const [draggedTrack, setDraggedTrack] = useState(null);
+  const [selectedTracks, setSelectedTracks] = useState(() => new Set());
   const [downloadSelections, setDownloadSelections] = useState(() => new Set());
   const [dismissedGhosts, setDismissedGhosts] = useState(() => new Set());
+  const [extraGhosts, setExtraGhosts] = useState({});
   const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums, albumRecords), [files, library, manualAlbums, albumRecords]);
 
   useEffect(() => {
@@ -847,28 +1039,35 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
 
   return (
     <div className="tree">
-      {grouped.map((artist) => (
-        <div key={artist.name}>
-          <div
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={() => {
-              if (draggedAlbum) {
-                updateImportAlbum(files, onFilesChange, draggedAlbum.artist, draggedAlbum.album, { artist: artist.name, albumartist: artist.name });
-                setDraggedAlbum(null);
-              }
-            }}
-          >
-            <TreeRow
-              icon={Folder}
-              open={openArtists.has(artist.name)}
-              title={artist.name}
-              meta={`${artist.count} files`}
-              onToggle={() => toggleSet(setOpenArtists, artist.name)}
-            />
-          </div>
-          {openArtists.has(artist.name) &&
-            artist.albums.map((album) => {
+      {grouped.map((artist) => {
+        const visibleAlbums = artist.albums.filter((album) =>
+          album.slots.some((slot) => slot.file || !dismissedGhosts.has(slot.id)),
+        );
+        if (visibleAlbums.length === 0) return null;
+        return (
+          <div key={artist.name}>
+            <div
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={() => {
+                if (draggedAlbum) {
+                  updateImportAlbum(files, onFilesChange, draggedAlbum.artist, draggedAlbum.album, { artist: artist.name, albumartist: artist.name });
+                  setDraggedAlbum(null);
+                }
+              }}
+            >
+              <TreeRow
+                icon={Folder}
+                open={openArtists.has(artist.name)}
+                title={artist.name}
+                meta={`${artist.count} files`}
+                onToggle={() => toggleSet(setOpenArtists, artist.name)}
+              />
+            </div>
+            {openArtists.has(artist.name) &&
+              visibleAlbums.map((album) => {
               const albumId = `${artist.name}/${album.name}`;
+              const albumSlots = [...album.slots, ...(extraGhosts[albumId] || [])];
+              const visibleSlots = albumSlots.filter((slot) => slot.file || !dismissedGhosts.has(slot.id));
               return (
                 <div key={albumId}>
                   <div
@@ -877,8 +1076,15 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                     onDragOver={(event) => event.preventDefault()}
                     onDrop={() => {
                       if (draggedTrack) {
-                        updateImportFile(files, onFilesChange, draggedTrack, { artist: artist.name, albumartist: artist.name, album: album.name });
+                        moveTrackPaths(files, onFilesChange, draggedTrack.paths, {
+                          artist: artist.name,
+                          albumartist: artist.name,
+                          album: album.name,
+                        });
                         setDraggedTrack(null);
+                      } else if (draggedAlbum) {
+                        mergeAlbumIntoAlbum(files, onFilesChange, draggedAlbum, { artist: artist.name, album: album.name, slots: album.slots });
+                        setDraggedAlbum(null);
                       }
                     }}
                   >
@@ -895,15 +1101,46 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
                         <Search size={15} />
                       </button>
+                      <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, albumId)} title="Album details">
+                        <Pencil size={15} />
+                      </button>
                     </div>
                   </div>
+                  {openAlbumDetails.has(albumId) && (
+                    <AlbumDetails
+                      artist={artist.name}
+                      album={album.name}
+                      coverUrl={album.cover_art_url}
+                      details={{ status: album.matchStatus, tracks: albumSlots.length }}
+                      onAddGhost={() =>
+                        setExtraGhosts((current) => {
+                          const currentSlots = current[albumId] || [];
+                          const nextNumber = albumSlots.length + 1;
+                          return {
+                            ...current,
+                            [albumId]: [
+                              ...currentSlots,
+                              {
+                                id: `${albumId}:manual:${nextNumber}`,
+                                track_number: nextNumber,
+                                title: `Track ${nextNumber}`,
+                                reason: "Manual slot",
+                              },
+                            ],
+                          };
+                        })
+                      }
+                    />
+                  )}
                   {openAlbums.has(albumId) &&
-                    album.slots.filter((slot) => slot.file || !dismissedGhosts.has(slot.id)).map((slot) =>
+                    visibleSlots.map((slot) =>
                       slot.file ? (
                         <ImportTrackRow
                           file={slot.file}
                           album={album}
-                          onDragStart={() => setDraggedTrack(slot.file.path)}
+                          selected={selectedTracks.has(slot.file.path)}
+                          onClick={(event) => toggleTrackSelection(setSelectedTracks, slot.file.path, event.shiftKey)}
+                          onDragStart={() => setDraggedTrack({ paths: dragPathsForTrack(selectedTracks, slot.file.path) })}
                           onChange={(patch) => updateImportFile(files, onFilesChange, slot.file.path, patch)}
                           onRecheck={() => onRecheckTrack(slot.file)}
                           key={slot.file.path}
@@ -917,8 +1154,9 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                           onDismiss={() => toggleDownloadSelection(setDismissedGhosts, slot.id, true)}
                           onDrop={() => {
                             if (draggedTrack) {
-                              const draggedFile = files.find((file) => file.path === draggedTrack);
-                              updateImportFile(files, onFilesChange, draggedTrack, {
+                              const primaryPath = draggedTrack.paths[0];
+                              const draggedFile = files.find((file) => file.path === primaryPath);
+                              moveTrackPaths(files, onFilesChange, draggedTrack.paths, {
                                 artist: artist.name,
                                 albumartist: artist.name,
                                 album: album.name,
@@ -926,6 +1164,9 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                                 title: titleForDroppedSlot(slot, draggedFile),
                               });
                               setDraggedTrack(null);
+                            } else if (draggedAlbum) {
+                              mergeAlbumIntoAlbum(files, onFilesChange, draggedAlbum, { artist: artist.name, album: album.name, slots: album.slots });
+                              setDraggedAlbum(null);
                             }
                           }}
                         />
@@ -934,19 +1175,20 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                 </div>
               );
             })}
-        </div>
-      ))}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function ImportTrackRow({ file, album, onChange, onDragStart, onRecheck }) {
+function ImportTrackRow({ file, album, selected, onClick, onChange, onDragStart, onRecheck }) {
   const metadata = file.metadata || {};
   const [editing, setEditing] = useState(false);
   return (
     <>
-      <div className="import-edit-row" draggable onDragStart={onDragStart}>
-        <span className="chevron" />
+      <div className={selected ? "import-edit-row selected" : "import-edit-row"} draggable onClick={onClick} onDragStart={onDragStart}>
+        <GripVertical className="grip" size={16} />
         <FileAudio size={17} />
         <DraftInput value={metadata.artist || ""} onCommit={(value) => onChange({ artist: value, albumartist: value })} />
         <DraftInput value={metadata.album || ""} onCommit={(value) => onChange({ album: value })} />
@@ -1044,6 +1286,32 @@ function MetadataEditor({ metadata, onChange }) {
           Add tag
         </button>
       </form>
+    </div>
+  );
+}
+
+function AlbumDetails({ artist, album, coverUrl, details = {}, onAddGhost }) {
+  return (
+    <div className="album-details">
+      <div className="album-art">{coverUrl ? <img src={coverUrl} alt="" /> : <Music size={24} />}</div>
+      <div className="album-detail-grid">
+        <label>Artist</label>
+        <strong>{artist}</strong>
+        <label>Album</label>
+        <strong>{album}</strong>
+        {Object.entries(details).map(([key, value]) => (
+          <React.Fragment key={key}>
+            <label>{key}</label>
+            <span>{String(value ?? "")}</span>
+          </React.Fragment>
+        ))}
+      </div>
+      {onAddGhost && (
+        <button className="secondary" onClick={onAddGhost}>
+          <Plus size={15} />
+          Add ghost track
+        </button>
+      )}
     </div>
   );
 }
@@ -1191,9 +1459,7 @@ function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgro
   );
 }
 
-function Inspector({ page, importFiles, approvals, tasks }) {
-  const selectedApprovalCount = approvals.reduce((total, batch) => total + batch.items.filter((item) => item.selected).length, 0);
-
+function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks }) {
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
@@ -1203,7 +1469,7 @@ function Inspector({ page, importFiles, approvals, tasks }) {
         <label>Imports</label>
         <strong>{importFiles.length}</strong>
         <label>Queue</label>
-        <strong>{selectedApprovalCount} selected</strong>
+        <strong>{queueSelectionCount} / {queueItemCount} selected</strong>
         <label>Tasks</label>
         <strong>{tasks.length}</strong>
       </div>
@@ -1299,6 +1565,49 @@ function patchImportFile(files, path, metadataPatch) {
       suggested_library_path: suggestImportPath(file, metadata),
     };
   });
+}
+
+function moveTrackPaths(files, onFilesChange, paths, metadataPatch) {
+  const pathSet = new Set(paths);
+  onFilesChange(
+    files.map((file) => {
+      if (!pathSet.has(file.path)) return file;
+      const metadata = { ...(file.metadata || {}), ...metadataPatch };
+      return {
+        ...file,
+        metadata,
+        suggested_library_path: suggestImportPath(file, metadata),
+      };
+    }),
+  );
+}
+
+function mergeAlbumIntoAlbum(files, onFilesChange, sourceAlbum, targetAlbum) {
+  const sourceFiles = files.filter((file) => {
+    const metadata = file.metadata || {};
+    const artist = metadata.albumartist || metadata.artist || "Unknown Artist";
+    const album = metadata.album || "Unknown Album";
+    return artist === sourceAlbum.artist && album === sourceAlbum.album;
+  });
+  const slotByTrack = new Map(targetAlbum.slots.map((slot) => [slot.track_number, slot]));
+  onFilesChange(
+    files.map((file) => {
+      if (!sourceFiles.some((sourceFile) => sourceFile.path === file.path)) return file;
+      const slot = slotByTrack.get(file.metadata?.track_number);
+      const metadata = {
+        ...(file.metadata || {}),
+        artist: targetAlbum.artist,
+        albumartist: targetAlbum.artist,
+        album: targetAlbum.album,
+        title: slot ? titleForDroppedSlot(slot, file) : file.metadata?.title,
+      };
+      return {
+        ...file,
+        metadata,
+        suggested_library_path: suggestImportPath(file, metadata),
+      };
+    }),
+  );
 }
 
 function updateImportAlbum(files, onFilesChange, artistName, albumName, metadataPatch) {
@@ -1463,6 +1772,19 @@ function toggleDownloadSelection(setter, id, checked) {
   });
 }
 
+function toggleTrackSelection(setter, path, additive) {
+  setter((current) => {
+    const next = additive ? new Set(current) : new Set();
+    if (additive && next.has(path)) next.delete(path);
+    else next.add(path);
+    return next;
+  });
+}
+
+function dragPathsForTrack(selectedTracks, path) {
+  return selectedTracks.has(path) ? [...selectedTracks] : [path];
+}
+
 function coerceMetadataValue(key, value) {
   if (["track_number", "disc_number", "bitrate", "duration_ms"].includes(key)) {
     return parseInt(value, 10) || null;
@@ -1498,6 +1820,19 @@ function buildLiveLog(tasks, notifications) {
   return [...taskEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+function notificationSeverity(notification) {
+  const text = `${notification.title || ""} ${notification.body || ""} ${notification.event_type || ""}`.toLowerCase();
+  if (text.includes("failed") || text.includes("error")) return "error";
+  if (text.includes("warning") || text.includes("skipped") || text.includes("missing")) return "warning";
+  if (notification.status === "unread") return "info";
+  return "normal";
+}
+
+function maxSeverity(current, next) {
+  const rank = { normal: 0, info: 1, warning: 2, error: 3 };
+  return rank[next] > rank[current] ? next : current;
+}
+
 function groupBy(items, getKey) {
   const groups = new Map();
   items.forEach((item) => {
@@ -1506,6 +1841,19 @@ function groupBy(items, getKey) {
     groups.get(key).push(item);
   });
   return groups;
+}
+
+function groupRequestedAlbums(albums) {
+  const artistMap = new Map();
+  albums
+    .filter((album) => album.tracks.length > 0)
+    .forEach((album) => {
+      if (!artistMap.has(album.artist)) {
+        artistMap.set(album.artist, { name: album.artist, albums: [] });
+      }
+      artistMap.get(album.artist).albums.push(album);
+    });
+  return [...artistMap.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function toggleSet(setter, value) {

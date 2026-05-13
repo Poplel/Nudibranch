@@ -32,6 +32,7 @@ GET  /api/v1/library/tree
 POST /api/v1/imports/scan
 POST /api/v1/imports/propose
 POST /api/v1/imports/acoustic-match
+POST /api/v1/imports/album-search
 POST /api/v1/imports/album-lookup
 
 GET  /api/v1/wishlist
@@ -88,14 +89,28 @@ POST /api/v1/imports/acoustic-match
 }
 ```
 
-Album track-list checks use MusicBrainz release data:
+Album search returns MusicBrainz release candidates with cover-art URLs where
+available:
+
+```http
+POST /api/v1/imports/album-search
+
+{
+  "artist": "Artist",
+  "album": "Album"
+}
+```
+
+Album track-list checks use a selected MusicBrainz release, or the best match
+when `release_id` is omitted:
 
 ```http
 POST /api/v1/imports/album-lookup
 
 {
   "artist": "Artist",
-  "album": "Album"
+  "album": "Album",
+  "release_id": "optional-musicbrainz-release-id"
 }
 ```
 
