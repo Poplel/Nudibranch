@@ -34,6 +34,18 @@ const navItems = [
   ["Settings", Settings],
 ];
 
+const pageDescriptions = {
+  Library: "Browse artists, albums, and tracks in the managed library.",
+  Import: "Scan new files and prepare them for review.",
+  Wishlist: "Request artists, albums, and tracks for download.",
+  Approvals: "Review pending changes and apply selected items.",
+  Downloads: "Review download searches, candidates, and completed transfers.",
+  Playlists: "Create, import, and manage playlists.",
+  Tasks: "Track queued, running, completed, and failed work.",
+  Users: "Manage users, PINs, API access, and permissions.",
+  Settings: "Manage appearance, integrations, and system status.",
+};
+
 const artists = [
   {
     name: "Japanese Breakfast",
@@ -105,7 +117,7 @@ function App() {
   const [dark, setDark] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toastVisible, setToastVisible] = useState(true);
-  const [buttonColor, setButtonColor] = useState("#356df3");
+  const [accentColor, setAccentColor] = useState("#356df3");
   const [backgroundTint, setBackgroundTint] = useState("#356df3");
   const [selected, setSelected] = useState(() => new Set(proposals.filter((item) => item.selected).map((item) => item.id)));
   const trayRef = useRef(null);
@@ -131,7 +143,7 @@ function App() {
   }, [toastVisible]);
 
   return (
-    <main className={theme} style={{ "--button-color": buttonColor, "--background-tint": backgroundTint }}>
+    <main className={theme} style={{ "--accent-color": accentColor, "--background-tint": backgroundTint }}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">N</div>
@@ -176,8 +188,8 @@ function App() {
             {page === "Import" && <ImportWizard />}
             {page === "Settings" && (
               <SettingsPanel
-                buttonColor={buttonColor}
-                setButtonColor={setButtonColor}
+                accentColor={accentColor}
+                setAccentColor={setAccentColor}
                 backgroundTint={backgroundTint}
                 setBackgroundTint={setBackgroundTint}
               />
@@ -237,11 +249,13 @@ function TrayItem({ title, body, tone = "normal" }) {
 }
 
 function PanelHeader({ page, selectedCount }) {
+  const description = page === "Approvals" ? `${selectedCount} selected changes are ready for review.` : pageDescriptions[page];
+
   return (
     <div className="panel-header">
       <div>
         <h1>{page}</h1>
-        <p>{page === "Approvals" ? `${selectedCount} selected changes will execute after approval.` : "Database-backed source of truth for Jellyfin."}</p>
+        <p>{description ?? "Manage this section of Nudibranch."}</p>
       </div>
       {page === "Approvals" && (
         <div className="approval-actions">
@@ -315,7 +329,7 @@ function Approvals({ selected, setSelected }) {
           />
           Select all visible
         </label>
-        <span>Bulk approval, granular deselection</span>
+        <span>{selected.size} selected</span>
       </div>
       {proposals.map((proposal) => (
         <label className="proposal-row" style={{ "--depth": proposal.depth }} key={proposal.id}>
@@ -355,22 +369,22 @@ function Placeholder({ page }) {
     <div className="placeholder">
       <Shield size={28} />
       <h2>{page}</h2>
-      <p>This section is routed through the REST API and permission model.</p>
+      <p>{pageDescriptions[page] ?? "Manage this section of Nudibranch."}</p>
     </div>
   );
 }
 
-function SettingsPanel({ buttonColor, setButtonColor, backgroundTint, setBackgroundTint }) {
+function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint }) {
   return (
     <div className="settings-grid">
       <section className="settings-section">
         <h2>Appearance</h2>
         <label className="setting-row">
           <span>
-            Button color
-            <small>Used for selected states, buttons, and highlights.</small>
+            Accent color
+            <small>Interactive highlights and hover states.</small>
           </span>
-          <input type="color" value={buttonColor} onChange={(event) => setButtonColor(event.target.value)} />
+          <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value)} />
         </label>
         <label className="setting-row">
           <span>

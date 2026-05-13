@@ -13,19 +13,72 @@ from nudibranch.services.tasks import claim_next_task, complete_task, fail_task,
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
-    files = discover_import_files(payload.get("path"))
+    files = discover_import_files(payload.get("path"), include_fingerprint=True)
     batch = ProposalBatch(title="Import folder review", kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
+
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+
     for file_info in files:
+        metadata = file_info["metadata"]
+        artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+        album = metadata.get("album") or "Unknown Album"
+        track_title = metadata.get("title") or file_info["relative_path"]
+        artist_item = artist_items.get(artist)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+
+        album_key = (artist, album)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist, "album": album}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+
         session.add(
             ProposalItem(
                 batch_id=batch.id,
-                title=f"Import {file_info['relative_path']}",
+                parent_id=album_item.id,
+                title=track_title,
                 kind=ProposalKind.import_files,
                 old_value=file_info["path"],
-                new_value="/app/library/Artist/Album/#-Title.flac",
+                new_value=file_info["suggested_library_path"],
                 payload_json=json.dumps(file_info),
+            )
+        )
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_item.id,
+                title=f"Write metadata for {track_title}",
+                kind=ProposalKind.metadata,
+                old_value=file_info["relative_path"],
+                new_value=json.dumps(metadata),
+                payload_json=json.dumps(
+                    {
+                        "source_path": file_info["path"],
+                        "size_bytes": file_info["size_bytes"],
+                        "mtime_ns": file_info["mtime_ns"],
+                        "metadata": metadata,
+                    }
+                ),
             )
         )
     create_notification(
@@ -96,4 +149,3 @@ async def worker_loop() -> None:
 
 if __name__ == "__main__":
     asyncio.run(worker_loop())
-

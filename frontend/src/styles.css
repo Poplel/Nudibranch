@@ -27,7 +27,7 @@ button {
 }
 
 .app {
-  --button-color: #356df3;
+  --accent-color: #356df3;
   --background-tint: #356df3;
   --bg: color-mix(in srgb, var(--background-tint) 7%, #f1f2f4);
   --panel: color-mix(in srgb, var(--background-tint) 4%, #fafafa);
@@ -35,8 +35,9 @@ button {
   --text: #202124;
   --muted: #6b7078;
   --line: color-mix(in srgb, var(--background-tint) 10%, #d6d8dc);
-  --accent: var(--button-color);
-  --accent-strong: color-mix(in srgb, var(--button-color) 72%, #0d1b2a);
+  --accent: var(--accent-color);
+  --accent-strong: color-mix(in srgb, var(--accent-color) 72%, #0d1b2a);
+  --accent-soft: color-mix(in srgb, var(--accent-color) 13%, transparent);
   --soft: color-mix(in srgb, var(--background-tint) 11%, #ffffff);
   --warn: #a75d08;
   --danger: #b3404a;
@@ -54,8 +55,9 @@ button {
   --text: #f4f2ec;
   --muted: #aab2c4;
   --line: color-mix(in srgb, var(--background-tint) 13%, #30333a);
-  --accent: color-mix(in srgb, var(--button-color) 82%, #ffffff);
-  --accent-strong: color-mix(in srgb, var(--button-color) 70%, #ffffff);
+  --accent: color-mix(in srgb, var(--accent-color) 82%, #ffffff);
+  --accent-strong: color-mix(in srgb, var(--accent-color) 70%, #ffffff);
+  --accent-soft: color-mix(in srgb, var(--accent-color) 21%, transparent);
   --soft: color-mix(in srgb, var(--background-tint) 18%, #16191e);
   --warn: #ffc15d;
   --danger: #ff7b86;
@@ -122,7 +124,7 @@ nav button,
 nav button.active,
 nav button:hover,
 .theme-toggle:hover {
-  background: var(--soft);
+  background: var(--accent-soft);
   color: var(--text);
 }
 
@@ -208,7 +210,7 @@ nav button:hover,
 
 .tray-item:hover,
 .tray-item.urgent {
-  background: var(--soft);
+  background: var(--accent-soft);
 }
 
 .tray-item small {
@@ -336,8 +338,8 @@ nav button:hover,
 
 .tree-row:hover,
 .proposal-row:hover,
-.bulk-row {
-  background: var(--panel-strong);
+.bulk-row:hover {
+  background: var(--accent-soft);
 }
 
 .tree-title,
@@ -373,6 +375,7 @@ nav button:hover,
   justify-content: space-between;
   margin-bottom: 8px;
   border: 1px solid var(--line);
+  background: var(--panel-strong);
 }
 
 .bulk-row label {
@@ -619,4 +622,13 @@ nav button:hover,
   .wizard {
     grid-template-columns: 1fr;
   }
+}
+
+.secondary:hover,
+.icon-button:hover {
+  background: var(--accent-soft);
+}
+
+.primary:hover {
+  background: var(--accent-strong);
 }
