@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
   Bell,
@@ -20,6 +21,7 @@ import {
   Music,
   Pencil,
   Pause,
+  PictureInPicture2,
   Play,
   Plus,
   RefreshCw,
@@ -94,6 +96,8 @@ function App() {
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
+  const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
+  const [integrationSettings, setIntegrationSettings] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -252,6 +256,10 @@ function App() {
       setTasks(taskData);
       setNotifications(notificationData);
       setWishlist(wishlistData);
+      if (canManageSettings(me)) {
+        refreshIntegrationSettings();
+      }
+      refreshFavorites();
     } catch (refreshError) {
       setError(refreshError.message);
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
@@ -284,6 +292,52 @@ function App() {
       setNotifications(await api("/notifications"));
     } catch {
       // Notification polling is best-effort.
+    }
+  }
+
+  async function refreshIntegrationSettings() {
+    try {
+      setIntegrationSettings(await api("/settings/integrations"));
+    } catch {
+      // Users without settings permissions do not need integration fields.
+    }
+  }
+
+  async function saveIntegrationSettings(settings) {
+    setLoading(true);
+    setError("");
+    try {
+      const saved = await api("/settings/integrations", {
+        method: "PUT",
+        body: JSON.stringify(settings),
+      });
+      setIntegrationSettings(saved);
+      setToast({ title: "Settings saved", body: "Integration settings were updated." });
+    } catch (settingsError) {
+      setError(settingsError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshFavorites() {
+    try {
+      const favorites = await api("/playlists/favorites");
+      setFavoriteTrackIds(new Set(favorites.track_ids || []));
+    } catch {
+      // Favorites are optional for users without playlist permissions.
+    }
+  }
+
+  async function addFavoriteTrack(track) {
+    if (!track?.id) return;
+    try {
+      const favorites = await api(`/playlists/favorites/tracks/${track.id}`, { method: "POST" });
+      setFavoriteTrackIds(new Set(favorites.track_ids || []));
+      setToast({ title: "Added to Favorites", body: "Favorites will sync to Jellyfin." });
+    } catch (favoriteError) {
+      setError(favoriteError.message);
+      setToast({ title: "Favorite failed", body: favoriteError.message });
     }
   }
 
@@ -666,6 +720,8 @@ function App() {
                 setBackgroundTint={setBackgroundTint}
                 user={user}
                 apiKey={token}
+                integrationSettings={integrationSettings}
+                onSaveIntegrations={saveIntegrationSettings}
               />
             )}
             {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} />}
@@ -695,6 +751,8 @@ function App() {
             onEnded={playNextTrack}
             onSkipBack={playPreviousTrack}
             onSkipForward={playNextTrack}
+            onFavorite={addFavoriteTrack}
+            favoriteTrackIds={favoriteTrackIds}
             onClose={() => setPlayerOpen(false)}
           />
         )}
@@ -1836,6 +1894,27 @@ function removeKey(type, id) {
   return `${type}:${id}`;
 }
 
+function canManageSettings(user) {
+  return Boolean(user?.is_admin || user?.permissions?.includes("settings:manage"));
+}
+
+function copyStylesToWindow(targetWindow) {
+  for (const sheet of document.styleSheets) {
+    try {
+      const style = targetWindow.document.createElement("style");
+      style.textContent = [...sheet.cssRules].map((rule) => rule.cssText).join("\n");
+      targetWindow.document.head.appendChild(style);
+    } catch {
+      if (sheet.href) {
+        const link = targetWindow.document.createElement("link");
+        link.rel = "stylesheet";
+        link.href = sheet.href;
+        targetWindow.document.head.appendChild(link);
+      }
+    }
+  }
+}
+
 function normalizeEntityChanges(changes, fields) {
   const fieldByKey = new Map(fields.map((field) => [field.key, field]));
   return Object.fromEntries(
@@ -1941,10 +2020,24 @@ function Placeholder({ page }) {
   );
 }
 
-function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint, user, apiKey }) {
+function SettingsPanel({
+  accentColor,
+  setAccentColor,
+  backgroundTint,
+  setBackgroundTint,
+  user,
+  apiKey,
+  integrationSettings,
+  onSaveIntegrations,
+}) {
   const [showApiKey, setShowApiKey] = useState(false);
+  const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
   const canViewApiKey =
     user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
+
+  useEffect(() => {
+    setIntegrationDraft(integrationSettings || {});
+  }, [integrationSettings]);
 
   return (
     <div className="settings-grid">
@@ -1985,6 +2078,30 @@ function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgro
               {showApiKey ? "Hide" : "Show"}
             </button>
           </div>
+        </section>
+      )}
+      {canManageSettings(user) && (
+        <section className="settings-section">
+          <h2>Integrations</h2>
+          {[
+            ["acoustid_api_key", "AcoustID API key"],
+            ["jellyfin_url", "Jellyfin URL"],
+            ["jellyfin_api_key", "Jellyfin API key"],
+            ["slskd_url", "slskd URL"],
+            ["slskd_api_key", "slskd API key"],
+          ].map(([key, label]) => (
+            <label className="setting-row integration-row" key={key}>
+              <span>{label}</span>
+              <input
+                type={key.endsWith("api_key") ? "password" : "text"}
+                value={integrationDraft[key] || ""}
+                onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+              />
+            </label>
+          ))}
+          <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
+            Save integrations
+          </button>
         </section>
       )}
     </div>
@@ -2029,14 +2146,19 @@ function AudioPlayer({
   onEnded,
   onSkipBack,
   onSkipForward,
+  onFavorite,
+  favoriteTrackIds,
   onClose,
 }) {
   const audioRef = useRef(null);
+  const pipWindowRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [pipContainer, setPipContainer] = useState(null);
   const upcomingQueue = queue.slice(Math.max(currentIndex + 1, 0));
   const progress = duration ? (currentTime / duration) * 100 : 0;
+  const isFavorite = currentTrack?.id ? favoriteTrackIds.has(currentTrack.id) : false;
 
   useEffect(() => {
     setPlaying(false);
@@ -2061,7 +2183,28 @@ function AudioPlayer({
     setCurrentTime(nextTime);
   }
 
-  return (
+  async function openPictureInPicture() {
+    const pipWindow =
+      "documentPictureInPicture" in window
+        ? await window.documentPictureInPicture.requestWindow({ width: 340, height: 430 })
+        : window.open("", "nudibranch-player", "width=340,height=430,popup");
+    if (!pipWindow) return;
+    pipWindowRef.current = pipWindow;
+    pipWindow.document.body.innerHTML = "";
+    pipWindow.document.body.style.margin = "0";
+    copyStylesToWindow(pipWindow);
+    const container = pipWindow.document.createElement("div");
+    container.className = document.querySelector("main")?.className || "app";
+    container.style.minHeight = "100vh";
+    container.style.display = "grid";
+    container.style.placeItems = "center";
+    pipWindow.document.body.appendChild(container);
+    pipWindow.addEventListener("pagehide", () => setPipContainer(null), { once: true });
+    pipWindow.addEventListener("beforeunload", () => setPipContainer(null), { once: true });
+    setPipContainer(container);
+  }
+
+  const surface = (
     <div className="audio-player">
       <div className="audio-header">
         <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
@@ -2074,16 +2217,6 @@ function AudioPlayer({
         </button>
       </div>
       <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
-      <audio
-        ref={audioRef}
-        autoPlay
-        src={audioUrl}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
-        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-        onEnded={onEnded}
-      />
       <div className="player-controls">
         <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
           <Menu size={19} />
@@ -2097,8 +2230,11 @@ function AudioPlayer({
         <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
           <SkipForward size={18} />
         </button>
-        <button className="player-icon-button" title="Favorite">
+        <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
           <Heart size={19} />
+        </button>
+        <button className="player-icon-button pip-button" onClick={openPictureInPicture} title="Pop out">
+          <PictureInPicture2 size={18} />
         </button>
       </div>
       {queueOpen && (
@@ -2112,6 +2248,23 @@ function AudioPlayer({
         </div>
       )}
     </div>
+  );
+
+  return (
+    <>
+      {surface}
+      <audio
+        ref={audioRef}
+        autoPlay
+        src={audioUrl}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
+        onEnded={onEnded}
+      />
+      {pipContainer ? createPortal(surface, pipContainer) : null}
+    </>
   );
 }
 

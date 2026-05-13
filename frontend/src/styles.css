@@ -910,7 +910,7 @@ nav button:hover,
 
 .player-controls {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   align-items: center;
   gap: 8px;
 }
@@ -939,6 +939,14 @@ nav button:hover,
 
 .player-icon-button:disabled {
   opacity: 0.35;
+}
+
+.player-icon-button.active {
+  color: var(--danger);
+}
+
+.pip-button {
+  color: var(--muted);
 }
 
 .local-queue {

@@ -10,9 +10,10 @@ from nudibranch.services.imports import fingerprint_audio
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
 
 
-def lookup_recording_by_fingerprint(file_info: dict) -> list[dict]:
+def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | None = None) -> list[dict]:
     settings = get_settings()
-    if not settings.acoustid_api_key:
+    api_key = acoustid_api_key or settings.acoustid_api_key
+    if not api_key:
         raise ValueError("ACOUSTID_API_KEY is required for acoustic metadata lookup")
 
     fingerprint = file_info.get("fingerprint")
@@ -23,7 +24,7 @@ def lookup_recording_by_fingerprint(file_info: dict) -> list[dict]:
         raise ValueError("Unable to fingerprint this file")
 
     params = {
-        "client": settings.acoustid_api_key,
+        "client": api_key,
         "duration": fingerprint.get("duration"),
         "fingerprint": fingerprint.get("fingerprint"),
         "meta": "recordings releasegroups releases tracks",

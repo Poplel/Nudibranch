@@ -147,6 +147,21 @@ class DeviceRegistration(BaseModel):
     apns_token: str
 
 
+class IntegrationSettings(BaseModel):
+    acoustid_api_key: str = ""
+    jellyfin_url: str = ""
+    jellyfin_api_key: str = ""
+    slskd_url: str = ""
+    slskd_api_key: str = ""
+
+
+class FavoritesOut(BaseModel):
+    id: str
+    name: str
+    track_ids: list[str]
+    protected: bool = True
+
+
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None

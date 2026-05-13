@@ -12,7 +12,9 @@ from nudibranch.api.deps import get_current_user, require_permission
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
     DeviceRegistration,
+    FavoritesOut,
     ImportAcousticLookupRequest,
+    IntegrationSettings,
     ImportScanRequest,
     LibraryMetadataProposalRequest,
     LibraryRemoveProposalRequest,
@@ -41,6 +43,8 @@ from nudibranch.db.models import (
     Notification,
     NotificationStatus,
     Permission,
+    Playlist,
+    PlaylistTrack,
     ProposalBatch,
     ProposalItem,
     ProposalKind,
@@ -55,6 +59,7 @@ from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
+from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import enqueue_task, task_result, task_to_payload
 
 router = APIRouter(prefix="/api/v1")
@@ -265,10 +270,11 @@ def propose_import(
 @router.post("/imports/acoustic-match", tags=["imports"])
 def acoustic_match(
     payload: ImportAcousticLookupRequest,
+    session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     try:
-        candidates = lookup_recording_by_fingerprint(payload.file)
+        candidates = lookup_recording_by_fingerprint(payload.file, integration_value(session, "acoustid_api_key"))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except httpx.HTTPError as error:
@@ -321,6 +327,33 @@ def create_wishlist_item(
     session.commit()
     session.refresh(item)
     return WishlistOut.model_validate(item, from_attributes=True)
+
+
+@router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"])
+def favorites_playlist(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    playlist = get_or_create_favorites(session)
+    return serialize_favorites(session, playlist)
+
+
+@router.post("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+def add_favorite_track(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    track = session.get(Track, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    playlist = get_or_create_favorites(session)
+    if not any(entry.track_id == track_id for entry in playlist.tracks):
+        session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=len(playlist.tracks) + 1))
+        session.commit()
+        session.refresh(playlist)
+    enqueue_task(session, "sync_favorites_jellyfin", {})
+    return serialize_favorites(session, playlist)
 
 
 @router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"])
@@ -404,6 +437,23 @@ def create_task(
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, payload.type, payload.payload))
+
+
+@router.get("/settings/integrations", response_model=IntegrationSettings, tags=["settings"])
+def get_integrations(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> IntegrationSettings:
+    return IntegrationSettings(**integration_settings(session))
+
+
+@router.put("/settings/integrations", response_model=IntegrationSettings, tags=["settings"])
+def update_integrations(
+    payload: IntegrationSettings,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> IntegrationSettings:
+    return IntegrationSettings(**update_integration_settings(session, payload.model_dump()))
 
 
 @router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"])
@@ -510,6 +560,25 @@ def library_target_tracks(target) -> list[Track]:
 
 def remove_action_title(action: str) -> str:
     return "Delete" if action == "delete" else "Move to import"
+
+
+def get_or_create_favorites(session: Session) -> Playlist:
+    playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+    if not playlist:
+        playlist = Playlist(name="Favorites", protected=True)
+        session.add(playlist)
+        session.commit()
+        session.refresh(playlist)
+    elif not playlist.protected:
+        playlist.protected = True
+        session.commit()
+        session.refresh(playlist)
+    return playlist
+
+
+def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
+    track_ids = list(session.scalars(select(PlaylistTrack.track_id).where(PlaylistTrack.playlist_id == playlist.id).order_by(PlaylistTrack.position)))
+    return FavoritesOut(id=playlist.id, name=playlist.name, protected=playlist.protected, track_ids=track_ids)
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

@@ -4,14 +4,16 @@ import shutil
 import time
 from pathlib import Path
 
+import httpx
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track
+from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
+from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
 
 
@@ -380,10 +382,80 @@ def run_process_wishlist(session: Session, _payload: dict) -> dict:
     return {"status": "stubbed", "message": "slskd ranking pipeline placeholder created"}
 
 
+def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        raise ValueError("Jellyfin URL and API key are required to sync Favorites")
+
+    playlist = session.scalar(
+        select(Playlist)
+        .where(Playlist.name == "Favorites")
+        .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track))
+    )
+    if not playlist:
+        return {"synced": 0, "message": "Favorites playlist has not been created yet"}
+
+    headers = {"X-Emby-Token": jellyfin_api_key}
+    with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
+        users = client.get("/Users")
+        users.raise_for_status()
+        user_id = (users.json() or [{}])[0].get("Id")
+        if not user_id:
+            raise ValueError("No Jellyfin user was found for playlist sync")
+
+        jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
+        if not jellyfin_playlist_id:
+            created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
+            created.raise_for_status()
+            jellyfin_playlist_id = created.json().get("Id")
+            playlist.jellyfin_playlist_id = jellyfin_playlist_id
+            session.commit()
+
+        item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
+        if item_ids:
+            response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
+            response.raise_for_status()
+
+    create_notification(
+        session,
+        title="Favorites synced",
+        body=f"{len(item_ids)} tracks were sent to the Jellyfin Favorites playlist.",
+        event_type="task_completed",
+        target_url="/playlists",
+    )
+    return {"synced": len(item_ids), "playlist": "Favorites"}
+
+
+def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str | None:
+    response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist", "SearchTerm": name})
+    response.raise_for_status()
+    for item in response.json().get("Items", []):
+        if item.get("Name") == name:
+            return item.get("Id")
+    return None
+
+
+def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -> str | None:
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={"Recursive": "true", "IncludeItemTypes": "Audio", "SearchTerm": track.title},
+    )
+    response.raise_for_status()
+    normalized_path = str(track.path or "").lower()
+    for item in response.json().get("Items", []):
+        path = str(item.get("Path") or "").lower()
+        if normalized_path and path == normalized_path:
+            return item.get("Id")
+    return (response.json().get("Items") or [{}])[0].get("Id")
+
+
 TASK_HANDLERS = {
     "propose_import": run_propose_import,
     "execute_proposal_batch": run_execute_proposal_batch,
     "process_wishlist": run_process_wishlist,
+    "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
 }
 
 

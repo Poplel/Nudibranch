@@ -161,6 +161,41 @@ class WishlistItem(Base):
     user: Mapped[User] = relationship(back_populates="wishlists")
 
 
+class Playlist(Base):
+    __tablename__ = "playlists"
+    __table_args__ = (UniqueConstraint("name"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    protected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    jellyfin_playlist_id: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    tracks: Mapped[list["PlaylistTrack"]] = relationship(back_populates="playlist", cascade="all, delete-orphan")
+
+
+class PlaylistTrack(Base):
+    __tablename__ = "playlist_tracks"
+    __table_args__ = (UniqueConstraint("playlist_id", "track_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    playlist_id: Mapped[str] = mapped_column(ForeignKey("playlists.id", ondelete="CASCADE"), nullable=False)
+    track_id: Mapped[str] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    playlist: Mapped[Playlist] = relationship(back_populates="tracks")
+    track: Mapped[Track] = relationship()
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class ProposalBatch(Base):
     __tablename__ = "proposal_batches"
 
