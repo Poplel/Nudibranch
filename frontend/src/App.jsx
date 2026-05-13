@@ -16,7 +16,9 @@ import {
   ListChecks,
   ListPlus,
   LogOut,
+  Maximize2,
   Menu,
+  Minimize2,
   Moon,
   Music,
   Pencil,
@@ -2201,7 +2203,9 @@ function AudioPlayer({
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [pipContainer, setPipContainer] = useState(null);
+  const [fullscreenPlayer, setFullscreenPlayer] = useState(false);
   const upcomingQueue = queue.slice(Math.max(currentIndex + 1, 0));
+  const nextTrack = upcomingQueue[0];
   const progress = duration ? (currentTime / duration) * 100 : 0;
   const isFavorite = currentTrack?.id ? favoriteTrackIds.has(currentTrack.id) : false;
 
@@ -2213,6 +2217,12 @@ function AudioPlayer({
   useEffect(() => () => {
     pipWindowRef.current?.close?.();
   }, []);
+
+  useEffect(() => {
+    if (!pipContainer) {
+      setFullscreenPlayer(false);
+    }
+  }, [pipContainer]);
 
   useEffect(() => {
     const measureCompactHeight = () => (coreRef.current ? coreRef.current.offsetHeight + 36 : dockRef.current?.offsetHeight || 0);
@@ -2253,10 +2263,13 @@ function AudioPlayer({
   }
 
   async function openPictureInPicture() {
+    const playerRect = dockRef.current?.getBoundingClientRect();
+    const width = Math.round(Math.max(340, playerRect?.width || 340));
+    const height = Math.round(Math.max(360, playerRect?.height || 420));
     const pipWindow =
       "documentPictureInPicture" in window
-        ? await window.documentPictureInPicture.requestWindow({ width: 340, height: 430 })
-        : window.open("", "nudibranch-player", "width=340,height=430,popup");
+        ? await window.documentPictureInPicture.requestWindow({ width, height })
+        : window.open("", "nudibranch-player", `width=${width},height=${height},popup`);
     if (!pipWindow) return;
     pipWindowRef.current = pipWindow;
     pipWindow.document.body.innerHTML = "";
@@ -2268,62 +2281,96 @@ function AudioPlayer({
     container.style.display = "grid";
     container.style.placeItems = "center";
     pipWindow.document.body.appendChild(container);
-    pipWindow.addEventListener("pagehide", () => setPipContainer(null), { once: true });
-    pipWindow.addEventListener("beforeunload", () => setPipContainer(null), { once: true });
+    const closePip = () => {
+      setFullscreenPlayer(false);
+      setPipContainer(null);
+    };
+    pipWindow.addEventListener("pagehide", closePip, { once: true });
+    pipWindow.addEventListener("beforeunload", closePip, { once: true });
     setPipContainer(container);
   }
 
+  function toggleFullscreenPlayer() {
+    setFullscreenPlayer((value) => {
+      const nextValue = !value;
+      const pipWindow = pipWindowRef.current;
+      if (pipWindow?.resizeTo) {
+        pipWindow.resizeTo(nextValue ? 960 : 360, nextValue ? 640 : 430);
+      }
+      return nextValue;
+    });
+  }
+
   function surface({ popped = false } = {}) {
+    const fullscreen = popped && fullscreenPlayer;
     return (
-    <div className={popped ? "audio-player popped" : "audio-player"} ref={popped ? null : dockRef}>
-      <div className="player-core" ref={popped ? null : coreRef}>
-        <div className="audio-header">
-          <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
-          <div>
-            <strong>{currentTrack?.title || "Local player"}</strong>
-            <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
-          </div>
-          <div className="player-window-actions">
-            {!popped && (
-              <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
-                <PictureInPicture2 size={14} />
+      <div
+        className={`${popped ? "audio-player popped" : "audio-player"}${fullscreen ? " fullscreen-player" : ""}`}
+        ref={popped ? null : dockRef}
+        style={fullscreen && currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
+      >
+        <div className="player-core" ref={popped ? null : coreRef}>
+          <div className="audio-header">
+            <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
+            <div className="audio-track-copy">
+              {fullscreen && <span className="playing-from">Playing from library</span>}
+              <strong>{currentTrack?.title || "Local player"}</strong>
+              <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
+            </div>
+            <div className="player-window-actions">
+              {popped ? (
+                <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreen ? "Compact" : "Fullscreen"}>
+                  {fullscreen ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+                </button>
+              ) : (
+                <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
+                  <PictureInPicture2 size={14} />
+                </button>
+              )}
+              <button className="row-icon-button" onClick={onClose} title="Close player">
+                <X size={14} />
               </button>
-            )}
-            <button className="row-icon-button" onClick={onClose} title="Close player">
-              <X size={14} />
-            </button>
+            </div>
+          </div>
+          {fullscreen && nextTrack && (
+            <div className="fullscreen-next">
+              <span>Up next</span>
+              <strong>{nextTrack.title}</strong>
+              <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+            </div>
+          )}
+          <div className="fullscreen-controls">
+            <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+            <div className="player-controls">
+              <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
+                <Menu size={19} />
+              </button>
+              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+                <SkipBack size={18} />
+              </button>
+              <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+                {playing ? <Pause size={21} /> : <Play size={21} />}
+              </button>
+              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+                <SkipForward size={18} />
+              </button>
+              <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
+                <Heart size={19} />
+              </button>
+            </div>
           </div>
         </div>
-        <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
-        <div className="player-controls">
-          <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
-            <Menu size={19} />
-          </button>
-          <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
-            <SkipBack size={18} />
-          </button>
-          <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
-            {playing ? <Pause size={21} /> : <Play size={21} />}
-          </button>
-          <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
-            <SkipForward size={18} />
-          </button>
-          <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
-            <Heart size={19} />
-          </button>
-        </div>
+        {queueOpen && (
+          <div className="local-queue">
+            {upcomingQueue.map((track, index) => (
+              <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
+                <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
+                <strong>{track.title}</strong>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
-      {queueOpen && (
-        <div className="local-queue">
-          {upcomingQueue.map((track, index) => (
-            <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
-              <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
-              <strong>{track.title}</strong>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
     );
   }
 

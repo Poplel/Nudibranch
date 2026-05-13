@@ -398,25 +398,35 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         return {"synced": 0, "message": "Favorites playlist has not been created yet"}
 
     headers = {"X-Emby-Token": jellyfin_api_key}
-    with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
-        users = client.get("/Users")
-        users.raise_for_status()
-        user_id = (users.json() or [{}])[0].get("Id")
-        if not user_id:
-            raise ValueError("No Jellyfin user was found for playlist sync")
+    try:
+        with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
+            users = client.get("/Users")
+            users.raise_for_status()
+            user_id = (users.json() or [{}])[0].get("Id")
+            if not user_id:
+                raise ValueError("No Jellyfin user was found for playlist sync")
 
-        jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
-        if not jellyfin_playlist_id:
-            created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
-            created.raise_for_status()
-            jellyfin_playlist_id = created.json().get("Id")
-            playlist.jellyfin_playlist_id = jellyfin_playlist_id
-            session.commit()
+            jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
+            if not jellyfin_playlist_id:
+                created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
+                created.raise_for_status()
+                jellyfin_playlist_id = created.json().get("Id")
+                playlist.jellyfin_playlist_id = jellyfin_playlist_id
+                session.commit()
 
-        item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
-        if item_ids:
-            response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
-            response.raise_for_status()
+            item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
+            if item_ids:
+                response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
+                response.raise_for_status()
+    except httpx.TransportError:
+        create_notification(
+            session,
+            title="Favorites sync skipped",
+            body=f"Jellyfin is unreachable at {jellyfin_url}.",
+            event_type="task_warning",
+            target_url="/settings",
+        )
+        return {"synced": 0, "warning": f"Jellyfin is unreachable at {jellyfin_url}"}
 
     create_notification(
         session,
