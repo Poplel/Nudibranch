@@ -377,6 +377,14 @@ def remove_favorite_track(
     return serialize_favorites(session, playlist)
 
 
+@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"])
+def sync_playlists(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
+
+
 @router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"])
 def propose_favorite_position(
     entry_id: str,

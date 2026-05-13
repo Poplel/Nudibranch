@@ -301,6 +301,7 @@ def apply_playlist_item(session: Session, item: ProposalItem) -> None:
     if not entry:
         raise ValueError("Playlist entry no longer exists")
     entry.position = int(payload.get("position"))
+    enqueue_task(session, "sync_favorites_jellyfin", {})
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
@@ -445,13 +446,6 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
             response.raise_for_status()
 
-    create_notification(
-        session,
-        title="Favorites synced",
-        body=f"{len(item_ids)} tracks were sent to the Jellyfin Favorites playlist.",
-        event_type="task_completed",
-        target_url="/playlists",
-    )
     return {"synced": len(item_ids), "playlist": "Favorites"}
 
 

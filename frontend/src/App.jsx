@@ -113,6 +113,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const trayRef = useRef(null);
+  const syncToastTaskIds = useRef(new Set());
 
   const theme = dark ? "app dark" : "app";
   const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
@@ -140,6 +141,7 @@ function App() {
   );
   const currentTrackIndex = playerQueue.findIndex((track) => track.id === currentTrack?.id);
   const playerDocked = playerOpen && !playerPopped;
+  const appearanceVars = useMemo(() => buildAppearanceVars(dark, accentColor, backgroundTint), [dark, accentColor, backgroundTint]);
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -262,7 +264,12 @@ function App() {
       setLibrary(libraryTree);
       setApprovals(approvalData);
       setTasks(taskData);
-      setNotifications(notificationData);
+      taskData.forEach((task) => {
+        if (task.type === "sync_favorites_jellyfin" && task.status === "completed") {
+          syncToastTaskIds.current.add(task.id);
+        }
+      });
+      setNotifications(visibleTrayNotifications(notificationData));
       setWishlist(wishlistData);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
@@ -281,10 +288,24 @@ function App() {
   async function refreshTasks() {
     try {
       const taskData = await api("/tasks");
+      showCompletedSyncToasts(taskData);
       setTasks(taskData);
     } catch {
       // Task polling should not disrupt the page the user is working in.
     }
+  }
+
+  function showCompletedSyncToasts(taskData) {
+    taskData.forEach((task) => {
+      if (task.type !== "sync_favorites_jellyfin") return;
+      if (task.status !== "completed") return;
+      if (syncToastTaskIds.current.has(task.id)) return;
+      syncToastTaskIds.current.add(task.id);
+      setToast({
+        title: "Favorites synced",
+        body: `${task.result?.synced || 0} tracks were sent to Jellyfin.`,
+      });
+    });
   }
 
   async function refreshLibrary() {
@@ -297,7 +318,7 @@ function App() {
 
   async function refreshNotifications() {
     try {
-      setNotifications(await api("/notifications"));
+      setNotifications(visibleTrayNotifications(await api("/notifications")));
     } catch {
       // Notification polling is best-effort.
     }
@@ -567,6 +588,23 @@ function App() {
     }
   }
 
+  async function syncPlaylists() {
+    setLoading(true);
+    setError("");
+    try {
+      const task = await api("/playlists/sync", { method: "POST" });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Playlist sync queued", body: "Favorites sync was added to activity." });
+      return task;
+    } catch (syncError) {
+      setError(syncError.message);
+      setToast({ title: "Playlist sync failed", body: syncError.message });
+      throw syncError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function playTracks(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
@@ -668,8 +706,7 @@ function App() {
     <main
       className={`${theme}${playerDocked ? " player-docked" : ""}`}
       style={{
-        "--accent-color": accentColor,
-        "--background-tint": backgroundTint,
+        ...appearanceVars,
         "--player-dock-height": playerDocked ? `${playerDockHeight}px` : "0px",
         "--toast-bottom": playerDocked ? `${playerToastHeight + 32}px` : "18px",
       }}
@@ -783,6 +820,7 @@ function App() {
                 onQueuePosition={proposePlaylistPosition}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
+                onSync={syncPlaylists}
               />
             )}
             {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
@@ -917,6 +955,18 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, o
     <div className="library-view">
       {visibleArtists.length === 0 && (
         <EmptyState title="No library records" body="Import queued music to populate the managed library." />
+      )}
+      {visibleArtists.length > 0 && (
+        <TreeControls
+          onExpand={() => {
+            setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
+            setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
+          }}
+          onCollapse={() => {
+            setOpenArtists(new Set());
+            setOpenAlbums(new Set());
+          }}
+        />
       )}
       <div className="tree">
         {visibleArtists.map((artist) => (
@@ -1150,6 +1200,10 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           Select all visible
         </label>
         <span>{selectedItems.length} selected</span>
+        <TreeControls
+          onExpand={() => setOpenItems(new Set(batch.items.map((item) => item.id)))}
+          onCollapse={() => setOpenItems(new Set())}
+        />
       </div>
       {tree.roots.map((item) => (
         <ApprovalNode
@@ -1167,7 +1221,8 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
 
 function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection, depth = 0 }) {
   const children = childrenById.get(item.id) || [];
-  const hasChildren = children.length > 0;
+  const metadataChanges = metadataChangeRows(item);
+  const hasChildren = children.length > 0 || metadataChanges.length > 0;
   const open = openItems.has(item.id);
   const descendantIds = collectItemIds(item, childrenById);
 
@@ -1184,8 +1239,17 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
           {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
         </button>
         <span className="proposal-title">{item.title}</span>
-        <small>{item.kind}</small>
+        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : item.kind}</small>
       </div>
+      {open &&
+        metadataChanges.map((change) => (
+          <div className="proposal-row metadata-change-row" style={{ "--depth": depth + 1 }} key={`${item.id}:${change.field}`}>
+            <span />
+            <span />
+            <span className="proposal-title">{change.field}</span>
+            <small>{change.oldValue} {"->"} {change.newValue}</small>
+          </div>
+        ))}
       {open &&
         children.map((child) => (
           <ApprovalNode
@@ -1389,7 +1453,7 @@ function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
   );
 }
 
-function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue }) {
+function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue, onSync }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
   const [draftPositions, setDraftPositions] = useState({});
   const tracks = favorites?.tracks || [];
@@ -1420,6 +1484,16 @@ function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue }) {
 
   return (
     <div className="playlist-view">
+      <div className="tree-toolbar">
+        <TreeControls
+          onExpand={() => setOpenPlaylists(new Set(["Favorites"]))}
+          onCollapse={() => setOpenPlaylists(new Set())}
+        />
+        <button className="secondary compact" onClick={onSync}>
+          <RefreshCw size={15} />
+          Sync
+        </button>
+      </div>
       <div className="tree-action-row library-row-actions">
         <TreeRow
           icon={Heart}
@@ -1519,6 +1593,18 @@ function ImportTree({
 
   return (
     <div className="tree">
+      {grouped.length > 0 && (
+        <TreeControls
+          onExpand={() => {
+            setOpenArtists(new Set(grouped.map((artist) => artist.name)));
+            setOpenAlbums(new Set(grouped.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+          }}
+          onCollapse={() => {
+            setOpenArtists(new Set());
+            setOpenAlbums(new Set());
+          }}
+        />
+      )}
       {grouped.map((artist) => {
         const visibleAlbums = artist.albums.filter((album) =>
           album.slots.some((slot) => slot.file || !dismissedGhosts.has(slot.id)),
@@ -2272,6 +2358,9 @@ function SettingsPanel({
           </button>
         </section>
       )}
+      <footer className="settings-footer">
+        Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
+      </footer>
     </div>
   );
 }
@@ -2470,7 +2559,7 @@ function AudioPlayer({
                   {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                 </button>
               ) : (
-                <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
+                <button className="row-icon-button" onClick={openPictureInPicture} disabled={queue.length === 0} title={queue.length === 0 ? "Queue is empty" : "Pop out"}>
                   <PictureInPicture2 size={14} />
                 </button>
               )}
@@ -2529,6 +2618,19 @@ function AudioPlayer({
       />
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
     </>
+  );
+}
+
+function TreeControls({ onExpand, onCollapse }) {
+  return (
+    <div className="tree-controls">
+      <button className="secondary compact" onClick={onExpand}>
+        Expand all
+      </button>
+      <button className="secondary compact" onClick={onCollapse}>
+        Collapse all
+      </button>
+    </div>
   );
 }
 
@@ -2861,6 +2963,66 @@ function coerceMetadataValue(key, value) {
 function upsertTask(tasks, task) {
   const withoutTask = tasks.filter((current) => current.id !== task.id);
   return [task, ...withoutTask];
+}
+
+function visibleTrayNotifications(notifications) {
+  return notifications.filter((notification) => notification.title !== "Favorites synced");
+}
+
+function buildAppearanceVars(dark, accentColor, backgroundTint) {
+  if (dark) {
+    return {
+      "--accent-color": accentColor,
+      "--background-tint": backgroundTint,
+      "--bg": `color-mix(in srgb, ${backgroundTint} 10%, #101216)`,
+      "--panel": `color-mix(in srgb, ${backgroundTint} 8%, #181b20)`,
+      "--panel-strong": `color-mix(in srgb, ${backgroundTint} 9%, #20242b)`,
+      "--line": `color-mix(in srgb, ${backgroundTint} 13%, #30333a)`,
+      "--accent": `color-mix(in srgb, ${accentColor} 82%, #ffffff)`,
+      "--accent-strong": `color-mix(in srgb, ${accentColor} 70%, #ffffff)`,
+      "--accent-soft": `color-mix(in srgb, ${accentColor} 21%, transparent)`,
+      "--soft": `color-mix(in srgb, ${backgroundTint} 18%, #16191e)`,
+    };
+  }
+  return {
+    "--accent-color": accentColor,
+    "--background-tint": backgroundTint,
+    "--bg": `color-mix(in srgb, ${backgroundTint} 7%, #f1f2f4)`,
+    "--panel": `color-mix(in srgb, ${backgroundTint} 4%, #fafafa)`,
+    "--panel-strong": "#ffffff",
+    "--line": `color-mix(in srgb, ${backgroundTint} 10%, #d6d8dc)`,
+    "--accent": accentColor,
+    "--accent-strong": `color-mix(in srgb, ${accentColor} 72%, #0d1b2a)`,
+    "--accent-soft": `color-mix(in srgb, ${accentColor} 13%, transparent)`,
+    "--soft": `color-mix(in srgb, ${backgroundTint} 11%, #ffffff)`,
+  };
+}
+
+function metadataChangeRows(item) {
+  if (item.kind !== "metadata") return [];
+  const oldValues = parseJsonObject(item.old_value);
+  const newValues = parseJsonObject(item.new_value);
+  return Object.entries(newValues).map(([field, newValue]) => ({
+    field,
+    oldValue: formatMetadataValue(oldValues[field]),
+    newValue: formatMetadataValue(newValue),
+  }));
+}
+
+function parseJsonObject(value) {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function formatMetadataValue(value) {
+  if (value === null || value === undefined || value === "") return "blank";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return String(value);
 }
 
 function taskSummary(task) {

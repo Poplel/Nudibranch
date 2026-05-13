@@ -870,6 +870,22 @@ nav button:hover,
   gap: 6px;
 }
 
+.tree-toolbar,
+.tree-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tree-toolbar {
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.tree-controls {
+  flex-wrap: wrap;
+}
+
 .compact,
 .compact-button {
   width: fit-content;
@@ -1300,6 +1316,17 @@ nav button:hover,
   padding-left: calc(14px + var(--depth, 0) * 24px);
 }
 
+.metadata-change-row {
+  background: color-mix(in srgb, var(--background-tint) 5%, transparent);
+}
+
+.metadata-change-row small {
+  max-width: min(520px, 46vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .row-toggle {
   display: grid;
   width: 18px;
@@ -1424,6 +1451,16 @@ nav button:hover,
 .settings-section h2 {
   margin: 0;
   font-size: 15px;
+}
+
+.settings-footer {
+  padding: 10px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-footer a {
+  color: var(--accent);
 }
 
 .setting-row {
