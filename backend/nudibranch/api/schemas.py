@@ -155,12 +155,27 @@ class IntegrationSettings(BaseModel):
     slskd_api_key: str = ""
 
 
+class PlaylistTrackOut(BaseModel):
+    id: str
+    track_id: str
+    position: int
+    title: str
+    artist: str
+    album: str
+    format: str | None = None
+
+
 class FavoritesOut(BaseModel):
     id: str
     name: str
     track_ids: list[str]
+    tracks: list[PlaylistTrackOut] = Field(default_factory=list)
     protected: bool = True
     track_count: int = 0
+
+
+class PlaylistPositionProposalRequest(BaseModel):
+    position: int = Field(ge=1)
 
 
 class ImportScanRequest(BaseModel):

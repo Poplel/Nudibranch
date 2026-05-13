@@ -835,6 +835,35 @@ nav button:hover,
   font-size: 12px;
 }
 
+.playlist-view {
+  display: grid;
+  gap: 8px;
+}
+
+.playlist-track-tree {
+  display: grid;
+  gap: 2px;
+}
+
+.playlist-order-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.playlist-order-field input {
+  width: 64px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
 .compact,
 .compact-button {
   width: fit-content;
@@ -1067,8 +1096,7 @@ nav button:hover,
   color: var(--accent);
 }
 
-.player-icon-button.active svg,
-.protected-playlist svg {
+.player-icon-button.active svg {
   fill: var(--accent);
   color: var(--accent);
 }

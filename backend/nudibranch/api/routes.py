@@ -24,6 +24,8 @@ from nudibranch.api.schemas import (
     LoginRequest,
     LoginResponse,
     NotificationOut,
+    PlaylistPositionProposalRequest,
+    PlaylistTrackOut,
     ProposalBatchOut,
     ProposalApproveRequest,
     ProposalItemOut,
@@ -375,6 +377,52 @@ def remove_favorite_track(
     return serialize_favorites(session, playlist)
 
 
+@router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"])
+def propose_favorite_position(
+    entry_id: str,
+    payload: PlaylistPositionProposalRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> ProposalBatchOut:
+    playlist = get_or_create_favorites(session)
+    entry = session.scalar(
+        select(PlaylistTrack)
+        .where(PlaylistTrack.id == entry_id, PlaylistTrack.playlist_id == playlist.id)
+        .options(selectinload(PlaylistTrack.track))
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Playlist entry not found")
+    if entry.position == payload.position:
+        raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
+
+    batch = ProposalBatch(
+        title="Update Favorites order",
+        kind=ProposalKind.playlist,
+        tree_path="/playlists/Favorites",
+    )
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=entry.track.title,
+            kind=ProposalKind.playlist,
+            old_value=str(entry.position),
+            new_value=str(payload.position),
+            payload_json=json.dumps(
+                {
+                    "action": "set_position",
+                    "playlist_track_id": entry.id,
+                    "position": payload.position,
+                }
+            ),
+        )
+    )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
 @router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"])
 def process_wishlist(
     session: Session = Depends(get_session),
@@ -596,8 +644,35 @@ def get_or_create_favorites(session: Session) -> Playlist:
 
 
 def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
-    track_ids = list(session.scalars(select(PlaylistTrack.track_id).where(PlaylistTrack.playlist_id == playlist.id).order_by(PlaylistTrack.position)))
-    return FavoritesOut(id=playlist.id, name=playlist.name, protected=playlist.protected, track_ids=track_ids, track_count=len(track_ids))
+    entries = list(
+        session.scalars(
+            select(PlaylistTrack)
+            .where(PlaylistTrack.playlist_id == playlist.id)
+            .options(selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+            .order_by(PlaylistTrack.position, PlaylistTrack.created_at)
+        )
+    )
+    tracks = [
+        PlaylistTrackOut(
+            id=entry.id,
+            track_id=entry.track_id,
+            position=entry.position,
+            title=entry.track.title,
+            artist=entry.track.album.artist.name,
+            album=entry.track.album.title,
+            format=entry.track.format,
+        )
+        for entry in entries
+    ]
+    track_ids = [entry.track_id for entry in entries]
+    return FavoritesOut(
+        id=playlist.id,
+        name=playlist.name,
+        protected=playlist.protected,
+        track_ids=track_ids,
+        tracks=tracks,
+        track_count=len(track_ids),
+    )
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

@@ -125,6 +125,11 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind in {ProposalKind.delete, ProposalKind.file_move} and json.loads(item.payload_json or "{}").get("action")
     ]
+    playlist_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.playlist and json.loads(item.payload_json or "{}").get("action")
+    ]
 
     if batch.kind == ProposalKind.import_files and not executable_items:
         errors.append("No approved import file operations were selected.")
@@ -158,6 +163,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
 
+    playlist_changes = 0
+    for item in playlist_items:
+        try:
+            apply_playlist_item(session, item)
+            item.status = ProposalStatus.completed
+            playlist_changes += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
@@ -175,7 +190,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, metadata_updated, file_actions, skipped, errors),
+        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
@@ -184,13 +199,14 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         "imported": imported,
         "metadata_updated": metadata_updated,
         "file_actions": file_actions,
+        "playlist_changes": playlist_changes,
         "skipped": skipped,
         "errors": errors,
     }
 
 
-def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {skipped} items skipped."
+def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {skipped} items skipped."
     if errors:
         return f"{body} First failure: {errors[0]}"
     return body
@@ -274,6 +290,17 @@ def apply_metadata_item(session: Session, item: ProposalItem) -> None:
         apply_scalar_changes(target, changes, editable_track_fields())
     else:
         raise ValueError("Unsupported metadata target")
+
+
+def apply_playlist_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if action != "set_position":
+        raise ValueError("Unsupported playlist action")
+    entry = session.get(PlaylistTrack, payload.get("playlist_track_id"))
+    if not entry:
+        raise ValueError("Playlist entry no longer exists")
+    entry.position = int(payload.get("position"))
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
@@ -398,35 +425,25 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         return {"synced": 0, "message": "Favorites playlist has not been created yet"}
 
     headers = {"X-Emby-Token": jellyfin_api_key}
-    try:
-        with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
-            users = client.get("/Users")
-            users.raise_for_status()
-            user_id = (users.json() or [{}])[0].get("Id")
-            if not user_id:
-                raise ValueError("No Jellyfin user was found for playlist sync")
+    with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
+        users = client.get("/Users")
+        users.raise_for_status()
+        user_id = (users.json() or [{}])[0].get("Id")
+        if not user_id:
+            raise ValueError("No Jellyfin user was found for playlist sync")
 
-            jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
-            if not jellyfin_playlist_id:
-                created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
-                created.raise_for_status()
-                jellyfin_playlist_id = created.json().get("Id")
-                playlist.jellyfin_playlist_id = jellyfin_playlist_id
-                session.commit()
+        jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
+        if not jellyfin_playlist_id:
+            created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
+            created.raise_for_status()
+            jellyfin_playlist_id = created.json().get("Id")
+            playlist.jellyfin_playlist_id = jellyfin_playlist_id
+            session.commit()
 
-            item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
-            if item_ids:
-                response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
-                response.raise_for_status()
-    except httpx.TransportError:
-        create_notification(
-            session,
-            title="Favorites sync skipped",
-            body=f"Jellyfin is unreachable at {jellyfin_url}.",
-            event_type="task_warning",
-            target_url="/settings",
-        )
-        return {"synced": 0, "warning": f"Jellyfin is unreachable at {jellyfin_url}"}
+        item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
+        if item_ids:
+            response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
+            response.raise_for_status()
 
     create_notification(
         session,

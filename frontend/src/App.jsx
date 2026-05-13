@@ -166,6 +166,7 @@ function App() {
       refreshTasks();
       refreshApprovals();
       refreshNotifications();
+      refreshFavorites();
     }, 10000);
     return () => window.clearInterval(interval);
   }, [token]);
@@ -546,6 +547,26 @@ function App() {
     }
   }
 
+  async function proposePlaylistPosition(entryId, position) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api(`/playlists/favorites/entries/${entryId}/position`, {
+        method: "POST",
+        body: JSON.stringify({ position }),
+      });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "Playlist change queued", body: "The order change was added to the task queue." });
+      return batch;
+    } catch (playlistError) {
+      setError(playlistError.message);
+      setToast({ title: "Playlist queue failed", body: playlistError.message });
+      throw playlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function playTracks(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
@@ -756,7 +777,7 @@ function App() {
                 onLookupAlbum={lookupImportAlbum}
               />
             )}
-            {page === "Playlists" && <PlaylistsView favorites={favoritesPlaylist} />}
+            {page === "Playlists" && <PlaylistsView favorites={favoritesPlaylist} onQueuePosition={proposePlaylistPosition} />}
             {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
           </section>
 
@@ -1361,18 +1382,81 @@ function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
   );
 }
 
-function PlaylistsView({ favorites }) {
+function PlaylistsView({ favorites, onQueuePosition }) {
+  const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
+  const [draftPositions, setDraftPositions] = useState({});
+  const tracks = favorites?.tracks || [];
+
+  useEffect(() => {
+    setDraftPositions(
+      Object.fromEntries(tracks.map((track) => [track.id, String(track.position || "")])),
+    );
+  }, [favorites?.id, favorites?.track_count]);
+
+  function updateDraft(entryId, value) {
+    setDraftPositions((current) => ({ ...current, [entryId]: value }));
+  }
+
+  async function submitPosition(track) {
+    const nextPosition = Number.parseInt(draftPositions[track.id], 10);
+    if (!Number.isFinite(nextPosition) || nextPosition < 1 || nextPosition === track.position) {
+      updateDraft(track.id, String(track.position || ""));
+      return;
+    }
+    try {
+      await onQueuePosition(track.id, nextPosition);
+    } catch {
+    }
+    updateDraft(track.id, String(track.position || ""));
+  }
+
   return (
     <div className="playlist-view">
-      <div className="file-row protected-playlist">
-        <Heart size={16} />
-        <div>
-          <strong>Favorites</strong>
-          <span>{favorites ? `${favorites.track_count || 0} tracks` : "Created when the first track is favorited"}</span>
-        </div>
-        <small>Protected</small>
+      <div className="tree-action-row library-row-actions">
+        <TreeRow
+          icon={Heart}
+          open={openPlaylists.has("Favorites")}
+          title="Favorites"
+          meta={favorites ? `${favorites.track_count || 0} tracks` : "Created when the first track is favorited"}
+          onToggle={() => toggleSet(setOpenPlaylists, "Favorites")}
+        />
       </div>
-    </div>
+      {openPlaylists.has("Favorites") &&
+        (tracks.length === 0 ? (
+          <EmptyState title="No favorite tracks" body="Favorite a song to add it here." />
+        ) : (
+          <div className="playlist-track-tree">
+            {tracks.map((track) => (
+              <div className="tree-action-row library-row-actions" key={track.id}>
+                <TreeRow
+                  depth={1}
+                  icon={FileAudio}
+                  title={track.title}
+                  meta={[track.artist, track.album, track.format].filter(Boolean).join(" / ")}
+                />
+                <label className="playlist-order-field">
+                  <span>Order</span>
+                  <input
+                    value={draftPositions[track.id] ?? String(track.position || "")}
+                    inputMode="numeric"
+                    onChange={(event) => updateDraft(track.id, event.target.value)}
+                    onBlur={() => submitPosition(track)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur();
+                      }
+                      if (event.key === "Escape") {
+                        updateDraft(track.id, String(track.position || ""));
+                        event.currentTarget.blur();
+                      }
+                    }}
+                  />
+                </label>
+              </div>
+            ))}
+          </div>
+        ))}
+        </div>
   );
 }
 
