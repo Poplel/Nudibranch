@@ -2,7 +2,7 @@ import secrets
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import select
@@ -224,9 +224,13 @@ def propose_library_remove(
 @router.get("/library/tracks/{track_id}/stream", tags=["library"])
 def stream_track(
     track_id: str,
+    api_key: str = Query(""),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
 ) -> FileResponse:
+    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    permissions = {permission.permission for permission in user.permissions} if user else set()
+    if not user or (not user.is_admin and Permission.library_read not in permissions):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     track = session.get(Track, track_id)
     if not track or not track.path:
         raise HTTPException(status_code=404, detail="Track not found")

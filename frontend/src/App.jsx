@@ -11,12 +11,15 @@ import {
   Folder,
   GripVertical,
   HardDriveUpload,
+  Heart,
   ListChecks,
   ListPlus,
   LogOut,
+  Menu,
   Moon,
   Music,
   Pencil,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -24,6 +27,8 @@ import {
   Settings,
   Shield,
   Sparkles,
+  SkipBack,
+  SkipForward,
   Sun,
   Trash2,
   Users,
@@ -123,6 +128,7 @@ function App() {
     () => unreadNotifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
     [unreadNotifications],
   );
+  const currentTrackIndex = playerQueue.findIndex((track) => track.id === currentTrack?.id);
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -140,10 +146,6 @@ function App() {
     const timeout = window.setTimeout(() => setToast(null), 5200);
     return () => window.clearTimeout(timeout);
   }, [toast]);
-
-  useEffect(() => () => {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-  }, [audioUrl]);
 
   useEffect(() => {
     if (!token) return;
@@ -494,14 +496,8 @@ function App() {
 
   async function loadPlayerTrack(track) {
     if (!track?.id) return;
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
     try {
-      const response = await fetch(`${API_BASE}/library/tracks/${track.id}/stream`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      const blob = await response.blob();
-      setAudioUrl(URL.createObjectURL(blob));
+      setAudioUrl(`${API_BASE}/library/tracks/${track.id}/stream?api_key=${encodeURIComponent(token)}`);
       setCurrentTrack(track);
     } catch (playError) {
       setError(`Playback failed: ${playError.message}`);
@@ -510,10 +506,16 @@ function App() {
   }
 
   async function playNextTrack() {
-    if (playerQueue.length === 0 || !currentTrack) return;
-    const index = playerQueue.findIndex((track) => track.id === currentTrack.id);
+    if (playerQueue.length === 0) return;
+    const index = currentTrackIndex < 0 ? -1 : currentTrackIndex;
     const nextTrack = playerQueue[index + 1];
     if (nextTrack) await loadPlayerTrack(nextTrack);
+  }
+
+  async function playPreviousTrack() {
+    if (playerQueue.length === 0) return;
+    const previousTrack = playerQueue[currentTrackIndex - 1] || playerQueue[0];
+    if (previousTrack) await loadPlayerTrack(previousTrack);
   }
 
   async function setApprovalSelection(batchId, itemIds, selected) {
@@ -686,10 +688,13 @@ function App() {
             currentTrack={currentTrack}
             audioUrl={audioUrl}
             queue={playerQueue}
+            currentIndex={currentTrackIndex}
             queueOpen={queueOpen}
             setQueueOpen={setQueueOpen}
             onPlayTrack={loadPlayerTrack}
             onEnded={playNextTrack}
+            onSkipBack={playPreviousTrack}
+            onSkipForward={playNextTrack}
             onClose={() => setPlayerOpen(false)}
           />
         )}
@@ -851,8 +856,8 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, o
                       onToggle={() => toggleSet(setOpenAlbums, album.id)}
                     />
                     <QuickLibraryActions
-                      onPlay={() => onPlay(album.tracks)}
-                      onQueue={() => onQueue(album.tracks)}
+                      onPlay={() => onPlay(albumTracks(artist, album))}
+                      onQueue={() => onQueue(albumTracks(artist, album))}
                       onRemove={() => setRemoveTarget(removeKey("album", album.id))}
                     />
                     <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
@@ -895,8 +900,8 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, o
                             warning={!track.is_lossless}
                           />
                           <QuickLibraryActions
-                            onPlay={() => onPlay([track])}
-                            onQueue={() => onQueue([track])}
+                            onPlay={() => onPlay([hydrateTrack(track, artist, album)])}
+                            onQueue={() => onQueue([hydrateTrack(track, artist, album)])}
                             onRemove={() => setRemoveTarget(removeKey("track", track.id))}
                           />
                           <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
@@ -1811,7 +1816,20 @@ function metadataPatchFromAlbum(targetType, draft, album) {
 }
 
 function artistTracks(artist) {
-  return artist.albums.flatMap((album) => album.tracks);
+  return artist.albums.flatMap((album) => albumTracks(artist, album));
+}
+
+function albumTracks(artist, album) {
+  return album.tracks.map((track) => hydrateTrack(track, artist, album));
+}
+
+function hydrateTrack(track, artist, album) {
+  return {
+    ...track,
+    _artist: artist.name,
+    _album: album.title,
+    _coverUrl: album.cover_path,
+  };
 }
 
 function removeKey(type, id) {
@@ -2000,26 +2018,92 @@ function Toast({ title, body, onClose }) {
   );
 }
 
-function AudioPlayer({ currentTrack, audioUrl, queue, queueOpen, setQueueOpen, onPlayTrack, onEnded, onClose }) {
+function AudioPlayer({
+  currentTrack,
+  audioUrl,
+  queue,
+  currentIndex,
+  queueOpen,
+  setQueueOpen,
+  onPlayTrack,
+  onEnded,
+  onSkipBack,
+  onSkipForward,
+  onClose,
+}) {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const upcomingQueue = queue.slice(Math.max(currentIndex + 1, 0));
+  const progress = duration ? (currentTime / duration) * 100 : 0;
+
+  useEffect(() => {
+    setPlaying(false);
+    setCurrentTime(0);
+  }, [audioUrl]);
+
+  function togglePlayback() {
+    const audio = audioRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      audio.play();
+    } else {
+      audio.pause();
+    }
+  }
+
+  function seek(event) {
+    const audio = audioRef.current;
+    if (!audio || !duration) return;
+    const nextTime = Number(event.target.value);
+    audio.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  }
+
   return (
     <div className="audio-player">
       <div className="audio-header">
+        <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
         <div>
           <strong>{currentTrack?.title || "Local player"}</strong>
-          <small>{currentTrack?.path || "Ready"}</small>
+          <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
         </div>
         <button className="row-icon-button" onClick={onClose} title="Close player">
           <X size={14} />
         </button>
       </div>
-      <audio controls autoPlay src={audioUrl} onEnded={onEnded} />
-      <button className="secondary compact" onClick={() => setQueueOpen((value) => !value)}>
-        <ListChecks size={14} />
-        Queue ({queue.length})
-      </button>
+      <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+      <audio
+        ref={audioRef}
+        autoPlay
+        src={audioUrl}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
+        onEnded={onEnded}
+      />
+      <div className="player-controls">
+        <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
+          <Menu size={19} />
+        </button>
+        <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+          <SkipBack size={18} />
+        </button>
+        <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+          {playing ? <Pause size={21} /> : <Play size={21} />}
+        </button>
+        <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+          <SkipForward size={18} />
+        </button>
+        <button className="player-icon-button" title="Favorite">
+          <Heart size={19} />
+        </button>
+      </div>
       {queueOpen && (
         <div className="local-queue">
-          {queue.map((track, index) => (
+          {upcomingQueue.map((track, index) => (
             <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
               <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
               <strong>{track.title}</strong>
