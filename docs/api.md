@@ -31,6 +31,8 @@ GET  /api/v1/library/tree
 
 POST /api/v1/imports/scan
 POST /api/v1/imports/propose
+POST /api/v1/imports/acoustic-match
+POST /api/v1/imports/album-lookup
 
 GET  /api/v1/wishlist
 POST /api/v1/wishlist
@@ -67,6 +69,35 @@ POST /api/v1/approvals/{batch_id}/approve
 ```
 
 Only selected items should execute.
+
+## Import Metadata Lookups
+
+Fingerprint-based track matching uses AcoustID when `ACOUSTID_API_KEY` is set:
+
+```http
+POST /api/v1/imports/acoustic-match
+
+{
+  "file": {
+    "path": "/app/import/Artist/Album/01 Track.flac",
+    "fingerprint": {
+      "duration": 180,
+      "fingerprint": "..."
+    }
+  }
+}
+```
+
+Album track-list checks use MusicBrainz release data:
+
+```http
+POST /api/v1/imports/album-lookup
+
+{
+  "artist": "Artist",
+  "album": "Album"
+}
+```
 
 ## Rejection Suppression
 
@@ -115,4 +146,3 @@ The scaffold intentionally leaves room for these API groups:
 /api/v1/settings
 /api/v1/system
 ```
-

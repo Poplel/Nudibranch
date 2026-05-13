@@ -108,10 +108,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     imported = 0
     skipped = 0
     errors: list[str] = []
+    executable_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.import_files and item.old_value and item.new_value
+    ]
 
-    for item in selected_items:
-        if item.kind != ProposalKind.import_files or not item.old_value or not item.new_value:
-            continue
+    if batch.kind == ProposalKind.import_files and not executable_items:
+        errors.append("No approved import file operations were selected.")
+
+    for item in executable_items:
         try:
             import_track_item(session, item)
             item.status = ProposalStatus.completed
@@ -121,7 +127,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             errors.append(f"{item.title}: {error}")
 
     for item in batch.items:
-        if item.status == ProposalStatus.approved:
+        if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
         elif not item.selected and item.status == ProposalStatus.pending:
             skipped += 1
@@ -137,11 +143,18 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=f"{imported} tracks imported. {skipped} items skipped. {len(errors)} errors.",
+        body=task_queue_notification_body(imported, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
     return {"batch_id": batch_id, "imported": imported, "skipped": skipped, "errors": errors}
+
+
+def task_queue_notification_body(imported: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {skipped} items skipped. {len(errors)} errors."
+    if errors:
+        return f"{body} First error: {errors[0]}"
+    return body
 
 
 def import_track_item(session: Session, item: ProposalItem) -> None:
@@ -156,8 +169,6 @@ def import_track_item(session: Session, item: ProposalItem) -> None:
     stat = source_path.stat()
     if payload.get("size_bytes") and stat.st_size != payload["size_bytes"]:
         raise ValueError("source file size changed after review")
-    if payload.get("mtime_ns") and stat.st_mtime_ns != payload["mtime_ns"]:
-        raise ValueError("source file timestamp changed after review")
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if target_path.exists():
@@ -239,6 +250,13 @@ async def worker_loop() -> None:
                 result = handler(session, task_to_payload(task))
                 complete_task(session, task, result)
             except Exception as error:  # noqa: BLE001 - worker must persist task failures.
+                create_notification(
+                    session,
+                    title=f"{task.type} failed",
+                    body=str(error),
+                    event_type="task_failed",
+                    target_url="/activity",
+                )
                 fail_task(session, task, str(error))
 
 

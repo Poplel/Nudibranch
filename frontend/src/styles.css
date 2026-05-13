@@ -448,7 +448,7 @@ nav button:hover,
 
 .import-edit-row {
   display: grid;
-  grid-template-columns: 18px 18px minmax(110px, 1fr) minmax(120px, 1fr) 56px minmax(140px, 1.4fr) auto 30px;
+  grid-template-columns: 18px 18px minmax(110px, 1fr) minmax(120px, 1fr) 56px minmax(140px, 1.4fr) auto 30px 30px;
   align-items: center;
   gap: 8px;
   min-height: 38px;
@@ -490,7 +490,7 @@ nav button:hover,
 
 .ghost-track-row {
   display: grid;
-  grid-template-columns: 18px 18px 100px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 18px 100px minmax(0, 1fr) auto 30px;
   align-items: center;
   gap: 8px;
   min-height: 36px;
@@ -575,6 +575,13 @@ nav button:hover,
   background: var(--panel-strong);
 }
 
+.tree-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 6px;
+  align-items: center;
+}
+
 .file-row div,
 .task-row {
   min-width: 0;
@@ -600,6 +607,27 @@ nav button:hover,
 
 .task-row {
   grid-template-columns: minmax(0, 1fr) 110px minmax(0, 1fr);
+  width: 100%;
+  color: var(--text);
+  text-align: left;
+}
+
+.task-entry {
+  display: grid;
+  gap: 4px;
+}
+
+.task-detail {
+  overflow: auto;
+  max-height: 320px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
 }
 
 .empty-panel,
@@ -850,11 +878,16 @@ nav button:hover,
   color: var(--text);
 }
 
+.tools-view {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
 .tool-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
-  padding: 12px;
 }
 
 .tool-card {
@@ -880,6 +913,60 @@ nav button:hover,
   margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.log-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.log-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.log-header input {
+  min-width: 220px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 9px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.log-list {
+  display: grid;
+  gap: 6px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.log-row {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.log-row.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  color: var(--danger);
 }
 
 .toast {

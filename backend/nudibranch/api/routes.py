@@ -1,12 +1,15 @@
 import secrets
 
 from fastapi import APIRouter, Depends, HTTPException
+import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.api.deps import get_current_user, require_permission
 from nudibranch.api.schemas import (
+    AlbumLookupRequest,
     DeviceRegistration,
+    ImportAcousticLookupRequest,
     ImportScanRequest,
     LibraryTreeAlbum,
     LibraryTreeArtist,
@@ -40,6 +43,7 @@ from nudibranch.db.models import (
 )
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files
+from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.tasks import enqueue_task, task_result, task_to_payload
 
@@ -128,6 +132,31 @@ def propose_import(
 ) -> TaskOut:
     task = enqueue_task(session, "propose_import", {"path": payload.path, "files": payload.files})
     return serialize_task(task)
+
+
+@router.post("/imports/acoustic-match", tags=["imports"])
+def acoustic_match(
+    payload: ImportAcousticLookupRequest,
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    try:
+        candidates = lookup_recording_by_fingerprint(payload.file)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Metadata lookup failed: {error}") from error
+    return {"candidates": candidates}
+
+
+@router.post("/imports/album-lookup", tags=["imports"])
+def album_lookup(
+    payload: AlbumLookupRequest,
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    try:
+        return lookup_album_tracks(payload.artist, payload.album)
+    except httpx.HTTPError as error:
+        raise HTTPException(status_code=502, detail=f"Album lookup failed: {error}") from error
 
 
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"])

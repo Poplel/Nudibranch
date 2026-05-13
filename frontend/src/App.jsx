@@ -24,6 +24,7 @@ import {
   Sun,
   Users,
   Wrench,
+  X,
 } from "lucide-react";
 import "./styles.css";
 
@@ -297,6 +298,49 @@ function App() {
     }
   }
 
+  async function recheckImportTrack(file) {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api("/imports/acoustic-match", {
+        method: "POST",
+        body: JSON.stringify({ file }),
+      });
+      const candidate = data.candidates?.[0];
+      if (!candidate) {
+        setToast({ title: "No metadata match", body: "No acoustic match was found for this track." });
+        return;
+      }
+      const metadataPatch = compactMetadata(candidate.metadata || {});
+      setImportFiles((current) => patchImportFile(current, file.path, metadataPatch));
+      setToast({ title: "Metadata updated", body: "The most likely acoustic match was applied." });
+    } catch (lookupError) {
+      setError(lookupError.message);
+      setToast({ title: "Metadata lookup failed", body: lookupError.message });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function lookupImportAlbum(artist, album) {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api("/imports/album-lookup", {
+        method: "POST",
+        body: JSON.stringify({ artist, album }),
+      });
+      setToast({ title: "Album checked", body: `${data.tracks?.length || 0} tracks found.` });
+      return data;
+    } catch (lookupError) {
+      setError(lookupError.message);
+      setToast({ title: "Album lookup failed", body: lookupError.message });
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function setApprovalSelection(batchId, itemIds, selected) {
     await api(`/approvals/${batchId}/selection`, {
       method: "POST",
@@ -418,6 +462,8 @@ function App() {
                 onPropose={proposeImport}
                 onFilesChange={setImportFiles}
                 library={library}
+                onRecheckTrack={recheckImportTrack}
+                onCheckAlbum={lookupImportAlbum}
                 loading={loading}
                 activeImportTask={activeImportTask}
               />
@@ -433,7 +479,7 @@ function App() {
                 apiKey={token}
               />
             )}
-            {page === "Tools" && <ToolsView />}
+            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} />}
             {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools"].includes(page) && <Placeholder page={page} />}
           </section>
 
@@ -676,13 +722,29 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
   );
 }
 
-function ImportWizard({ files, onScan, onPropose, onFilesChange, library, loading, activeImportTask }) {
+function ImportWizard({ files, onScan, onPropose, onFilesChange, library, onRecheckTrack, onCheckAlbum, loading, activeImportTask }) {
   const [manualAlbums, setManualAlbums] = useState([]);
+  const [albumRecords, setAlbumRecords] = useState({});
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
 
   function addManualAlbum(album) {
     setManualAlbums((current) => [...current, album]);
+    setAlbumRecords((current) => ({
+      ...current,
+      [albumRecordKey(album.artist, album.name)]: album.tracks,
+    }));
     setAlbumSearchOpen(false);
+  }
+
+  async function checkAlbum(artist, album) {
+    const record = await onCheckAlbum(artist, album);
+    if (!record?.tracks?.length) return null;
+    setAlbumRecords((current) => ({
+      ...current,
+      [albumRecordKey(record.artist || artist, record.album || album)]: record.tracks,
+      [albumRecordKey(artist, album)]: record.tracks,
+    }));
+    return record;
   }
 
   return (
@@ -700,24 +762,42 @@ function ImportWizard({ files, onScan, onPropose, onFilesChange, library, loadin
           {activeImportTask ? "Import review running" : "Add to task queue"}
         </button>
       </div>
-      {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} />}
+      {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} onLookup={checkAlbum} />}
       {files.length === 0 && manualAlbums.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
       ) : (
-        <ImportTree files={files} onFilesChange={onFilesChange} library={library} manualAlbums={manualAlbums} />
+        <ImportTree
+          files={files}
+          onFilesChange={onFilesChange}
+          library={library}
+          manualAlbums={manualAlbums}
+          albumRecords={albumRecords}
+          onRecheckTrack={onRecheckTrack}
+          onCheckAlbum={checkAlbum}
+        />
       )}
     </div>
   );
 }
 
-function AlbumSearchPanel({ onAdd }) {
+function AlbumSearchPanel({ onAdd, onLookup }) {
   const [artist, setArtist] = useState("");
   const [album, setAlbum] = useState("");
   const [tracks, setTracks] = useState(10);
 
-  function submit(event) {
+  async function submit(event) {
     event.preventDefault();
     if (!artist.trim() || !album.trim()) return;
+    const record = await onLookup(artist.trim(), album.trim());
+    if (record?.tracks?.length) {
+      onAdd({
+        id: record.musicbrainz_album_id || `manual:${Date.now()}`,
+        name: record.album || album.trim(),
+        artist: record.artist || artist.trim(),
+        tracks: record.tracks,
+      });
+      return;
+    }
     onAdd({
       id: `manual:${Date.now()}`,
       name: album.trim(),
@@ -751,13 +831,14 @@ function AlbumSearchPanel({ onAdd }) {
   );
 }
 
-function ImportTree({ files, onFilesChange, library, manualAlbums }) {
+function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords, onRecheckTrack, onCheckAlbum }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [draggedAlbum, setDraggedAlbum] = useState(null);
   const [draggedTrack, setDraggedTrack] = useState(null);
   const [downloadSelections, setDownloadSelections] = useState(() => new Set());
-  const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums), [files, library, manualAlbums]);
+  const [dismissedGhosts, setDismissedGhosts] = useState(() => new Set());
+  const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums, albumRecords), [files, library, manualAlbums, albumRecords]);
 
   useEffect(() => {
     setOpenArtists(new Set(grouped.map((artist) => artist.name)));
@@ -801,24 +882,30 @@ function ImportTree({ files, onFilesChange, library, manualAlbums }) {
                       }
                     }}
                   >
-                    <TreeRow
-                      depth={1}
-                      icon={Folder}
-                      open={openAlbums.has(albumId)}
-                      title={album.name}
-                      meta={`${album.files.length}/${album.slots.length} matched · ${album.matchStatus}`}
-                      warning={album.matchStatus === "partial"}
-                      onToggle={() => toggleSet(setOpenAlbums, albumId)}
-                    />
+                    <div className="tree-action-row">
+                      <TreeRow
+                        depth={1}
+                        icon={Folder}
+                        open={openAlbums.has(albumId)}
+                        title={album.name}
+                        meta={`${album.files.length}/${album.slots.length} matched · ${album.matchStatus}`}
+                        warning={album.matchStatus === "partial"}
+                        onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                      />
+                      <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
+                        <Search size={15} />
+                      </button>
+                    </div>
                   </div>
                   {openAlbums.has(albumId) &&
-                    album.slots.map((slot) =>
+                    album.slots.filter((slot) => slot.file || !dismissedGhosts.has(slot.id)).map((slot) =>
                       slot.file ? (
                         <ImportTrackRow
                           file={slot.file}
                           album={album}
                           onDragStart={() => setDraggedTrack(slot.file.path)}
                           onChange={(patch) => updateImportFile(files, onFilesChange, slot.file.path, patch)}
+                          onRecheck={() => onRecheckTrack(slot.file)}
                           key={slot.file.path}
                         />
                       ) : (
@@ -827,14 +914,16 @@ function ImportTree({ files, onFilesChange, library, manualAlbums }) {
                           slot={slot}
                           checked={downloadSelections.has(slot.id)}
                           onChecked={(checked) => toggleDownloadSelection(setDownloadSelections, slot.id, checked)}
+                          onDismiss={() => toggleDownloadSelection(setDismissedGhosts, slot.id, true)}
                           onDrop={() => {
                             if (draggedTrack) {
+                              const draggedFile = files.find((file) => file.path === draggedTrack);
                               updateImportFile(files, onFilesChange, draggedTrack, {
                                 artist: artist.name,
                                 albumartist: artist.name,
                                 album: album.name,
                                 track_number: slot.track_number,
-                                title: slot.title,
+                                title: titleForDroppedSlot(slot, draggedFile),
                               });
                               setDraggedTrack(null);
                             }
@@ -851,7 +940,7 @@ function ImportTree({ files, onFilesChange, library, manualAlbums }) {
   );
 }
 
-function ImportTrackRow({ file, album, onChange, onDragStart }) {
+function ImportTrackRow({ file, album, onChange, onDragStart, onRecheck }) {
   const metadata = file.metadata || {};
   const [editing, setEditing] = useState(false);
   return (
@@ -867,6 +956,9 @@ function ImportTrackRow({ file, album, onChange, onDragStart }) {
         />
         <DraftInput value={metadata.title || ""} onCommit={(value) => onChange({ title: value })} />
         <small>{album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
+        <button className="row-icon-button" onClick={onRecheck} title="Scan and match metadata">
+          <Search size={15} />
+        </button>
         <button className="row-icon-button" onClick={() => setEditing((value) => !value)} title="Edit metadata">
           <Pencil size={15} />
         </button>
@@ -956,7 +1048,7 @@ function MetadataEditor({ metadata, onChange }) {
   );
 }
 
-function GhostTrackRow({ slot, checked, onChecked, onDrop }) {
+function GhostTrackRow({ slot, checked, onChecked, onDismiss, onDrop }) {
   return (
     <div className="ghost-track-row" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
       <span className="chevron" />
@@ -969,11 +1061,15 @@ function GhostTrackRow({ slot, checked, onChecked, onDrop }) {
         {slot.track_number ? String(slot.track_number).padStart(2, "0") : "#"}-{slot.title}
       </span>
       <small>{slot.reason}</small>
+      <button className="row-icon-button" onClick={onDismiss} title="Dismiss slot">
+        <X size={15} />
+      </button>
     </div>
   );
 }
 
 function TasksView({ tasks }) {
+  const [openTasks, setOpenTasks] = useState(() => new Set());
   if (tasks.length === 0) {
     return <EmptyState title="No activity" body="Scans, queued changes, downloads, and notifications will appear here." />;
   }
@@ -981,17 +1077,23 @@ function TasksView({ tasks }) {
   return (
     <div className="task-list">
       {tasks.map((task) => (
-        <div className="task-row" key={task.id}>
-          <strong>{task.type}</strong>
-          <span>{task.status}</span>
-          <small>{taskSummary(task)}</small>
-        </div>
+        <section className="task-entry" key={task.id}>
+          <button className="task-row" onClick={() => toggleSet(setOpenTasks, task.id)}>
+            <strong>{task.type}</strong>
+            <span>{task.status}</span>
+            <small>{taskSummary(task)}</small>
+          </button>
+          {openTasks.has(task.id) && (
+            <pre className="task-detail">{JSON.stringify({ payload: task.payload, result: task.result, error: task.error }, null, 2)}</pre>
+          )}
+        </section>
       ))}
     </div>
   );
 }
 
-function ToolsView() {
+function ToolsView({ tasks, notifications }) {
+  const [query, setQuery] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library."],
     ["Find missing album tracks", "Compare known albums against library records and queue download searches."],
@@ -999,17 +1101,32 @@ function ToolsView() {
     ["Backup now", "Create a manual backup when no file operations are running."],
   ];
 
+  const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
+
   return (
-    <div className="tool-grid">
-      {tools.map(([title, body]) => (
-        <button className="tool-card" key={title} disabled>
-          <Wrench size={18} />
-          <span>
-            <strong>{title}</strong>
-            <small>{body}</small>
-          </span>
-        </button>
-      ))}
+    <div className="tools-view">
+      <div className="tool-grid">
+        {tools.map(([title, body]) => (
+          <button className="tool-card" key={title} disabled>
+            <Wrench size={18} />
+            <span>
+              <strong>{title}</strong>
+              <small>{body}</small>
+            </span>
+          </button>
+        ))}
+      </div>
+      <section className="log-panel">
+        <div className="log-header">
+          <h2>Live Log</h2>
+          <input placeholder="Search log" value={query} onChange={(event) => setQuery(event.target.value)} />
+        </div>
+        <div className="log-list">
+          {logs.map((entry) => (
+            <pre className={entry.level === "error" ? "log-row error" : "log-row"} key={entry.id}>{entry.text}</pre>
+          ))}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1169,17 +1286,19 @@ function collectItemIds(item, childrenById) {
 }
 
 function updateImportFile(files, onFilesChange, path, metadataPatch) {
-  onFilesChange(
-    files.map((file) => {
-      if (file.path !== path) return file;
-      const metadata = { ...(file.metadata || {}), ...metadataPatch };
-      return {
-        ...file,
-        metadata,
-        suggested_library_path: suggestImportPath(file, metadata),
-      };
-    }),
-  );
+  onFilesChange(patchImportFile(files, path, metadataPatch));
+}
+
+function patchImportFile(files, path, metadataPatch) {
+  return files.map((file) => {
+    if (file.path !== path) return file;
+    const metadata = { ...(file.metadata || {}), ...metadataPatch };
+    return {
+      ...file,
+      metadata,
+      suggested_library_path: suggestImportPath(file, metadata),
+    };
+  });
 }
 
 function updateImportAlbum(files, onFilesChange, artistName, albumName, metadataPatch) {
@@ -1215,7 +1334,7 @@ function safePathPart(value) {
     .trim();
 }
 
-function groupImportFiles(files, library = [], manualAlbums = []) {
+function groupImportFiles(files, library = [], manualAlbums = [], albumRecords = {}) {
   const artistMap = new Map();
   files.forEach((file) => {
     const artistName = file.metadata?.albumartist || file.metadata?.artist || "Unknown Artist";
@@ -1245,15 +1364,16 @@ function groupImportFiles(files, library = [], manualAlbums = []) {
     .map((artist) => ({
       name: artist.name,
       count: artist.count,
-      albums: [...artist.albumMap.values()].map((album) => buildImportAlbum(album, artist.name, library)),
+      albums: [...artist.albumMap.values()].map((album) => buildImportAlbum(album, artist.name, library, albumRecords)),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function buildImportAlbum(album, artistName, library) {
+function buildImportAlbum(album, artistName, library, albumRecords) {
   const files = album.files.sort((a, b) => (a.metadata?.track_number || 9999) - (b.metadata?.track_number || 9999));
   const libraryAlbum = findLibraryAlbum(library, artistName, album.name);
-  const expectedTracks = album.expectedTracks || libraryAlbum?.tracks || inferExpectedTracks(files);
+  const recordTracks = albumRecords[albumRecordKey(artistName, album.name)];
+  const expectedTracks = recordTracks || album.expectedTracks || libraryAlbum?.tracks || inferExpectedTracks(files);
   const trackMap = new Map();
   files.forEach((file) => {
     const trackNumber = file.metadata?.track_number;
@@ -1268,7 +1388,7 @@ function buildImportAlbum(album, artistName, library) {
           id: `${artistName}:${album.name}:${trackNumber}:${track.title}`,
           track_number: trackNumber,
           title: track.title || `Track ${trackNumber}`,
-          reason: libraryAlbum ? "Missing from import" : "Album slot",
+          reason: recordTracks ? "Missing from album record" : libraryAlbum ? "Missing from import" : "Album slot",
         };
   });
   const matchedCount = slots.filter((slot) => slot.file).length;
@@ -1280,6 +1400,25 @@ function buildImportAlbum(album, artistName, library) {
     matchStatus,
     libraryAlbum,
   };
+}
+
+function albumRecordKey(artist, album) {
+  return `${normalizeName(artist)}::${normalizeName(album)}`;
+}
+
+function titleForDroppedSlot(slot, file) {
+  if (isGenericTrackTitle(slot.title)) {
+    return file?.metadata?.title || slot.title;
+  }
+  return slot.title;
+}
+
+function isGenericTrackTitle(title) {
+  return /^track\s+#?\d+$/i.test(String(title || "").trim());
+}
+
+function compactMetadata(metadata) {
+  return Object.fromEntries(Object.entries(metadata).filter(([, value]) => value !== null && value !== undefined && value !== ""));
 }
 
 function findLibraryAlbum(library, artistName, albumName) {
@@ -1341,6 +1480,22 @@ function taskSummary(task) {
   if (task.result?.errors?.length) return task.result.errors.join("; ");
   if (task.result?.imported !== undefined) return `${task.result.imported} imported, ${task.result.skipped || 0} skipped`;
   return new Date(task.created_at).toLocaleString();
+}
+
+function buildLiveLog(tasks, notifications) {
+  const taskEntries = tasks.map((task) => ({
+    id: `task:${task.id}`,
+    level: task.status === "failed" || task.error || task.result?.errors?.length ? "error" : "info",
+    createdAt: task.updated_at || task.created_at,
+    text: `[${new Date(task.updated_at || task.created_at).toLocaleString()}] ${task.type} ${task.status}: ${taskSummary(task)}`,
+  }));
+  const notificationEntries = notifications.map((notification) => ({
+    id: `notification:${notification.id}`,
+    level: notification.event_type?.includes("failed") || notification.title?.toLowerCase().includes("failed") ? "error" : "info",
+    createdAt: notification.created_at,
+    text: `[${new Date(notification.created_at).toLocaleString()}] ${notification.title}: ${notification.body}`,
+  }));
+  return [...taskEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 function groupBy(items, getKey) {

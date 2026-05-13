@@ -137,3 +137,12 @@ class DeviceRegistration(BaseModel):
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None
+
+
+class ImportAcousticLookupRequest(BaseModel):
+    file: dict[str, Any]
+
+
+class AlbumLookupRequest(BaseModel):
+    artist: str
+    album: str
