@@ -356,6 +356,25 @@ def add_favorite_track(
     return serialize_favorites(session, playlist)
 
 
+@router.delete("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+def remove_favorite_track(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    playlist = get_or_create_favorites(session)
+    items = list(
+        session.scalars(
+            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id, PlaylistTrack.track_id == track_id)
+        )
+    )
+    for item in items:
+        session.delete(item)
+    session.commit()
+    enqueue_task(session, "sync_favorites_jellyfin", {})
+    return serialize_favorites(session, playlist)
+
+
 @router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"])
 def process_wishlist(
     session: Session = Depends(get_session),
@@ -578,7 +597,7 @@ def get_or_create_favorites(session: Session) -> Playlist:
 
 def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
     track_ids = list(session.scalars(select(PlaylistTrack.track_id).where(PlaylistTrack.playlist_id == playlist.id).order_by(PlaylistTrack.position)))
-    return FavoritesOut(id=playlist.id, name=playlist.name, protected=playlist.protected, track_ids=track_ids)
+    return FavoritesOut(id=playlist.id, name=playlist.name, protected=playlist.protected, track_ids=track_ids, track_count=len(track_ids))
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

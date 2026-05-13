@@ -340,7 +340,7 @@ nav button:hover,
   grid-template-columns: minmax(0, 1fr) 330px;
   gap: 14px;
   min-height: 0;
-  padding: 14px;
+  padding: 14px 14px calc(14px + var(--player-dock-height, 0px));
 }
 
 .panel {
@@ -860,11 +860,22 @@ nav button:hover,
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
 }
 
+.audio-player.popped {
+  position: static;
+  width: min(330px, calc(100vw - 24px));
+}
+
 .audio-header {
   display: grid;
-  grid-template-columns: 82px minmax(0, 1fr) 30px;
+  grid-template-columns: 82px minmax(0, 1fr) 64px;
   gap: 12px;
   align-items: center;
+}
+
+.player-window-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
 }
 
 .player-art {
@@ -910,7 +921,7 @@ nav button:hover,
 
 .player-controls {
   display: grid;
-  grid-template-columns: repeat(6, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   align-items: center;
   gap: 8px;
 }
@@ -942,11 +953,13 @@ nav button:hover,
 }
 
 .player-icon-button.active {
-  color: var(--danger);
+  color: var(--accent);
 }
 
-.pip-button {
-  color: var(--muted);
+.player-icon-button.active svg,
+.protected-playlist svg {
+  fill: var(--accent);
+  color: var(--accent);
 }
 
 .local-queue {
@@ -1162,6 +1175,7 @@ nav button:hover,
 .inspector {
   padding: 14px;
   overflow: auto;
+  max-height: calc(100vh - 92px - var(--player-dock-height, 0px));
 }
 
 .diff {
@@ -1364,7 +1378,7 @@ nav button:hover,
 .toast {
   position: fixed;
   right: 18px;
-  bottom: 18px;
+  bottom: var(--toast-bottom, 18px);
   z-index: 30;
   display: grid;
   gap: 4px;

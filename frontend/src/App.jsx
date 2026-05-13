@@ -96,12 +96,15 @@ function App() {
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
+  const [favoritesPlaylist, setFavoritesPlaylist] = useState(null);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
   const [playerOpen, setPlayerOpen] = useState(false);
+  const [playerPopped, setPlayerPopped] = useState(false);
+  const [playerDockHeight, setPlayerDockHeight] = useState(0);
   const [queueOpen, setQueueOpen] = useState(false);
   const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -133,6 +136,7 @@ function App() {
     [unreadNotifications],
   );
   const currentTrackIndex = playerQueue.findIndex((track) => track.id === currentTrack?.id);
+  const playerDocked = playerOpen && !playerPopped;
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -323,18 +327,25 @@ function App() {
   async function refreshFavorites() {
     try {
       const favorites = await api("/playlists/favorites");
+      setFavoritesPlaylist(favorites);
       setFavoriteTrackIds(new Set(favorites.track_ids || []));
     } catch {
       // Favorites are optional for users without playlist permissions.
     }
   }
 
-  async function addFavoriteTrack(track) {
+  async function toggleFavoriteTrack(track) {
     if (!track?.id) return;
     try {
-      const favorites = await api(`/playlists/favorites/tracks/${track.id}`, { method: "POST" });
+      const favorites = await api(`/playlists/favorites/tracks/${track.id}`, {
+        method: favoriteTrackIds.has(track.id) ? "DELETE" : "POST",
+      });
+      setFavoritesPlaylist(favorites);
       setFavoriteTrackIds(new Set(favorites.track_ids || []));
-      setToast({ title: "Added to Favorites", body: "Favorites will sync to Jellyfin." });
+      setToast({
+        title: favoriteTrackIds.has(track.id) ? "Removed from Favorites" : "Added to Favorites",
+        body: "Favorites will sync to Jellyfin.",
+      });
     } catch (favoriteError) {
       setError(favoriteError.message);
       setToast({ title: "Favorite failed", body: favoriteError.message });
@@ -629,7 +640,15 @@ function App() {
   }
 
   return (
-    <main className={theme} style={{ "--accent-color": accentColor, "--background-tint": backgroundTint }}>
+    <main
+      className={`${theme}${playerDocked ? " player-docked" : ""}`}
+      style={{
+        "--accent-color": accentColor,
+        "--background-tint": backgroundTint,
+        "--player-dock-height": playerDocked ? `${playerDockHeight}px` : "0px",
+        "--toast-bottom": playerDocked ? `${playerDockHeight + 34}px` : "18px",
+      }}
+    >
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">N</div>
@@ -733,7 +752,8 @@ function App() {
                 onLookupAlbum={lookupImportAlbum}
               />
             )}
-            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist"].includes(page) && <Placeholder page={page} />}
+            {page === "Playlists" && <PlaylistsView favorites={favoritesPlaylist} />}
+            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
@@ -751,8 +771,12 @@ function App() {
             onEnded={playNextTrack}
             onSkipBack={playPreviousTrack}
             onSkipForward={playNextTrack}
-            onFavorite={addFavoriteTrack}
+            onFavorite={toggleFavoriteTrack}
             favoriteTrackIds={favoriteTrackIds}
+            onDockChange={({ popped, height }) => {
+              setPlayerPopped(popped);
+              setPlayerDockHeight(height || 0);
+            }}
             onClose={() => setPlayerOpen(false)}
           />
         )}
@@ -1328,6 +1352,21 @@ function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function PlaylistsView({ favorites }) {
+  return (
+    <div className="playlist-view">
+      <div className="file-row protected-playlist">
+        <Heart size={16} />
+        <div>
+          <strong>Favorites</strong>
+          <span>{favorites ? `${favorites.track_count || 0} tracks` : "Created when the first track is favorited"}</span>
+        </div>
+        <small>Protected</small>
+      </div>
     </div>
   );
 }
@@ -2148,9 +2187,11 @@ function AudioPlayer({
   onSkipForward,
   onFavorite,
   favoriteTrackIds,
+  onDockChange,
   onClose,
 }) {
   const audioRef = useRef(null);
+  const dockRef = useRef(null);
   const pipWindowRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -2164,6 +2205,20 @@ function AudioPlayer({
     setPlaying(false);
     setCurrentTime(0);
   }, [audioUrl]);
+
+  useEffect(() => () => {
+    pipWindowRef.current?.close?.();
+  }, []);
+
+  useEffect(() => {
+    onDockChange?.({ popped: Boolean(pipContainer), height: pipContainer ? 0 : dockRef.current?.offsetHeight || 0 });
+    if (pipContainer || !dockRef.current) return undefined;
+    const observer = new ResizeObserver(([entry]) => {
+      onDockChange?.({ popped: false, height: entry.contentRect.height });
+    });
+    observer.observe(dockRef.current);
+    return () => observer.disconnect();
+  }, [onDockChange, pipContainer, queueOpen, currentTrack?.id]);
 
   function togglePlayback() {
     const audio = audioRef.current;
@@ -2204,17 +2259,25 @@ function AudioPlayer({
     setPipContainer(container);
   }
 
-  const surface = (
-    <div className="audio-player">
+  function surface({ popped = false } = {}) {
+    return (
+    <div className={popped ? "audio-player popped" : "audio-player"} ref={popped ? null : dockRef}>
       <div className="audio-header">
         <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
         <div>
           <strong>{currentTrack?.title || "Local player"}</strong>
           <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
         </div>
-        <button className="row-icon-button" onClick={onClose} title="Close player">
-          <X size={14} />
-        </button>
+        <div className="player-window-actions">
+          {!popped && (
+            <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
+              <PictureInPicture2 size={14} />
+            </button>
+          )}
+          <button className="row-icon-button" onClick={onClose} title="Close player">
+            <X size={14} />
+          </button>
+        </div>
       </div>
       <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
       <div className="player-controls">
@@ -2233,9 +2296,6 @@ function AudioPlayer({
         <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
           <Heart size={19} />
         </button>
-        <button className="player-icon-button pip-button" onClick={openPictureInPicture} title="Pop out">
-          <PictureInPicture2 size={18} />
-        </button>
       </div>
       {queueOpen && (
         <div className="local-queue">
@@ -2248,11 +2308,12 @@ function AudioPlayer({
         </div>
       )}
     </div>
-  );
+    );
+  }
 
   return (
     <>
-      {surface}
+      {!pipContainer ? surface() : null}
       <audio
         ref={audioRef}
         autoPlay
@@ -2263,7 +2324,7 @@ function AudioPlayer({
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
         onEnded={onEnded}
       />
-      {pipContainer ? createPortal(surface, pipContainer) : null}
+      {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
     </>
   );
 }

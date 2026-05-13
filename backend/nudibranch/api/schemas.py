@@ -160,6 +160,7 @@ class FavoritesOut(BaseModel):
     name: str
     track_ids: list[str]
     protected: bool = True
+    track_count: int = 0
 
 
 class ImportScanRequest(BaseModel):
