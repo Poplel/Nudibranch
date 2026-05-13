@@ -10,13 +10,18 @@ from nudibranch.db.models import Task, TaskStatus
 
 def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
     payload_json = json.dumps(payload, sort_keys=True)
-    existing = session.scalar(
+    existing_query = (
         select(Task)
         .where(Task.type == task_type)
-        .where(Task.payload_json == payload_json)
         .where(Task.status.in_([TaskStatus.queued, TaskStatus.running]))
         .order_by(Task.created_at.asc())
         .limit(1)
+    )
+    if task_type not in {"propose_import"}:
+        existing_query = existing_query.where(Task.payload_json == payload_json)
+
+    existing = session.scalar(
+        existing_query
     )
     if existing:
         return existing

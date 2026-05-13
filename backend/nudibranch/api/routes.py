@@ -15,6 +15,7 @@ from nudibranch.api.schemas import (
     LoginResponse,
     NotificationOut,
     ProposalBatchOut,
+    ProposalApproveRequest,
     ProposalItemOut,
     ProposalRejectRequest,
     ProposalSelectionUpdate,
@@ -32,6 +33,7 @@ from nudibranch.db.models import (
     Notification,
     Permission,
     ProposalBatch,
+    ProposalStatus,
     Task,
     User,
     WishlistItem,
@@ -124,7 +126,7 @@ def propose_import(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> TaskOut:
-    task = enqueue_task(session, "propose_import", {"path": payload.path})
+    task = enqueue_task(session, "propose_import", {"path": payload.path, "files": payload.files})
     return serialize_task(task)
 
 
@@ -171,6 +173,7 @@ def list_approvals(
         session.scalars(
             select(ProposalBatch)
             .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing]))
             .order_by(ProposalBatch.created_at.desc())
         )
     )
@@ -191,11 +194,12 @@ def update_selection(
 @router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"])
 def approve(
     batch_id: str,
+    payload: ProposalApproveRequest | None = None,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> TaskOut:
     try:
-        task = approve_batch(session, batch_id)
+        task = approve_batch(session, batch_id, payload.item_ids if payload else None)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     return serialize_task(task)
@@ -264,6 +268,7 @@ def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:
         items=[
             ProposalItemOut(
                 id=item.id,
+                batch_id=item.batch_id,
                 parent_id=item.parent_id,
                 title=item.title,
                 kind=item.kind,

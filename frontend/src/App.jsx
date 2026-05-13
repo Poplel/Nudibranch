@@ -52,6 +52,18 @@ const pageDescriptions = {
   Settings: "Manage appearance, integrations, and system status.",
 };
 
+const approvalTypeLabels = {
+  import_files: "Imports",
+  download: "Downloads",
+  metadata: "Metadata",
+  artwork: "Artwork",
+  lyrics: "Lyrics",
+  file_move: "File moves",
+  delete: "Deletes",
+  jellyfin_sync: "Jellyfin sync",
+  playlist: "Playlists",
+};
+
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
@@ -99,6 +111,7 @@ function App() {
     if (!token) return;
     refreshAll();
     const interval = window.setInterval(() => {
+      refreshLibrary();
       refreshTasks();
       refreshApprovals();
       refreshNotifications();
@@ -216,6 +229,14 @@ function App() {
     }
   }
 
+  async function refreshLibrary() {
+    try {
+      setLibrary(await api("/library/tree"));
+    } catch {
+      // Library polling is best-effort after approval execution.
+    }
+  }
+
   async function refreshNotifications() {
     try {
       setNotifications(await api("/notifications"));
@@ -255,7 +276,7 @@ function App() {
     try {
       const task = await api("/imports/propose", {
         method: "POST",
-        body: JSON.stringify({ path: null }),
+        body: JSON.stringify({ path: null, files: importFiles }),
       });
       setTasks((current) => upsertTask(current, task));
       setToast({ title: "Import review queued", body: "A proposal batch will appear in Approvals." });
@@ -293,6 +314,31 @@ function App() {
     }
   }
 
+  async function approveItems(items) {
+    setLoading(true);
+    try {
+      const batchIds = [...new Set(items.map((item) => item.batch_id))];
+      const createdTasks = [];
+      const itemsByBatch = groupBy(items, (item) => item.batch_id);
+      for (const [batchId, batchItems] of itemsByBatch) {
+        createdTasks.push(
+          await api(`/approvals/${batchId}/approve`, {
+            method: "POST",
+            body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
+          }),
+        );
+      }
+      setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
+      setToast({ title: "Approvals queued", body: `${batchIds.length} approval groups were sent to the task queue.` });
+      await refreshApprovals();
+      window.setTimeout(refreshLibrary, 3500);
+    } catch (approvalError) {
+      setError(approvalError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function rejectSelected(batchId, itemIds) {
     setLoading(true);
     try {
@@ -300,6 +346,25 @@ function App() {
         method: "POST",
         body: JSON.stringify({ item_ids: itemIds, suppress_for: "week" }),
       });
+      setToast({ title: "Changes rejected", body: "Selected items were suppressed for one week." });
+      await refreshApprovals();
+    } catch (rejectError) {
+      setError(rejectError.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function rejectItems(items) {
+    setLoading(true);
+    try {
+      const itemsByBatch = groupBy(items, (item) => item.batch_id);
+      for (const [batchId, batchItems] of itemsByBatch) {
+        await api(`/approvals/${batchId}/reject`, {
+          method: "POST",
+          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), suppress_for: "week" }),
+        });
+      }
       setToast({ title: "Changes rejected", body: "Selected items were suppressed for one week." });
       await refreshApprovals();
     } catch (rejectError) {
@@ -367,8 +432,8 @@ function App() {
               <Approvals
                 approvals={approvals}
                 onSelection={setApprovalSelection}
-                onApprove={approveBatch}
-                onReject={rejectSelected}
+                onApprove={approveItems}
+                onReject={rejectItems}
               />
             )}
             {page === "Import" && (
@@ -376,6 +441,7 @@ function App() {
                 files={importFiles}
                 onScan={scanImportFolder}
                 onPropose={proposeImport}
+                onFilesChange={setImportFiles}
                 loading={loading}
                 activeImportTask={activeImportTask}
               />
@@ -523,14 +589,16 @@ function LibraryTree({ artists }) {
 }
 
 function Approvals({ approvals, onSelection, onApprove, onReject }) {
-  if (approvals.length === 0) {
+  const groups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
+
+  if (groups.length === 0) {
     return <EmptyState title="No pending approvals" body="Import scans and download searches will create review batches here." />;
   }
 
   return (
     <div className="approval-tree">
-      {approvals.map((batch) => (
-        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
+      {groups.map((group) => (
+        <ApprovalBatch key={group.id} batch={group} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
   );
@@ -556,10 +624,10 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           </p>
         </div>
         <div className="approval-actions">
-          <button className="secondary" onClick={() => onReject(batch.id, selectedItems.map((item) => item.id))} disabled={selectedItems.length === 0}>
+          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={selectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(batch.id)} disabled={selectedItems.length === 0}>
+          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={selectedItems.length === 0}>
             <Check size={16} />
             Approve selected
           </button>
@@ -570,7 +638,11 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           <input
             type="checkbox"
             checked={allSelected}
-            onChange={(event) => onSelection(batch.id, batch.items.map((item) => item.id), event.target.checked)}
+            onChange={(event) => {
+              for (const [batchId, items] of groupBy(batch.items, (item) => item.batch_id)) {
+                onSelection(batchId, items.map((item) => item.id), event.target.checked);
+              }
+            }}
           />
           Select all visible
         </label>
@@ -578,7 +650,6 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
       </div>
       {tree.roots.map((item) => (
         <ApprovalNode
-          batchId={batch.id}
           item={item}
           childrenById={tree.childrenById}
           openItems={openItems}
@@ -591,7 +662,7 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
   );
 }
 
-function ApprovalNode({ batchId, item, childrenById, openItems, setOpenItems, onSelection, depth = 0 }) {
+function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection, depth = 0 }) {
   const children = childrenById.get(item.id) || [];
   const hasChildren = children.length > 0;
   const open = openItems.has(item.id);
@@ -600,11 +671,7 @@ function ApprovalNode({ batchId, item, childrenById, openItems, setOpenItems, on
   return (
     <>
       <div className="proposal-row" style={{ "--depth": depth }}>
-        <input
-          type="checkbox"
-          checked={item.selected}
-          onChange={(event) => onSelection(batchId, descendantIds, event.target.checked)}
-        />
+        <input type="checkbox" checked={item.selected} onChange={(event) => onSelection(item.batch_id, descendantIds, event.target.checked)} />
         <button
           className="row-toggle"
           disabled={!hasChildren}
@@ -619,7 +686,6 @@ function ApprovalNode({ batchId, item, childrenById, openItems, setOpenItems, on
       {open &&
         children.map((child) => (
           <ApprovalNode
-            batchId={batchId}
             item={child}
             childrenById={childrenById}
             openItems={openItems}
@@ -633,7 +699,7 @@ function ApprovalNode({ batchId, item, childrenById, openItems, setOpenItems, on
   );
 }
 
-function ImportWizard({ files, onScan, onPropose, loading, activeImportTask }) {
+function ImportWizard({ files, onScan, onPropose, onFilesChange, loading, activeImportTask }) {
   return (
     <div className="import-view">
       <div className="action-bar">
@@ -648,15 +714,17 @@ function ImportWizard({ files, onScan, onPropose, loading, activeImportTask }) {
       {files.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
       ) : (
-        <ImportTree files={files} />
+        <ImportTree files={files} onFilesChange={onFilesChange} />
       )}
     </div>
   );
 }
 
-function ImportTree({ files }) {
+function ImportTree({ files, onFilesChange }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [draggedAlbum, setDraggedAlbum] = useState(null);
+  const [draggedTrack, setDraggedTrack] = useState(null);
   const grouped = useMemo(() => groupImportFiles(files), [files]);
 
   useEffect(() => {
@@ -668,34 +736,54 @@ function ImportTree({ files }) {
     <div className="tree">
       {grouped.map((artist) => (
         <div key={artist.name}>
-          <TreeRow
-            icon={Folder}
-            open={openArtists.has(artist.name)}
-            title={artist.name}
-            meta={`${artist.count} files`}
-            onToggle={() => toggleSet(setOpenArtists, artist.name)}
-          />
+          <div
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={() => {
+              if (draggedAlbum) {
+                updateImportAlbum(files, onFilesChange, draggedAlbum.artist, draggedAlbum.album, { artist: artist.name, albumartist: artist.name });
+                setDraggedAlbum(null);
+              }
+            }}
+          >
+            <TreeRow
+              icon={Folder}
+              open={openArtists.has(artist.name)}
+              title={artist.name}
+              meta={`${artist.count} files`}
+              onToggle={() => toggleSet(setOpenArtists, artist.name)}
+            />
+          </div>
           {openArtists.has(artist.name) &&
             artist.albums.map((album) => {
               const albumId = `${artist.name}/${album.name}`;
               return (
                 <div key={albumId}>
-                  <TreeRow
-                    depth={1}
-                    icon={Folder}
-                    open={openAlbums.has(albumId)}
-                    title={album.name}
-                    meta={`${album.files.length} tracks`}
-                    onToggle={() => toggleSet(setOpenAlbums, albumId)}
-                  />
+                  <div
+                    draggable
+                    onDragStart={() => setDraggedAlbum({ artist: artist.name, album: album.name })}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDrop={() => {
+                      if (draggedTrack) {
+                        updateImportFile(files, onFilesChange, draggedTrack, { artist: artist.name, albumartist: artist.name, album: album.name });
+                        setDraggedTrack(null);
+                      }
+                    }}
+                  >
+                    <TreeRow
+                      depth={1}
+                      icon={Folder}
+                      open={openAlbums.has(albumId)}
+                      title={album.name}
+                      meta={`${album.files.length} tracks`}
+                      onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                    />
+                  </div>
                   {openAlbums.has(albumId) &&
                     album.files.map((file) => (
-                      <TreeRow
-                        depth={2}
-                        icon={FileAudio}
-                        title={`${file.metadata?.track_number ? String(file.metadata.track_number).padStart(2, "0") : "#"}-${file.metadata?.title || file.relative_path}`}
-                        meta={formatBytes(file.size_bytes)}
-                        warning={!file.metadata?.is_lossless}
+                      <ImportTrackRow
+                        file={file}
+                        onDragStart={() => setDraggedTrack(file.path)}
+                        onChange={(patch) => updateImportFile(files, onFilesChange, file.path, patch)}
                         key={file.path}
                       />
                     ))}
@@ -704,6 +792,21 @@ function ImportTree({ files }) {
             })}
         </div>
       ))}
+    </div>
+  );
+}
+
+function ImportTrackRow({ file, onChange, onDragStart }) {
+  const metadata = file.metadata || {};
+  return (
+    <div className="import-edit-row" draggable onDragStart={onDragStart}>
+      <span className="chevron" />
+      <FileAudio size={17} />
+      <input value={metadata.artist || ""} onChange={(event) => onChange({ artist: event.target.value, albumartist: event.target.value })} />
+      <input value={metadata.album || ""} onChange={(event) => onChange({ album: event.target.value })} />
+      <input value={metadata.track_number || ""} onChange={(event) => onChange({ track_number: parseInt(event.target.value, 10) || null })} />
+      <input value={metadata.title || ""} onChange={(event) => onChange({ title: event.target.value })} />
+      <small>{formatBytes(file.size_bytes)}</small>
     </div>
   );
 }
@@ -850,9 +953,81 @@ function buildItemTree(items) {
   return { roots, childrenById };
 }
 
+function groupApprovalBatches(batches) {
+  const groups = new Map();
+  const seen = new Set();
+  batches.forEach((batch) => {
+    const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
+    batch.items.forEach((item) => {
+      if (!["pending", "approved", "executing"].includes(item.status)) return;
+      const groupKind = batchGroupKind || item.kind;
+      const key = `${groupKind}:${item.kind}:${item.title}:${item.old_value || ""}:${item.new_value || ""}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      if (!groups.has(groupKind)) {
+        groups.set(groupKind, {
+          id: `type:${groupKind}`,
+          title: approvalTypeLabels[groupKind] || groupKind,
+          status: "pending",
+          items: [],
+        });
+      }
+      groups.get(groupKind).items.push(item);
+    });
+  });
+  return [...groups.values()];
+}
+
 function collectItemIds(item, childrenById) {
   const children = childrenById.get(item.id) || [];
   return [item.id, ...children.flatMap((child) => collectItemIds(child, childrenById))];
+}
+
+function updateImportFile(files, onFilesChange, path, metadataPatch) {
+  onFilesChange(
+    files.map((file) => {
+      if (file.path !== path) return file;
+      const metadata = { ...(file.metadata || {}), ...metadataPatch };
+      return {
+        ...file,
+        metadata,
+        suggested_library_path: suggestImportPath(file, metadata),
+      };
+    }),
+  );
+}
+
+function updateImportAlbum(files, onFilesChange, artistName, albumName, metadataPatch) {
+  onFilesChange(
+    files.map((file) => {
+      const metadata = file.metadata || {};
+      const currentArtist = metadata.albumartist || metadata.artist || "Unknown Artist";
+      const currentAlbum = metadata.album || "Unknown Album";
+      if (currentArtist !== artistName || currentAlbum !== albumName) return file;
+      return {
+        ...file,
+        metadata: { ...metadata, ...metadataPatch },
+        suggested_library_path: suggestImportPath(file, { ...metadata, ...metadataPatch }),
+      };
+    }),
+  );
+}
+
+function suggestImportPath(file, metadata) {
+  const artist = safePathPart(metadata.albumartist || metadata.artist || "Unknown Artist");
+  const album = safePathPart(metadata.album || "Unknown Album");
+  const title = safePathPart(metadata.title || "Unknown Title");
+  const extension = file.extension || `.${file.path.split(".").pop()}`;
+  const track = metadata.track_number ? String(metadata.track_number).padStart(2, "0") : "#";
+  return `/app/library/${artist}/${album}/${track}-${title}${extension}`;
+}
+
+function safePathPart(value) {
+  return String(value || "")
+    .replace(/[/:*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .replace(/^\.+|\.+$/g, "")
+    .trim();
 }
 
 function groupImportFiles(files) {
@@ -886,6 +1061,16 @@ function groupImportFiles(files) {
 function upsertTask(tasks, task) {
   const withoutTask = tasks.filter((current) => current.id !== task.id);
   return [task, ...withoutTask];
+}
+
+function groupBy(items, getKey) {
+  const groups = new Map();
+  items.forEach((item) => {
+    const key = getKey(item);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  });
+  return groups;
 }
 
 function toggleSet(setter, value) {

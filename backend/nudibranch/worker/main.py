@@ -1,11 +1,14 @@
 import asyncio
 import json
+import shutil
 import time
+from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nudibranch.db.init import init_db
-from nudibranch.db.models import ProposalBatch, ProposalItem, ProposalKind
+from nudibranch.db.models import Album, Artist, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
@@ -13,7 +16,7 @@ from nudibranch.services.tasks import claim_next_task, complete_task, fail_task,
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
-    files = discover_import_files(payload.get("path"), include_fingerprint=True)
+    files = payload.get("files") or discover_import_files(payload.get("path"), include_fingerprint=True)
     batch = ProposalBatch(title="Import folder review", kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
@@ -52,21 +55,21 @@ def run_propose_import(session: Session, payload: dict) -> dict:
             session.flush()
             album_items[album_key] = album_item
 
-        session.add(
-            ProposalItem(
-                batch_id=batch.id,
-                parent_id=album_item.id,
-                title=track_title,
-                kind=ProposalKind.import_files,
-                old_value=file_info["path"],
-                new_value=file_info["suggested_library_path"],
-                payload_json=json.dumps(file_info),
-            )
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=track_title,
+            kind=ProposalKind.import_files,
+            old_value=file_info["path"],
+            new_value=file_info["suggested_library_path"],
+            payload_json=json.dumps(file_info),
         )
+        session.add(track_item)
+        session.flush()
         session.add(
             ProposalItem(
                 batch_id=batch.id,
-                parent_id=album_item.id,
+                parent_id=track_item.id,
                 title=f"Write metadata for {track_title}",
                 kind=ProposalKind.metadata,
                 old_value=file_info["relative_path"],
@@ -96,15 +99,107 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
-    selected_items = [item for item in batch.items if item.selected]
+    batch.status = ProposalStatus.executing
+    selected_items = [
+        item
+        for item in batch.items
+        if item.selected and item.status == ProposalStatus.approved
+    ]
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for item in selected_items:
+        if item.kind != ProposalKind.import_files or not item.old_value or not item.new_value:
+            continue
+        try:
+            import_track_item(session, item)
+            item.status = ProposalStatus.completed
+            imported += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
+    for item in batch.items:
+        if item.status == ProposalStatus.approved:
+            item.status = ProposalStatus.completed
+        elif not item.selected and item.status == ProposalStatus.pending:
+            skipped += 1
+
+    if errors:
+        batch.status = ProposalStatus.failed
+    elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected} or not item.selected for item in batch.items):
+        batch.status = ProposalStatus.completed
+    else:
+        batch.status = ProposalStatus.pending
+    session.commit()
+
     create_notification(
         session,
-        title="Approved batch queued",
-        body=f"{len(selected_items)} selected operations are queued for execution.",
+        title="Approval batch completed",
+        body=f"{imported} tracks imported. {skipped} items skipped.",
         event_type="task_completed",
         target_url="/tasks",
     )
-    return {"batch_id": batch_id, "selected_items": len(selected_items)}
+    return {"batch_id": batch_id, "imported": imported, "skipped": skipped, "errors": errors}
+
+
+def import_track_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    source_path = Path(item.old_value)
+    target_path = Path(item.new_value)
+    metadata = payload.get("metadata", {})
+
+    if not source_path.exists():
+        raise FileNotFoundError(f"{source_path} no longer exists")
+
+    stat = source_path.stat()
+    if payload.get("size_bytes") and stat.st_size != payload["size_bytes"]:
+        raise ValueError("source file size changed after review")
+    if payload.get("mtime_ns") and stat.st_mtime_ns != payload["mtime_ns"]:
+        raise ValueError("source file timestamp changed after review")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists():
+        raise FileExistsError(f"{target_path} already exists")
+
+    shutil.move(str(source_path), str(target_path))
+
+    artist_name = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+    album_title = metadata.get("album") or "Unknown Album"
+    track_title = metadata.get("title") or target_path.stem
+
+    artist = session.scalar(select(Artist).where(Artist.name == artist_name))
+    if not artist:
+        artist = Artist(name=artist_name)
+        session.add(artist)
+        session.flush()
+
+    album = session.scalar(select(Album).where(Album.artist_id == artist.id, Album.title == album_title))
+    if not album:
+        album = Album(artist_id=artist.id, title=album_title, path=str(target_path.parent))
+        session.add(album)
+        session.flush()
+
+    existing_track = session.scalar(select(Track).where(Track.path == str(target_path)))
+    if existing_track:
+        return
+
+    session.add(
+        Track(
+            album_id=album.id,
+            title=track_title,
+            track_number=metadata.get("track_number"),
+            disc_number=metadata.get("disc_number"),
+            duration_ms=metadata.get("duration_ms"),
+            format=metadata.get("format"),
+            bitrate=metadata.get("bitrate"),
+            path=str(target_path),
+            acoustic_fingerprint=json.dumps(payload.get("fingerprint")) if payload.get("fingerprint") else None,
+            musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
+            is_lossless=metadata.get("is_lossless", False),
+        )
+    )
 
 
 def run_process_wishlist(session: Session, _payload: dict) -> dict:

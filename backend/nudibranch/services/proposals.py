@@ -23,12 +23,14 @@ def set_selection(session: Session, batch_id: str, item_ids: list[str], selected
     return len(items)
 
 
-def approve_batch(session: Session, batch_id: str) -> Task:
+def approve_batch(session: Session, batch_id: str, item_ids: list[str] | None = None) -> Task:
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.approved
     for item in batch.items:
+        if item_ids is not None and item.id not in item_ids:
+            continue
         if item.selected and item.status == ProposalStatus.pending:
             item.status = ProposalStatus.approved
     session.commit()
@@ -53,5 +55,9 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
     for item in items:
         item.status = ProposalStatus.rejected
         item.suppress_until = suppress_until
+
+    batch = session.get(ProposalBatch, batch_id)
+    if batch and all(item.status == ProposalStatus.rejected for item in batch.items):
+        batch.status = ProposalStatus.rejected
     session.commit()
     return len(items)

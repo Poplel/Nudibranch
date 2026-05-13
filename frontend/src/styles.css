@@ -446,6 +446,37 @@ nav button:hover,
   grid-template-columns: 18px minmax(0, 1fr) auto;
 }
 
+.import-edit-row {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(110px, 1fr) minmax(120px, 1fr) 56px minmax(140px, 1.4fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 10px 0 calc(10px + 2 * 22px);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.import-edit-row:hover {
+  background: var(--accent-soft);
+}
+
+.import-edit-row input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.import-edit-row small {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 .file-row div,
 .task-row {
   min-width: 0;
@@ -831,6 +862,17 @@ nav button:hover,
 
   .wizard {
     grid-template-columns: 1fr;
+  }
+
+  .import-edit-row {
+    grid-template-columns: 18px 18px minmax(0, 1fr);
+    height: auto;
+    padding-block: 6px;
+  }
+
+  .import-edit-row input,
+  .import-edit-row small {
+    grid-column: 3;
   }
 }
 
