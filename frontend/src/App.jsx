@@ -105,6 +105,7 @@ function App() {
   const [playerOpen, setPlayerOpen] = useState(false);
   const [playerPopped, setPlayerPopped] = useState(false);
   const [playerDockHeight, setPlayerDockHeight] = useState(0);
+  const [playerToastHeight, setPlayerToastHeight] = useState(0);
   const [queueOpen, setQueueOpen] = useState(false);
   const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -336,15 +337,16 @@ function App() {
 
   async function toggleFavoriteTrack(track) {
     if (!track?.id) return;
+    const wasFavorite = favoriteTrackIds.has(track.id);
     try {
       const favorites = await api(`/playlists/favorites/tracks/${track.id}`, {
-        method: favoriteTrackIds.has(track.id) ? "DELETE" : "POST",
+        method: wasFavorite ? "DELETE" : "POST",
       });
       setFavoritesPlaylist(favorites);
       setFavoriteTrackIds(new Set(favorites.track_ids || []));
       setToast({
-        title: favoriteTrackIds.has(track.id) ? "Removed from Favorites" : "Added to Favorites",
-        body: "Favorites will sync to Jellyfin.",
+        title: wasFavorite ? "Removed from Favorites" : "Added to Favorites",
+        body: track._artist ? `${track.title} by ${track._artist}` : track.title,
       });
     } catch (favoriteError) {
       setError(favoriteError.message);
@@ -646,7 +648,7 @@ function App() {
         "--accent-color": accentColor,
         "--background-tint": backgroundTint,
         "--player-dock-height": playerDocked ? `${playerDockHeight}px` : "0px",
-        "--toast-bottom": playerDocked ? `${playerDockHeight + 34}px` : "18px",
+        "--toast-bottom": playerDocked ? `${playerToastHeight + 32}px` : "18px",
       }}
     >
       <aside className="sidebar">
@@ -773,9 +775,10 @@ function App() {
             onSkipForward={playNextTrack}
             onFavorite={toggleFavoriteTrack}
             favoriteTrackIds={favoriteTrackIds}
-            onDockChange={({ popped, height }) => {
+            onDockChange={({ popped, compactHeight, fullHeight }) => {
               setPlayerPopped(popped);
-              setPlayerDockHeight(height || 0);
+              setPlayerDockHeight(compactHeight || 0);
+              setPlayerToastHeight(fullHeight || compactHeight || 0);
             }}
             onClose={() => setPlayerOpen(false)}
           />
@@ -2192,6 +2195,7 @@ function AudioPlayer({
 }) {
   const audioRef = useRef(null);
   const dockRef = useRef(null);
+  const coreRef = useRef(null);
   const pipWindowRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -2211,14 +2215,24 @@ function AudioPlayer({
   }, []);
 
   useEffect(() => {
-    onDockChange?.({ popped: Boolean(pipContainer), height: pipContainer ? 0 : dockRef.current?.offsetHeight || 0 });
-    if (pipContainer || !dockRef.current) return undefined;
-    const observer = new ResizeObserver(([entry]) => {
-      onDockChange?.({ popped: false, height: entry.contentRect.height });
-    });
+    const measureCompactHeight = () => (coreRef.current ? coreRef.current.offsetHeight + 36 : dockRef.current?.offsetHeight || 0);
+    const measureFullHeight = () => dockRef.current?.offsetHeight || measureCompactHeight();
+    const reportDock = () =>
+      onDockChange?.({
+        popped: Boolean(pipContainer),
+        compactHeight: pipContainer ? 0 : measureCompactHeight(),
+        fullHeight: pipContainer ? 0 : measureFullHeight(),
+      });
+    reportDock();
+    if (pipContainer || !coreRef.current || !dockRef.current) return undefined;
+    const observer = new ResizeObserver(reportDock);
+    observer.observe(coreRef.current);
     observer.observe(dockRef.current);
-    return () => observer.disconnect();
-  }, [onDockChange, pipContainer, queueOpen, currentTrack?.id]);
+    return () => {
+      observer.disconnect();
+      onDockChange?.({ popped: false, compactHeight: 0, fullHeight: 0 });
+    };
+  }, [onDockChange, pipContainer, currentTrack?.id]);
 
   function togglePlayback() {
     const audio = audioRef.current;
@@ -2262,40 +2276,42 @@ function AudioPlayer({
   function surface({ popped = false } = {}) {
     return (
     <div className={popped ? "audio-player popped" : "audio-player"} ref={popped ? null : dockRef}>
-      <div className="audio-header">
-        <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
-        <div>
-          <strong>{currentTrack?.title || "Local player"}</strong>
-          <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
-        </div>
-        <div className="player-window-actions">
-          {!popped && (
-            <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
-              <PictureInPicture2 size={14} />
+      <div className="player-core" ref={popped ? null : coreRef}>
+        <div className="audio-header">
+          <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
+          <div>
+            <strong>{currentTrack?.title || "Local player"}</strong>
+            <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
+          </div>
+          <div className="player-window-actions">
+            {!popped && (
+              <button className="row-icon-button" onClick={openPictureInPicture} title="Pop out">
+                <PictureInPicture2 size={14} />
+              </button>
+            )}
+            <button className="row-icon-button" onClick={onClose} title="Close player">
+              <X size={14} />
             </button>
-          )}
-          <button className="row-icon-button" onClick={onClose} title="Close player">
-            <X size={14} />
+          </div>
+        </div>
+        <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+        <div className="player-controls">
+          <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
+            <Menu size={19} />
+          </button>
+          <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+            <SkipBack size={18} />
+          </button>
+          <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+            {playing ? <Pause size={21} /> : <Play size={21} />}
+          </button>
+          <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+            <SkipForward size={18} />
+          </button>
+          <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
+            <Heart size={19} />
           </button>
         </div>
-      </div>
-      <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
-      <div className="player-controls">
-        <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
-          <Menu size={19} />
-        </button>
-        <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
-          <SkipBack size={18} />
-        </button>
-        <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
-          {playing ? <Pause size={21} /> : <Play size={21} />}
-        </button>
-        <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
-          <SkipForward size={18} />
-        </button>
-        <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
-          <Heart size={19} />
-        </button>
       </div>
       {queueOpen && (
         <div className="local-queue">

@@ -340,7 +340,7 @@ nav button:hover,
   grid-template-columns: minmax(0, 1fr) 330px;
   gap: 14px;
   min-height: 0;
-  padding: 14px 14px calc(14px + var(--player-dock-height, 0px));
+  padding: 14px;
 }
 
 .panel {
@@ -848,7 +848,7 @@ nav button:hover,
 .audio-player {
   position: fixed;
   right: 18px;
-  bottom: 18px;
+  bottom: 24px;
   z-index: 30;
   display: grid;
   gap: 12px;
@@ -863,6 +863,11 @@ nav button:hover,
 .audio-player.popped {
   position: static;
   width: min(330px, calc(100vw - 24px));
+}
+
+.player-core {
+  display: grid;
+  gap: 12px;
 }
 
 .audio-header {
@@ -1175,7 +1180,8 @@ nav button:hover,
 .inspector {
   padding: 14px;
   overflow: auto;
-  max-height: calc(100vh - 92px - var(--player-dock-height, 0px));
+  max-height: calc(100vh - 92px - var(--player-dock-height, 0px) - 22px);
+  margin-bottom: calc(var(--player-dock-height, 0px) + 22px);
 }
 
 .diff {
