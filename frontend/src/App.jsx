@@ -26,6 +26,7 @@ import "./styles.css";
 
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
+const APPEARANCE_KEY = "nudibranch_appearance";
 
 const navItems = [
   ["Library", Music],
@@ -65,6 +66,7 @@ function App() {
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const trayRef = useRef(null);
@@ -74,6 +76,7 @@ function App() {
     () => approvals.reduce((total, batch) => total + batch.items.filter((item) => item.selected).length, 0),
     [approvals],
   );
+  const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -97,10 +100,39 @@ function App() {
     refreshAll();
     const interval = window.setInterval(() => {
       refreshTasks();
+      refreshApprovals();
       refreshNotifications();
     }, 10000);
     return () => window.clearInterval(interval);
   }, [token]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    setAppearanceReady(false);
+    const saved = localStorage.getItem(`${APPEARANCE_KEY}_${user.id}`);
+    if (!saved) {
+      setAppearanceReady(true);
+      return;
+    }
+    try {
+      const appearance = JSON.parse(saved);
+      setDark(Boolean(appearance.dark));
+      setAccentColor(appearance.accentColor || "#356df3");
+      setBackgroundTint(appearance.backgroundTint || "#356df3");
+    } catch {
+      localStorage.removeItem(`${APPEARANCE_KEY}_${user.id}`);
+    }
+    setAppearanceReady(true);
+  }, [user?.id]);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    if (!appearanceReady) return;
+    localStorage.setItem(
+      `${APPEARANCE_KEY}_${user.id}`,
+      JSON.stringify({ dark, accentColor, backgroundTint }),
+    );
+  }, [user?.id, appearanceReady, dark, accentColor, backgroundTint]);
 
   async function api(path, options = {}) {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -177,7 +209,8 @@ function App() {
 
   async function refreshTasks() {
     try {
-      setTasks(await api("/tasks"));
+      const taskData = await api("/tasks");
+      setTasks(taskData);
     } catch {
       // Task polling should not disrupt the page the user is working in.
     }
@@ -188,6 +221,14 @@ function App() {
       setNotifications(await api("/notifications"));
     } catch {
       // Notification polling is best-effort.
+    }
+  }
+
+  async function refreshApprovals() {
+    try {
+      setApprovals(await api("/approvals"));
+    } catch {
+      // Approval polling is best-effort.
     }
   }
 
@@ -216,9 +257,13 @@ function App() {
         method: "POST",
         body: JSON.stringify({ path: null }),
       });
-      setTasks((current) => [task, ...current]);
+      setTasks((current) => upsertTask(current, task));
       setToast({ title: "Import review queued", body: "A proposal batch will appear in Approvals." });
-      setPage("Tasks");
+      setPage("Approvals");
+      window.setTimeout(() => {
+        refreshApprovals();
+        refreshTasks();
+      }, 2500);
     } catch (proposeError) {
       setError(proposeError.message);
     } finally {
@@ -234,15 +279,11 @@ function App() {
     await refreshApprovals();
   }
 
-  async function refreshApprovals() {
-    setApprovals(await api("/approvals"));
-  }
-
   async function approveBatch(batchId) {
     setLoading(true);
     try {
       const task = await api(`/approvals/${batchId}/approve`, { method: "POST" });
-      setTasks((current) => [task, ...current]);
+      setTasks((current) => upsertTask(current, task));
       setToast({ title: "Approval queued", body: "Selected changes were sent to the task queue." });
       await refreshApprovals();
     } catch (approvalError) {
@@ -331,7 +372,13 @@ function App() {
               />
             )}
             {page === "Import" && (
-              <ImportWizard files={importFiles} onScan={scanImportFolder} onPropose={proposeImport} loading={loading} />
+              <ImportWizard
+                files={importFiles}
+                onScan={scanImportFolder}
+                onPropose={proposeImport}
+                loading={loading}
+                activeImportTask={activeImportTask}
+              />
             )}
             {page === "Tasks" && <TasksView tasks={tasks} />}
             {page === "Settings" && (
@@ -341,6 +388,7 @@ function App() {
                 backgroundTint={backgroundTint}
                 setBackgroundTint={setBackgroundTint}
                 user={user}
+                apiKey={token}
               />
             )}
             {!["Library", "Approvals", "Import", "Tasks", "Settings"].includes(page) && <Placeholder page={page} />}
@@ -489,9 +537,14 @@ function Approvals({ approvals, onSelection, onApprove, onReject }) {
 }
 
 function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
-  const depths = useMemo(() => calculateDepths(batch.items), [batch.items]);
+  const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
+  const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
   const selectedItems = batch.items.filter((item) => item.selected);
   const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
+
+  useEffect(() => {
+    setOpenItems(new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
+  }, [batch.id, batch.items.length]);
 
   return (
     <section className="batch">
@@ -523,22 +576,64 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
         </label>
         <span>{selectedItems.length} selected</span>
       </div>
-      {batch.items.map((item) => (
-        <label className="proposal-row" style={{ "--depth": depths.get(item.id) || 0 }} key={item.id}>
-          <input
-            type="checkbox"
-            checked={item.selected}
-            onChange={(event) => onSelection(batch.id, [item.id], event.target.checked)}
-          />
-          <span className="proposal-title">{item.title}</span>
-          <small>{item.kind}</small>
-        </label>
+      {tree.roots.map((item) => (
+        <ApprovalNode
+          batchId={batch.id}
+          item={item}
+          childrenById={tree.childrenById}
+          openItems={openItems}
+          setOpenItems={setOpenItems}
+          onSelection={onSelection}
+          key={item.id}
+        />
       ))}
     </section>
   );
 }
 
-function ImportWizard({ files, onScan, onPropose, loading }) {
+function ApprovalNode({ batchId, item, childrenById, openItems, setOpenItems, onSelection, depth = 0 }) {
+  const children = childrenById.get(item.id) || [];
+  const hasChildren = children.length > 0;
+  const open = openItems.has(item.id);
+  const descendantIds = collectItemIds(item, childrenById);
+
+  return (
+    <>
+      <div className="proposal-row" style={{ "--depth": depth }}>
+        <input
+          type="checkbox"
+          checked={item.selected}
+          onChange={(event) => onSelection(batchId, descendantIds, event.target.checked)}
+        />
+        <button
+          className="row-toggle"
+          disabled={!hasChildren}
+          onClick={() => toggleSet(setOpenItems, item.id)}
+          title={hasChildren ? "Toggle branch" : ""}
+        >
+          {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
+        </button>
+        <span className="proposal-title">{item.title}</span>
+        <small>{item.kind}</small>
+      </div>
+      {open &&
+        children.map((child) => (
+          <ApprovalNode
+            batchId={batchId}
+            item={child}
+            childrenById={childrenById}
+            openItems={openItems}
+            setOpenItems={setOpenItems}
+            onSelection={onSelection}
+            depth={depth + 1}
+            key={child.id}
+          />
+        ))}
+    </>
+  );
+}
+
+function ImportWizard({ files, onScan, onPropose, loading, activeImportTask }) {
   return (
     <div className="import-view">
       <div className="action-bar">
@@ -546,28 +641,69 @@ function ImportWizard({ files, onScan, onPropose, loading }) {
           <RefreshCw size={16} />
           Scan import folder
         </button>
-        <button className="secondary" onClick={onPropose} disabled={loading || files.length === 0}>
-          Create review batch
+        <button className="secondary" onClick={onPropose} disabled={loading || activeImportTask || files.length === 0}>
+          {activeImportTask ? "Review batch running" : "Create review batch"}
         </button>
       </div>
       {files.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
       ) : (
-        <div className="file-list">
-          {files.map((file) => (
-            <div className="file-row" key={file.path}>
-              <FileAudio size={17} />
-              <div>
-                <strong>{file.metadata?.title || file.relative_path}</strong>
-                <span>
-                  {file.metadata?.artist || "Unknown Artist"} · {file.metadata?.album || "Unknown Album"}
-                </span>
-              </div>
-              <small>{formatBytes(file.size_bytes)}</small>
-            </div>
-          ))}
-        </div>
+        <ImportTree files={files} />
       )}
+    </div>
+  );
+}
+
+function ImportTree({ files }) {
+  const [openArtists, setOpenArtists] = useState(() => new Set());
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const grouped = useMemo(() => groupImportFiles(files), [files]);
+
+  useEffect(() => {
+    setOpenArtists(new Set(grouped.map((artist) => artist.name)));
+    setOpenAlbums(new Set(grouped.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+  }, [grouped]);
+
+  return (
+    <div className="tree">
+      {grouped.map((artist) => (
+        <div key={artist.name}>
+          <TreeRow
+            icon={Folder}
+            open={openArtists.has(artist.name)}
+            title={artist.name}
+            meta={`${artist.count} files`}
+            onToggle={() => toggleSet(setOpenArtists, artist.name)}
+          />
+          {openArtists.has(artist.name) &&
+            artist.albums.map((album) => {
+              const albumId = `${artist.name}/${album.name}`;
+              return (
+                <div key={albumId}>
+                  <TreeRow
+                    depth={1}
+                    icon={Folder}
+                    open={openAlbums.has(albumId)}
+                    title={album.name}
+                    meta={`${album.files.length} tracks`}
+                    onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                  />
+                  {openAlbums.has(albumId) &&
+                    album.files.map((file) => (
+                      <TreeRow
+                        depth={2}
+                        icon={FileAudio}
+                        title={`${file.metadata?.track_number ? String(file.metadata.track_number).padStart(2, "0") : "#"}-${file.metadata?.title || file.relative_path}`}
+                        meta={formatBytes(file.size_bytes)}
+                        warning={!file.metadata?.is_lossless}
+                        key={file.path}
+                      />
+                    ))}
+                </div>
+              );
+            })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -600,7 +736,11 @@ function Placeholder({ page }) {
   );
 }
 
-function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint, user }) {
+function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgroundTint, user, apiKey }) {
+  const [showApiKey, setShowApiKey] = useState(false);
+  const canViewApiKey =
+    user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
+
   return (
     <div className="settings-grid">
       <section className="settings-section">
@@ -631,6 +771,17 @@ function SettingsPanel({ accentColor, setAccentColor, backgroundTint, setBackgro
           <strong>Connected</strong>
         </div>
       </section>
+      {canViewApiKey && (
+        <section className="settings-section">
+          <h2>API Access</h2>
+          <div className="api-key-row">
+            <input readOnly type={showApiKey ? "text" : "password"} value={apiKey} />
+            <button className="secondary" onClick={() => setShowApiKey((value) => !value)}>
+              {showApiKey ? "Hide" : "Show"}
+            </button>
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -685,19 +836,56 @@ function EmptyState({ title, body }) {
   );
 }
 
-function calculateDepths(items) {
-  const byId = new Map(items.map((item) => [item.id, item]));
-  const depths = new Map();
-  const depthOf = (item) => {
-    if (!item.parent_id) return 0;
-    if (depths.has(item.id)) return depths.get(item.id);
-    const parent = byId.get(item.parent_id);
-    const depth = parent ? depthOf(parent) + 1 : 0;
-    depths.set(item.id, depth);
-    return depth;
-  };
-  items.forEach((item) => depths.set(item.id, depthOf(item)));
-  return depths;
+function buildItemTree(items) {
+  const childrenById = new Map();
+  const roots = [];
+  items.forEach((item) => childrenById.set(item.id, []));
+  items.forEach((item) => {
+    if (item.parent_id && childrenById.has(item.parent_id)) {
+      childrenById.get(item.parent_id).push(item);
+    } else {
+      roots.push(item);
+    }
+  });
+  return { roots, childrenById };
+}
+
+function collectItemIds(item, childrenById) {
+  const children = childrenById.get(item.id) || [];
+  return [item.id, ...children.flatMap((child) => collectItemIds(child, childrenById))];
+}
+
+function groupImportFiles(files) {
+  const artistMap = new Map();
+  files.forEach((file) => {
+    const artistName = file.metadata?.albumartist || file.metadata?.artist || "Unknown Artist";
+    const albumName = file.metadata?.album || "Unknown Album";
+    if (!artistMap.has(artistName)) {
+      artistMap.set(artistName, { name: artistName, count: 0, albumMap: new Map() });
+    }
+    const artist = artistMap.get(artistName);
+    artist.count += 1;
+    if (!artist.albumMap.has(albumName)) {
+      artist.albumMap.set(albumName, { name: albumName, files: [] });
+    }
+    artist.albumMap.get(albumName).files.push(file);
+  });
+
+  return [...artistMap.values()]
+    .map((artist) => ({
+      name: artist.name,
+      count: artist.count,
+      albums: [...artist.albumMap.values()].map((album) => ({
+        ...album,
+        files: album.files.sort((a, b) => (a.metadata?.track_number || 9999) - (b.metadata?.track_number || 9999)),
+      })),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function upsertTask(tasks, task) {
+  const withoutTask = tasks.filter((current) => current.id !== task.id);
+  return [task, ...withoutTask];
 }
 
 function toggleSet(setter, value) {

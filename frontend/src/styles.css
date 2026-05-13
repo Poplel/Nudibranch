@@ -540,8 +540,23 @@ nav button:hover,
 }
 
 .proposal-row {
-  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
   padding-left: calc(14px + var(--depth, 0) * 24px);
+}
+
+.row-toggle {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.row-toggle:disabled {
+  opacity: 1;
 }
 
 .proposal-row input,
@@ -688,6 +703,22 @@ nav button:hover,
 
 .status-list span {
   color: var(--muted);
+}
+
+.api-key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.api-key-row input {
+  min-width: 0;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
 }
 
 .toast {

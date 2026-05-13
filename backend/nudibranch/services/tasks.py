@@ -9,7 +9,19 @@ from nudibranch.db.models import Task, TaskStatus
 
 
 def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
-    task = Task(type=task_type, payload_json=json.dumps(payload))
+    payload_json = json.dumps(payload, sort_keys=True)
+    existing = session.scalar(
+        select(Task)
+        .where(Task.type == task_type)
+        .where(Task.payload_json == payload_json)
+        .where(Task.status.in_([TaskStatus.queued, TaskStatus.running]))
+        .order_by(Task.created_at.asc())
+        .limit(1)
+    )
+    if existing:
+        return existing
+
+    task = Task(type=task_type, payload_json=payload_json)
     session.add(task)
     session.commit()
     session.refresh(task)
@@ -78,4 +90,3 @@ def fail_task(session: Session, task: Task, error: str) -> None:
     task.error = error
     task.lease_until = None
     session.commit()
-
