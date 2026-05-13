@@ -166,3 +166,9 @@ class LibraryMetadataProposalRequest(BaseModel):
     target_type: str = Field(pattern="^(artist|album|track)$")
     target_id: str
     changes: dict[str, Any]
+
+
+class LibraryRemoveProposalRequest(BaseModel):
+    target_type: str = Field(pattern="^(artist|album|track)$")
+    target_id: str
+    action: str = Field(pattern="^(delete|move_to_import)$")

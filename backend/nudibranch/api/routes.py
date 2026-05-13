@@ -1,7 +1,9 @@
 import secrets
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
@@ -13,6 +15,7 @@ from nudibranch.api.schemas import (
     ImportAcousticLookupRequest,
     ImportScanRequest,
     LibraryMetadataProposalRequest,
+    LibraryRemoveProposalRequest,
     LibraryTreeAlbum,
     LibraryTreeArtist,
     LibraryTreeTrack,
@@ -36,6 +39,7 @@ from nudibranch.db.models import (
     Artist,
     MobileDevice,
     Notification,
+    NotificationStatus,
     Permission,
     ProposalBatch,
     ProposalItem,
@@ -46,6 +50,7 @@ from nudibranch.db.models import (
     User,
     WishlistItem,
 )
+from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
@@ -171,6 +176,64 @@ def propose_library_metadata(
     session.commit()
     session.refresh(batch)
     return serialize_batch(batch)
+
+
+@router.post("/library/remove", response_model=ProposalBatchOut, tags=["library"])
+def propose_library_remove(
+    payload: LibraryRemoveProposalRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_write)),
+) -> ProposalBatchOut:
+    target = metadata_target(session, payload.target_type, payload.target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Library item not found")
+
+    tracks = library_target_tracks(target)
+    tracks = [track for track in tracks if track.path]
+    if not tracks:
+        raise HTTPException(status_code=400, detail="No files were found for this library item")
+
+    batch_kind = ProposalKind.delete if payload.action == "delete" else ProposalKind.file_move
+    batch = ProposalBatch(
+        title=f"{remove_action_title(payload.action)} {payload.target_type}",
+        kind=batch_kind,
+        tree_path="/library",
+    )
+    session.add(batch)
+    session.flush()
+    settings = get_settings()
+    destination_root = settings.trash_path if payload.action == "delete" else settings.import_path
+    for track in tracks:
+        old_path = Path(track.path)
+        new_path = destination_root / old_path.name
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=track.title,
+                kind=batch_kind,
+                old_value=str(old_path),
+                new_value=str(new_path),
+                payload_json=json.dumps({"action": payload.action, "track_id": track.id}),
+            )
+        )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
+@router.get("/library/tracks/{track_id}/stream", tags=["library"])
+def stream_track(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> FileResponse:
+    track = session.get(Track, track_id)
+    if not track or not track.path:
+        raise HTTPException(status_code=404, detail="Track not found")
+    path = Path(track.path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Track file is missing")
+    return FileResponse(path)
 
 
 @router.post("/imports/scan", tags=["imports"])
@@ -344,7 +407,10 @@ def list_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),
 ) -> list[NotificationOut]:
-    query = select(Notification).where((Notification.user_id == user.id) | (Notification.user_id.is_(None)))
+    query = select(Notification).where(
+        ((Notification.user_id == user.id) | (Notification.user_id.is_(None)))
+        & (Notification.status != NotificationStatus.dismissed)
+    )
     notifications = list(session.scalars(query.order_by(Notification.created_at.desc()).limit(100)))
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
 
@@ -359,6 +425,31 @@ def register_device(
     session.add(device)
     session.commit()
     return {"device_id": device.id, "enabled": device.enabled}
+
+
+@router.post("/notifications/read", tags=["notifications"])
+def mark_notifications_read(
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.notifications_read)),
+) -> dict:
+    notifications = list(session.scalars(select(Notification).where((Notification.user_id == user.id) | (Notification.user_id.is_(None)))))
+    for notification in notifications:
+        if notification.status == NotificationStatus.unread:
+            notification.status = NotificationStatus.read
+    session.commit()
+    return {"updated": len(notifications)}
+
+
+@router.delete("/notifications", tags=["notifications"])
+def clear_notifications(
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.notifications_read)),
+) -> dict:
+    notifications = list(session.scalars(select(Notification).where((Notification.user_id == user.id) | (Notification.user_id.is_(None)))))
+    for notification in notifications:
+        notification.status = NotificationStatus.dismissed
+    session.commit()
+    return {"cleared": len(notifications)}
 
 
 def editable_fields(target_type: str) -> set[str]:
@@ -401,6 +492,20 @@ def metadata_target_title(target_type: str, target) -> str:
     if target_type == "album":
         return f"Album: {target.title}"
     return f"Track: {target.title}"
+
+
+def library_target_tracks(target) -> list[Track]:
+    if isinstance(target, Artist):
+        return [track for album in target.albums for track in album.tracks]
+    if isinstance(target, Album):
+        return list(target.tracks)
+    if isinstance(target, Track):
+        return [target]
+    return []
+
+
+def remove_action_title(action: str) -> str:
+    return "Delete" if action == "delete" else "Move to import"
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

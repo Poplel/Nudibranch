@@ -262,9 +262,17 @@ nav button:hover,
   overflow: auto;
 }
 
+.notification-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 .notification-tray h2,
 .inspector h2 {
-  margin: 0 0 10px;
+  margin: 0;
   font-size: 15px;
 }
 
@@ -791,6 +799,114 @@ nav button:hover,
 
 .tree-action-row.one-action {
   grid-template-columns: minmax(0, 1fr) 30px;
+}
+
+.tree-action-row.library-row-actions {
+  grid-template-columns: minmax(0, 1fr) auto 30px;
+}
+
+.quick-library-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.library-row-actions:hover .quick-library-actions,
+.library-row-actions:focus-within .quick-library-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.remove-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.remove-choice span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.compact,
+.compact-button {
+  width: fit-content;
+  white-space: nowrap;
+}
+
+.danger {
+  color: var(--danger);
+}
+
+.audio-player {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 30;
+  display: grid;
+  gap: 8px;
+  width: min(390px, calc(100vw - 36px));
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
+}
+
+.audio-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 8px;
+  align-items: center;
+}
+
+.audio-header strong,
+.audio-header small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audio-header small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.audio-player audio {
+  width: 100%;
+}
+
+.local-queue {
+  display: grid;
+  gap: 4px;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.local-queue button {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+
+.local-queue button.active {
+  background: var(--accent-soft);
 }
 
 .file-row div,

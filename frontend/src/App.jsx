@@ -12,10 +12,12 @@ import {
   GripVertical,
   HardDriveUpload,
   ListChecks,
+  ListPlus,
   LogOut,
   Moon,
   Music,
   Pencil,
+  Play,
   Plus,
   RefreshCw,
   Search,
@@ -23,6 +25,7 @@ import {
   Shield,
   Sparkles,
   Sun,
+  Trash2,
   Users,
   Wrench,
   X,
@@ -85,6 +88,12 @@ function App() {
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
+  const [wishlist, setWishlist] = useState([]);
+  const [playerQueue, setPlayerQueue] = useState([]);
+  const [currentTrack, setCurrentTrack] = useState(null);
+  const [audioUrl, setAudioUrl] = useState("");
+  const [playerOpen, setPlayerOpen] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
   const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -109,9 +118,10 @@ function App() {
     [queueGroupCount, queueItemCount, queueSelectionCount],
   );
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
+  const unreadNotifications = useMemo(() => notifications.filter((notification) => notification.status === "unread"), [notifications]);
   const activeSeverity = useMemo(
-    () => notifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
-    [notifications],
+    () => unreadNotifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
+    [unreadNotifications],
   );
 
   useEffect(() => {
@@ -130,6 +140,10 @@ function App() {
     const timeout = window.setTimeout(() => setToast(null), 5200);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => () => {
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+  }, [audioUrl]);
 
   useEffect(() => {
     if (!token) return;
@@ -222,18 +236,20 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const [me, libraryTree, approvalData, taskData, notificationData] = await Promise.all([
+      const [me, libraryTree, approvalData, taskData, notificationData, wishlistData] = await Promise.all([
         api("/me"),
         api("/library/tree"),
         api("/approvals"),
         api("/tasks"),
         api("/notifications"),
+        api("/wishlist"),
       ]);
       setUser(me);
       setLibrary(libraryTree);
       setApprovals(approvalData);
       setTasks(taskData);
       setNotifications(notificationData);
+      setWishlist(wishlistData);
     } catch (refreshError) {
       setError(refreshError.message);
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
@@ -269,11 +285,53 @@ function App() {
     }
   }
 
+  async function openNotificationTray() {
+    const nextOpen = !trayOpen;
+    setTrayOpen(nextOpen);
+    if (!nextOpen || unreadNotifications.length === 0) return;
+    setNotifications((current) => current.map((notification) => ({ ...notification, status: "read" })));
+    try {
+      await api("/notifications/read", { method: "POST" });
+      await refreshNotifications();
+    } catch {
+      // The tray can still behave locally if marking read fails.
+    }
+  }
+
+  async function clearNotifications() {
+    setNotifications([]);
+    try {
+      await api("/notifications", { method: "DELETE" });
+    } catch (clearError) {
+      setError(clearError.message);
+    }
+  }
+
   async function refreshApprovals() {
     try {
       setApprovals(await api("/approvals"));
     } catch {
       // Approval polling is best-effort.
+    }
+  }
+
+  async function createWishlistItem(item) {
+    setLoading(true);
+    setError("");
+    try {
+      const created = await api("/wishlist", {
+        method: "POST",
+        body: JSON.stringify(item),
+      });
+      setWishlist((current) => [created, ...current]);
+      setToast({ title: "Wishlist updated", body: "The item was added to the wishlist." });
+      return created;
+    } catch (wishlistError) {
+      setError(wishlistError.message);
+      setToast({ title: "Wishlist failed", body: wishlistError.message });
+      throw wishlistError;
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -397,6 +455,67 @@ function App() {
     }
   }
 
+  async function proposeLibraryRemove(targetType, targetId, action) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api("/library/remove", {
+        method: "POST",
+        body: JSON.stringify({ target_type: targetType, target_id: targetId, action }),
+      });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "Library change queued", body: "The removal request was added to the task queue." });
+      return batch;
+    } catch (removeError) {
+      setError(removeError.message);
+      setToast({ title: "Queue request failed", body: removeError.message });
+      throw removeError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function playTracks(tracks) {
+    const playable = tracks.filter((track) => track?.id);
+    if (playable.length === 0) return;
+    setPlayerQueue(playable);
+    setPlayerOpen(true);
+    setQueueOpen(false);
+    await loadPlayerTrack(playable[0]);
+  }
+
+  function addTracksToPlayerQueue(tracks) {
+    const playable = tracks.filter((track) => track?.id);
+    if (playable.length === 0) return;
+    setPlayerQueue((current) => [...current, ...playable]);
+    setPlayerOpen(true);
+    setToast({ title: "Queue updated", body: `${playable.length} track${playable.length === 1 ? "" : "s"} added locally.` });
+  }
+
+  async function loadPlayerTrack(track) {
+    if (!track?.id) return;
+    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    try {
+      const response = await fetch(`${API_BASE}/library/tracks/${track.id}/stream`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      const blob = await response.blob();
+      setAudioUrl(URL.createObjectURL(blob));
+      setCurrentTrack(track);
+    } catch (playError) {
+      setError(`Playback failed: ${playError.message}`);
+      setToast({ title: "Playback failed", body: playError.message });
+    }
+  }
+
+  async function playNextTrack() {
+    if (playerQueue.length === 0 || !currentTrack) return;
+    const index = playerQueue.findIndex((track) => track.id === currentTrack.id);
+    const nextTrack = playerQueue[index + 1];
+    if (nextTrack) await loadPlayerTrack(nextTrack);
+  }
+
   async function setApprovalSelection(batchId, itemIds, selected) {
     await api(`/approvals/${batchId}/selection`, {
       method: "POST",
@@ -486,12 +605,12 @@ function App() {
             <RefreshCw size={18} />
           </button>
           <div className="notification-anchor" ref={trayRef}>
-            <button className="icon-button" onClick={() => setTrayOpen((value) => !value)} title="Notifications">
+            <button className="icon-button" onClick={openNotificationTray} title="Notifications">
               <Bell size={18} />
-              {notifications.length > 0 && <span className="badge">{notifications.length}</span>}
-              {notifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
+              {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
+              {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
             </button>
-            {trayOpen && <NotificationTray notifications={notifications} />}
+            {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
           </div>
           <button className="icon-button" onClick={logout} title="Sign out">
             <LogOut size={18} />
@@ -509,6 +628,9 @@ function App() {
                 onCheckAlbum={lookupImportAlbum}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
+                onQueueRemove={proposeLibraryRemove}
+                onPlay={playTracks}
+                onQueue={addTracksToPlayerQueue}
               />
             )}
             {page === "Task Queue" && (
@@ -545,12 +667,32 @@ function App() {
               />
             )}
             {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} />}
-            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools"].includes(page) && <Placeholder page={page} />}
+            {page === "Wishlist" && (
+              <WishlistView
+                wishlist={wishlist}
+                onAdd={createWishlistItem}
+                onSearchAlbums={searchImportAlbums}
+                onLookupAlbum={lookupImportAlbum}
+              />
+            )}
+            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
+        {playerOpen && (
+          <AudioPlayer
+            currentTrack={currentTrack}
+            audioUrl={audioUrl}
+            queue={playerQueue}
+            queueOpen={queueOpen}
+            setQueueOpen={setQueueOpen}
+            onPlayTrack={loadPlayerTrack}
+            onEnded={playNextTrack}
+            onClose={() => setPlayerOpen(false)}
+          />
+        )}
       </section>
     </main>
   );
@@ -585,10 +727,15 @@ function LoginScreen({ loading, error, onLogin }) {
   );
 }
 
-function NotificationTray({ notifications }) {
+function NotificationTray({ notifications, onClear }) {
   return (
     <div className="notification-tray">
-      <h2>Notifications</h2>
+      <div className="notification-header">
+        <h2>Notifications</h2>
+        <button className="secondary compact" onClick={onClear} disabled={notifications.length === 0}>
+          Clear
+        </button>
+      </div>
       <div className="notification-list">
         {notifications.length === 0 ? (
           <p className="empty-state">No notifications yet.</p>
@@ -629,14 +776,13 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata }) {
+function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, onQueueRemove, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
   const [openAlbumDetails, setOpenAlbumDetails] = useState(() => new Set());
   const [openTrackDetails, setOpenTrackDetails] = useState(() => new Set());
-  const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
-  const [requestedAlbums, setRequestedAlbums] = useState([]);
+  const [removeTarget, setRemoveTarget] = useState(null);
   const visibleArtists = useMemo(
     () =>
       artists
@@ -647,36 +793,15 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
         .filter((artist) => artist.albums.length > 0),
     [artists],
   );
-  const requestedArtists = useMemo(() => groupRequestedAlbums(requestedAlbums), [requestedAlbums]);
-
-  async function addRequestedAlbum(album) {
-    const record = await onCheckAlbum(album.artist, album.name, album.id);
-    setRequestedAlbums((current) => [
-      ...current,
-      {
-        ...album,
-        tracks: record?.tracks?.length ? record.tracks : album.tracks,
-      },
-    ]);
-    setAlbumSearchOpen(false);
-  }
-
   return (
     <div className="library-view">
-      <div className="action-bar">
-        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
-          <Plus size={16} />
-          Add album
-        </button>
-      </div>
-      {albumSearchOpen && <AlbumSearchPanel onAdd={addRequestedAlbum} onLookup={onCheckAlbum} onSearch={onSearchAlbums} />}
-      {visibleArtists.length === 0 && requestedArtists.length === 0 && (
+      {visibleArtists.length === 0 && (
         <EmptyState title="No library records" body="Import queued music to populate the managed library." />
       )}
       <div className="tree">
         {visibleArtists.map((artist) => (
           <div key={artist.id}>
-            <div className="tree-action-row one-action">
+            <div className="tree-action-row library-row-actions">
               <TreeRow
                 icon={Folder}
                 open={openArtists.has(artist.id)}
@@ -684,10 +809,25 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                 meta={`${artist.albums.length} albums`}
                 onToggle={() => toggleSet(setOpenArtists, artist.id)}
               />
+              <QuickLibraryActions
+                onPlay={() => onPlay(artistTracks(artist))}
+                onQueue={() => onQueue(artistTracks(artist))}
+                onRemove={() => setRemoveTarget(removeKey("artist", artist.id))}
+              />
               <button className="row-icon-button" onClick={() => toggleSet(setOpenArtistDetails, artist.id)} title="Edit artist">
                 <Pencil size={15} />
               </button>
             </div>
+            {removeTarget === removeKey("artist", artist.id) && (
+              <RemoveChoice
+                title={artist.name}
+                onCancel={() => setRemoveTarget(null)}
+                onChoose={(action) => {
+                  onQueueRemove("artist", artist.id, action);
+                  setRemoveTarget(null);
+                }}
+              />
+            )}
             {openArtistDetails.has(artist.id) && (
               <LibraryMetadataEditor
                 targetType="artist"
@@ -701,7 +841,7 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
             {openArtists.has(artist.id) &&
               artist.albums.map((album) => (
                 <div key={album.id}>
-                  <div className="tree-action-row one-action">
+                  <div className="tree-action-row library-row-actions">
                     <TreeRow
                       depth={1}
                       icon={Folder}
@@ -710,10 +850,25 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                       meta={`${album.tracks.length} tracks`}
                       onToggle={() => toggleSet(setOpenAlbums, album.id)}
                     />
+                    <QuickLibraryActions
+                      onPlay={() => onPlay(album.tracks)}
+                      onQueue={() => onQueue(album.tracks)}
+                      onRemove={() => setRemoveTarget(removeKey("album", album.id))}
+                    />
                     <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
                       <Pencil size={15} />
                     </button>
                   </div>
+                  {removeTarget === removeKey("album", album.id) && (
+                    <RemoveChoice
+                      title={album.title}
+                      onCancel={() => setRemoveTarget(null)}
+                      onChoose={(action) => {
+                        onQueueRemove("album", album.id, action);
+                        setRemoveTarget(null);
+                      }}
+                    />
+                  )}
                   {openAlbumDetails.has(album.id) && (
                     <LibraryMetadataEditor
                       targetType="album"
@@ -723,6 +878,7 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                       fields={albumFields(album)}
                       details={{ artist: artist.name, tracks: album.tracks.length }}
                       onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
+                      onSearchAlbums={onSearchAlbums}
                       onQueue={onQueueMetadata}
                       onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
                     />
@@ -730,7 +886,7 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                   {openAlbums.has(album.id) &&
                     album.tracks.map((track) => (
                       <div key={track.id}>
-                        <div className="tree-action-row one-action">
+                        <div className="tree-action-row library-row-actions">
                           <TreeRow
                             depth={2}
                             icon={FileAudio}
@@ -738,10 +894,25 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                             meta={track.format || "audio"}
                             warning={!track.is_lossless}
                           />
+                          <QuickLibraryActions
+                            onPlay={() => onPlay([track])}
+                            onQueue={() => onQueue([track])}
+                            onRemove={() => setRemoveTarget(removeKey("track", track.id))}
+                          />
                           <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
                             <Pencil size={15} />
                           </button>
                         </div>
+                        {removeTarget === removeKey("track", track.id) && (
+                          <RemoveChoice
+                            title={track.title}
+                            onCancel={() => setRemoveTarget(null)}
+                            onChoose={(action) => {
+                              onQueueRemove("track", track.id, action);
+                              setRemoveTarget(null);
+                            }}
+                          />
+                        )}
                         {openTrackDetails.has(track.id) && (
                           <LibraryMetadataEditor
                             targetType="track"
@@ -749,6 +920,8 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
                             title={track.title}
                             fields={trackFields(track)}
                             details={{ artist: artist.name, album: album.title }}
+                            onAutoLookup={(field, draft) => trackAutoLookup(field, draft, artist.name, album.title, onCheckAlbum)}
+                            onSearchAlbums={onSearchAlbums}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
@@ -759,84 +932,41 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata })
               ))}
           </div>
         ))}
-      {requestedArtists.map((artist) => (
-        <div key={artist.name}>
-          <TreeRow
-            icon={Folder}
-            open={openArtists.has(artist.name)}
-            title={artist.name}
-            meta={`${artist.albums.length} requested albums`}
-            onToggle={() => toggleSet(setOpenArtists, artist.name)}
-          />
-          {openArtists.has(artist.name) &&
-            artist.albums.map((album) => (
-              <div key={album.id}>
-                <div className="tree-action-row">
-                  <TreeRow
-                    depth={1}
-                    icon={Folder}
-                    open={openAlbums.has(album.id)}
-                    title={album.name}
-                    meta={`${album.tracks.length} ghost tracks`}
-                    warning
-                    onToggle={() => toggleSet(setOpenAlbums, album.id)}
-                  />
-                  <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Album details">
-                    <Pencil size={15} />
-                  </button>
-                </div>
-                {openAlbumDetails.has(album.id) && (
-                  <AlbumDetails
-                    artist={artist.name}
-                    album={album.name}
-                    coverUrl={album.cover_art_url}
-                    details={{ status: "Requested", tracks: album.tracks.length }}
-                    onAddGhost={() =>
-                      setRequestedAlbums((current) =>
-                        current.map((currentAlbum) =>
-                          currentAlbum.id === album.id
-                            ? {
-                                ...currentAlbum,
-                                tracks: [
-                                  ...currentAlbum.tracks,
-                                  { track_number: currentAlbum.tracks.length + 1, title: `Track ${currentAlbum.tracks.length + 1}` },
-                                ],
-                              }
-                            : currentAlbum,
-                        ),
-                      )
-                    }
-                  />
-                )}
-                {openAlbums.has(album.id) &&
-                  album.tracks.map((track) => (
-                    <GhostTrackRow
-                      key={`${album.id}:${track.track_number}:${track.title}`}
-                      slot={{
-                        id: `${album.id}:${track.track_number}:${track.title}`,
-                        track_number: track.track_number,
-                        title: track.title,
-                        reason: "Requested for download",
-                      }}
-                      checked
-                      onChecked={() => {}}
-                      onDismiss={() =>
-                        setRequestedAlbums((current) =>
-                          current.map((currentAlbum) =>
-                            currentAlbum.id === album.id
-                              ? { ...currentAlbum, tracks: currentAlbum.tracks.filter((currentTrack) => currentTrack !== track) }
-                              : currentAlbum,
-                          ),
-                        )
-                      }
-                      onDrop={() => {}}
-                    />
-                  ))}
-              </div>
-            ))}
-        </div>
-      ))}
       </div>
+    </div>
+  );
+}
+
+function QuickLibraryActions({ onPlay, onQueue, onRemove }) {
+  return (
+    <div className="quick-library-actions">
+      <button className="row-icon-button" onClick={onPlay} title="Play">
+        <Play size={14} />
+      </button>
+      <button className="row-icon-button" onClick={onQueue} title="Add to local queue">
+        <ListPlus size={14} />
+      </button>
+      <button className="row-icon-button" onClick={onRemove} title="Remove">
+        <Trash2 size={14} />
+      </button>
+    </div>
+  );
+}
+
+function RemoveChoice({ title, onChoose, onCancel }) {
+  return (
+    <div className="remove-choice">
+      <strong>{title}</strong>
+      <span>Queue this change for review.</span>
+      <button className="secondary compact" onClick={() => onChoose("move_to_import")}>
+        Move to import
+      </button>
+      <button className="secondary compact danger" onClick={() => onChoose("delete")}>
+        Delete from library
+      </button>
+      <button className="row-icon-button" onClick={onCancel} title="Cancel">
+        <X size={14} />
+      </button>
     </div>
   );
 }
@@ -977,6 +1107,22 @@ function ImportWizard({
     setAlbumSearchOpen(false);
   }
 
+  function removeManualAlbum(artist, album) {
+    setManualAlbums((current) => current.filter((entry) => entry.artist !== artist || entry.name !== album));
+    setAlbumRecords((current) => {
+      const next = { ...current };
+      delete next[albumRecordKey(artist, album)];
+      return next;
+    });
+  }
+
+  function removeManualArtist(artist) {
+    setManualAlbums((current) => current.filter((entry) => entry.artist !== artist));
+    setAlbumRecords((current) =>
+      Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${normalizeName(artist)}::`))),
+    );
+  }
+
   async function checkAlbum(artist, album) {
     const record = await onCheckAlbum(artist, album);
     if (!record?.tracks?.length) return null;
@@ -1015,15 +1161,17 @@ function ImportWizard({
           albumRecords={albumRecords}
           onRecheckTrack={onRecheckTrack}
           onCheckAlbum={checkAlbum}
+          onRemoveManualAlbum={removeManualAlbum}
+          onRemoveManualArtist={removeManualArtist}
         />
       )}
     </div>
   );
 }
 
-function AlbumSearchPanel({ onAdd, onLookup, onSearch }) {
-  const [artist, setArtist] = useState("");
-  const [album, setAlbum] = useState("");
+function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initialAlbum = "" }) {
+  const [artist, setArtist] = useState(initialArtist);
+  const [album, setAlbum] = useState(initialAlbum);
   const [results, setResults] = useState([]);
   const [searched, setSearched] = useState(false);
 
@@ -1084,7 +1232,54 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch }) {
   );
 }
 
-function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords, onRecheckTrack, onCheckAlbum }) {
+function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
+  const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
+
+  async function addAlbumToWishlist(album) {
+    await onAdd({ kind: "album", artist: album.artist, album: album.name });
+    setAlbumSearchOpen(false);
+  }
+
+  return (
+    <div className="wishlist-view">
+      <div className="action-bar">
+        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
+          <Plus size={16} />
+          Add album
+        </button>
+      </div>
+      {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
+      {wishlist.length === 0 ? (
+        <EmptyState title="No wishlist items" body="Add music here before sending wishlist work to the task queue." />
+      ) : (
+        <div className="wishlist-list">
+          {wishlist.map((item) => (
+            <div className="file-row" key={item.id}>
+              <Sparkles size={16} />
+              <div>
+                <strong>{item.track || item.album || item.artist}</strong>
+                <span>{[item.artist, item.album, item.track].filter(Boolean).join(" / ")}</span>
+              </div>
+              <small>{item.status}</small>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ImportTree({
+  files,
+  onFilesChange,
+  library,
+  manualAlbums,
+  albumRecords,
+  onRecheckTrack,
+  onCheckAlbum,
+  onRemoveManualAlbum,
+  onRemoveManualArtist,
+}) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openAlbumDetails, setOpenAlbumDetails] = useState(() => new Set());
@@ -1129,7 +1324,13 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                 />
                 <button
                   className="row-icon-button"
-                  onClick={() => removeImportArtist(files, onFilesChange, artist.name)}
+                  onClick={() => {
+                    removeImportArtist(files, onFilesChange, artist.name);
+                    onRemoveManualArtist(artist.name);
+                    setExtraGhosts((current) =>
+                      Object.fromEntries(Object.entries(current).filter(([key]) => !key.startsWith(`${artist.name}/`))),
+                    );
+                  }}
                   title="Remove from this scan"
                 >
                   <X size={15} />
@@ -1179,7 +1380,15 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                       </button>
                       <button
                         className="row-icon-button"
-                        onClick={() => removeImportAlbum(files, onFilesChange, artist.name, album.name)}
+                        onClick={() => {
+                          removeImportAlbum(files, onFilesChange, artist.name, album.name);
+                          onRemoveManualAlbum(artist.name, album.name);
+                          setExtraGhosts((current) => {
+                            const next = { ...current };
+                            delete next[albumId];
+                            return next;
+                          });
+                        }}
                         title="Remove from this scan"
                       >
                         <X size={15} />
@@ -1404,9 +1613,21 @@ function AlbumDetails({ artist, album, coverUrl, details = {}, onAddGhost }) {
   );
 }
 
-function LibraryMetadataEditor({ targetType, targetId, title, coverUrl, fields, details = {}, onAutoLookup, onQueue, onClose }) {
+function LibraryMetadataEditor({
+  targetType,
+  targetId,
+  title,
+  coverUrl,
+  fields,
+  details = {},
+  onAutoLookup,
+  onSearchAlbums,
+  onQueue,
+  onClose,
+}) {
   const initialValues = useMemo(() => initialFieldValues(fields), [targetId]);
   const [draft, setDraft] = useState(() => initialFieldValues(fields));
+  const [lookupOpen, setLookupOpen] = useState(false);
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
   );
@@ -1417,10 +1638,12 @@ function LibraryMetadataEditor({ targetType, targetId, title, coverUrl, fields, 
   }, [targetId]);
 
   async function autoLookup(field) {
-    if (!onAutoLookup) return;
-    const patch = await onAutoLookup(field.key, draft);
+    if (!onAutoLookup && !onSearchAlbums) return;
+    const patch = onAutoLookup ? await onAutoLookup(field.key, draft) : null;
     if (patch && Object.prototype.hasOwnProperty.call(patch, field.key)) {
       setDraft((current) => ({ ...current, [field.key]: patch[field.key] ?? "" }));
+    } else if (onSearchAlbums) {
+      setLookupOpen(true);
     }
   }
 
@@ -1428,6 +1651,14 @@ function LibraryMetadataEditor({ targetType, targetId, title, coverUrl, fields, 
     if (!hasChanges) return;
     await onQueue(targetType, targetId, normalizeEntityChanges(changed, fields));
     onClose?.();
+  }
+
+  async function applyLookupAlbum(album) {
+    setDraft((current) => ({
+      ...current,
+      ...metadataPatchFromAlbum(targetType, current, album),
+    }));
+    setLookupOpen(false);
   }
 
   return (
@@ -1460,16 +1691,27 @@ function LibraryMetadataEditor({ targetType, targetId, title, coverUrl, fields, 
                       onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
                     />
                   )}
-                  <button className="row-icon-button" onClick={() => autoLookup(field)} disabled={!onAutoLookup} title="Auto lookup">
-                    <Search size={14} />
-                  </button>
+                  {(onAutoLookup || onSearchAlbums) && (
+                    <button className="row-icon-button" onClick={() => autoLookup(field)} title="Auto lookup">
+                      <Search size={14} />
+                    </button>
+                  )}
                 </div>
               </label>
             );
           })}
         </div>
+        {lookupOpen && (
+          <AlbumSearchPanel
+            initialArtist={String(details.artist || draft.artist || title || "")}
+            initialAlbum={String(details.album || draft.title || draft.release_title || title || "")}
+            onAdd={applyLookupAlbum}
+            onLookup={async (artist, album, releaseId) => ({ artist, album, musicbrainz_album_id: releaseId, tracks: [] })}
+            onSearch={onSearchAlbums}
+          />
+        )}
       </div>
-      <button className="primary" onClick={queueChanges} disabled={!hasChanges}>
+      <button className="primary compact-button" onClick={queueChanges} disabled={!hasChanges}>
         <ListChecks size={15} />
         Add to task queue
       </button>
@@ -1530,6 +1772,50 @@ async function albumAutoLookup(field, draft, artistName, onCheckAlbum) {
     return { [field]: lookup.album };
   }
   return null;
+}
+
+async function trackAutoLookup(field, draft, artistName, albumTitle, onCheckAlbum) {
+  const lookup = await onCheckAlbum(artistName, albumTitle, null);
+  const match = lookup?.tracks?.find((track) => track.track_number === Number(draft.track_number)) || lookup?.tracks?.find((track) => track.title === draft.title);
+  if (!match) return null;
+  if (field === "title") return { title: match.title };
+  if (field === "track_number") return { track_number: match.track_number };
+  if (field === "disc_number") return { disc_number: match.disc_number };
+  if (field === "duration_ms") return { duration_ms: match.length };
+  if (field === "musicbrainz_recording_id") return { musicbrainz_recording_id: match.musicbrainz_recording_id };
+  return null;
+}
+
+function metadataPatchFromAlbum(targetType, draft, album) {
+  if (targetType === "album") {
+    return {
+      title: album.name,
+      release_title: album.name,
+      musicbrainz_release_id: album.id,
+      cover_path: album.cover_art_url,
+    };
+  }
+  if (targetType === "track") {
+    const trackNumber = Number(draft.track_number);
+    const match = album.tracks?.find((track) => track.track_number === trackNumber) || album.tracks?.[0];
+    if (!match) return {};
+    return {
+      title: match.title,
+      track_number: match.track_number,
+      disc_number: match.disc_number,
+      duration_ms: match.length,
+      musicbrainz_recording_id: match.musicbrainz_recording_id,
+    };
+  }
+  return {};
+}
+
+function artistTracks(artist) {
+  return artist.albums.flatMap((album) => album.tracks);
+}
+
+function removeKey(type, id) {
+  return `${type}:${id}`;
 }
 
 function normalizeEntityChanges(changes, fields) {
@@ -1711,6 +1997,37 @@ function Toast({ title, body, onClose }) {
       <strong>{title}</strong>
       <span>{body}</span>
     </button>
+  );
+}
+
+function AudioPlayer({ currentTrack, audioUrl, queue, queueOpen, setQueueOpen, onPlayTrack, onEnded, onClose }) {
+  return (
+    <div className="audio-player">
+      <div className="audio-header">
+        <div>
+          <strong>{currentTrack?.title || "Local player"}</strong>
+          <small>{currentTrack?.path || "Ready"}</small>
+        </div>
+        <button className="row-icon-button" onClick={onClose} title="Close player">
+          <X size={14} />
+        </button>
+      </div>
+      <audio controls autoPlay src={audioUrl} onEnded={onEnded} />
+      <button className="secondary compact" onClick={() => setQueueOpen((value) => !value)}>
+        <ListChecks size={14} />
+        Queue ({queue.length})
+      </button>
+      {queueOpen && (
+        <div className="local-queue">
+          {queue.map((track, index) => (
+            <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
+              <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
+              <strong>{track.title}</strong>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -2070,8 +2387,8 @@ function buildLiveLog(tasks, notifications) {
 
 function notificationSeverity(notification) {
   const text = `${notification.title || ""} ${notification.body || ""} ${notification.event_type || ""}`.toLowerCase();
-  if (text.includes("failed") || text.includes("error")) return "error";
-  if (text.includes("warning") || text.includes("skipped") || text.includes("missing")) return "warning";
+  if (text.includes("failed") || text.includes("first failure") || /[1-9]\d*\s+errors?/.test(text)) return "error";
+  if (text.includes("warning") || text.includes("missing")) return "warning";
   if (notification.status === "unread") return "info";
   return "normal";
 }

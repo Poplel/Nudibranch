@@ -4,7 +4,7 @@ import shutil
 import time
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from nudibranch.db.init import init_db
@@ -118,6 +118,11 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.metadata and json.loads(item.payload_json or "{}").get("target_type")
     ]
+    file_action_items = [
+        item
+        for item in selected_items
+        if item.kind in {ProposalKind.delete, ProposalKind.file_move} and json.loads(item.payload_json or "{}").get("action")
+    ]
 
     if batch.kind == ProposalKind.import_files and not executable_items:
         errors.append("No approved import file operations were selected.")
@@ -141,6 +146,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
 
+    file_actions = 0
+    for item in file_action_items:
+        try:
+            apply_file_action_item(session, item)
+            item.status = ProposalStatus.completed
+            file_actions += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
@@ -158,17 +173,24 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, metadata_updated, skipped, errors),
+        body=task_queue_notification_body(imported, metadata_updated, file_actions, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
-    return {"batch_id": batch_id, "imported": imported, "metadata_updated": metadata_updated, "skipped": skipped, "errors": errors}
+    return {
+        "batch_id": batch_id,
+        "imported": imported,
+        "metadata_updated": metadata_updated,
+        "file_actions": file_actions,
+        "skipped": skipped,
+        "errors": errors,
+    }
 
 
-def task_queue_notification_body(imported: int, metadata_updated: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {skipped} items skipped. {len(errors)} errors."
+def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {skipped} items skipped."
     if errors:
-        return f"{body} First error: {errors[0]}"
+        return f"{body} First failure: {errors[0]}"
     return body
 
 
@@ -305,6 +327,46 @@ def editable_track_fields() -> set[str]:
         "artwork_locked",
         "filename_locked",
     }
+
+
+def apply_file_action_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    source_path = Path(item.old_value or "")
+    target_path = unique_destination(Path(item.new_value or ""))
+    track = session.get(Track, payload.get("track_id"))
+    if not source_path.exists():
+        raise FileNotFoundError(f"{source_path} no longer exists")
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(target_path))
+    if track:
+        album = track.album
+        session.delete(track)
+        session.flush()
+        cleanup_empty_album_artist(session, album)
+
+
+def unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No available destination for {path}")
+
+
+def cleanup_empty_album_artist(session: Session, album: Album | None) -> None:
+    if not album:
+        return
+    artist = album.artist
+    track_count = session.scalar(select(func.count()).select_from(Track).where(Track.album_id == album.id))
+    if track_count == 0:
+        session.delete(album)
+        session.flush()
+    if artist:
+        album_count = session.scalar(select(func.count()).select_from(Album).where(Album.artist_id == artist.id))
+        if album_count == 0:
+            session.delete(artist)
 
 
 def run_process_wishlist(session: Session, _payload: dict) -> dict:
