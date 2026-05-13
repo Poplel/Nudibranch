@@ -14,6 +14,8 @@ import {
   LogOut,
   Moon,
   Music,
+  Pencil,
+  Plus,
   RefreshCw,
   Search,
   Settings,
@@ -21,6 +23,7 @@ import {
   Sparkles,
   Sun,
   Users,
+  Wrench,
 } from "lucide-react";
 import "./styles.css";
 
@@ -32,10 +35,11 @@ const navItems = [
   ["Library", Music],
   ["Import", HardDriveUpload],
   ["Wishlist", Sparkles],
-  ["Approvals", ListChecks],
+  ["Task Queue", ListChecks],
   ["Downloads", Download],
   ["Playlists", FileAudio],
-  ["Tasks", Database],
+  ["Activity", Database],
+  ["Tools", Wrench],
   ["Users", Users],
   ["Settings", Settings],
 ];
@@ -44,10 +48,11 @@ const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the managed library.",
   Import: "Scan new files and prepare them for review.",
   Wishlist: "Request artists, albums, and tracks for download.",
-  Approvals: "Review pending changes and apply selected items.",
+  "Task Queue": "Review requested changes before they run.",
   Downloads: "Review download searches, candidates, and completed transfers.",
   Playlists: "Create, import, and manage playlists.",
-  Tasks: "Track queued, running, completed, and failed work.",
+  Activity: "Track queued, running, completed, and failed work.",
+  Tools: "Run maintenance checks and library actions.",
   Users: "Manage users, PINs, API access, and permissions.",
   Settings: "Manage appearance, integrations, and system status.",
 };
@@ -279,8 +284,8 @@ function App() {
         body: JSON.stringify({ path: null, files: importFiles }),
       });
       setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Import review queued", body: "A proposal batch will appear in Approvals." });
-      setPage("Approvals");
+      setToast({ title: "Import review queued", body: "A review item was added to the task queue." });
+      setPage("Task Queue");
       window.setTimeout(() => {
         refreshApprovals();
         refreshTasks();
@@ -300,20 +305,6 @@ function App() {
     await refreshApprovals();
   }
 
-  async function approveBatch(batchId) {
-    setLoading(true);
-    try {
-      const task = await api(`/approvals/${batchId}/approve`, { method: "POST" });
-      setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Approval queued", body: "Selected changes were sent to the task queue." });
-      await refreshApprovals();
-    } catch (approvalError) {
-      setError(approvalError.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
   async function approveItems(items) {
     setLoading(true);
     try {
@@ -329,27 +320,11 @@ function App() {
         );
       }
       setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
-      setToast({ title: "Approvals queued", body: `${batchIds.length} approval groups were sent to the task queue.` });
+      setToast({ title: "Tasks queued", body: `${batchIds.length} change groups were sent to the task queue.` });
       await refreshApprovals();
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
       setError(approvalError.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function rejectSelected(batchId, itemIds) {
-    setLoading(true);
-    try {
-      await api(`/approvals/${batchId}/reject`, {
-        method: "POST",
-        body: JSON.stringify({ item_ids: itemIds, suppress_for: "week" }),
-      });
-      setToast({ title: "Changes rejected", body: "Selected items were suppressed for one week." });
-      await refreshApprovals();
-    } catch (rejectError) {
-      setError(rejectError.message);
     } finally {
       setLoading(false);
     }
@@ -405,7 +380,7 @@ function App() {
         <header className="topbar">
           <div className="search">
             <Search size={16} />
-            <input placeholder="Search library, proposals, tasks" />
+            <input placeholder="Search library, queue, activity" />
           </div>
           <button className="icon-button" onClick={refreshAll} title="Refresh">
             <RefreshCw size={18} />
@@ -428,7 +403,7 @@ function App() {
             {error && <div className="error-banner">{error}</div>}
             {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && <LibraryTree artists={library} />}
-            {page === "Approvals" && (
+            {page === "Task Queue" && (
               <Approvals
                 approvals={approvals}
                 onSelection={setApprovalSelection}
@@ -442,11 +417,12 @@ function App() {
                 onScan={scanImportFolder}
                 onPropose={proposeImport}
                 onFilesChange={setImportFiles}
+                library={library}
                 loading={loading}
                 activeImportTask={activeImportTask}
               />
             )}
-            {page === "Tasks" && <TasksView tasks={tasks} />}
+            {page === "Activity" && <TasksView tasks={tasks} />}
             {page === "Settings" && (
               <SettingsPanel
                 accentColor={accentColor}
@@ -457,7 +433,8 @@ function App() {
                 apiKey={token}
               />
             )}
-            {!["Library", "Approvals", "Import", "Tasks", "Settings"].includes(page) && <Placeholder page={page} />}
+            {page === "Tools" && <ToolsView />}
+            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} approvals={approvals} tasks={tasks} />
@@ -527,7 +504,7 @@ function TrayItem({ title, body, tone = "normal" }) {
 }
 
 function PanelHeader({ page, selectedCount }) {
-  const description = page === "Approvals" ? `${selectedCount} selected changes are ready for review.` : pageDescriptions[page];
+  const description = page === "Task Queue" ? `${selectedCount} selected changes are ready to run.` : pageDescriptions[page];
 
   return (
     <div className="panel-header">
@@ -544,7 +521,7 @@ function LibraryTree({ artists }) {
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
 
   if (artists.length === 0) {
-    return <EmptyState title="No library records" body="Import approved music to populate the managed library." />;
+    return <EmptyState title="No library records" body="Import queued music to populate the managed library." />;
   }
 
   return (
@@ -592,7 +569,7 @@ function Approvals({ approvals, onSelection, onApprove, onReject }) {
   const groups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
 
   if (groups.length === 0) {
-    return <EmptyState title="No pending approvals" body="Import scans and download searches will create review batches here." />;
+    return <EmptyState title="No queued changes" body="Import scans, download searches, and maintenance actions will add review items here." />;
   }
 
   return (
@@ -629,7 +606,7 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           </button>
           <button className="primary" onClick={() => onApprove(selectedItems)} disabled={selectedItems.length === 0}>
             <Check size={16} />
-            Approve selected
+            Run selected
           </button>
         </div>
       </div>
@@ -699,7 +676,15 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
   );
 }
 
-function ImportWizard({ files, onScan, onPropose, onFilesChange, loading, activeImportTask }) {
+function ImportWizard({ files, onScan, onPropose, onFilesChange, library, loading, activeImportTask }) {
+  const [manualAlbums, setManualAlbums] = useState([]);
+  const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
+
+  function addManualAlbum(album) {
+    setManualAlbums((current) => [...current, album]);
+    setAlbumSearchOpen(false);
+  }
+
   return (
     <div className="import-view">
       <div className="action-bar">
@@ -707,30 +692,77 @@ function ImportWizard({ files, onScan, onPropose, onFilesChange, loading, active
           <RefreshCw size={16} />
           Scan import folder
         </button>
+        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
+          <Plus size={16} />
+          Add album
+        </button>
         <button className="secondary" onClick={onPropose} disabled={loading || activeImportTask || files.length === 0}>
-          {activeImportTask ? "Review batch running" : "Create review batch"}
+          {activeImportTask ? "Import review running" : "Add to task queue"}
         </button>
       </div>
-      {files.length === 0 ? (
+      {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} />}
+      {files.length === 0 && manualAlbums.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
       ) : (
-        <ImportTree files={files} onFilesChange={onFilesChange} />
+        <ImportTree files={files} onFilesChange={onFilesChange} library={library} manualAlbums={manualAlbums} />
       )}
     </div>
   );
 }
 
-function ImportTree({ files, onFilesChange }) {
+function AlbumSearchPanel({ onAdd }) {
+  const [artist, setArtist] = useState("");
+  const [album, setAlbum] = useState("");
+  const [tracks, setTracks] = useState(10);
+
+  function submit(event) {
+    event.preventDefault();
+    if (!artist.trim() || !album.trim()) return;
+    onAdd({
+      id: `manual:${Date.now()}`,
+      name: album.trim(),
+      artist: artist.trim(),
+      tracks: Array.from({ length: Number(tracks) || 10 }, (_, index) => ({
+        track_number: index + 1,
+        title: `Track ${index + 1}`,
+      })),
+    });
+  }
+
+  return (
+    <form className="album-search-panel" onSubmit={submit}>
+      <label>
+        Artist
+        <input value={artist} onChange={(event) => setArtist(event.target.value)} />
+      </label>
+      <label>
+        Album
+        <input value={album} onChange={(event) => setAlbum(event.target.value)} />
+      </label>
+      <label>
+        Tracks
+        <input type="number" min="1" max="80" value={tracks} onChange={(event) => setTracks(event.target.value)} />
+      </label>
+      <button className="primary">
+        <Plus size={16} />
+        Add
+      </button>
+    </form>
+  );
+}
+
+function ImportTree({ files, onFilesChange, library, manualAlbums }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [draggedAlbum, setDraggedAlbum] = useState(null);
   const [draggedTrack, setDraggedTrack] = useState(null);
-  const grouped = useMemo(() => groupImportFiles(files), [files]);
+  const [downloadSelections, setDownloadSelections] = useState(() => new Set());
+  const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums), [files, library, manualAlbums]);
 
   useEffect(() => {
     setOpenArtists(new Set(grouped.map((artist) => artist.name)));
     setOpenAlbums(new Set(grouped.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
-  }, [grouped]);
+  }, [files.length, manualAlbums.length]);
 
   return (
     <div className="tree">
@@ -774,19 +806,42 @@ function ImportTree({ files, onFilesChange }) {
                       icon={Folder}
                       open={openAlbums.has(albumId)}
                       title={album.name}
-                      meta={`${album.files.length} tracks`}
+                      meta={`${album.files.length}/${album.slots.length} matched · ${album.matchStatus}`}
+                      warning={album.matchStatus === "partial"}
                       onToggle={() => toggleSet(setOpenAlbums, albumId)}
                     />
                   </div>
                   {openAlbums.has(albumId) &&
-                    album.files.map((file) => (
-                      <ImportTrackRow
-                        file={file}
-                        onDragStart={() => setDraggedTrack(file.path)}
-                        onChange={(patch) => updateImportFile(files, onFilesChange, file.path, patch)}
-                        key={file.path}
-                      />
-                    ))}
+                    album.slots.map((slot) =>
+                      slot.file ? (
+                        <ImportTrackRow
+                          file={slot.file}
+                          album={album}
+                          onDragStart={() => setDraggedTrack(slot.file.path)}
+                          onChange={(patch) => updateImportFile(files, onFilesChange, slot.file.path, patch)}
+                          key={slot.file.path}
+                        />
+                      ) : (
+                        <GhostTrackRow
+                          key={`${albumId}:${slot.track_number}:${slot.title}`}
+                          slot={slot}
+                          checked={downloadSelections.has(slot.id)}
+                          onChecked={(checked) => toggleDownloadSelection(setDownloadSelections, slot.id, checked)}
+                          onDrop={() => {
+                            if (draggedTrack) {
+                              updateImportFile(files, onFilesChange, draggedTrack, {
+                                artist: artist.name,
+                                albumartist: artist.name,
+                                album: album.name,
+                                track_number: slot.track_number,
+                                title: slot.title,
+                              });
+                              setDraggedTrack(null);
+                            }
+                          }}
+                        />
+                      ),
+                    )}
                 </div>
               );
             })}
@@ -796,24 +851,131 @@ function ImportTree({ files, onFilesChange }) {
   );
 }
 
-function ImportTrackRow({ file, onChange, onDragStart }) {
+function ImportTrackRow({ file, album, onChange, onDragStart }) {
   const metadata = file.metadata || {};
+  const [editing, setEditing] = useState(false);
   return (
-    <div className="import-edit-row" draggable onDragStart={onDragStart}>
+    <>
+      <div className="import-edit-row" draggable onDragStart={onDragStart}>
+        <span className="chevron" />
+        <FileAudio size={17} />
+        <DraftInput value={metadata.artist || ""} onCommit={(value) => onChange({ artist: value, albumartist: value })} />
+        <DraftInput value={metadata.album || ""} onCommit={(value) => onChange({ album: value })} />
+        <DraftInput
+          value={metadata.track_number || ""}
+          onCommit={(value) => onChange({ track_number: parseInt(value, 10) || null })}
+        />
+        <DraftInput value={metadata.title || ""} onCommit={(value) => onChange({ title: value })} />
+        <small>{album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
+        <button className="row-icon-button" onClick={() => setEditing((value) => !value)} title="Edit metadata">
+          <Pencil size={15} />
+        </button>
+      </div>
+      {editing && <MetadataEditor metadata={metadata} onChange={onChange} />}
+    </>
+  );
+}
+
+function DraftInput({ value, onCommit, type = "text" }) {
+  const [draft, setDraft] = useState(value ?? "");
+
+  useEffect(() => {
+    setDraft(value ?? "");
+  }, [value]);
+
+  function commit() {
+    if (String(draft) !== String(value ?? "")) {
+      onCommit(draft);
+    }
+  }
+
+  return (
+    <input
+      type={type}
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.currentTarget.blur();
+        }
+      }}
+    />
+  );
+}
+
+function MetadataEditor({ metadata, onChange }) {
+  const [extraKey, setExtraKey] = useState("");
+  const visibleKeys = [
+    "artist",
+    "albumartist",
+    "album",
+    "title",
+    "track_number",
+    "disc_number",
+    "genre",
+    "date",
+    "musicbrainz_artist_id",
+    "musicbrainz_album_id",
+    "musicbrainz_recording_id",
+    "format",
+    "bitrate",
+    "duration_ms",
+    "is_lossless",
+  ];
+  const keys = [...new Set([...visibleKeys, ...Object.keys(metadata || {})])];
+
+  return (
+    <div className="metadata-editor">
+      {keys.map((key) => (
+        <label key={key}>
+          <span>{key}</span>
+          {typeof metadata[key] === "boolean" ? (
+            <input type="checkbox" checked={Boolean(metadata[key])} onChange={(event) => onChange({ [key]: event.target.checked })} />
+          ) : (
+            <DraftInput value={metadata[key] ?? ""} onCommit={(value) => onChange({ [key]: coerceMetadataValue(key, value) })} />
+          )}
+        </label>
+      ))}
+      <form
+        className="metadata-add-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!extraKey.trim()) return;
+          onChange({ [extraKey.trim()]: "" });
+          setExtraKey("");
+        }}
+      >
+        <input value={extraKey} placeholder="Add tag" onChange={(event) => setExtraKey(event.target.value)} />
+        <button className="secondary">
+          <Plus size={15} />
+          Add tag
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function GhostTrackRow({ slot, checked, onChecked, onDrop }) {
+  return (
+    <div className="ghost-track-row" onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
       <span className="chevron" />
       <FileAudio size={17} />
-      <input value={metadata.artist || ""} onChange={(event) => onChange({ artist: event.target.value, albumartist: event.target.value })} />
-      <input value={metadata.album || ""} onChange={(event) => onChange({ album: event.target.value })} />
-      <input value={metadata.track_number || ""} onChange={(event) => onChange({ track_number: parseInt(event.target.value, 10) || null })} />
-      <input value={metadata.title || ""} onChange={(event) => onChange({ title: event.target.value })} />
-      <small>{formatBytes(file.size_bytes)}</small>
+      <label>
+        <input type="checkbox" checked={checked} onChange={(event) => onChecked(event.target.checked)} />
+        Download
+      </label>
+      <span className="ghost-title">
+        {slot.track_number ? String(slot.track_number).padStart(2, "0") : "#"}-{slot.title}
+      </span>
+      <small>{slot.reason}</small>
     </div>
   );
 }
 
 function TasksView({ tasks }) {
   if (tasks.length === 0) {
-    return <EmptyState title="No tasks" body="Scans, approvals, downloads, and notifications will appear here." />;
+    return <EmptyState title="No activity" body="Scans, queued changes, downloads, and notifications will appear here." />;
   }
 
   return (
@@ -822,8 +984,31 @@ function TasksView({ tasks }) {
         <div className="task-row" key={task.id}>
           <strong>{task.type}</strong>
           <span>{task.status}</span>
-          <small>{task.error || new Date(task.created_at).toLocaleString()}</small>
+          <small>{taskSummary(task)}</small>
         </div>
+      ))}
+    </div>
+  );
+}
+
+function ToolsView() {
+  const tools = [
+    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library."],
+    ["Find missing album tracks", "Compare known albums against library records and queue download searches."],
+    ["Check files against database", "Find library files missing from the database and records with missing files."],
+    ["Backup now", "Create a manual backup when no file operations are running."],
+  ];
+
+  return (
+    <div className="tool-grid">
+      {tools.map(([title, body]) => (
+        <button className="tool-card" key={title} disabled>
+          <Wrench size={18} />
+          <span>
+            <strong>{title}</strong>
+            <small>{body}</small>
+          </span>
+        </button>
       ))}
     </div>
   );
@@ -900,7 +1085,7 @@ function Inspector({ page, importFiles, approvals, tasks }) {
         <strong>{page}</strong>
         <label>Imports</label>
         <strong>{importFiles.length}</strong>
-        <label>Approvals</label>
+        <label>Queue</label>
         <strong>{selectedApprovalCount} selected</strong>
         <label>Tasks</label>
         <strong>{tasks.length}</strong>
@@ -959,7 +1144,7 @@ function groupApprovalBatches(batches) {
   batches.forEach((batch) => {
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
-      if (!["pending", "approved", "executing"].includes(item.status)) return;
+      if (!["pending", "approved", "executing", "failed"].includes(item.status)) return;
       const groupKind = batchGroupKind || item.kind;
       const key = `${groupKind}:${item.kind}:${item.title}:${item.old_value || ""}:${item.new_value || ""}`;
       if (seen.has(key)) return;
@@ -1030,7 +1215,7 @@ function safePathPart(value) {
     .trim();
 }
 
-function groupImportFiles(files) {
+function groupImportFiles(files, library = [], manualAlbums = []) {
   const artistMap = new Map();
   files.forEach((file) => {
     const artistName = file.metadata?.albumartist || file.metadata?.artist || "Unknown Artist";
@@ -1046,21 +1231,116 @@ function groupImportFiles(files) {
     artist.albumMap.get(albumName).files.push(file);
   });
 
+  manualAlbums.forEach((album) => {
+    if (!artistMap.has(album.artist)) {
+      artistMap.set(album.artist, { name: album.artist, count: 0, albumMap: new Map() });
+    }
+    const artist = artistMap.get(album.artist);
+    if (!artist.albumMap.has(album.name)) {
+      artist.albumMap.set(album.name, { name: album.name, files: [], expectedTracks: album.tracks, manual: true });
+    }
+  });
+
   return [...artistMap.values()]
     .map((artist) => ({
       name: artist.name,
       count: artist.count,
-      albums: [...artist.albumMap.values()].map((album) => ({
-        ...album,
-        files: album.files.sort((a, b) => (a.metadata?.track_number || 9999) - (b.metadata?.track_number || 9999)),
-      })),
+      albums: [...artist.albumMap.values()].map((album) => buildImportAlbum(album, artist.name, library)),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildImportAlbum(album, artistName, library) {
+  const files = album.files.sort((a, b) => (a.metadata?.track_number || 9999) - (b.metadata?.track_number || 9999));
+  const libraryAlbum = findLibraryAlbum(library, artistName, album.name);
+  const expectedTracks = album.expectedTracks || libraryAlbum?.tracks || inferExpectedTracks(files);
+  const trackMap = new Map();
+  files.forEach((file) => {
+    const trackNumber = file.metadata?.track_number;
+    if (trackNumber) trackMap.set(trackNumber, file);
+  });
+  const slots = expectedTracks.map((track, index) => {
+    const trackNumber = track.track_number || index + 1;
+    const file = trackMap.get(trackNumber);
+    return file
+      ? { id: file.path, track_number: trackNumber, title: file.metadata?.title || track.title, file }
+      : {
+          id: `${artistName}:${album.name}:${trackNumber}:${track.title}`,
+          track_number: trackNumber,
+          title: track.title || `Track ${trackNumber}`,
+          reason: libraryAlbum ? "Missing from import" : "Album slot",
+        };
+  });
+  const matchedCount = slots.filter((slot) => slot.file).length;
+  const matchStatus = libraryAlbum ? (matchedCount >= expectedTracks.length ? "full" : "partial") : "new";
+  return {
+    ...album,
+    files,
+    slots,
+    matchStatus,
+    libraryAlbum,
+  };
+}
+
+function findLibraryAlbum(library, artistName, albumName) {
+  const normalizedArtist = normalizeName(artistName);
+  const normalizedAlbum = normalizeName(albumName);
+  const artist =
+    library.find((entry) => normalizeName(entry.name) === normalizedArtist) ||
+    library.find((entry) => normalizeName(entry.name).includes(normalizedArtist) || normalizedArtist.includes(normalizeName(entry.name)));
+  if (!artist) return null;
+  return (
+    artist.albums.find((album) => normalizeName(album.title) === normalizedAlbum) ||
+    artist.albums.find((album) => normalizeName(album.title).includes(normalizedAlbum) || normalizedAlbum.includes(normalizeName(album.title)))
+  );
+}
+
+function inferExpectedTracks(files) {
+  const numberedTracks = files
+    .map((file) => file.metadata?.track_number)
+    .filter((trackNumber) => Number.isInteger(trackNumber) && trackNumber > 0);
+  const maxTrack = Math.max(files.length, numberedTracks.length ? Math.max(...numberedTracks) : 0);
+  return Array.from({ length: maxTrack }, (_, index) => ({
+    track_number: index + 1,
+    title: files.find((file) => file.metadata?.track_number === index + 1)?.metadata?.title || `Track ${index + 1}`,
+  }));
+}
+
+function normalizeName(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\([^)]*\)|\[[^\]]*\]/g, "")
+    .replace(/deluxe|expanded|remaster(?:ed)?|edition|explicit/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function toggleDownloadSelection(setter, id, checked) {
+  setter((current) => {
+    const next = new Set(current);
+    if (checked) next.add(id);
+    else next.delete(id);
+    return next;
+  });
+}
+
+function coerceMetadataValue(key, value) {
+  if (["track_number", "disc_number", "bitrate", "duration_ms"].includes(key)) {
+    return parseInt(value, 10) || null;
+  }
+  return value;
 }
 
 function upsertTask(tasks, task) {
   const withoutTask = tasks.filter((current) => current.id !== task.id);
   return [task, ...withoutTask];
+}
+
+function taskSummary(task) {
+  if (task.error) return task.error;
+  if (task.result?.errors?.length) return task.result.errors.join("; ");
+  if (task.result?.imported !== undefined) return `${task.result.imported} imported, ${task.result.skipped || 0} skipped`;
+  return new Date(task.created_at).toLocaleString();
 }
 
 function groupBy(items, getKey) {

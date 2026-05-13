@@ -31,7 +31,7 @@ def approve_batch(session: Session, batch_id: str, item_ids: list[str] | None = 
     for item in batch.items:
         if item_ids is not None and item.id not in item_ids:
             continue
-        if item.selected and item.status == ProposalStatus.pending:
+        if item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
             item.status = ProposalStatus.approved
     session.commit()
     return enqueue_task(session, "execute_proposal_batch", {"batch_id": batch_id})

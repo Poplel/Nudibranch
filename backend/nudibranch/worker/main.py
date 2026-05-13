@@ -86,10 +86,10 @@ def run_propose_import(session: Session, payload: dict) -> dict:
         )
     create_notification(
         session,
-        title="Import ready for approval",
-        body=f"{len(files)} files were found in /app/import.",
+        title="Import review ready",
+        body=f"{len(files)} files were added to the task queue.",
         event_type="approval_needed",
-        target_url="/approvals",
+        target_url="/task-queue",
     )
     return {"batch_id": batch.id, "files": len(files)}
 
@@ -136,10 +136,10 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
 
     create_notification(
         session,
-        title="Approval batch completed",
-        body=f"{imported} tracks imported. {skipped} items skipped.",
+        title="Task queue item failed" if errors else "Task queue item completed",
+        body=f"{imported} tracks imported. {skipped} items skipped. {len(errors)} errors.",
         event_type="task_completed",
-        target_url="/tasks",
+        target_url="/activity",
     )
     return {"batch_id": batch_id, "imported": imported, "skipped": skipped, "errors": errors}
 
@@ -208,7 +208,7 @@ def run_process_wishlist(session: Session, _payload: dict) -> dict:
         title="Wishlist search finished",
         body="Download candidates are ready to review.",
         event_type="approval_needed",
-        target_url="/approvals",
+        target_url="/task-queue",
     )
     return {"status": "stubbed", "message": "slskd ranking pipeline placeholder created"}
 

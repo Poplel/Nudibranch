@@ -173,7 +173,11 @@ def list_approvals(
         session.scalars(
             select(ProposalBatch)
             .options(selectinload(ProposalBatch.items))
-            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing]))
+            .where(
+                ProposalBatch.status.in_(
+                    [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
+                )
+            )
             .order_by(ProposalBatch.created_at.desc())
         )
     )
