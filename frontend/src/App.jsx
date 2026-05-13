@@ -377,6 +377,26 @@ function App() {
     }
   }
 
+  async function proposeLibraryMetadata(targetType, targetId, changes) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api("/library/metadata", {
+        method: "POST",
+        body: JSON.stringify({ target_type: targetType, target_id: targetId, changes }),
+      });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "Metadata queued", body: "The change was added to the task queue." });
+      return batch;
+    } catch (metadataError) {
+      setError(metadataError.message);
+      setToast({ title: "Metadata queue failed", body: metadataError.message });
+      throw metadataError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function setApprovalSelection(batchId, itemIds, selected) {
     await api(`/approvals/${batchId}/selection`, {
       method: "POST",
@@ -484,7 +504,12 @@ function App() {
             {error && <div className="error-banner">{error}</div>}
             {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && (
-              <LibraryTree artists={library} onCheckAlbum={lookupImportAlbum} onSearchAlbums={searchImportAlbums} />
+              <LibraryTree
+                artists={library}
+                onCheckAlbum={lookupImportAlbum}
+                onSearchAlbums={searchImportAlbums}
+                onQueueMetadata={proposeLibraryMetadata}
+              />
             )}
             {page === "Task Queue" && (
               <Approvals
@@ -604,10 +629,12 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onSearchAlbums }) {
+function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
   const [openAlbumDetails, setOpenAlbumDetails] = useState(() => new Set());
+  const [openTrackDetails, setOpenTrackDetails] = useState(() => new Set());
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [requestedAlbums, setRequestedAlbums] = useState([]);
   const visibleArtists = useMemo(
@@ -649,17 +676,32 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums }) {
       <div className="tree">
         {visibleArtists.map((artist) => (
           <div key={artist.id}>
-            <TreeRow
-              icon={Folder}
-              open={openArtists.has(artist.id)}
-              title={artist.name}
-              meta={`${artist.albums.length} albums`}
-              onToggle={() => toggleSet(setOpenArtists, artist.id)}
-            />
+            <div className="tree-action-row one-action">
+              <TreeRow
+                icon={Folder}
+                open={openArtists.has(artist.id)}
+                title={artist.name}
+                meta={`${artist.albums.length} albums`}
+                onToggle={() => toggleSet(setOpenArtists, artist.id)}
+              />
+              <button className="row-icon-button" onClick={() => toggleSet(setOpenArtistDetails, artist.id)} title="Edit artist">
+                <Pencil size={15} />
+              </button>
+            </div>
+            {openArtistDetails.has(artist.id) && (
+              <LibraryMetadataEditor
+                targetType="artist"
+                targetId={artist.id}
+                title={artist.name}
+                fields={artistFields(artist)}
+                onQueue={onQueueMetadata}
+                onClose={() => toggleSet(setOpenArtistDetails, artist.id)}
+              />
+            )}
             {openArtists.has(artist.id) &&
               artist.albums.map((album) => (
                 <div key={album.id}>
-                  <div className="tree-action-row">
+                  <div className="tree-action-row one-action">
                     <TreeRow
                       depth={1}
                       icon={Folder}
@@ -668,28 +710,50 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums }) {
                       meta={`${album.tracks.length} tracks`}
                       onToggle={() => toggleSet(setOpenAlbums, album.id)}
                     />
-                    <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Album details">
+                    <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
                       <Pencil size={15} />
                     </button>
                   </div>
                   {openAlbumDetails.has(album.id) && (
-                    <AlbumDetails
-                      artist={artist.name}
-                      album={album.title}
+                    <LibraryMetadataEditor
+                      targetType="album"
+                      targetId={album.id}
+                      title={album.title}
                       coverUrl={album.cover_path}
-                      details={{ path: album.path, tracks: album.tracks.length }}
+                      fields={albumFields(album)}
+                      details={{ artist: artist.name, tracks: album.tracks.length }}
+                      onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
+                      onQueue={onQueueMetadata}
+                      onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
                     />
                   )}
                   {openAlbums.has(album.id) &&
                     album.tracks.map((track) => (
-                      <TreeRow
-                        key={track.id}
-                        depth={2}
-                        icon={FileAudio}
-                        title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
-                        meta={track.format || "audio"}
-                        warning={!track.is_lossless}
-                      />
+                      <div key={track.id}>
+                        <div className="tree-action-row one-action">
+                          <TreeRow
+                            depth={2}
+                            icon={FileAudio}
+                            title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
+                            meta={track.format || "audio"}
+                            warning={!track.is_lossless}
+                          />
+                          <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
+                            <Pencil size={15} />
+                          </button>
+                        </div>
+                        {openTrackDetails.has(track.id) && (
+                          <LibraryMetadataEditor
+                            targetType="track"
+                            targetId={track.id}
+                            title={track.title}
+                            fields={trackFields(track)}
+                            details={{ artist: artist.name, album: album.title }}
+                            onQueue={onQueueMetadata}
+                            onClose={() => toggleSet(setOpenTrackDetails, track.id)}
+                          />
+                        )}
+                      </div>
                     ))}
                 </div>
               ))}
@@ -1055,13 +1119,22 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                 }
               }}
             >
-              <TreeRow
-                icon={Folder}
-                open={openArtists.has(artist.name)}
-                title={artist.name}
-                meta={`${artist.count} files`}
-                onToggle={() => toggleSet(setOpenArtists, artist.name)}
-              />
+              <div className="tree-action-row one-action">
+                <TreeRow
+                  icon={Folder}
+                  open={openArtists.has(artist.name)}
+                  title={artist.name}
+                  meta={`${artist.count} files`}
+                  onToggle={() => toggleSet(setOpenArtists, artist.name)}
+                />
+                <button
+                  className="row-icon-button"
+                  onClick={() => removeImportArtist(files, onFilesChange, artist.name)}
+                  title="Remove from this scan"
+                >
+                  <X size={15} />
+                </button>
+              </div>
             </div>
             {openArtists.has(artist.name) &&
               visibleAlbums.map((album) => {
@@ -1103,6 +1176,13 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                       </button>
                       <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, albumId)} title="Album details">
                         <Pencil size={15} />
+                      </button>
+                      <button
+                        className="row-icon-button"
+                        onClick={() => removeImportAlbum(files, onFilesChange, artist.name, album.name)}
+                        title="Remove from this scan"
+                      >
+                        <X size={15} />
                       </button>
                     </div>
                   </div>
@@ -1154,15 +1234,23 @@ function ImportTree({ files, onFilesChange, library, manualAlbums, albumRecords,
                           onDismiss={() => toggleDownloadSelection(setDismissedGhosts, slot.id, true)}
                           onDrop={() => {
                             if (draggedTrack) {
-                              const primaryPath = draggedTrack.paths[0];
-                              const draggedFile = files.find((file) => file.path === primaryPath);
-                              moveTrackPaths(files, onFilesChange, draggedTrack.paths, {
-                                artist: artist.name,
-                                albumartist: artist.name,
-                                album: album.name,
-                                track_number: slot.track_number,
-                                title: titleForDroppedSlot(slot, draggedFile),
-                              });
+                              if (draggedTrack.paths.length > 1) {
+                                moveTrackPaths(files, onFilesChange, draggedTrack.paths, {
+                                  artist: artist.name,
+                                  albumartist: artist.name,
+                                  album: album.name,
+                                });
+                              } else {
+                                const primaryPath = draggedTrack.paths[0];
+                                const draggedFile = files.find((file) => file.path === primaryPath);
+                                moveTrackPaths(files, onFilesChange, draggedTrack.paths, {
+                                  artist: artist.name,
+                                  albumartist: artist.name,
+                                  album: album.name,
+                                  track_number: slot.track_number,
+                                  title: titleForDroppedSlot(slot, draggedFile),
+                                });
+                              }
                               setDraggedTrack(null);
                             } else if (draggedAlbum) {
                               mergeAlbumIntoAlbum(files, onFilesChange, draggedAlbum, { artist: artist.name, album: album.name, slots: album.slots });
@@ -1313,6 +1401,146 @@ function AlbumDetails({ artist, album, coverUrl, details = {}, onAddGhost }) {
         </button>
       )}
     </div>
+  );
+}
+
+function LibraryMetadataEditor({ targetType, targetId, title, coverUrl, fields, details = {}, onAutoLookup, onQueue, onClose }) {
+  const initialValues = useMemo(() => initialFieldValues(fields), [targetId]);
+  const [draft, setDraft] = useState(() => initialFieldValues(fields));
+  const changed = Object.fromEntries(
+    Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
+  );
+  const hasChanges = Object.keys(changed).length > 0;
+
+  useEffect(() => {
+    setDraft(initialValues);
+  }, [targetId]);
+
+  async function autoLookup(field) {
+    if (!onAutoLookup) return;
+    const patch = await onAutoLookup(field.key, draft);
+    if (patch && Object.prototype.hasOwnProperty.call(patch, field.key)) {
+      setDraft((current) => ({ ...current, [field.key]: patch[field.key] ?? "" }));
+    }
+  }
+
+  async function queueChanges() {
+    if (!hasChanges) return;
+    await onQueue(targetType, targetId, normalizeEntityChanges(changed, fields));
+    onClose?.();
+  }
+
+  return (
+    <div className="album-details metadata-panel">
+      {coverUrl !== undefined && <div className="album-art">{coverUrl ? <img src={coverUrl} alt="" /> : <Music size={24} />}</div>}
+      <div className="library-metadata-form">
+        <strong>{title}</strong>
+        {Object.entries(details).map(([key, value]) => (
+          <small key={key}>
+            {key}: {String(value ?? "")}
+          </small>
+        ))}
+        <div className="metadata-field-grid">
+          {fields.map((field) => {
+            const isChanged = String(draft[field.key] ?? "") !== String(initialValues[field.key] ?? "");
+            return (
+              <label className={isChanged ? "changed" : ""} key={field.key}>
+                <span>{field.label}</span>
+                <div className="metadata-input-action">
+                  {field.type === "boolean" ? (
+                    <input
+                      type="checkbox"
+                      checked={Boolean(draft[field.key])}
+                      onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.checked }))}
+                    />
+                  ) : (
+                    <input
+                      type={field.type === "number" ? "number" : "text"}
+                      value={draft[field.key] ?? ""}
+                      onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
+                    />
+                  )}
+                  <button className="row-icon-button" onClick={() => autoLookup(field)} disabled={!onAutoLookup} title="Auto lookup">
+                    <Search size={14} />
+                  </button>
+                </div>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+      <button className="primary" onClick={queueChanges} disabled={!hasChanges}>
+        <ListChecks size={15} />
+        Add to task queue
+      </button>
+    </div>
+  );
+}
+
+function initialFieldValues(fields) {
+  return Object.fromEntries(fields.map((field) => [field.key, field.value ?? ""]));
+}
+
+function artistFields(artist) {
+  return [
+    { key: "name", label: "Name", value: artist.name },
+    { key: "sort_name", label: "Sort name", value: artist.sort_name },
+    { key: "musicbrainz_id", label: "MusicBrainz ID", value: artist.musicbrainz_id },
+  ];
+}
+
+function albumFields(album) {
+  return [
+    { key: "title", label: "Album", value: album.title },
+    { key: "release_title", label: "Release title", value: album.release_title },
+    { key: "musicbrainz_release_id", label: "MusicBrainz release ID", value: album.musicbrainz_release_id },
+    { key: "musicbrainz_release_group_id", label: "MusicBrainz release group ID", value: album.musicbrainz_release_group_id },
+    { key: "cover_path", label: "Cover art", value: album.cover_path },
+    { key: "path", label: "Path", value: album.path },
+  ];
+}
+
+function trackFields(track) {
+  return [
+    { key: "title", label: "Title", value: track.title },
+    { key: "track_number", label: "Track number", value: track.track_number, type: "number" },
+    { key: "disc_number", label: "Disc number", value: track.disc_number, type: "number" },
+    { key: "duration_ms", label: "Duration ms", value: track.duration_ms, type: "number" },
+    { key: "format", label: "Format", value: track.format },
+    { key: "bitrate", label: "Bitrate", value: track.bitrate, type: "number" },
+    { key: "path", label: "Path", value: track.path },
+    { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id },
+    { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
+    { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean" },
+    { key: "metadata_locked", label: "Metadata locked", value: track.metadata_locked, type: "boolean" },
+    { key: "artwork_locked", label: "Artwork locked", value: track.artwork_locked, type: "boolean" },
+    { key: "filename_locked", label: "Filename locked", value: track.filename_locked, type: "boolean" },
+  ];
+}
+
+async function albumAutoLookup(field, draft, artistName, onCheckAlbum) {
+  const releaseId = draft.musicbrainz_release_id || null;
+  if (field === "cover_path" && releaseId) {
+    return { cover_path: `https://coverartarchive.org/release/${releaseId}/front-250` };
+  }
+  if (!releaseId) return null;
+  const lookup = await onCheckAlbum(artistName, draft.title || draft.release_title || "", releaseId);
+  if (!lookup) return null;
+  if (field === "title" || field === "release_title") {
+    return { [field]: lookup.album };
+  }
+  return null;
+}
+
+function normalizeEntityChanges(changes, fields) {
+  const fieldByKey = new Map(fields.map((field) => [field.key, field]));
+  return Object.fromEntries(
+    Object.entries(changes).map(([key, value]) => {
+      const field = fieldByKey.get(key);
+      if (field?.type === "number") return [key, value === "" ? null : Number(value)];
+      if (field?.type === "boolean") return [key, Boolean(value)];
+      return [key, value === "" ? null : value];
+    }),
   );
 }
 
@@ -1622,6 +1850,26 @@ function updateImportAlbum(files, onFilesChange, artistName, albumName, metadata
         metadata: { ...metadata, ...metadataPatch },
         suggested_library_path: suggestImportPath(file, { ...metadata, ...metadataPatch }),
       };
+    }),
+  );
+}
+
+function removeImportArtist(files, onFilesChange, artistName) {
+  onFilesChange(
+    files.filter((file) => {
+      const metadata = file.metadata || {};
+      return (metadata.albumartist || metadata.artist || "Unknown Artist") !== artistName;
+    }),
+  );
+}
+
+function removeImportAlbum(files, onFilesChange, artistName, albumName) {
+  onFilesChange(
+    files.filter((file) => {
+      const metadata = file.metadata || {};
+      const currentArtist = metadata.albumartist || metadata.artist || "Unknown Artist";
+      const currentAlbum = metadata.album || "Unknown Album";
+      return currentArtist !== artistName || currentAlbum !== albumName;
     }),
   );
 }

@@ -589,6 +589,64 @@ nav button:hover,
   background: var(--panel-strong);
 }
 
+.metadata-panel {
+  grid-template-columns: 74px minmax(0, 1fr) auto;
+}
+
+.library-metadata-form {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.library-metadata-form > strong,
+.library-metadata-form > small {
+  overflow-wrap: anywhere;
+}
+
+.library-metadata-form > small {
+  color: var(--muted);
+}
+
+.metadata-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(170px, 1fr));
+  gap: 8px;
+}
+
+.metadata-field-grid label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.metadata-field-grid label.changed span {
+  color: var(--accent);
+}
+
+.metadata-input-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 6px;
+  align-items: center;
+}
+
+.metadata-input-action input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.metadata-input-action input[type="checkbox"] {
+  width: 18px;
+  accent-color: var(--accent);
+}
+
 .album-art {
   display: grid;
   width: 64px;
@@ -726,9 +784,13 @@ nav button:hover,
 
 .tree-action-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) repeat(2, 30px);
+  grid-template-columns: minmax(0, 1fr) repeat(3, 30px);
   gap: 6px;
   align-items: center;
+}
+
+.tree-action-row.one-action {
+  grid-template-columns: minmax(0, 1fr) 30px;
 }
 
 .file-row div,

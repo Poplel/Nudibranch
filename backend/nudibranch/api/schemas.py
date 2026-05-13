@@ -28,22 +28,35 @@ class LibraryTreeTrack(BaseModel):
     id: str
     title: str
     track_number: int | None = None
+    disc_number: int | None = None
+    duration_ms: int | None = None
     format: str | None = None
+    bitrate: int | None = None
     is_lossless: bool = False
     path: str | None = None
+    musicbrainz_recording_id: str | None = None
+    explicit: bool | None = None
+    metadata_locked: bool = False
+    artwork_locked: bool = False
+    filename_locked: bool = False
 
 
 class LibraryTreeAlbum(BaseModel):
     id: str
     title: str
+    release_title: str | None = None
     path: str | None = None
     cover_path: str | None = None
+    musicbrainz_release_id: str | None = None
+    musicbrainz_release_group_id: str | None = None
     tracks: list[LibraryTreeTrack] = Field(default_factory=list)
 
 
 class LibraryTreeArtist(BaseModel):
     id: str
     name: str
+    sort_name: str | None = None
+    musicbrainz_id: str | None = None
     albums: list[LibraryTreeAlbum] = Field(default_factory=list)
 
 
@@ -147,3 +160,9 @@ class AlbumLookupRequest(BaseModel):
     artist: str
     album: str
     release_id: str | None = None
+
+
+class LibraryMetadataProposalRequest(BaseModel):
+    target_type: str = Field(pattern="^(artist|album|track)$")
+    target_id: str
+    changes: dict[str, Any]

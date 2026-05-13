@@ -113,6 +113,11 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.import_files and item.old_value and item.new_value
     ]
+    metadata_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.metadata and json.loads(item.payload_json or "{}").get("target_type")
+    ]
 
     if batch.kind == ProposalKind.import_files and not executable_items:
         errors.append("No approved import file operations were selected.")
@@ -122,6 +127,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             import_track_item(session, item)
             item.status = ProposalStatus.completed
             imported += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
+    metadata_updated = 0
+    for item in metadata_items:
+        try:
+            apply_metadata_item(session, item)
+            item.status = ProposalStatus.completed
+            metadata_updated += 1
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
@@ -143,15 +158,15 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, skipped, errors),
+        body=task_queue_notification_body(imported, metadata_updated, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
-    return {"batch_id": batch_id, "imported": imported, "skipped": skipped, "errors": errors}
+    return {"batch_id": batch_id, "imported": imported, "metadata_updated": metadata_updated, "skipped": skipped, "errors": errors}
 
 
-def task_queue_notification_body(imported: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {skipped} items skipped. {len(errors)} errors."
+def task_queue_notification_body(imported: int, metadata_updated: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {skipped} items skipped. {len(errors)} errors."
     if errors:
         return f"{body} First error: {errors[0]}"
     return body
@@ -211,6 +226,85 @@ def import_track_item(session: Session, item: ProposalItem) -> None:
             is_lossless=metadata.get("is_lossless", False),
         )
     )
+
+
+def apply_metadata_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    target_type = payload.get("target_type")
+    target_id = payload.get("target_id")
+    changes = payload.get("changes") or {}
+    if target_type == "artist":
+        target = session.get(Artist, target_id)
+        if not target:
+            raise ValueError("Artist no longer exists")
+        apply_artist_changes(session, target, changes)
+    elif target_type == "album":
+        target = session.get(Album, target_id)
+        if not target:
+            raise ValueError("Album no longer exists")
+        apply_album_changes(session, target, changes)
+    elif target_type == "track":
+        target = session.get(Track, target_id)
+        if not target:
+            raise ValueError("Track no longer exists")
+        apply_scalar_changes(target, changes, editable_track_fields())
+    else:
+        raise ValueError("Unsupported metadata target")
+
+
+def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
+    apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id"})
+    matching_artist = session.scalar(select(Artist).where(Artist.name == artist.name, Artist.id != artist.id))
+    if not matching_artist:
+        return
+    for album in list(artist.albums):
+        matching_album = session.scalar(
+            select(Album).where(Album.artist_id == matching_artist.id, Album.title == album.title, Album.id != album.id)
+        )
+        if matching_album:
+            for track in album.tracks:
+                track.album_id = matching_album.id
+        else:
+            album.artist_id = matching_artist.id
+
+
+def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
+    apply_scalar_changes(
+        album,
+        changes,
+        {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
+    )
+    matching_album = session.scalar(
+        select(Album).where(Album.artist_id == album.artist_id, Album.title == album.title, Album.id != album.id)
+    )
+    if not matching_album:
+        return
+    for track in album.tracks:
+        track.album_id = matching_album.id
+
+
+def apply_scalar_changes(target, changes: dict, allowed_fields: set[str]) -> None:
+    for key, value in changes.items():
+        if key in allowed_fields:
+            setattr(target, key, value)
+
+
+def editable_track_fields() -> set[str]:
+    return {
+        "title",
+        "track_number",
+        "disc_number",
+        "duration_ms",
+        "format",
+        "bitrate",
+        "path",
+        "musicbrainz_recording_id",
+        "explicit",
+        "is_lossless",
+        "metadata_locked",
+        "artwork_locked",
+        "filename_locked",
+    }
 
 
 def run_process_wishlist(session: Session, _payload: dict) -> dict:

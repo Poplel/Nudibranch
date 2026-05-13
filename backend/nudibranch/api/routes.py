@@ -1,4 +1,5 @@
 import secrets
+import json
 
 from fastapi import APIRouter, Depends, HTTPException
 import httpx
@@ -11,6 +12,7 @@ from nudibranch.api.schemas import (
     DeviceRegistration,
     ImportAcousticLookupRequest,
     ImportScanRequest,
+    LibraryMetadataProposalRequest,
     LibraryTreeAlbum,
     LibraryTreeArtist,
     LibraryTreeTrack,
@@ -36,8 +38,11 @@ from nudibranch.db.models import (
     Notification,
     Permission,
     ProposalBatch,
+    ProposalItem,
+    ProposalKind,
     ProposalStatus,
     Task,
+    Track,
     User,
     WishlistItem,
 )
@@ -98,18 +103,74 @@ def library_tree(
                             id=track.id,
                             title=track.title,
                             track_number=track.track_number,
+                            disc_number=track.disc_number,
+                            duration_ms=track.duration_ms,
                             format=track.format,
+                            bitrate=track.bitrate,
                             is_lossless=track.is_lossless,
                             path=track.path,
+                            musicbrainz_recording_id=track.musicbrainz_recording_id,
+                            explicit=track.explicit,
+                            metadata_locked=track.metadata_locked,
+                            artwork_locked=track.artwork_locked,
+                            filename_locked=track.filename_locked,
                         )
                         for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999))
                     ],
+                    release_title=album.release_title,
+                    musicbrainz_release_id=album.musicbrainz_release_id,
+                    musicbrainz_release_group_id=album.musicbrainz_release_group_id,
                 )
                 for album in sorted(artist.albums, key=lambda album: album.title.lower())
             ],
+            sort_name=artist.sort_name,
+            musicbrainz_id=artist.musicbrainz_id,
         )
         for artist in artists
     ]
+
+
+@router.post("/library/metadata", response_model=ProposalBatchOut, tags=["library"])
+def propose_library_metadata(
+    payload: LibraryMetadataProposalRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> ProposalBatchOut:
+    changes = {key: value for key, value in payload.changes.items() if key in editable_fields(payload.target_type)}
+    if not changes:
+        raise HTTPException(status_code=400, detail="No editable metadata fields were supplied")
+
+    target = metadata_target(session, payload.target_type, payload.target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Library item not found")
+
+    old_values = {key: getattr(target, key, None) for key in changes}
+    batch = ProposalBatch(
+        title=f"Update {payload.target_type} metadata",
+        kind=ProposalKind.metadata,
+        tree_path="/library",
+    )
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=metadata_target_title(payload.target_type, target),
+            kind=ProposalKind.metadata,
+            old_value=json.dumps(old_values),
+            new_value=json.dumps(changes),
+            payload_json=json.dumps(
+                {
+                    "target_type": payload.target_type,
+                    "target_id": payload.target_id,
+                    "changes": changes,
+                }
+            ),
+        )
+    )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
 
 
 @router.post("/imports/scan", tags=["imports"])
@@ -298,6 +359,48 @@ def register_device(
     session.add(device)
     session.commit()
     return {"device_id": device.id, "enabled": device.enabled}
+
+
+def editable_fields(target_type: str) -> set[str]:
+    if target_type == "artist":
+        return {"name", "sort_name", "musicbrainz_id"}
+    if target_type == "album":
+        return {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"}
+    if target_type == "track":
+        return {
+            "title",
+            "track_number",
+            "disc_number",
+            "duration_ms",
+            "format",
+            "bitrate",
+            "path",
+            "musicbrainz_recording_id",
+            "explicit",
+            "is_lossless",
+            "metadata_locked",
+            "artwork_locked",
+            "filename_locked",
+        }
+    return set()
+
+
+def metadata_target(session: Session, target_type: str, target_id: str):
+    if target_type == "artist":
+        return session.get(Artist, target_id)
+    if target_type == "album":
+        return session.get(Album, target_id)
+    if target_type == "track":
+        return session.get(Track, target_id)
+    return None
+
+
+def metadata_target_title(target_type: str, target) -> str:
+    if target_type == "artist":
+        return f"Artist: {target.name}"
+    if target_type == "album":
+        return f"Album: {target.title}"
+    return f"Track: {target.title}"
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:
