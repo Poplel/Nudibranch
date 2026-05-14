@@ -1,6 +1,7 @@
 import asyncio
 import json
 import shutil
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,10 +91,56 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                 ),
             )
         )
+    for request in payload.get("download_requests") or []:
+        artist = request.get("artist") or "Unknown Artist"
+        album = request.get("album") or "Unknown Album"
+        title = request.get("track") or request.get("title") or "Unknown Track"
+        artist_item = artist_items.get(artist)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+        album_key = (artist, album)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist, "album": album}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_item.id,
+                title=title,
+                kind=ProposalKind.download,
+                old_value="missing import slot",
+                payload_json=json.dumps(
+                    {
+                        "action": "wishlist_request",
+                        "kind": "track",
+                        "artist": artist,
+                        "album": album,
+                        "track": title,
+                    }
+                ),
+            )
+        )
     create_notification(
         session,
         title="Import review ready",
-        body=f"{len(files)} files were added to the task queue.",
+        body=f"{len(files)} files and {len(payload.get('download_requests') or [])} downloads were added to the task queue.",
         event_type="approval_needed",
         target_url="/task-queue",
     )
@@ -140,7 +187,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         if item.kind == ProposalKind.download and json.loads(item.payload_json or "{}").get("action")
     ]
 
-    if batch.kind == ProposalKind.import_files and not executable_items:
+    if batch.kind == ProposalKind.import_files and not executable_items and not download_items:
         errors.append("No approved import file operations were selected.")
 
     for item in executable_items:
@@ -245,11 +292,13 @@ def import_track_item(session: Session, item: ProposalItem) -> None:
     if payload.get("size_bytes") and stat.st_size != payload["size_bytes"]:
         raise ValueError("source file size changed after review")
 
+    create_record_only = payload.get("action") == "create_library_record"
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    if target_path.exists():
+    if target_path.exists() and not create_record_only:
         raise FileExistsError(f"{target_path} already exists")
 
-    shutil.move(str(source_path), str(target_path))
+    if not create_record_only:
+        shutil.move(str(source_path), str(target_path))
 
     artist_name = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
     album_title = metadata.get("album") or "Unknown Album"
@@ -315,12 +364,27 @@ def apply_metadata_item(session: Session, item: ProposalItem) -> None:
 def apply_playlist_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     action = payload.get("action")
-    if action != "set_position":
+    if action == "set_position":
+        entry = session.get(PlaylistTrack, payload.get("playlist_track_id"))
+        if not entry:
+            raise ValueError("Playlist entry no longer exists")
+        entry.position = int(payload.get("position"))
+    elif action == "rename_playlist":
+        playlist = session.get(Playlist, payload.get("playlist_id"))
+        if not playlist:
+            raise ValueError("Playlist no longer exists")
+        if playlist.protected:
+            raise ValueError("Favorites cannot be renamed")
+        playlist.name = str(payload.get("name") or "").strip()
+    elif action == "delete_playlist":
+        playlist = session.get(Playlist, payload.get("playlist_id"))
+        if not playlist:
+            raise ValueError("Playlist no longer exists")
+        if playlist.protected:
+            raise ValueError("Favorites cannot be deleted")
+        session.delete(playlist)
+    else:
         raise ValueError("Unsupported playlist action")
-    entry = session.get(PlaylistTrack, payload.get("playlist_track_id"))
-    if not entry:
-        raise ValueError("Playlist entry no longer exists")
-    entry.position = int(payload.get("position"))
     enqueue_task(session, "sync_favorites_jellyfin", {})
 
 
@@ -334,6 +398,9 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
         settings = integration_settings(session)
         queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), payload.get("candidate") or {})
         return
+    if action == "queue_ytdlp_download":
+        queue_ytdlp_download(session, payload.get("request") or {})
+        return
     raise ValueError("Unsupported download action")
 
 
@@ -342,13 +409,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     settings = integration_settings(session)
     candidates = search_slskd(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), query)
     if not candidates:
-        create_notification(
-            session,
-            title="No download candidates",
-            body=query,
-            event_type="download_empty",
-            target_url="/downloads",
-        )
+        create_ytdlp_fallback_batch(session, request, query)
         return
 
     batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, tree_path="/downloads")
@@ -378,6 +439,57 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
         event_type="approval_needed",
         target_url="/downloads",
     )
+
+
+def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> None:
+    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, tree_path="/downloads")
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=f"YouTube fallback: {query}",
+            kind=ProposalKind.download,
+            old_value=query,
+            new_value="yt-dlp",
+            payload_json=json.dumps(
+                {
+                    "action": "queue_ytdlp_download",
+                    "request": request,
+                }
+            ),
+        )
+    )
+    create_notification(
+        session,
+        title="Download fallback ready",
+        body=query,
+        event_type="approval_needed",
+        target_url="/downloads",
+    )
+
+
+def queue_ytdlp_download(session: Session, request: dict) -> None:
+    settings = get_settings()
+    integration = integration_settings(session)
+    query = download_query(request)
+    if not query:
+        raise ValueError("Download query is empty")
+    settings.downloads_path.mkdir(parents=True, exist_ok=True)
+    command = [
+        "yt-dlp",
+        f"ytsearch1:{query}",
+        "--no-playlist",
+        "--paths",
+        str(settings.downloads_path),
+        "--extract-audio",
+        "--audio-format",
+        "mp3",
+    ]
+    cookies_path = integration.get("youtube_cookies_path") or ""
+    if cookies_path and Path(cookies_path).exists():
+        command.extend(["--cookies", cookies_path])
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
 
 
 def download_query(request: dict) -> str:
@@ -442,8 +554,16 @@ def editable_track_fields() -> set[str]:
 def apply_file_action_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     source_path = Path(item.old_value or "")
-    target_path = unique_destination(Path(item.new_value or ""))
     track = session.get(Track, payload.get("track_id"))
+    if payload.get("action") == "remove_record":
+        if not track:
+            raise ValueError("Track record no longer exists")
+        album = track.album
+        session.delete(track)
+        session.flush()
+        cleanup_empty_album_artist(session, album)
+        return
+    target_path = unique_destination(Path(item.new_value or ""))
     if not source_path.exists():
         raise FileNotFoundError(f"{source_path} no longer exists")
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,14 +698,33 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
 def run_check_files(session: Session, _payload: dict) -> dict:
     settings = get_settings()
     audio_suffixes = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac"}
-    db_paths = {str(path) for path in session.scalars(select(Track.path).where(Track.path.is_not(None)))}
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    tracks_by_path = {str(track.path): track for track in tracks if track.path}
+    db_paths = set(tracks_by_path)
     disk_paths = {
         str(path)
         for path in settings.library_path.rglob("*")
         if path.is_file() and path.suffix.lower() in audio_suffixes
     }
-    missing_files = sorted(path for path in db_paths if not Path(path).exists())
-    missing_records = sorted(path for path in disk_paths if path not in db_paths)
+    missing_file_paths = sorted(path for path in db_paths if not Path(path).exists())
+    missing_record_paths = sorted(path for path in disk_paths if path not in db_paths)
+    missing_files = [
+        {
+            "track_id": tracks_by_path[path].id,
+            "path": path,
+            "title": tracks_by_path[path].title,
+            "artist": tracks_by_path[path].album.artist.name,
+            "album": tracks_by_path[path].album.title,
+        }
+        for path in missing_file_paths
+    ]
+    missing_records = [{"path": path, "name": Path(path).name} for path in missing_record_paths]
     create_notification(
         session,
         title="File check complete",
@@ -658,6 +797,36 @@ def run_backup_now(session: Session, _payload: dict) -> dict:
     return {"backup_path": str(backup_path)}
 
 
+def run_restore_default(session: Session, _payload: dict) -> dict:
+    backup = run_backup_now(session, {})
+    for model in (ProposalItem, ProposalBatch, PlaylistTrack, Playlist, WishlistItem, Track, Album, Artist):
+        for item in list(session.scalars(select(model))):
+            session.delete(item)
+    session.commit()
+    create_notification(session, title="Restore complete", body="Library data was restored to default.", event_type="tool_completed", target_url="/tools")
+    return {"reset": True, "pre_restore_backup": backup.get("backup_path")}
+
+
+def run_restore_backup(session: Session, payload: dict) -> dict:
+    settings = get_settings()
+    backup_path = Path(payload.get("backup_path", "")).resolve()
+    backup_root = settings.backups_path.resolve()
+    if backup_root not in [backup_path, *backup_path.parents] or not backup_path.exists():
+        raise ValueError("Backup must be inside the backups folder")
+    pre_restore = run_backup_now(session, {})
+    session.commit()
+    shutil.copy2(backup_path, settings.db_path)
+    for suffix in ("-wal", "-shm"):
+        source = Path(f"{backup_path}{suffix}")
+        target = Path(f"{settings.db_path}{suffix}")
+        if source.exists():
+            shutil.copy2(source, target)
+        elif target.exists():
+            target.unlink()
+    create_notification(session, title="Restore complete", body=backup_path.name, event_type="tool_completed", target_url="/tools")
+    return {"restored_from": str(backup_path), "pre_restore_backup": pre_restore.get("backup_path")}
+
+
 def first_admin_id(session: Session) -> str:
     admin_id = session.scalar(select(User.id).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
     if not admin_id:
@@ -697,6 +866,8 @@ TASK_HANDLERS = {
     "check_files": run_check_files,
     "check_missing_tracks": run_check_missing_tracks,
     "backup_now": run_backup_now,
+    "restore_default": run_restore_default,
+    "restore_backup": run_restore_backup,
 }
 
 

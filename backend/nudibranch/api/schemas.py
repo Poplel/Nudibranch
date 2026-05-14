@@ -176,6 +176,8 @@ class IntegrationSettings(BaseModel):
     jellyfin_api_key: str = ""
     slskd_url: str = ""
     slskd_api_key: str = ""
+    youtube_cookies_browser: str = ""
+    youtube_cookies_path: str = ""
 
 
 class PlaylistTrackOut(BaseModel):
@@ -205,6 +207,10 @@ class PlaylistCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
 
 
+class PlaylistUpdate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
 class PlaylistAddTracks(BaseModel):
     track_ids: list[str] = Field(min_length=1)
 
@@ -212,6 +218,7 @@ class PlaylistAddTracks(BaseModel):
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None
+    download_requests: list[dict[str, Any]] | None = None
 
 
 class ImportAcousticLookupRequest(BaseModel):
@@ -234,3 +241,13 @@ class LibraryRemoveProposalRequest(BaseModel):
     target_type: str = Field(pattern="^(artist|album|track)$")
     target_id: str
     action: str = Field(pattern="^(delete|move_to_import)$")
+
+
+class CheckFileFixRequest(BaseModel):
+    action: str = Field(pattern="^(remove_record|download_record|create_record)$")
+    path: str | None = None
+    track_id: str | None = None
+
+
+class BackupRestoreRequest(BaseModel):
+    backup_path: str

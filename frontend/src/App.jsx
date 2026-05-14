@@ -35,6 +35,7 @@ import {
   SkipForward,
   Sun,
   Trash2,
+  Upload,
   Users,
   Wrench,
   X,
@@ -105,6 +106,7 @@ function App() {
   const [permissionCatalog, setPermissionCatalog] = useState([]);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
+  const [backups, setBackups] = useState([]);
   const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
@@ -217,10 +219,11 @@ function App() {
   }, [user?.id, appearanceReady, dark, accentColor, backgroundTint]);
 
   async function api(path, options = {}) {
+    const isFormData = options.body instanceof FormData;
     const response = await fetch(`${API_BASE}${path}`, {
       ...options,
       headers: {
-        "Content-Type": "application/json",
+        ...(isFormData ? {} : { "Content-Type": "application/json" }),
         Authorization: `Bearer ${token}`,
         ...(options.headers || {}),
       },
@@ -269,7 +272,7 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData] = await Promise.all([
+      const [permissionData, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
         api("/permissions"),
         hasPermission(me, "library:read") ? api("/library/tree") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
@@ -278,6 +281,7 @@ function App() {
         hasPermission(me, "wishlist:manage_own") ? api("/wishlist/approvals") : Promise.resolve([]),
         hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
         hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
+        hasPermission(me, "backups:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
       ]);
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
@@ -288,6 +292,7 @@ function App() {
       setWishlistApprovals(wishlistApprovalData);
       setApprovals(approvalData);
       setPlaylists(playlistData);
+      setBackups(backupData.backups || []);
       setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
@@ -680,13 +685,13 @@ function App() {
     }
   }
 
-  async function proposeImport() {
+  async function proposeImport(downloadRequests = []) {
     setLoading(true);
     setError("");
     try {
       const task = await api("/imports/propose", {
         method: "POST",
-        body: JSON.stringify({ path: null, files: importFiles }),
+        body: JSON.stringify({ path: null, files: importFiles, download_requests: downloadRequests }),
       });
       setTasks((current) => upsertTask(current, task));
       setToast({ title: "Import review queued", body: "A review item was added to the task queue." });
@@ -889,6 +894,43 @@ function App() {
     }
   }
 
+  async function proposePlaylistRename(playlistId, name) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api(`/playlists/${playlistId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name }),
+      });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "Playlist change queued", body: "The rename was added to the task queue." });
+      return batch;
+    } catch (playlistError) {
+      setError(playlistError.message);
+      notify("Playlist queue failed", playlistError.message, "ui_error");
+      throw playlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function proposePlaylistDelete(playlistId) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api(`/playlists/${playlistId}`, { method: "DELETE" });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "Playlist change queued", body: "The delete request was added to the task queue." });
+      return batch;
+    } catch (playlistError) {
+      setError(playlistError.message);
+      notify("Playlist queue failed", playlistError.message, "ui_error");
+      throw playlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function syncPlaylists() {
     setLoading(true);
     setError("");
@@ -906,17 +948,66 @@ function App() {
     }
   }
 
-  async function runTool(action) {
+  async function runTool(action, payload = null) {
     setLoading(true);
     setError("");
     try {
-      const task = await api(`/tools/${action}`, { method: "POST" });
+      const task = await api(`/tools/${action}`, {
+        method: "POST",
+        ...(payload ? { body: JSON.stringify(payload) } : {}),
+      });
       setTasks((current) => upsertTask(current, task));
       setToast({ title: "Tool queued", body: task.type });
+      if (action === "backup") {
+        window.setTimeout(() => api("/tools/backups").then((data) => setBackups(data.backups || [])).catch(() => {}), 2500);
+      }
       return task;
     } catch (toolError) {
       notify("Tool failed", toolError.message, "ui_error");
       throw toolError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function proposeCheckFileFix(fix) {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api("/tools/check-files/fix", {
+        method: "POST",
+        body: JSON.stringify(fix),
+      });
+      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
+      setToast({ title: "File fix queued", body: "The fix was added to the task queue." });
+      return batch;
+    } catch (fixError) {
+      setError(fixError.message);
+      notify("File fix failed", fixError.message, "ui_error");
+      throw fixError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function uploadYoutubeCookies(browser, file) {
+    if (!file) return null;
+    setLoading(true);
+    setError("");
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      const saved = await api(`/settings/youtube-cookies?browser=${encodeURIComponent(browser || "")}`, {
+        method: "POST",
+        body,
+      });
+      setIntegrationSettings(saved);
+      setToast({ title: "Cookies uploaded", body: file.name });
+      return saved;
+    } catch (uploadError) {
+      setError(uploadError.message);
+      notify("Cookie upload failed", uploadError.message, "ui_error");
+      throw uploadError;
     } finally {
       setLoading(false);
     }
@@ -1135,9 +1226,19 @@ function App() {
                 apiKey={token}
                 integrationSettings={integrationSettings}
                 onSaveIntegrations={saveIntegrationSettings}
+                onUploadYoutubeCookies={uploadYoutubeCookies}
               />
             )}
-            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} user={user} onRun={runTool} />}
+            {page === "Tools" && (
+              <ToolsView
+                tasks={tasks}
+                notifications={notifications}
+                user={user}
+                backups={backups}
+                onRun={runTool}
+                onFixCheckFile={proposeCheckFileFix}
+              />
+            )}
             {page === "Wishlist" && (
               <WishlistView
                 wishlist={wishlist}
@@ -1156,6 +1257,8 @@ function App() {
                 onCreatePlaylist={createPlaylist}
                 onAddToPlaylist={addTracksToPlaylist}
                 onQueuePosition={proposePlaylistPosition}
+                onQueueRename={proposePlaylistRename}
+                onQueueDelete={proposePlaylistDelete}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
                 onSync={syncPlaylists}
@@ -1683,6 +1786,7 @@ function ImportWizard({
   const [manualAlbums, setManualAlbums] = useState([]);
   const [albumRecords, setAlbumRecords] = useState({});
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
+  const [downloadRequests, setDownloadRequests] = useState([]);
 
   function addManualAlbum(album) {
     setManualAlbums((current) => [...current, album]);
@@ -1731,7 +1835,7 @@ function ImportWizard({
           <Plus size={16} />
           Add album
         </button>
-        <button className="secondary" onClick={onPropose} disabled={loading || activeImportTask || files.length === 0}>
+        <button className="secondary" onClick={() => onPropose(downloadRequests)} disabled={loading || activeImportTask || (files.length === 0 && downloadRequests.length === 0)}>
           {activeImportTask ? "Import review running" : "Add to task queue"}
         </button>
       </div>
@@ -1750,6 +1854,7 @@ function ImportWizard({
           onCheckAlbum={checkAlbum}
           onRemoveManualAlbum={removeManualAlbum}
           onRemoveManualArtist={removeManualArtist}
+          onDownloadRequestsChange={setDownloadRequests}
         />
       )}
     </div>
@@ -1939,10 +2044,12 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onPlay, onQueue, onSync }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onQueueRename, onQueueDelete, onPlay, onQueue, onSync }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
   const [addOpen, setAddOpen] = useState(null);
+  const [editOpen, setEditOpen] = useState(null);
   const [playlistName, setPlaylistName] = useState("");
+  const [playlistDraftName, setPlaylistDraftName] = useState("");
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [draftPositions, setDraftPositions] = useState({});
 
@@ -2016,7 +2123,26 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
               <button className="row-icon-button" onClick={() => setAddOpen(addOpen === playlist.id ? null : playlist.id)} title="Add music">
                 <Plus size={14} />
               </button>
+              <button
+                className="row-icon-button"
+                onClick={() => {
+                  setEditOpen(editOpen === playlist.id ? null : playlist.id);
+                  setPlaylistDraftName(playlist.name);
+                }}
+                title="Edit playlist"
+              >
+                <Pencil size={14} />
+              </button>
             </div>
+            {editOpen === playlist.id && (
+              <PlaylistEditPanel
+                playlist={playlist}
+                draftName={playlistDraftName}
+                setDraftName={setPlaylistDraftName}
+                onRename={() => onQueueRename(playlist.id, playlistDraftName.trim()).then(() => setEditOpen(null))}
+                onDelete={() => onQueueDelete(playlist.id).then(() => setEditOpen(null))}
+              />
+            )}
             {addOpen === playlist.id && (
               <PlaylistAddPanel
                 library={library}
@@ -2069,6 +2195,30 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
   );
 }
 
+function PlaylistEditPanel({ playlist, draftName, setDraftName, onRename, onDelete }) {
+  const protectedPlaylist = playlist.protected || playlist.name === "Favorites";
+  return (
+    <div className="album-search-panel playlist-edit-panel">
+      <label>
+        Name
+        <input value={draftName} onChange={(event) => setDraftName(event.target.value)} disabled={protectedPlaylist} />
+      </label>
+      <div className="playlist-edit-actions">
+        <button className="primary compact" onClick={onRename} disabled={protectedPlaylist || !draftName.trim() || draftName.trim() === playlist.name}>
+          <ListChecks size={15} />
+          Rename
+        </button>
+        {!protectedPlaylist && (
+          <button className="secondary compact danger" onClick={onDelete}>
+            <Trash2 size={15} />
+            Delete
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function PlaylistAddPanel({ library, search, setSearch, onAdd }) {
   const results = useMemo(() => searchLibraryTargets(library, search), [library, search]);
   return (
@@ -2115,6 +2265,7 @@ function ImportTree({
   onCheckAlbum,
   onRemoveManualAlbum,
   onRemoveManualArtist,
+  onDownloadRequestsChange,
 }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2131,6 +2282,26 @@ function ImportTree({
     setOpenArtists(new Set(grouped.map((artist) => artist.name)));
     setOpenAlbums(new Set(grouped.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
   }, [files.length, manualAlbums.length]);
+
+  useEffect(() => {
+    const requests = [];
+    grouped.forEach((artist) => {
+      artist.albums.forEach((album) => {
+        album.slots.forEach((slot) => {
+          if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+          requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number });
+        });
+      });
+    });
+    Object.entries(extraGhosts).forEach(([albumId, slots]) => {
+      const [artistName, albumName] = albumId.split("/");
+      slots.forEach((slot) => {
+        if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+        requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number });
+      });
+    });
+    onDownloadRequestsChange?.(requests);
+  }, [grouped, downloadSelections, dismissedGhosts, extraGhosts, onDownloadRequestsChange]);
 
   return (
     <div className="tree">
@@ -2170,6 +2341,12 @@ function ImportTree({
                   title={artist.name}
                   meta={`${artist.count} files`}
                   onToggle={() => toggleSet(setOpenArtists, artist.name)}
+                />
+                <DownloadBranchToggle
+                  checked={artistGhostSlots(artist, dismissedGhosts).every((slot) => downloadSelections.has(slot.id))}
+                  disabled={artistGhostSlots(artist, dismissedGhosts).length === 0}
+                  onChange={(checked) => setDownloadSelectionForSlots(setDownloadSelections, artistGhostSlots(artist, dismissedGhosts), checked)}
+                  title="Select downloads for this artist"
                 />
                 <button
                   className="row-icon-button"
@@ -2220,6 +2397,12 @@ function ImportTree({
                         meta={`${album.files.length}/${album.slots.length} matched · ${album.matchStatus}`}
                         warning={album.matchStatus === "partial"}
                         onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                      />
+                      <DownloadBranchToggle
+                        checked={visibleSlots.filter((slot) => !slot.file).length > 0 && visibleSlots.filter((slot) => !slot.file).every((slot) => downloadSelections.has(slot.id))}
+                        disabled={visibleSlots.filter((slot) => !slot.file).length === 0}
+                        onChange={(checked) => setDownloadSelectionForSlots(setDownloadSelections, visibleSlots.filter((slot) => !slot.file), checked)}
+                        title="Select downloads for this album"
                       />
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
                         <Search size={15} />
@@ -2834,6 +3017,29 @@ function GhostTrackRow({ slot, checked, onChecked, onDismiss, onDrop }) {
   );
 }
 
+function DownloadBranchToggle({ checked, disabled, onChange, title }) {
+  return (
+    <label className="download-branch-toggle" title={title}>
+      <input type="checkbox" checked={checked && !disabled} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+    </label>
+  );
+}
+
+function setDownloadSelectionForSlots(setter, slots, checked) {
+  setter((current) => {
+    const next = new Set(current);
+    slots.forEach((slot) => {
+      if (checked) next.add(slot.id);
+      else next.delete(slot.id);
+    });
+    return next;
+  });
+}
+
+function artistGhostSlots(artist, dismissedGhosts) {
+  return artist.albums.flatMap((album) => album.slots.filter((slot) => !slot.file && !dismissedGhosts.has(slot.id)));
+}
+
 function TasksView({ tasks }) {
   const [openTasks, setOpenTasks] = useState(() => new Set());
   if (tasks.length === 0) {
@@ -2858,8 +3064,9 @@ function TasksView({ tasks }) {
   );
 }
 
-function ToolsView({ tasks, notifications, user, onRun }) {
+function ToolsView({ tasks, notifications, user, backups, onRun, onFixCheckFile }) {
   const [query, setQuery] = useState("");
+  const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
     ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks", "downloads:manage"],
@@ -2868,6 +3075,7 @@ function ToolsView({ tasks, notifications, user, onRun }) {
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
+  const latestCheckFiles = latestTaskResult(tasks, "check_files");
 
   return (
     <div className="tools-view">
@@ -2884,6 +3092,32 @@ function ToolsView({ tasks, notifications, user, onRun }) {
           ))}
         </div>
       )}
+      {hasPermission(user, "backups:manage") && (
+        <section className="restore-panel">
+          <h2>Restore</h2>
+          <div className="restore-actions">
+            <button className="secondary compact danger" onClick={() => onRun("restore-default")}>
+              <RefreshCw size={15} />
+              Restore to default
+            </button>
+            <select value={restoreBackupPath} onChange={(event) => setRestoreBackupPath(event.target.value)}>
+              <option value="">Choose backup</option>
+              {(backups || []).map((backup) => (
+                <option key={backup.path} value={backup.path}>
+                  {backup.name}
+                </option>
+              ))}
+            </select>
+            <button className="secondary compact" onClick={() => onRun("restore-backup", { backup_path: restoreBackupPath })} disabled={!restoreBackupPath}>
+              <RefreshCw size={15} />
+              Restore backup
+            </button>
+          </div>
+        </section>
+      )}
+      {hasPermission(user, "library:manage") && latestCheckFiles && (
+        <CheckFilesResult result={latestCheckFiles.result} onFix={onFixCheckFile} />
+      )}
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
           <div className="log-header">
@@ -2898,6 +3132,61 @@ function ToolsView({ tasks, notifications, user, onRun }) {
         </section>
       )}
     </div>
+  );
+}
+
+function CheckFilesResult({ result, onFix }) {
+  const missingFiles = result?.missing_files || [];
+  const missingRecords = result?.missing_records || [];
+  if (missingFiles.length === 0 && missingRecords.length === 0) {
+    return (
+      <section className="check-files-panel">
+        <h2>File Check</h2>
+        <p>No mismatches found.</p>
+      </section>
+    );
+  }
+  return (
+    <section className="check-files-panel">
+      <h2>File Check</h2>
+      <div className="check-files-grid">
+        <div>
+          <h3>Records With No Files</h3>
+          {missingFiles.map((record) => (
+            <div className="check-file-row" key={record.track_id || record.path}>
+              <span>
+                <strong>{record.title}</strong>
+                <small>{record.artist} / {record.album}</small>
+                <small>{record.path}</small>
+              </span>
+              <button className="secondary compact" onClick={() => onFix({ action: "remove_record", track_id: record.track_id })}>
+                <Trash2 size={15} />
+                Remove record
+              </button>
+              <button className="secondary compact" onClick={() => onFix({ action: "download_record", track_id: record.track_id })}>
+                <Download size={15} />
+                Download
+              </button>
+            </div>
+          ))}
+        </div>
+        <div>
+          <h3>Files With No Records</h3>
+          {missingRecords.map((file) => (
+            <div className="check-file-row" key={file.path}>
+              <span>
+                <strong>{file.name}</strong>
+                <small>{file.path}</small>
+              </span>
+              <button className="secondary compact" onClick={() => onFix({ action: "create_record", path: file.path })}>
+                <Plus size={15} />
+                Create record
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -3075,6 +3364,7 @@ function SettingsPanel({
   apiKey,
   integrationSettings,
   onSaveIntegrations,
+  onUploadYoutubeCookies,
 }) {
   const [showApiKey, setShowApiKey] = useState(false);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
@@ -3146,14 +3436,31 @@ function SettingsPanel({
             ["jellyfin_api_key", "Jellyfin API key"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
+            ["youtube_cookies_browser", "YouTube cookies browser"],
+            ["youtube_cookies_path", "YouTube cookies file"],
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
-              <input
-                type={key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
-                value={integrationDraft[key] || ""}
-                onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
-              />
+              {key === "youtube_cookies_browser" ? (
+                <select
+                  value={integrationDraft[key] || ""}
+                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+                >
+                  <option value="">Browser</option>
+                  {["Chrome", "Firefox", "Safari", "Edge", "Brave", "Other"].map((browser) => (
+                    <option key={browser} value={browser.toLowerCase()}>
+                      {browser}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input
+                  readOnly={key === "youtube_cookies_path"}
+                  type={key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
+                  value={integrationDraft[key] || ""}
+                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+                />
+              )}
               {key.endsWith("api_key") && (
                 <button className="secondary compact" type="button" onClick={() => setShownIntegrationKeys((current) => ({ ...current, [key]: !current[key] }))}>
                   {shownIntegrationKeys[key] ? "Hide" : "Show"}
@@ -3161,6 +3468,20 @@ function SettingsPanel({
               )}
             </label>
           ))}
+          <label className="setting-row integration-row">
+            <span>Upload cookies</span>
+            <input
+              type="file"
+              accept=".txt,text/plain"
+              onChange={(event) => {
+                const file = event.target.files?.[0];
+                if (!file) return;
+                onUploadYoutubeCookies?.(integrationDraft.youtube_cookies_browser || "", file);
+                event.target.value = "";
+              }}
+            />
+            <Upload size={16} />
+          </label>
           <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
             Save integrations
           </button>
@@ -3910,8 +4231,15 @@ function formatMetadataValue(value) {
 function taskSummary(task) {
   if (task.error) return task.error;
   if (task.result?.errors?.length) return task.result.errors.join("; ");
+  if (task.type === "check_files" && task.result) {
+    return `${task.result.missing_files?.length || 0} records missing files, ${task.result.missing_records?.length || 0} files missing records`;
+  }
   if (task.result?.imported !== undefined) return `${task.result.imported} imported, ${task.result.skipped || 0} skipped`;
   return new Date(task.created_at).toLocaleString();
+}
+
+function latestTaskResult(tasks, type) {
+  return tasks.find((task) => task.type === type && task.status === "completed" && task.result) || null;
 }
 
 function buildLiveLog(tasks, notifications) {

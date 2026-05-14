@@ -3,7 +3,7 @@ import json
 import re
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import func, select
@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session, selectinload
 from nudibranch.api.deps import get_current_user, require_permission
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
+    BackupRestoreRequest,
+    CheckFileFixRequest,
     DeviceRegistration,
     FavoritesOut,
     ImportAcousticLookupRequest,
@@ -29,6 +31,7 @@ from nudibranch.api.schemas import (
     PlaylistCreate,
     PlaylistPositionProposalRequest,
     PlaylistTrackOut,
+    PlaylistUpdate,
     PermissionOut,
     ProposalBatchOut,
     ProposalApproveRequest,
@@ -66,7 +69,7 @@ from nudibranch.db.models import (
 )
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
-from nudibranch.services.imports import discover_import_files
+from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
@@ -640,6 +643,72 @@ def create_playlist(
     return serialize_favorites(session, playlist)
 
 
+@router.patch("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"])
+def propose_playlist_rename(
+    playlist_id: str,
+    payload: PlaylistUpdate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> ProposalBatchOut:
+    playlist = session.get(Playlist, playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist.protected:
+        raise HTTPException(status_code=400, detail="Favorites cannot be renamed")
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Playlist name is required")
+    if name == playlist.name:
+        raise HTTPException(status_code=400, detail="Playlist name is already set")
+    existing = session.scalar(select(Playlist).where(Playlist.name == name, Playlist.id != playlist.id))
+    if existing:
+        raise HTTPException(status_code=400, detail="A playlist with that name already exists")
+    batch = ProposalBatch(title=f"Rename playlist {playlist.name}", kind=ProposalKind.playlist, tree_path=f"/playlists/{playlist.name}")
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=playlist.name,
+            kind=ProposalKind.playlist,
+            old_value=playlist.name,
+            new_value=name,
+            payload_json=json.dumps({"action": "rename_playlist", "playlist_id": playlist.id, "name": name}),
+        )
+    )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
+@router.delete("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"])
+def propose_playlist_delete(
+    playlist_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> ProposalBatchOut:
+    playlist = session.get(Playlist, playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    if playlist.protected:
+        raise HTTPException(status_code=400, detail="Favorites cannot be deleted")
+    batch = ProposalBatch(title=f"Delete playlist {playlist.name}", kind=ProposalKind.playlist, tree_path=f"/playlists/{playlist.name}")
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=playlist.name,
+            kind=ProposalKind.playlist,
+            old_value=playlist.name,
+            payload_json=json.dumps({"action": "delete_playlist", "playlist_id": playlist.id}),
+        )
+    )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
 @router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"])
 def add_playlist_tracks(
     playlist_id: str,
@@ -844,6 +913,89 @@ def tool_check_files(
     return serialize_task(enqueue_task(session, "check_files", {}))
 
 
+@router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"])
+def propose_check_file_fix(
+    payload: CheckFileFixRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> ProposalBatchOut:
+    if payload.action in {"remove_record", "download_record"}:
+        if not payload.track_id:
+            raise HTTPException(status_code=400, detail="track_id is required")
+        track = session.scalar(
+            select(Track)
+            .where(Track.id == payload.track_id)
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+        if not track:
+            raise HTTPException(status_code=404, detail="Track record not found")
+        if payload.action == "download_record":
+            batch = ProposalBatch(title=f"Download missing file for {track.title}", kind=ProposalKind.download, tree_path="/library")
+            session.add(batch)
+            session.flush()
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    title=track.title,
+                    kind=ProposalKind.download,
+                    payload_json=json.dumps(
+                        {
+                            "action": "wishlist_request",
+                            "kind": "track",
+                            "artist": track.album.artist.name,
+                            "album": track.album.title,
+                            "track": track.title,
+                        }
+                    ),
+                )
+            )
+        else:
+            batch = ProposalBatch(title=f"Remove missing record for {track.title}", kind=ProposalKind.delete, tree_path="/library")
+            session.add(batch)
+            session.flush()
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    title=track.title,
+                    kind=ProposalKind.delete,
+                    old_value=track.path,
+                    payload_json=json.dumps({"action": "remove_record", "track_id": track.id}),
+                )
+            )
+    else:
+        if not payload.path:
+            raise HTTPException(status_code=400, detail="path is required")
+        settings = get_settings()
+        file_path = Path(payload.path).resolve()
+        library_root = settings.library_path.resolve()
+        if library_root not in [file_path, *file_path.parents] or not file_path.exists() or not file_path.is_file():
+            raise HTTPException(status_code=400, detail="File must be inside the library folder")
+        metadata = read_audio_metadata(file_path)
+        batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files, tree_path="/library")
+        session.add(batch)
+        session.flush()
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=metadata.get("title") or file_path.stem,
+                kind=ProposalKind.import_files,
+                old_value=str(file_path),
+                new_value=str(file_path),
+                payload_json=json.dumps(
+                    {
+                        "action": "create_library_record",
+                        "path": str(file_path),
+                        "metadata": metadata,
+                        "size_bytes": file_path.stat().st_size,
+                    }
+                ),
+            )
+        )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
 @router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"])
 def tool_check_missing_tracks(
     session: Session = Depends(get_session),
@@ -858,6 +1010,56 @@ def tool_backup(
     _: User = Depends(require_permission(Permission.backups_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "backup_now", {}))
+
+
+@router.get("/tools/backups", tags=["tools"])
+def list_backups(
+    _: User = Depends(require_permission(Permission.backups_manage)),
+) -> dict:
+    settings = get_settings()
+    settings.backups_path.mkdir(parents=True, exist_ok=True)
+    backups = sorted(settings.backups_path.glob("nudibranch-*.sqlite"), key=lambda path: path.stat().st_mtime, reverse=True)
+    return {"backups": [{"path": str(path), "name": path.name, "size_bytes": path.stat().st_size} for path in backups]}
+
+
+@router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"])
+def tool_restore_default(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.backups_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "restore_default", {}))
+
+
+@router.post("/tools/restore-backup", response_model=TaskOut, tags=["tools"])
+def tool_restore_backup(
+    payload: BackupRestoreRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.backups_manage)),
+) -> TaskOut:
+    settings = get_settings()
+    backup_path = Path(payload.backup_path).resolve()
+    backup_root = settings.backups_path.resolve()
+    if backup_root not in [backup_path, *backup_path.parents] or not backup_path.exists():
+        raise HTTPException(status_code=400, detail="Backup must be inside the backups folder")
+    return serialize_task(enqueue_task(session, "restore_backup", {"backup_path": str(backup_path)}))
+
+
+@router.post("/settings/youtube-cookies", response_model=IntegrationSettings, tags=["settings"])
+async def upload_youtube_cookies(
+    browser: str = Query(""),
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> IntegrationSettings:
+    settings = get_settings()
+    settings.config_path.mkdir(parents=True, exist_ok=True)
+    destination = settings.config_path / "youtube-cookies.txt"
+    content = await file.read()
+    destination.write_bytes(content)
+    values = integration_settings(session)
+    values["youtube_cookies_browser"] = browser.strip()
+    values["youtube_cookies_path"] = str(destination)
+    return IntegrationSettings(**update_integration_settings(session, values))
 
 
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"])

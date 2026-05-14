@@ -10,6 +10,8 @@ INTEGRATION_KEYS = {
     "jellyfin_api_key",
     "slskd_url",
     "slskd_api_key",
+    "youtube_cookies_browser",
+    "youtube_cookies_path",
 }
 
 
@@ -21,6 +23,8 @@ def integration_settings(session: Session) -> dict[str, str]:
         "jellyfin_api_key": settings.jellyfin_api_key,
         "slskd_url": settings.slskd_url,
         "slskd_api_key": settings.slskd_api_key,
+        "youtube_cookies_browser": "",
+        "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value
