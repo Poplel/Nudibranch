@@ -4700,8 +4700,23 @@ function taskSummary(task) {
   if (task.type === "check_lyrics" && task.result) {
     return `${task.result.missing || 0} missing lyrics, ${task.result.existing || 0} already present`;
   }
-  if (task.result?.imported !== undefined) return `${task.result.imported} imported, ${task.result.skipped || 0} skipped`;
+  if (task.type === "execute_proposal_batch" && task.result) {
+    return proposalTaskSummary(task.result);
+  }
+  if (task.result?.imported !== undefined) return `${task.result.imported} imported${task.result.skipped ? `, ${task.result.skipped} skipped` : ""}`;
   return new Date(task.created_at).toLocaleString();
+}
+
+function proposalTaskSummary(result) {
+  const parts = [];
+  if (result.imported) parts.push(`${result.imported} imported`);
+  if (result.metadata_updated) parts.push(`${result.metadata_updated} metadata`);
+  if (result.file_actions) parts.push(`${result.file_actions} files`);
+  if (result.playlist_changes) parts.push(`${result.playlist_changes} playlists`);
+  if (result.download_changes) parts.push(`${result.download_changes} downloads`);
+  if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
+  if (result.skipped) parts.push(`${result.skipped} skipped`);
+  return parts.length ? parts.join(", ") : "No changes applied";
 }
 
 function latestTaskResult(tasks, type) {

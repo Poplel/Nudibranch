@@ -280,7 +280,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
-        elif not item.selected and item.status == ProposalStatus.pending:
+        elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
             skipped += 1
 
     if errors:
@@ -312,10 +312,30 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
 
 
 def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, download_changes: int, lyric_changes: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {download_changes} downloads handled. {lyric_changes} lyrics downloaded. {skipped} items skipped."
+    parts = [
+        f"{imported} tracks imported",
+        f"{metadata_updated} metadata changes applied",
+        f"{file_actions} files handled",
+        f"{playlist_changes} playlist changes applied",
+        f"{download_changes} downloads handled",
+        f"{lyric_changes} lyrics downloaded",
+    ]
+    if skipped:
+        parts.append(f"{skipped} items skipped")
+    body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
     return body
+
+
+def should_count_skipped_item(item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if item.kind == ProposalKind.download and action in {"queue_download", "queue_ytdlp_download"}:
+        return False
+    if item.kind == ProposalKind.download and not action:
+        return False
+    return True
 
 
 def import_track_item(session: Session, item: ProposalItem) -> None:
@@ -771,7 +791,21 @@ def queue_ytdlp_download(session: Session, request: dict) -> None:
     cookies_path = integration.get("youtube_cookies_path") or ""
     if cookies_path and Path(cookies_path).exists():
         command.extend(["--cookies", cookies_path])
-    subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        if not details:
+            details = f"exit code {error.returncode}"
+        raise RuntimeError(f"yt-dlp failed for {query}: {details[-1200:]}") from error
+    create_notification(
+        session,
+        title="YouTube fallback queued",
+        body=f"{query}: {result.stdout[-600:].strip() if result.stdout else 'download command completed'}",
+        event_type="download_queued",
+        target_url="/downloads",
+        deliver_apns=False,
+    )
 
 
 def fetch_lrclib_lyrics(track: Track) -> str | None:
@@ -1390,7 +1424,14 @@ async def worker_loop() -> None:
                 session.refresh(task)
                 if task.status == TaskStatus.canceled:
                     continue
-                complete_task(session, task, result)
+                if result.get("errors"):
+                    task.status = TaskStatus.failed
+                    task.result_json = json.dumps(result)
+                    task.error = result["errors"][0]
+                    task.lease_until = None
+                    session.commit()
+                else:
+                    complete_task(session, task, result)
             except Exception as error:  # noqa: BLE001 - worker must persist task failures.
                 create_notification(
                     session,
