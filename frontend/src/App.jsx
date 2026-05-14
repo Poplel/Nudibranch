@@ -4044,7 +4044,15 @@ function groupImportFiles(files, library = [], manualAlbums = [], albumRecords =
     }
     const artist = artistMap.get(album.artist);
     if (!artist.albumMap.has(album.name)) {
-      artist.albumMap.set(album.name, { name: album.name, files: [], expectedTracks: album.tracks, manual: true });
+      artist.albumMap.set(album.name, {
+        name: album.name,
+        files: [],
+        expectedTracks: album.tracks,
+        cover_art_url: album.cover_art_url,
+        manual: true,
+      });
+    } else if (album.cover_art_url) {
+      artist.albumMap.get(album.name).cover_art_url = album.cover_art_url;
     }
   });
 
@@ -4083,6 +4091,7 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
   const matchStatus = libraryAlbum ? (matchedCount >= expectedTracks.length ? "full" : "partial") : "new";
   return {
     ...album,
+    cover_art_url: album.cover_art_url || libraryAlbum?.cover_path,
     files,
     slots,
     matchStatus,
