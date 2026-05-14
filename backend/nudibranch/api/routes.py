@@ -572,6 +572,7 @@ def propose_wishlist_items(
                 payload_json=json.dumps(
                     {
                         "user_id": wishlist_item.user_id,
+                        "action": "wishlist_request",
                         "wishlist_item_id": wishlist_item.id,
                         "kind": wishlist_item.kind,
                         "artist": wishlist_item.artist,

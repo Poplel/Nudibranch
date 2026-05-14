@@ -9,11 +9,12 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track
+from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track, WishlistItem
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.settings_store import integration_settings
+from nudibranch.services.slskd import queue_slskd_download, search_slskd
 from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
 
 
@@ -130,6 +131,11 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.playlist and json.loads(item.payload_json or "{}").get("action")
     ]
+    download_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.download and json.loads(item.payload_json or "{}").get("action")
+    ]
 
     if batch.kind == ProposalKind.import_files and not executable_items:
         errors.append("No approved import file operations were selected.")
@@ -173,6 +179,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
 
+    download_changes = 0
+    for item in download_items:
+        try:
+            apply_download_item(session, item)
+            item.status = ProposalStatus.completed
+            download_changes += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
@@ -190,7 +206,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, skipped, errors),
+        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, download_changes, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
@@ -200,13 +216,14 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         "metadata_updated": metadata_updated,
         "file_actions": file_actions,
         "playlist_changes": playlist_changes,
+        "download_changes": download_changes,
         "skipped": skipped,
         "errors": errors,
     }
 
 
-def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {skipped} items skipped."
+def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, download_changes: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {download_changes} downloads handled. {skipped} items skipped."
     if errors:
         return f"{body} First failure: {errors[0]}"
     return body
@@ -302,6 +319,66 @@ def apply_playlist_item(session: Session, item: ProposalItem) -> None:
         raise ValueError("Playlist entry no longer exists")
     entry.position = int(payload.get("position"))
     enqueue_task(session, "sync_favorites_jellyfin", {})
+
+
+def apply_download_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if action == "wishlist_request":
+        create_download_candidate_batch(session, payload)
+        return
+    if action == "queue_download":
+        settings = integration_settings(session)
+        queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), payload.get("candidate") or {})
+        return
+    raise ValueError("Unsupported download action")
+
+
+def create_download_candidate_batch(session: Session, request: dict) -> None:
+    query = download_query(request)
+    settings = integration_settings(session)
+    candidates = search_slskd(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), query)
+    if not candidates:
+        create_notification(
+            session,
+            title="No download candidates",
+            body=query,
+            event_type="download_empty",
+            target_url="/downloads",
+        )
+        return
+
+    batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, tree_path="/downloads")
+    session.add(batch)
+    session.flush()
+    for candidate in candidates:
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=candidate.get("filename") or query,
+                kind=ProposalKind.download,
+                old_value=query,
+                new_value=candidate.get("username"),
+                payload_json=json.dumps(
+                    {
+                        "action": "queue_download",
+                        "request": request,
+                        "candidate": candidate,
+                    }
+                ),
+            )
+        )
+    create_notification(
+        session,
+        title="Download candidates ready",
+        body=f"{len(candidates)} candidates found for {query}.",
+        event_type="approval_needed",
+        target_url="/downloads",
+    )
+
+
+def download_query(request: dict) -> str:
+    return " ".join(str(part) for part in [request.get("artist"), request.get("album"), request.get("track")] if part).strip()
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
@@ -400,14 +477,47 @@ def cleanup_empty_album_artist(session: Session, album: Album | None) -> None:
 
 
 def run_process_wishlist(session: Session, _payload: dict) -> dict:
+    items = list(session.scalars(select(WishlistItem).where(WishlistItem.status == "wanted").order_by(WishlistItem.artist, WishlistItem.album, WishlistItem.track)))
+    if not items:
+        return {"items": 0, "batch_id": None}
+
+    batch = ProposalBatch(title="Wishlist download review", kind=ProposalKind.download, tree_path="/wishlist")
+    session.add(batch)
+    session.flush()
+    for wishlist_item in items:
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=download_query(
+                    {
+                        "artist": wishlist_item.artist,
+                        "album": wishlist_item.album,
+                        "track": wishlist_item.track,
+                    }
+                ),
+                kind=ProposalKind.download,
+                payload_json=json.dumps(
+                    {
+                        "action": "wishlist_request",
+                        "user_id": wishlist_item.user_id,
+                        "wishlist_item_id": wishlist_item.id,
+                        "kind": wishlist_item.kind,
+                        "artist": wishlist_item.artist,
+                        "album": wishlist_item.album,
+                        "track": wishlist_item.track,
+                    }
+                ),
+            )
+        )
+        wishlist_item.status = "review"
     create_notification(
         session,
         title="Wishlist search finished",
-        body="Download candidates are ready to review.",
+        body=f"{len(items)} wishlist items are ready for approval.",
         event_type="approval_needed",
         target_url="/task-queue",
     )
-    return {"status": "stubbed", "message": "slskd ranking pipeline placeholder created"}
+    return {"items": len(items), "batch_id": batch.id}
 
 
 def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:

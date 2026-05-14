@@ -1056,6 +1056,14 @@ function App() {
                 onReject={rejectItems}
               />
             )}
+            {page === "Downloads" && (
+              <DownloadsView
+                approvals={approvals}
+                onSelection={setApprovalSelection}
+                onApprove={approveItems}
+                onReject={rejectItems}
+              />
+            )}
             {page === "Import/Add" && (
               <ImportWizard
                 files={importFiles}
@@ -1120,7 +1128,7 @@ function App() {
                 onUpdatePin={updateUserPin}
               />
             )}
-            {!["Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
+            {!["Library", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
@@ -1476,6 +1484,20 @@ function Approvals({ approvals, onSelection, onApprove, onReject }) {
     <div className="approval-tree">
       {groups.map((group) => (
         <ApprovalBatch key={group.id} batch={group} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
+      ))}
+    </div>
+  );
+}
+
+function DownloadsView({ approvals, onSelection, onApprove, onReject }) {
+  const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
+  if (downloadBatches.length === 0) {
+    return <EmptyState title="No download candidates" body="Approved wishlist requests will add download candidates here." />;
+  }
+  return (
+    <div className="approval-tree">
+      {downloadBatches.map((batch) => (
+        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
   );
