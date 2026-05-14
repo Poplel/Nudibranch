@@ -21,6 +21,7 @@ class Base(DeclarativeBase):
 class Permission(str, enum.Enum):
     library_read = "library:read"
     library_write = "library:write"
+    library_manage = "library:manage"
     import_run = "import:run"
     approvals_manage = "approvals:manage"
     wishlist_manage_own = "wishlist:manage_own"
@@ -28,6 +29,7 @@ class Permission(str, enum.Enum):
     downloads_manage = "downloads:manage"
     metadata_edit = "metadata:edit"
     playlists_manage = "playlists:manage"
+    activity_read = "activity:read"
     notifications_read = "notifications:read"
     settings_manage = "settings:manage"
     users_manage = "users:manage"

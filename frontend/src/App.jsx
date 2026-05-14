@@ -139,6 +139,7 @@ function App() {
         : `${queueSelectionCount} of ${queueItemCount} visible changes selected across ${queueGroupCount} group${queueGroupCount === 1 ? "" : "s"}.`,
     [queueGroupCount, queueItemCount, queueSelectionCount],
   );
+  const visibleNavItems = useMemo(() => navItems.filter(([label]) => canViewPage(user, label)), [user]);
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
   const unreadNotifications = useMemo(() => notifications.filter((notification) => notification.status === "unread"), [notifications]);
   const activeSeverity = useMemo(
@@ -170,15 +171,22 @@ function App() {
     if (!token) return;
     refreshAll();
     const interval = window.setInterval(() => {
-      refreshLibrary();
-      refreshTasks();
-      refreshApprovals();
-      refreshNotifications();
-      refreshPlaylists();
-      refreshWishlistApprovals();
+      if (hasPermission(user, "library:read")) refreshLibrary();
+      if (hasPermission(user, "activity:read")) refreshTasks();
+      if (hasPermission(user, "approvals:manage")) refreshApprovals();
+      if (hasPermission(user, "notifications:read")) refreshNotifications();
+      if (hasPermission(user, "playlists:manage")) refreshPlaylists();
+      if (hasPermission(user, "wishlist:manage_own")) refreshWishlistApprovals();
     }, 10000);
     return () => window.clearInterval(interval);
-  }, [token]);
+  }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || [])]);
+
+  useEffect(() => {
+    if (!user || visibleNavItems.length === 0) return;
+    if (!canViewPage(user, page)) {
+      setPage(visibleNavItems[0][0]);
+    }
+  }, [user, page, visibleNavItems]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -259,34 +267,34 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const [me, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData] = await Promise.all([
-        api("/me"),
-        api("/library/tree"),
-        api("/tasks"),
-        api("/notifications"),
-        api("/wishlist"),
-        api("/wishlist/approvals"),
-      ]);
+      const me = await api("/me");
       setUser(me);
+      const [permissionData, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData] = await Promise.all([
+        api("/permissions"),
+        hasPermission(me, "library:read") ? api("/library/tree") : Promise.resolve([]),
+        hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
+        hasPermission(me, "notifications:read") ? api("/notifications") : Promise.resolve([]),
+        hasPermission(me, "wishlist:manage_own") ? api("/wishlist") : Promise.resolve([]),
+        hasPermission(me, "wishlist:manage_own") ? api("/wishlist/approvals") : Promise.resolve([]),
+        hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
+        hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
+      ]);
+      setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
       setTasks(taskData);
-      taskData.forEach((task) => {
-        if (task.type === "sync_favorites_jellyfin" && task.status === "completed") {
-          syncToastTaskIds.current.add(task.id);
-        }
-      });
+      showCompletedSyncToasts(taskData);
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
       setWishlistApprovals(wishlistApprovalData);
-      refreshApprovals();
+      setApprovals(approvalData);
+      setPlaylists(playlistData);
+      setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
       if (canManageUsers(me)) {
         refreshUsers();
-        refreshPermissions();
       }
-      refreshPlaylists();
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
         setError("");
@@ -426,6 +434,26 @@ function App() {
         method: "POST",
         body: JSON.stringify({ pin }),
       });
+      setUsers((current) => upsertUser(current, updated));
+      setToast({ title: "PIN updated", body: updated.display_name });
+      return updated;
+    } catch (userError) {
+      notify("PIN update failed", userError.message, "ui_error");
+      throw userError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateOwnPin(pin) {
+    setLoading(true);
+    setError("");
+    try {
+      const updated = await api("/me/pin", {
+        method: "POST",
+        body: JSON.stringify({ pin }),
+      });
+      setUser(updated);
       setUsers((current) => upsertUser(current, updated));
       setToast({ title: "PIN updated", body: updated.display_name });
       return updated;
@@ -1010,17 +1038,13 @@ function App() {
           </div>
         </div>
         <nav>
-          {navItems.map(([label, Icon]) => (
+          {visibleNavItems.map(([label, Icon]) => (
             <button className={page === label ? "active" : ""} key={label} onClick={() => setPage(label)}>
               <Icon size={17} />
               {label === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : label}
             </button>
           ))}
         </nav>
-        <button className="theme-toggle" onClick={() => setDark((value) => !value)} title="Toggle theme">
-          {dark ? <Sun size={17} /> : <Moon size={17} />}
-          {dark ? "Light" : "Dark"}
-        </button>
       </aside>
 
       <section className="workspace">
@@ -1032,14 +1056,16 @@ function App() {
           <button className="icon-button" onClick={refreshAll} title="Refresh">
             <RefreshCw size={18} />
           </button>
-          <div className="notification-anchor" ref={trayRef}>
-            <button className="icon-button" onClick={openNotificationTray} title="Notifications">
-              <Bell size={18} />
-              {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
-              {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
-            </button>
-            {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
-          </div>
+          {hasPermission(user, "notifications:read") && (
+            <div className="notification-anchor" ref={trayRef}>
+              <button className="icon-button" onClick={openNotificationTray} title="Notifications">
+                <Bell size={18} />
+                {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
+                {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
+              </button>
+              {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
+            </div>
+          )}
           <button className="icon-button" onClick={logout} title="Sign out">
             <LogOut size={18} />
           </button>
@@ -1060,6 +1086,7 @@ function App() {
                 onQueueRemove={proposeLibraryRemove}
                 playlists={playlists}
                 onAddToPlaylist={addTracksToPlaylist}
+                user={user}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
               />
@@ -1110,7 +1137,7 @@ function App() {
                 onSaveIntegrations={saveIntegrationSettings}
               />
             )}
-            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} onRun={runTool} />}
+            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} user={user} onRun={runTool} />}
             {page === "Wishlist" && (
               <WishlistView
                 wishlist={wishlist}
@@ -1139,9 +1166,11 @@ function App() {
                 users={users}
                 permissions={permissionCatalog}
                 currentUser={user}
+                canManage={canManageUsers(user)}
                 onCreate={createUserAccount}
                 onUpdate={updateUserAccount}
                 onUpdatePin={updateUserPin}
+                onUpdateOwnPin={updateOwnPin}
               />
             )}
             {!["Library", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
@@ -1255,7 +1284,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1272,6 +1301,9 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
         .filter((artist) => artist.albums.length > 0),
     [artists],
   );
+  const canEditMetadata = hasPermission(user, "metadata:edit");
+  const canRemoveLibrary = hasPermission(user, "library:write");
+  const canUsePlaylists = hasPermission(user, "playlists:manage");
   return (
     <div className="library-view">
       {visibleArtists.length === 0 && (
@@ -1304,11 +1336,13 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
               <QuickLibraryActions
                 onPlay={() => onPlay(artistTracks(artist))}
                 onQueue={() => onQueue(artistTracks(artist))}
-                onRemove={() => setRemoveTarget(removeKey("artist", artist.id))}
+                onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("artist", artist.id)) : null}
               />
-              <button className="row-icon-button" onClick={() => toggleSet(setOpenArtistDetails, artist.id)} title="Edit artist">
-                <Pencil size={15} />
-              </button>
+              {canEditMetadata && (
+                <button className="row-icon-button" onClick={() => toggleSet(setOpenArtistDetails, artist.id)} title="Edit artist">
+                  <Pencil size={15} />
+                </button>
+              )}
             </div>
             {removeTarget === removeKey("artist", artist.id) && (
               <RemoveChoice
@@ -1326,7 +1360,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                 targetId={artist.id}
                 title={artist.name}
                 fields={artistFields(artist)}
-                playlists={playlists}
+                playlists={canUsePlaylists ? playlists : []}
                 targetTrackIds={artistTracks(artist).map((track) => track.id)}
                 onAddToPlaylist={onAddToPlaylist}
                 onQueue={onQueueMetadata}
@@ -1349,9 +1383,11 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                       onPlay={() => onPlay(albumTracks(artist, album))}
                       onQueue={() => onQueue(albumTracks(artist, album))}
                     />
-                    <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
-                      <Pencil size={15} />
-                    </button>
+                    {(canEditMetadata || canRemoveLibrary || canUsePlaylists) && (
+                      <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
+                        <Pencil size={15} />
+                      </button>
+                    )}
                   </div>
                   {albumChecks[album.id] && (
                     <div className="album-acoustic-results">
@@ -1387,11 +1423,11 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                       details={{ artist: artist.name, tracks: album.tracks.length }}
                       onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
                       onSearchAlbums={onSearchAlbums}
-                      playlists={playlists}
+                      playlists={canUsePlaylists ? playlists : []}
                       targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
                       onAddToPlaylist={onAddToPlaylist}
-                      onAcousticCheck={() => onCheckAlbumAcoustID(album)}
-                      onRemove={() => setRemoveTarget(removeKey("album", album.id))}
+                      onAcousticCheck={canEditMetadata ? () => onCheckAlbumAcoustID(album) : null}
+                      onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("album", album.id)) : null}
                       onQueue={onQueueMetadata}
                       onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
                     />
@@ -1410,11 +1446,13 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                           <QuickLibraryActions
                             onPlay={() => onPlay([hydrateTrack(track, artist, album)])}
                             onQueue={() => onQueue([hydrateTrack(track, artist, album)])}
-                            onRemove={() => setRemoveTarget(removeKey("track", track.id))}
+                            onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("track", track.id)) : null}
                           />
-                          <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
-                            <Pencil size={15} />
-                          </button>
+                          {(canEditMetadata || canUsePlaylists) && (
+                            <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
+                              <Pencil size={15} />
+                            </button>
+                          )}
                         </div>
                         {removeTarget === removeKey("track", track.id) && (
                           <RemoveChoice
@@ -1435,7 +1473,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                             details={{ artist: artist.name, album: album.title }}
                             onAutoLookup={(field, draft) => trackAutoLookup(field, draft, artist.name, album.title, onCheckAlbum)}
                             onSearchAlbums={onSearchAlbums}
-                            playlists={playlists}
+                            playlists={canUsePlaylists ? playlists : []}
                             targetTrackIds={[track.id]}
                             onAddToPlaylist={onAddToPlaylist}
                             onQueue={onQueueMetadata}
@@ -2724,6 +2762,29 @@ function canManageUsers(user) {
   return Boolean(user?.is_admin || user?.permissions?.includes("users:manage"));
 }
 
+function hasPermission(user, permission) {
+  return Boolean(user?.is_admin || user?.permissions?.includes(permission));
+}
+
+function canViewPage(user, page) {
+  if (!user) return page === "Settings";
+  if (page === "Library") return hasPermission(user, "library:read");
+  if (page === "Import/Add") return hasPermission(user, "import:run");
+  if (page === "Wishlist") return hasPermission(user, "wishlist:manage_own");
+  if (page === "Task Queue") return hasPermission(user, "approvals:manage");
+  if (page === "Downloads") return hasPermission(user, "downloads:manage") && hasPermission(user, "approvals:manage");
+  if (page === "Playlists") return hasPermission(user, "playlists:manage");
+  if (page === "Activity") return hasPermission(user, "activity:read");
+  if (page === "Tools") {
+    return ["jellyfin:manage", "downloads:manage", "library:manage", "backups:manage", "activity:read"].some((permission) =>
+      hasPermission(user, permission),
+    );
+  }
+  if (page === "Users") return true;
+  if (page === "Settings") return true;
+  return false;
+}
+
 function copyStylesToWindow(targetWindow) {
   for (const sheet of document.styleSheets) {
     try {
@@ -2797,48 +2858,53 @@ function TasksView({ tasks }) {
   );
 }
 
-function ToolsView({ tasks, notifications, onRun }) {
+function ToolsView({ tasks, notifications, user, onRun }) {
   const [query, setQuery] = useState("");
   const tools = [
-    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan"],
-    ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks"],
-    ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files"],
-    ["Backup now", "Create a manual SQLite backup.", "backup"],
-  ];
+    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
+    ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks", "downloads:manage"],
+    ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
+    ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
+  ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
 
   return (
     <div className="tools-view">
-      <div className="tool-grid">
-        {tools.map(([title, body, action]) => (
-          <button className="tool-card" key={title} onClick={() => onRun(action)}>
-            <Wrench size={18} />
-            <span>
-              <strong>{title}</strong>
-              <small>{body}</small>
-            </span>
-          </button>
-        ))}
-      </div>
-      <section className="log-panel">
-        <div className="log-header">
-          <h2>Live Log</h2>
-          <input placeholder="Search log" value={query} onChange={(event) => setQuery(event.target.value)} />
-        </div>
-        <div className="log-list">
-          {logs.map((entry) => (
-            <pre className={entry.level === "error" ? "log-row error" : "log-row"} key={entry.id}>{entry.text}</pre>
+      {tools.length > 0 && (
+        <div className="tool-grid">
+          {tools.map(([title, body, action]) => (
+            <button className="tool-card" key={title} onClick={() => onRun(action)}>
+              <Wrench size={18} />
+              <span>
+                <strong>{title}</strong>
+                <small>{body}</small>
+              </span>
+            </button>
           ))}
         </div>
-      </section>
+      )}
+      {hasPermission(user, "activity:read") && (
+        <section className="log-panel">
+          <div className="log-header">
+            <h2>Live Log</h2>
+            <input placeholder="Search log" value={query} onChange={(event) => setQuery(event.target.value)} />
+          </div>
+          <div className="log-list">
+            {logs.map((entry) => (
+              <pre className={entry.level === "error" ? "log-row error" : "log-row"} key={entry.id}>{entry.text}</pre>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
 
-function UsersView({ users, permissions, currentUser, onCreate, onUpdate, onUpdatePin }) {
+function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
   const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
+  const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
 
   function toggleNewPermission(value) {
     setNewUser((current) => ({
@@ -2856,41 +2922,44 @@ function UsersView({ users, permissions, currentUser, onCreate, onUpdate, onUpda
 
   return (
     <div className="users-view">
-      <form className="user-create-panel" onSubmit={submitNewUser}>
-        <h2>Create user</h2>
-        <label>
-          Name
-          <input value={newUser.display_name} onChange={(event) => setNewUser((current) => ({ ...current, display_name: event.target.value }))} />
-        </label>
-        <label>
-          PIN
-          <input type="password" value={newUser.pin} onChange={(event) => setNewUser((current) => ({ ...current, pin: event.target.value }))} />
-        </label>
-        <label className="inline-check">
-          <input type="checkbox" checked={newUser.is_admin} onChange={(event) => setNewUser((current) => ({ ...current, is_admin: event.target.checked }))} />
-          Admin
-        </label>
-        {!newUser.is_admin && (
-          <PermissionGrid
-            groups={permissionGroups}
-            selected={newUser.permissions}
-            onToggle={toggleNewPermission}
-          />
-        )}
-        <button className="primary compact-button" disabled={!newUser.display_name.trim() || newUser.pin.length < 4}>
-          <Plus size={15} />
-          Create user
-        </button>
-      </form>
+      {canManage && (
+        <form className="user-create-panel" onSubmit={submitNewUser}>
+          <h2>Create user</h2>
+          <label>
+            Name
+            <input value={newUser.display_name} onChange={(event) => setNewUser((current) => ({ ...current, display_name: event.target.value }))} />
+          </label>
+          <label>
+            PIN
+            <input type="password" value={newUser.pin} onChange={(event) => setNewUser((current) => ({ ...current, pin: event.target.value }))} />
+          </label>
+          <label className="inline-check">
+            <input type="checkbox" checked={newUser.is_admin} onChange={(event) => setNewUser((current) => ({ ...current, is_admin: event.target.checked }))} />
+            Admin
+          </label>
+          {!newUser.is_admin && (
+            <PermissionGrid
+              groups={permissionGroups}
+              selected={newUser.permissions}
+              onToggle={toggleNewPermission}
+            />
+          )}
+          <button className="primary compact-button" disabled={!newUser.display_name.trim() || newUser.pin.length < 4}>
+            <Plus size={15} />
+            Create user
+          </button>
+        </form>
+      )}
       <div className="user-list">
-        {users.map((managedUser) => (
+        {visibleUsers.map((managedUser) => (
           <UserCard
             key={managedUser.id}
             user={managedUser}
             currentUser={currentUser}
             permissionGroups={permissionGroups}
+            canManage={canManage}
             onUpdate={onUpdate}
-            onUpdatePin={onUpdatePin}
+            onUpdatePin={canManage ? onUpdatePin : (_userId, pin) => onUpdateOwnPin(pin)}
           />
         ))}
       </div>
@@ -2898,7 +2967,7 @@ function UsersView({ users, permissions, currentUser, onCreate, onUpdate, onUpda
   );
 }
 
-function UserCard({ user, currentUser, permissionGroups, onUpdate, onUpdatePin }) {
+function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onUpdatePin }) {
   const [draft, setDraft] = useState(() => ({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] }));
   const [pin, setPin] = useState("");
   const changed =
@@ -2923,30 +2992,34 @@ function UserCard({ user, currentUser, permissionGroups, onUpdate, onUpdatePin }
       <div className="user-card-header">
         <label>
           Name
-          <input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} />
+          <input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} disabled={!canManage} />
         </label>
-        <label className="inline-check">
-          <input
-            type="checkbox"
-            checked={draft.is_admin}
-            onChange={(event) => setDraft((current) => ({ ...current, is_admin: event.target.checked }))}
-            disabled={user.id === currentUser?.id && user.is_admin}
-          />
-          Admin
-        </label>
-        <button
-          className="primary compact-button"
-          disabled={!changed || !draft.display_name.trim()}
-          onClick={() => onUpdate(user.id, draft)}
-        >
-          Save
-        </button>
+        {canManage && (
+          <label className="inline-check">
+            <input
+              type="checkbox"
+              checked={draft.is_admin}
+              onChange={(event) => setDraft((current) => ({ ...current, is_admin: event.target.checked }))}
+              disabled={user.id === currentUser?.id && user.is_admin}
+            />
+            Admin
+          </label>
+        )}
+        {canManage && (
+          <button
+            className="primary compact-button"
+            disabled={!changed || !draft.display_name.trim()}
+            onClick={() => onUpdate(user.id, draft)}
+          >
+            Save
+          </button>
+        )}
       </div>
       {!draft.is_admin && (
         <PermissionGrid
           groups={permissionGroups}
           selected={draft.permissions}
-          onToggle={togglePermission}
+          onToggle={canManage ? togglePermission : null}
         />
       )}
       {draft.is_admin && <p className="user-note">Admin users have every permission.</p>}
@@ -2971,7 +3044,7 @@ function PermissionGrid({ groups, selected, onToggle }) {
           <legend>{section}</legend>
           {permissions.map((permission) => (
             <label className="inline-check" key={permission.value}>
-              <input type="checkbox" checked={selected.includes(permission.value)} onChange={() => onToggle(permission.value)} />
+              <input type="checkbox" checked={selected.includes(permission.value)} disabled={!onToggle} onChange={() => onToggle?.(permission.value)} />
               {permission.label}
             </label>
           ))}

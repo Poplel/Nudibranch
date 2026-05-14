@@ -78,6 +78,7 @@ router = APIRouter(prefix="/api/v1")
 PERMISSION_SECTIONS = {
     Permission.library_read: "Library",
     Permission.library_write: "Library",
+    Permission.library_manage: "Library",
     Permission.metadata_edit: "Metadata",
     Permission.import_run: "Import",
     Permission.approvals_manage: "Task Queue",
@@ -85,6 +86,7 @@ PERMISSION_SECTIONS = {
     Permission.wishlist_manage_all: "Wishlist",
     Permission.downloads_manage: "Downloads",
     Permission.playlists_manage: "Playlists",
+    Permission.activity_read: "Activity",
     Permission.notifications_read: "Notifications",
     Permission.settings_manage: "Settings",
     Permission.users_manage: "Users",
@@ -112,7 +114,7 @@ def me(user: User = Depends(get_current_user)) -> UserOut:
 
 
 @router.get("/permissions", response_model=list[PermissionOut], tags=["users"])
-def permission_catalog(_: User = Depends(require_permission(Permission.users_manage))) -> list[PermissionOut]:
+def permission_catalog(_: User = Depends(get_current_user)) -> list[PermissionOut]:
     return [
         PermissionOut(value=permission.value, label=permission_label(permission), section=PERMISSION_SECTIONS.get(permission, "System"))
         for permission in Permission
@@ -178,6 +180,17 @@ def update_user_pin(
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    user.pin_hash = hash_secret(payload.pin)
+    session.commit()
+    return serialize_user(load_user(session, user.id))
+
+
+@router.post("/me/pin", response_model=UserOut, tags=["users"])
+def update_own_pin(
+    payload: UserPinUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> UserOut:
     user.pin_hash = hash_secret(payload.pin)
     session.commit()
     return serialize_user(load_user(session, user.id))
@@ -826,7 +839,7 @@ def tool_jellyfin_scan(
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"])
 def tool_check_files(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_files", {}))
 
@@ -906,7 +919,7 @@ def reject(
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"])
 def list_tasks(
     session: Session = Depends(get_session),
-    _: User = Depends(get_current_user),
+    _: User = Depends(require_permission(Permission.activity_read)),
 ) -> list[TaskOut]:
     tasks = list(session.scalars(select(Task).order_by(Task.created_at.desc()).limit(100)))
     return [serialize_task(task) for task in tasks]
