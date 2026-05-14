@@ -101,7 +101,6 @@ function App() {
   const [wishlist, setWishlist] = useState([]);
   const [wishlistApprovals, setWishlistApprovals] = useState([]);
   const [playlists, setPlaylists] = useState([]);
-  const [favoritesPlaylist, setFavoritesPlaylist] = useState(null);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
   const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
@@ -173,7 +172,7 @@ function App() {
       refreshTasks();
       refreshApprovals();
       refreshNotifications();
-      refreshFavorites();
+      refreshPlaylists();
       refreshWishlistApprovals();
     }, 10000);
     return () => window.clearInterval(interval);
@@ -281,7 +280,7 @@ function App() {
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
-      refreshFavorites();
+      refreshPlaylists();
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
         setError("");
@@ -311,7 +310,7 @@ function App() {
       if (syncToastTaskIds.current.has(task.id)) return;
       syncToastTaskIds.current.add(task.id);
       setToast({
-        title: "Favorites synced",
+        title: "Playlists synced",
         body: `${task.result?.synced || 0} tracks were sent to Jellyfin.`,
       });
     });
@@ -377,15 +376,13 @@ function App() {
     }
   }
 
-  async function refreshFavorites() {
+  async function refreshPlaylists() {
     try {
       const playlistData = await api("/playlists");
       setPlaylists(playlistData);
-      const favorites = playlistData.find((playlist) => playlist.name === "Favorites") || (await api("/playlists/favorites"));
-      setFavoritesPlaylist(favorites);
-      setFavoriteTrackIds(new Set(favorites.track_ids || []));
+      setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
     } catch {
-      // Favorites are optional for users without playlist permissions.
+      // Playlists are optional for users without playlist permissions.
     }
   }
 
@@ -398,6 +395,9 @@ function App() {
         body: JSON.stringify({ name }),
       });
       setPlaylists((current) => upsertPlaylist(current, playlist));
+      if (playlist.name === "Favorites") {
+        setFavoriteTrackIds(new Set(playlist.track_ids || []));
+      }
       setToast({ title: "Playlist created", body: playlist.name });
       return playlist;
     } catch (playlistError) {
@@ -419,7 +419,6 @@ function App() {
       });
       setPlaylists((current) => upsertPlaylist(current, playlist));
       if (playlist.name === "Favorites") {
-        setFavoritesPlaylist(playlist);
         setFavoriteTrackIds(new Set(playlist.track_ids || []));
       }
       setToast({ title: "Playlist updated", body: `${trackIds.length} item${trackIds.length === 1 ? "" : "s"} added to ${playlist.name}.` });
@@ -436,12 +435,21 @@ function App() {
     if (!track?.id) return;
     const wasFavorite = favoriteTrackIds.has(track.id);
     try {
-      const favorites = await api(`/playlists/favorites/tracks/${track.id}`, {
-        method: wasFavorite ? "DELETE" : "POST",
-      });
-      setFavoritesPlaylist(favorites);
-      setPlaylists((current) => upsertPlaylist(current, favorites));
-      setFavoriteTrackIds(new Set(favorites.track_ids || []));
+      let favorites = favoritePlaylistFrom(playlists);
+      if (!favorites) {
+        const playlistData = await api("/playlists");
+        setPlaylists(playlistData);
+        favorites = favoritePlaylistFrom(playlistData);
+      }
+      if (!favorites) throw new Error("Favorites playlist is not available");
+      const updatedFavorites = wasFavorite
+        ? await api(`/playlists/${favorites.id}/tracks/${track.id}`, { method: "DELETE" })
+        : await api(`/playlists/${favorites.id}/tracks`, {
+            method: "POST",
+            body: JSON.stringify({ track_ids: [track.id] }),
+          });
+      setPlaylists((current) => upsertPlaylist(current, updatedFavorites));
+      setFavoriteTrackIds(new Set(updatedFavorites.track_ids || []));
       setToast({
         title: wasFavorite ? "Removed from Favorites" : "Added to Favorites",
         body: track._artist ? `${track.title} by ${track._artist}` : track.title,
@@ -780,7 +788,7 @@ function App() {
     try {
       const task = await api("/playlists/sync", { method: "POST" });
       setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Playlist sync queued", body: "Favorites sync was added to activity." });
+      setToast({ title: "Playlist sync queued", body: "Playlist sync was added to activity." });
       return task;
     } catch (syncError) {
       setError(syncError.message);
@@ -1013,7 +1021,7 @@ function App() {
             )}
             {page === "Playlists" && (
               <PlaylistsView
-                playlists={playlists.length ? playlists : favoritesPlaylist ? [favoritesPlaylist] : []}
+                playlists={playlists}
                 library={library}
                 onCreatePlaylist={createPlaylist}
                 onAddToPlaylist={addTracksToPlaylist}
@@ -3467,8 +3475,12 @@ function upsertPlaylist(playlists, playlist) {
   return [...withoutPlaylist, playlist].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function favoritePlaylistFrom(playlists) {
+  return playlists.find((playlist) => playlist.name === "Favorites") || null;
+}
+
 function visibleTrayNotifications(notifications) {
-  return notifications.filter((notification) => notification.title !== "Favorites synced");
+  return notifications.filter((notification) => !["Favorites synced", "Playlists synced"].includes(notification.title));
 }
 
 function mergeTrayNotifications(serverNotifications, currentNotifications) {

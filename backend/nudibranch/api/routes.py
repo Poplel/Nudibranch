@@ -561,6 +561,30 @@ def add_playlist_tracks(
     return serialize_favorites(session, playlist)
 
 
+@router.delete("/playlists/{playlist_id}/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+def remove_playlist_track(
+    playlist_id: str,
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    playlist = session.get(Playlist, playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    items = list(
+        session.scalars(
+            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id, PlaylistTrack.track_id == track_id)
+        )
+    )
+    for item in items:
+        session.delete(item)
+    session.commit()
+    session.refresh(playlist)
+    if playlist.name == "Favorites":
+        enqueue_task(session, "sync_favorites_jellyfin", {})
+    return serialize_favorites(session, playlist)
+
+
 @router.post("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
 def add_favorite_track(
     track_id: str,
