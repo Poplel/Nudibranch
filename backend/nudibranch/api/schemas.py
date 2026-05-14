@@ -24,6 +24,29 @@ class UserOut(BaseModel):
     permissions: list[str]
 
 
+class PermissionOut(BaseModel):
+    value: str
+    label: str
+    section: str
+
+
+class UserCreate(BaseModel):
+    display_name: str = Field(min_length=1, max_length=120)
+    pin: str = Field(min_length=4, max_length=32)
+    is_admin: bool = False
+    permissions: list[str] = Field(default_factory=list)
+
+
+class UserUpdate(BaseModel):
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    is_admin: bool | None = None
+    permissions: list[str] | None = None
+
+
+class UserPinUpdate(BaseModel):
+    pin: str = Field(min_length=4, max_length=32)
+
+
 class LibraryTreeTrack(BaseModel):
     id: str
     title: str

@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.api.deps import get_current_user, require_permission
@@ -29,6 +29,7 @@ from nudibranch.api.schemas import (
     PlaylistCreate,
     PlaylistPositionProposalRequest,
     PlaylistTrackOut,
+    PermissionOut,
     ProposalBatchOut,
     ProposalApproveRequest,
     ProposalItemOut,
@@ -36,7 +37,10 @@ from nudibranch.api.schemas import (
     ProposalSelectionUpdate,
     TaskCreate,
     TaskOut,
+    UserCreate,
     UserOut,
+    UserPinUpdate,
+    UserUpdate,
     WishlistCreate,
     WishlistOut,
 )
@@ -57,6 +61,7 @@ from nudibranch.db.models import (
     Task,
     Track,
     User,
+    UserPermission,
     WishlistItem,
 )
 from nudibranch.core.config import get_settings
@@ -68,6 +73,24 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.tasks import enqueue_task, task_result, task_to_payload
 
 router = APIRouter(prefix="/api/v1")
+
+
+PERMISSION_SECTIONS = {
+    Permission.library_read: "Library",
+    Permission.library_write: "Library",
+    Permission.metadata_edit: "Metadata",
+    Permission.import_run: "Import",
+    Permission.approvals_manage: "Task Queue",
+    Permission.wishlist_manage_own: "Wishlist",
+    Permission.wishlist_manage_all: "Wishlist",
+    Permission.downloads_manage: "Downloads",
+    Permission.playlists_manage: "Playlists",
+    Permission.notifications_read: "Notifications",
+    Permission.settings_manage: "Settings",
+    Permission.users_manage: "Users",
+    Permission.backups_manage: "Tools",
+    Permission.jellyfin_manage: "Tools",
+}
 
 
 @router.post("/auth/login", response_model=LoginResponse, tags=["auth"])
@@ -85,12 +108,79 @@ def login(payload: LoginRequest, session: Session = Depends(get_session)) -> Log
 
 @router.get("/me", response_model=UserOut, tags=["users"])
 def me(user: User = Depends(get_current_user)) -> UserOut:
-    return UserOut(
-        id=user.id,
-        display_name=user.display_name,
-        is_admin=user.is_admin,
-        permissions=[permission.permission.value for permission in user.permissions],
+    return serialize_user(user)
+
+
+@router.get("/permissions", response_model=list[PermissionOut], tags=["users"])
+def permission_catalog(_: User = Depends(require_permission(Permission.users_manage))) -> list[PermissionOut]:
+    return [
+        PermissionOut(value=permission.value, label=permission_label(permission), section=PERMISSION_SECTIONS.get(permission, "System"))
+        for permission in Permission
+    ]
+
+
+@router.get("/users", response_model=list[UserOut], tags=["users"])
+def list_users(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> list[UserOut]:
+    users = list(session.scalars(select(User).options(selectinload(User.permissions)).order_by(User.created_at.asc())))
+    return [serialize_user(user) for user in users]
+
+
+@router.post("/users", response_model=UserOut, tags=["users"])
+def create_user(
+    payload: UserCreate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> UserOut:
+    user = User(
+        display_name=payload.display_name.strip(),
+        pin_hash=hash_secret(payload.pin),
+        is_admin=payload.is_admin,
     )
+    session.add(user)
+    session.flush()
+    set_user_permissions(session, user, payload.permissions)
+    session.commit()
+    return serialize_user(load_user(session, user.id))
+
+
+@router.patch("/users/{user_id}", response_model=UserOut, tags=["users"])
+def update_user(
+    user_id: str,
+    payload: UserUpdate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> UserOut:
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if payload.display_name is not None:
+        user.display_name = payload.display_name.strip()
+    if payload.is_admin is not None:
+        if user.is_admin and not payload.is_admin and count_admins(session) <= 1:
+            raise HTTPException(status_code=400, detail="At least one admin user is required")
+        user.is_admin = payload.is_admin
+    if payload.permissions is not None:
+        set_user_permissions(session, user, payload.permissions)
+    session.commit()
+    return serialize_user(load_user(session, user.id))
+
+
+@router.post("/users/{user_id}/pin", response_model=UserOut, tags=["users"])
+def update_user_pin(
+    user_id: str,
+    payload: UserPinUpdate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> UserOut:
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.pin_hash = hash_secret(payload.pin)
+    session.commit()
+    return serialize_user(load_user(session, user.id))
 
 
 @router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"])
@@ -987,6 +1077,54 @@ def lookup_error_detail(service: str, error: httpx.HTTPStatusError) -> str:
     if detail:
         return f"{service} lookup failed: {detail}"
     return f"{service} lookup failed with HTTP {response.status_code}"
+
+
+def serialize_user(user: User) -> UserOut:
+    return UserOut(
+        id=user.id,
+        display_name=user.display_name,
+        is_admin=user.is_admin,
+        permissions=effective_permission_values(user),
+    )
+
+
+def load_user(session: Session, user_id: str) -> User:
+    user = session.scalar(select(User).options(selectinload(User.permissions)).where(User.id == user_id))
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def effective_permission_values(user: User) -> list[str]:
+    if user.is_admin:
+        return [permission.value for permission in Permission]
+    return sorted({permission.permission.value for permission in user.permissions})
+
+
+def permission_label(permission: Permission) -> str:
+    return permission.value.replace(":", " ").replace("_", " ").title()
+
+
+def parse_permissions(permission_values: list[str]) -> list[Permission]:
+    permissions: list[Permission] = []
+    for value in permission_values:
+        try:
+            permissions.append(Permission(value))
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=f"Unknown permission: {value}") from error
+    return sorted(set(permissions), key=lambda permission: permission.value)
+
+
+def set_user_permissions(session: Session, user: User, permission_values: list[str]) -> None:
+    for existing in list(user.permissions):
+        session.delete(existing)
+    session.flush()
+    for permission in parse_permissions(permission_values):
+        session.add(UserPermission(user_id=user.id, permission=permission))
+
+
+def count_admins(session: Session) -> int:
+    return session.scalar(select(func.count()).select_from(User).where(User.is_admin.is_(True))) or 0
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

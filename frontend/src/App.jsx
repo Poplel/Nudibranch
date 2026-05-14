@@ -101,6 +101,8 @@ function App() {
   const [wishlist, setWishlist] = useState([]);
   const [wishlistApprovals, setWishlistApprovals] = useState([]);
   const [playlists, setPlaylists] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [permissionCatalog, setPermissionCatalog] = useState([]);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
   const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
@@ -280,6 +282,10 @@ function App() {
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
+      if (canManageUsers(me)) {
+        refreshUsers();
+        refreshPermissions();
+      }
       refreshPlaylists();
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
@@ -355,6 +361,79 @@ function App() {
       setIntegrationSettings(await api("/settings/integrations"));
     } catch {
       // Users without settings permissions do not need integration fields.
+    }
+  }
+
+  async function refreshUsers() {
+    try {
+      setUsers(await api("/users"));
+    } catch {
+      // Users without management permissions do not need this list.
+    }
+  }
+
+  async function refreshPermissions() {
+    try {
+      setPermissionCatalog(await api("/permissions"));
+    } catch {
+      // Users without management permissions do not need this catalog.
+    }
+  }
+
+  async function createUserAccount(payload) {
+    setLoading(true);
+    setError("");
+    try {
+      const created = await api("/users", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      setUsers((current) => upsertUser(current, created));
+      setToast({ title: "User created", body: created.display_name });
+      return created;
+    } catch (userError) {
+      notify("User failed", userError.message, "ui_error");
+      throw userError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateUserAccount(userId, payload) {
+    setLoading(true);
+    setError("");
+    try {
+      const updated = await api(`/users/${userId}`, {
+        method: "PATCH",
+        body: JSON.stringify(payload),
+      });
+      setUsers((current) => upsertUser(current, updated));
+      setToast({ title: "User updated", body: updated.display_name });
+      return updated;
+    } catch (userError) {
+      notify("User failed", userError.message, "ui_error");
+      throw userError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function updateUserPin(userId, pin) {
+    setLoading(true);
+    setError("");
+    try {
+      const updated = await api(`/users/${userId}/pin`, {
+        method: "POST",
+        body: JSON.stringify({ pin }),
+      });
+      setUsers((current) => upsertUser(current, updated));
+      setToast({ title: "PIN updated", body: updated.display_name });
+      return updated;
+    } catch (userError) {
+      notify("PIN update failed", userError.message, "ui_error");
+      throw userError;
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -1031,7 +1110,17 @@ function App() {
                 onSync={syncPlaylists}
               />
             )}
-            {!["Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
+            {page === "Users" && (
+              <UsersView
+                users={users}
+                permissions={permissionCatalog}
+                currentUser={user}
+                onCreate={createUserAccount}
+                onUpdate={updateUserAccount}
+                onUpdatePin={updateUserPin}
+              />
+            )}
+            {!["Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
@@ -2593,6 +2682,10 @@ function canManageSettings(user) {
   return Boolean(user?.is_admin || user?.permissions?.includes("settings:manage"));
 }
 
+function canManageUsers(user) {
+  return Boolean(user?.is_admin || user?.permissions?.includes("users:manage"));
+}
+
 function copyStylesToWindow(targetWindow) {
   for (const sheet of document.styleSheets) {
     try {
@@ -2701,6 +2794,151 @@ function ToolsView({ tasks, notifications }) {
           ))}
         </div>
       </section>
+    </div>
+  );
+}
+
+function UsersView({ users, permissions, currentUser, onCreate, onUpdate, onUpdatePin }) {
+  const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
+  const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
+
+  function toggleNewPermission(value) {
+    setNewUser((current) => ({
+      ...current,
+      permissions: toggleArrayValue(current.permissions, value),
+    }));
+  }
+
+  async function submitNewUser(event) {
+    event.preventDefault();
+    if (!newUser.display_name.trim() || newUser.pin.length < 4) return;
+    await onCreate(newUser);
+    setNewUser({ display_name: "", pin: "", is_admin: false, permissions: [] });
+  }
+
+  return (
+    <div className="users-view">
+      <form className="user-create-panel" onSubmit={submitNewUser}>
+        <h2>Create user</h2>
+        <label>
+          Name
+          <input value={newUser.display_name} onChange={(event) => setNewUser((current) => ({ ...current, display_name: event.target.value }))} />
+        </label>
+        <label>
+          PIN
+          <input type="password" value={newUser.pin} onChange={(event) => setNewUser((current) => ({ ...current, pin: event.target.value }))} />
+        </label>
+        <label className="inline-check">
+          <input type="checkbox" checked={newUser.is_admin} onChange={(event) => setNewUser((current) => ({ ...current, is_admin: event.target.checked }))} />
+          Admin
+        </label>
+        {!newUser.is_admin && (
+          <PermissionGrid
+            groups={permissionGroups}
+            selected={newUser.permissions}
+            onToggle={toggleNewPermission}
+          />
+        )}
+        <button className="primary compact-button" disabled={!newUser.display_name.trim() || newUser.pin.length < 4}>
+          <Plus size={15} />
+          Create user
+        </button>
+      </form>
+      <div className="user-list">
+        {users.map((managedUser) => (
+          <UserCard
+            key={managedUser.id}
+            user={managedUser}
+            currentUser={currentUser}
+            permissionGroups={permissionGroups}
+            onUpdate={onUpdate}
+            onUpdatePin={onUpdatePin}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function UserCard({ user, currentUser, permissionGroups, onUpdate, onUpdatePin }) {
+  const [draft, setDraft] = useState(() => ({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] }));
+  const [pin, setPin] = useState("");
+  const changed =
+    draft.display_name !== user.display_name ||
+    draft.is_admin !== user.is_admin ||
+    stablePermissionKey(draft.permissions) !== stablePermissionKey(user.permissions || []);
+
+  useEffect(() => {
+    setDraft({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] });
+    setPin("");
+  }, [user.id, user.display_name, user.is_admin, stablePermissionKey(user.permissions || [])]);
+
+  function togglePermission(value) {
+    setDraft((current) => ({
+      ...current,
+      permissions: toggleArrayValue(current.permissions, value),
+    }));
+  }
+
+  return (
+    <section className="user-card">
+      <div className="user-card-header">
+        <label>
+          Name
+          <input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} />
+        </label>
+        <label className="inline-check">
+          <input
+            type="checkbox"
+            checked={draft.is_admin}
+            onChange={(event) => setDraft((current) => ({ ...current, is_admin: event.target.checked }))}
+            disabled={user.id === currentUser?.id && user.is_admin}
+          />
+          Admin
+        </label>
+        <button
+          className="primary compact-button"
+          disabled={!changed || !draft.display_name.trim()}
+          onClick={() => onUpdate(user.id, draft)}
+        >
+          Save
+        </button>
+      </div>
+      {!draft.is_admin && (
+        <PermissionGrid
+          groups={permissionGroups}
+          selected={draft.permissions}
+          onToggle={togglePermission}
+        />
+      )}
+      {draft.is_admin && <p className="user-note">Admin users have every permission.</p>}
+      <div className="pin-reset-row">
+        <label>
+          New PIN
+          <input type="password" value={pin} onChange={(event) => setPin(event.target.value)} />
+        </label>
+        <button className="secondary compact" disabled={pin.length < 4} onClick={() => onUpdatePin(user.id, pin).then(() => setPin(""))}>
+          Reset PIN
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function PermissionGrid({ groups, selected, onToggle }) {
+  return (
+    <div className="permission-grid">
+      {[...groups.entries()].map(([section, permissions]) => (
+        <fieldset key={section}>
+          <legend>{section}</legend>
+          {permissions.map((permission) => (
+            <label className="inline-check" key={permission.value}>
+              <input type="checkbox" checked={selected.includes(permission.value)} onChange={() => onToggle(permission.value)} />
+              {permission.label}
+            </label>
+          ))}
+        </fieldset>
+      ))}
     </div>
   );
 }
@@ -3475,8 +3713,21 @@ function upsertPlaylist(playlists, playlist) {
   return [...withoutPlaylist, playlist].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function upsertUser(users, user) {
+  const withoutUser = users.filter((current) => current.id !== user.id);
+  return [...withoutUser, user].sort((a, b) => a.display_name.localeCompare(b.display_name));
+}
+
 function favoritePlaylistFrom(playlists) {
   return playlists.find((playlist) => playlist.name === "Favorites") || null;
+}
+
+function toggleArrayValue(values, value) {
+  return values.includes(value) ? values.filter((entry) => entry !== value) : [...values, value].sort();
+}
+
+function stablePermissionKey(values) {
+  return [...values].sort().join("|");
 }
 
 function visibleTrayNotifications(notifications) {

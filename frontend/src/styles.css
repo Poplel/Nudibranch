@@ -900,6 +900,99 @@ nav button:hover,
   gap: 6px;
 }
 
+.users-view {
+  display: grid;
+  gap: 10px;
+  padding: 8px;
+}
+
+.user-create-panel,
+.user-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  background: var(--panel-strong);
+}
+
+.user-create-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.user-create-panel label,
+.user-card label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.user-create-panel input:not([type="checkbox"]),
+.user-card input:not([type="checkbox"]) {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.user-list {
+  display: grid;
+  gap: 8px;
+}
+
+.user-card-header,
+.pin-reset-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+.permission-grid fieldset {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin: 0;
+  padding: 10px;
+}
+
+.permission-grid legend {
+  color: var(--text);
+  font-weight: 700;
+  padding: 0 4px;
+}
+
+.inline-check {
+  display: flex !important;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px !important;
+  color: var(--text) !important;
+}
+
+.inline-check input {
+  accent-color: var(--accent);
+}
+
+.user-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
 .wishlist-row.removed {
   opacity: 0.58;
 }
