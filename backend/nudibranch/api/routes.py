@@ -416,7 +416,7 @@ def scan_imports(
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     try:
-        files = discover_import_files(payload.path)
+        files = discover_import_files(payload.path, include_fingerprint=True)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {"files": files, "count": len(files)}
@@ -911,6 +911,14 @@ def tool_check_files(
     _: User = Depends(require_permission(Permission.library_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_files", {}))
+
+
+@router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"])
+def tool_check_lyrics(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_lyrics", {}))
 
 
 @router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"])

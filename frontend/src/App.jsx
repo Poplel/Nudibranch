@@ -3071,6 +3071,7 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFixCheckFile 
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
     ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks", "downloads:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
+    ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
@@ -4233,6 +4234,9 @@ function taskSummary(task) {
   if (task.result?.errors?.length) return task.result.errors.join("; ");
   if (task.type === "check_files" && task.result) {
     return `${task.result.missing_files?.length || 0} records missing files, ${task.result.missing_records?.length || 0} files missing records`;
+  }
+  if (task.type === "check_lyrics" && task.result) {
+    return `${task.result.missing || 0} missing lyrics, ${task.result.existing || 0} already present`;
   }
   if (task.result?.imported !== undefined) return `${task.result.imported} imported, ${task.result.skipped || 0} skipped`;
   return new Date(task.created_at).toLocaleString();

@@ -23,7 +23,9 @@ from nudibranch.services.tasks import claim_next_task, complete_task, fail_task,
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
-    files = payload.get("files") or discover_import_files(payload.get("path"), include_fingerprint=True)
+    files = payload.get("files")
+    if files is None:
+        files = discover_import_files(payload.get("path"), include_fingerprint=True)
     batch = ProposalBatch(title="Import folder review", kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
@@ -186,6 +188,11 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.download and json.loads(item.payload_json or "{}").get("action")
     ]
+    lyrics_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.lyrics and json.loads(item.payload_json or "{}").get("action")
+    ]
 
     if batch.kind == ProposalKind.import_files and not executable_items and not download_items:
         errors.append("No approved import file operations were selected.")
@@ -239,6 +246,16 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
 
+    lyric_changes = 0
+    for item in lyrics_items:
+        try:
+            apply_lyrics_item(session, item)
+            item.status = ProposalStatus.completed
+            lyric_changes += 1
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
             item.status = ProposalStatus.completed
@@ -256,7 +273,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, download_changes, skipped, errors),
+        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, download_changes, lyric_changes, skipped, errors),
         event_type="task_completed",
         target_url="/activity",
     )
@@ -267,13 +284,14 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         "file_actions": file_actions,
         "playlist_changes": playlist_changes,
         "download_changes": download_changes,
+        "lyric_changes": lyric_changes,
         "skipped": skipped,
         "errors": errors,
     }
 
 
-def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, download_changes: int, skipped: int, errors: list[str]) -> str:
-    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {download_changes} downloads handled. {skipped} items skipped."
+def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, download_changes: int, lyric_changes: int, skipped: int, errors: list[str]) -> str:
+    body = f"{imported} tracks imported. {metadata_updated} metadata changes applied. {file_actions} files handled. {playlist_changes} playlist changes applied. {download_changes} downloads handled. {lyric_changes} lyrics downloaded. {skipped} items skipped."
     if errors:
         return f"{body} First failure: {errors[0]}"
     return body
@@ -404,6 +422,27 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
     raise ValueError("Unsupported download action")
 
 
+def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "download_lyrics":
+        raise ValueError("Unsupported lyrics action")
+    track = session.scalar(
+        select(Track)
+        .where(Track.id == payload.get("track_id"))
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    )
+    if not track or not track.path:
+        raise ValueError("Track file no longer exists in the library")
+    audio_path = Path(track.path)
+    if not audio_path.exists():
+        raise FileNotFoundError(f"{audio_path} is missing")
+    lyric_text = fetch_lrclib_lyrics(track)
+    if not lyric_text:
+        raise ValueError("No synced or unsynced lyrics were found")
+    lrc_path = audio_path.with_suffix(".lrc")
+    lrc_path.write_text(lyric_text, encoding="utf-8")
+
+
 def create_download_candidate_batch(session: Session, request: dict) -> None:
     query = download_query(request)
     settings = integration_settings(session)
@@ -490,6 +529,25 @@ def queue_ytdlp_download(session: Session, request: dict) -> None:
     if cookies_path and Path(cookies_path).exists():
         command.extend(["--cookies", cookies_path])
     subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+
+
+def fetch_lrclib_lyrics(track: Track) -> str | None:
+    duration_seconds = round((track.duration_ms or 0) / 1000) if track.duration_ms else None
+    params = {
+        "track_name": track.title,
+        "artist_name": track.album.artist.name,
+        "album_name": track.album.title,
+    }
+    if duration_seconds:
+        params["duration"] = str(duration_seconds)
+    headers = {"User-Agent": "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"}
+    with httpx.Client(base_url="https://lrclib.net", headers=headers, timeout=20) as client:
+        response = client.get("/api/get", params=params)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+    return payload.get("syncedLyrics") or payload.get("plainLyrics")
 
 
 def download_query(request: dict) -> str:
@@ -735,6 +793,70 @@ def run_check_files(session: Session, _payload: dict) -> dict:
     return {"missing_files": missing_files, "missing_records": missing_records}
 
 
+def run_check_lyrics(session: Session, _payload: dict) -> dict:
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+            .order_by(Track.title.asc())
+        )
+    )
+    missing = []
+    existing = 0
+    for track in tracks:
+        if not track.path:
+            continue
+        audio_path = Path(track.path)
+        if not audio_path.exists():
+            continue
+        if audio_path.with_suffix(".lrc").exists():
+            existing += 1
+            continue
+        missing.append(track)
+
+    if not missing:
+        create_notification(
+            session,
+            title="Lyrics check complete",
+            body=f"{existing} tracks already have lyrics. No missing lyrics found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"checked": len(tracks), "existing": existing, "missing": 0, "batch_id": None}
+
+    batch = ProposalBatch(title="Download missing lyrics", kind=ProposalKind.lyrics, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    for track in missing:
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=track.title,
+                kind=ProposalKind.lyrics,
+                old_value=str(Path(track.path).with_suffix(".lrc")),
+                new_value="LRCLIB",
+                payload_json=json.dumps(
+                    {
+                        "action": "download_lyrics",
+                        "track_id": track.id,
+                        "artist": track.album.artist.name,
+                        "album": track.album.title,
+                        "track": track.title,
+                    }
+                ),
+            )
+        )
+    create_notification(
+        session,
+        title="Lyrics review ready",
+        body=f"{len(missing)} lyric downloads were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
+
+
 def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     albums = list(
         session.scalars(
@@ -864,6 +986,7 @@ TASK_HANDLERS = {
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
     "jellyfin_scan": run_jellyfin_scan,
     "check_files": run_check_files,
+    "check_lyrics": run_check_lyrics,
     "check_missing_tracks": run_check_missing_tracks,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
