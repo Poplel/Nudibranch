@@ -26,6 +26,9 @@ def run_propose_import(session: Session, payload: dict) -> dict:
     files = payload.get("files")
     if files is None:
         files = discover_import_files(payload.get("path"), include_fingerprint=True)
+    download_requests = payload.get("download_requests") or []
+    if not files and not download_requests:
+        raise ValueError("No import files or downloads were selected")
     batch = ProposalBatch(title="Import folder review", kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
@@ -93,7 +96,7 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                 ),
             )
         )
-    for request in payload.get("download_requests") or []:
+    for request in download_requests:
         artist = request.get("artist") or "Unknown Artist"
         album = request.get("album") or "Unknown Album"
         title = request.get("track") or request.get("title") or "Unknown Track"
@@ -142,11 +145,11 @@ def run_propose_import(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Import review ready",
-        body=f"{len(files)} files and {len(payload.get('download_requests') or [])} downloads were added to the task queue.",
+        body=f"{len(files)} files and {len(download_requests)} downloads were added to the task queue.",
         event_type="approval_needed",
         target_url="/task-queue",
     )
-    return {"batch_id": batch.id, "files": len(files)}
+    return {"batch_id": batch.id, "files": len(files), "downloads": len(download_requests)}
 
 
 def run_execute_proposal_batch(session: Session, payload: dict) -> dict:

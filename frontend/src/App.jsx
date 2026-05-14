@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
@@ -1787,6 +1787,12 @@ function ImportWizard({
   const [albumRecords, setAlbumRecords] = useState({});
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [downloadRequests, setDownloadRequests] = useState([]);
+  const downloadRequestsRef = useRef([]);
+
+  const updateDownloadRequests = useCallback((requests) => {
+    downloadRequestsRef.current = requests;
+    setDownloadRequests(requests);
+  }, []);
 
   function addManualAlbum(album) {
     setManualAlbums((current) => [...current, album]);
@@ -1835,8 +1841,8 @@ function ImportWizard({
           <Plus size={16} />
           Add album
         </button>
-        <button className="secondary" onClick={() => onPropose(downloadRequests)} disabled={loading || activeImportTask || (files.length === 0 && downloadRequests.length === 0)}>
-          {activeImportTask ? "Import review running" : "Add to task queue"}
+        <button className="secondary" onClick={() => onPropose(downloadRequestsRef.current)} disabled={loading || activeImportTask || (files.length === 0 && downloadRequests.length === 0)}>
+          {activeImportTask ? "Import review running" : `Add to task queue${downloadRequests.length ? ` (${downloadRequests.length} downloads)` : ""}`}
         </button>
       </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} onLookup={checkAlbum} onSearch={onSearchAlbums} />}
@@ -1854,7 +1860,7 @@ function ImportWizard({
           onCheckAlbum={checkAlbum}
           onRemoveManualAlbum={removeManualAlbum}
           onRemoveManualArtist={removeManualArtist}
-          onDownloadRequestsChange={setDownloadRequests}
+          onDownloadRequestsChange={updateDownloadRequests}
         />
       )}
     </div>
@@ -2284,24 +2290,43 @@ function ImportTree({
   }, [files.length, manualAlbums.length]);
 
   useEffect(() => {
-    const requests = [];
-    grouped.forEach((artist) => {
-      artist.albums.forEach((album) => {
-        album.slots.forEach((slot) => {
-          if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
-          requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number });
-        });
-      });
-    });
-    Object.entries(extraGhosts).forEach(([albumId, slots]) => {
-      const [artistName, albumName] = albumId.split("/");
-      slots.forEach((slot) => {
-        if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
-        requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number });
-      });
-    });
-    onDownloadRequestsChange?.(requests);
+    emitDownloadRequests(downloadSelections, dismissedGhosts, extraGhosts);
   }, [grouped, downloadSelections, dismissedGhosts, extraGhosts, onDownloadRequestsChange]);
+
+  function emitDownloadRequests(selections = downloadSelections, dismissed = dismissedGhosts, extra = extraGhosts) {
+    onDownloadRequestsChange?.(buildImportDownloadRequests(grouped, selections, dismissed, extra));
+  }
+
+  function setSingleDownloadSelection(id, checked) {
+    setDownloadSelections((current) => {
+      const next = new Set(current);
+      if (checked) next.add(id);
+      else next.delete(id);
+      emitDownloadRequests(next);
+      return next;
+    });
+  }
+
+  function setSlotDownloadSelections(slots, checked) {
+    setDownloadSelections((current) => {
+      const next = new Set(current);
+      slots.forEach((slot) => {
+        if (checked) next.add(slot.id);
+        else next.delete(slot.id);
+      });
+      emitDownloadRequests(next);
+      return next;
+    });
+  }
+
+  function dismissGhost(id) {
+    setDismissedGhosts((current) => {
+      const next = new Set(current);
+      next.add(id);
+      emitDownloadRequests(downloadSelections, next);
+      return next;
+    });
+  }
 
   return (
     <div className="tree">
@@ -2345,7 +2370,7 @@ function ImportTree({
                 <DownloadBranchToggle
                   checked={artistGhostSlots(artist, dismissedGhosts).every((slot) => downloadSelections.has(slot.id))}
                   disabled={artistGhostSlots(artist, dismissedGhosts).length === 0}
-                  onChange={(checked) => setDownloadSelectionForSlots(setDownloadSelections, artistGhostSlots(artist, dismissedGhosts), checked)}
+                  onChange={(checked) => setSlotDownloadSelections(artistGhostSlots(artist, dismissedGhosts), checked)}
                   title="Select downloads for this artist"
                 />
                 <button
@@ -2401,7 +2426,7 @@ function ImportTree({
                       <DownloadBranchToggle
                         checked={visibleSlots.filter((slot) => !slot.file).length > 0 && visibleSlots.filter((slot) => !slot.file).every((slot) => downloadSelections.has(slot.id))}
                         disabled={visibleSlots.filter((slot) => !slot.file).length === 0}
-                        onChange={(checked) => setDownloadSelectionForSlots(setDownloadSelections, visibleSlots.filter((slot) => !slot.file), checked)}
+                        onChange={(checked) => setSlotDownloadSelections(visibleSlots.filter((slot) => !slot.file), checked)}
                         title="Select downloads for this album"
                       />
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
@@ -2474,8 +2499,8 @@ function ImportTree({
                           key={`${albumId}:${slot.track_number}:${slot.title}`}
                           slot={slot}
                           checked={downloadSelections.has(slot.id)}
-                          onChecked={(checked) => toggleDownloadSelection(setDownloadSelections, slot.id, checked)}
-                          onDismiss={() => toggleDownloadSelection(setDismissedGhosts, slot.id, true)}
+                          onChecked={(checked) => setSingleDownloadSelection(slot.id, checked)}
+                          onDismiss={() => dismissGhost(slot.id)}
                           onDrop={() => {
                             if (draggedTrack) {
                               if (draggedTrack.paths.length > 1) {
@@ -3025,15 +3050,25 @@ function DownloadBranchToggle({ checked, disabled, onChange, title }) {
   );
 }
 
-function setDownloadSelectionForSlots(setter, slots, checked) {
-  setter((current) => {
-    const next = new Set(current);
-    slots.forEach((slot) => {
-      if (checked) next.add(slot.id);
-      else next.delete(slot.id);
+function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhosts, extraGhosts) {
+  const requests = [];
+  grouped.forEach((artist) => {
+    artist.albums.forEach((album) => {
+      album.slots.forEach((slot) => {
+        if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+        requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number });
+      });
     });
-    return next;
   });
+  Object.entries(extraGhosts).forEach(([albumId, slots]) => {
+    const [artistName, ...albumParts] = albumId.split("/");
+    const albumName = albumParts.join("/");
+    slots.forEach((slot) => {
+      if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+      requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number });
+    });
+  });
+  return requests;
 }
 
 function artistGhostSlots(artist, dismissedGhosts) {
@@ -4105,15 +4140,6 @@ function normalizeName(value) {
     .replace(/deluxe|expanded|remaster(?:ed)?|edition|explicit/g, "")
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
-}
-
-function toggleDownloadSelection(setter, id, checked) {
-  setter((current) => {
-    const next = new Set(current);
-    if (checked) next.add(id);
-    else next.delete(id);
-    return next;
-  });
 }
 
 function toggleTrackSelection(setter, path, additive) {
