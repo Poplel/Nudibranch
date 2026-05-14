@@ -101,6 +101,7 @@ function App() {
   const [favoritesPlaylist, setFavoritesPlaylist] = useState(null);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
+  const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -449,6 +450,23 @@ function App() {
     }
   }
 
+  async function removeWishlistItem(itemId) {
+    setLoading(true);
+    setError("");
+    try {
+      const updated = await api(`/wishlist/${itemId}`, { method: "DELETE" });
+      setWishlist((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setToast({ title: "Wishlist updated", body: "The track was removed." });
+      return updated;
+    } catch (wishlistError) {
+      setError(wishlistError.message);
+      notify("Wishlist failed", wishlistError.message, "ui_error");
+      throw wishlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function scanImportFolder() {
     setLoading(true);
     setError("");
@@ -507,8 +525,73 @@ function App() {
       setImportFiles((current) => patchImportFile(current, file.path, metadataPatch));
       setToast({ title: "Metadata updated", body: "The most likely acoustic match was applied." });
     } catch (lookupError) {
-      setError(lookupError.message);
       notify("Metadata lookup failed", lookupError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function recheckImportAlbum(album) {
+    const albumFiles = album.files || [];
+    if (albumFiles.length === 0) return;
+    setLoading(true);
+    setError("");
+    let nextFiles = importFiles;
+    let matched = 0;
+    let changed = 0;
+    let missing = 0;
+    let failed = 0;
+    try {
+      for (const file of albumFiles) {
+        try {
+          const data = await api("/imports/acoustic-match", {
+            method: "POST",
+            body: JSON.stringify({ file }),
+          });
+          const candidate = data.candidates?.[0];
+          if (!candidate) {
+            missing += 1;
+            nextFiles = patchImportFile(nextFiles, file.path, { acoustid_match: "no match" });
+            continue;
+          }
+          const metadataPatch = compactMetadata(candidate.metadata || {});
+          const oldTitle = file.metadata?.title || "";
+          const nextTitle = metadataPatch.title || oldTitle;
+          const matchStatus = normalizeName(oldTitle) === normalizeName(nextTitle) ? "matched" : "changed";
+          if (matchStatus === "matched") matched += 1;
+          else changed += 1;
+          nextFiles = patchImportFile(nextFiles, file.path, {
+            ...metadataPatch,
+            acoustid_match: matchStatus,
+            acoustid_score: Math.round((candidate.score || 0) * 100),
+          });
+        } catch {
+          failed += 1;
+        }
+      }
+      setImportFiles(nextFiles);
+      setToast({
+        title: "Album AcoustID check complete",
+        body: `${matched} matched. ${changed} updated. ${missing} unmatched. ${failed} failed.`,
+      });
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function checkLibraryAlbumAcoustID(album) {
+    setLoading(true);
+    setError("");
+    try {
+      const data = await api(`/library/albums/${album.id}/acoustic-match`, { method: "POST" });
+      setLibraryAlbumChecks((current) => ({ ...current, [album.id]: data }));
+      const counts = countAcousticStatuses(data.tracks || []);
+      setToast({
+        title: "Album AcoustID check complete",
+        body: `${counts.matched} matched. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed.`,
+      });
+    } catch (lookupError) {
+      notify("Album AcoustID check failed", lookupError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -787,6 +870,8 @@ function App() {
               <LibraryTree
                 artists={library}
                 onCheckAlbum={lookupImportAlbum}
+                onCheckAlbumAcoustID={checkLibraryAlbumAcoustID}
+                albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
                 onQueueRemove={proposeLibraryRemove}
@@ -810,6 +895,7 @@ function App() {
                 onFilesChange={setImportFiles}
                 library={library}
                 onRecheckTrack={recheckImportTrack}
+                onRecheckAlbum={recheckImportAlbum}
                 onCheckAlbum={lookupImportAlbum}
                 onSearchAlbums={searchImportAlbums}
                 loading={loading}
@@ -834,6 +920,7 @@ function App() {
               <WishlistView
                 wishlist={wishlist}
                 onAdd={createWishlistItem}
+                onRemove={removeWishlistItem}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
               />
@@ -958,7 +1045,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, onQueueRemove, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1049,10 +1136,27 @@ function LibraryTree({ artists, onCheckAlbum, onSearchAlbums, onQueueMetadata, o
                       onQueue={() => onQueue(albumTracks(artist, album))}
                       onRemove={() => setRemoveTarget(removeKey("album", album.id))}
                     />
+                    <button className="row-icon-button" onClick={() => onCheckAlbumAcoustID(album)} title="Check album tracks with AcoustID">
+                      <Sparkles size={15} />
+                    </button>
                     <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
                       <Pencil size={15} />
                     </button>
                   </div>
+                  {albumChecks[album.id] && (
+                    <div className="album-acoustic-results">
+                      {albumChecks[album.id].tracks.map((result) => (
+                        <TreeRow
+                          key={result.track_id}
+                          depth={2}
+                          icon={Search}
+                          title={result.title}
+                          meta={acousticResultMeta(result)}
+                          warning={["changed", "unmatched", "missing_file", "error"].includes(result.status)}
+                        />
+                      ))}
+                    </div>
+                  )}
                   {removeTarget === removeKey("album", album.id) && (
                     <RemoveChoice
                       title={album.title}
@@ -1297,6 +1401,7 @@ function ImportWizard({
   onFilesChange,
   library,
   onRecheckTrack,
+  onRecheckAlbum,
   onCheckAlbum,
   onSearchAlbums,
   loading,
@@ -1368,6 +1473,7 @@ function ImportWizard({
           manualAlbums={manualAlbums}
           albumRecords={albumRecords}
           onRecheckTrack={onRecheckTrack}
+          onRecheckAlbum={onRecheckAlbum}
           onCheckAlbum={checkAlbum}
           onRemoveManualAlbum={removeManualAlbum}
           onRemoveManualArtist={removeManualArtist}
@@ -1440,11 +1546,29 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initi
   );
 }
 
-function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
+function WishlistView({ wishlist, onAdd, onRemove, onSearchAlbums, onLookupAlbum }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
+  const [openArtists, setOpenArtists] = useState(() => new Set());
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const tree = useMemo(() => buildWishlistTree(wishlist), [wishlist]);
+  const treeKey = useMemo(
+    () => tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
+    [tree],
+  );
+
+  useEffect(() => {
+    setOpenArtists(new Set(tree.map((artist) => artist.name)));
+    setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+  }, [treeKey]);
 
   async function addAlbumToWishlist(album) {
-    await onAdd({ kind: "album", artist: album.artist, album: album.name });
+    if (album.tracks?.length) {
+      for (const track of album.tracks) {
+        await onAdd({ kind: "track", artist: album.artist, album: album.name, track: track.title });
+      }
+    } else {
+      await onAdd({ kind: "album", artist: album.artist, album: album.name });
+    }
     setAlbumSearchOpen(false);
   }
 
@@ -1460,15 +1584,64 @@ function WishlistView({ wishlist, onAdd, onSearchAlbums, onLookupAlbum }) {
       {wishlist.length === 0 ? (
         <EmptyState title="No wishlist items" body="Add music here before sending wishlist work to the task queue." />
       ) : (
-        <div className="wishlist-list">
-          {wishlist.map((item) => (
-            <div className="file-row" key={item.id}>
-              <Sparkles size={16} />
-              <div>
-                <strong>{item.track || item.album || item.artist}</strong>
-                <span>{[item.artist, item.album, item.track].filter(Boolean).join(" / ")}</span>
-              </div>
-              <small>{item.status}</small>
+        <div className="tree">
+          <TreeControls
+            onExpand={() => {
+              setOpenArtists(new Set(tree.map((artist) => artist.name)));
+              setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+            }}
+            onCollapse={() => {
+              setOpenArtists(new Set());
+              setOpenAlbums(new Set());
+            }}
+          />
+          {tree.map((artist) => (
+            <div key={artist.name}>
+              <TreeRow
+                icon={Sparkles}
+                open={openArtists.has(artist.name)}
+                title={artist.name}
+                meta={`${artist.albums.length} albums`}
+                onToggle={() => toggleSet(setOpenArtists, artist.name)}
+              />
+              {openArtists.has(artist.name) &&
+                artist.albums.map((album) => {
+                  const albumId = `${artist.name}/${album.name}`;
+                  return (
+                    <div key={albumId}>
+                      <TreeRow
+                        depth={1}
+                        icon={Folder}
+                        open={openAlbums.has(albumId)}
+                        title={album.name}
+                        meta={`${album.tracks.length || 1} requested`}
+                        onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                      />
+                      {openAlbums.has(albumId) &&
+                        (album.tracks.length > 0 ? (
+                          album.tracks.map((track) => (
+                            <div className={track.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"} key={track.id}>
+                              <TreeRow depth={2} icon={FileAudio} title={track.track || "Track"} meta={track.status} />
+                              {track.status !== "removed" && (
+                                <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
+                                  <X size={15} />
+                                </button>
+                              )}
+                            </div>
+                          ))
+                        ) : (
+                          <div className={album.request?.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"}>
+                            <TreeRow depth={2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request?.status || "wanted"} />
+                            {album.request && album.request.status !== "removed" && (
+                              <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
+                                <X size={15} />
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                    </div>
+                  );
+                })}
             </div>
           ))}
         </div>
@@ -1595,6 +1768,7 @@ function ImportTree({
   manualAlbums,
   albumRecords,
   onRecheckTrack,
+  onRecheckAlbum,
   onCheckAlbum,
   onRemoveManualAlbum,
   onRemoveManualArtist,
@@ -1705,6 +1879,9 @@ function ImportTree({
                       />
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
                         <Search size={15} />
+                      </button>
+                      <button className="row-icon-button" onClick={() => onRecheckAlbum(album)} title="Check album tracks with AcoustID">
+                        <Sparkles size={15} />
                       </button>
                       <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, albumId)} title="Album details">
                         <Pencil size={15} />
@@ -1825,7 +2002,7 @@ function ImportTrackRow({ file, album, selected, onClick, onChange, onDragStart,
           onCommit={(value) => onChange({ track_number: parseInt(value, 10) || null })}
         />
         <DraftInput value={metadata.title || ""} onCommit={(value) => onChange({ title: value })} />
-        <small>{album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
+        <small>{metadata.acoustid_match ? `AcoustID ${metadata.acoustid_match}${metadata.acoustid_score ? ` ${metadata.acoustid_score}%` : ""}` : album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
         <button className="row-icon-button" onClick={onRecheck} title="Scan and match metadata">
           <Search size={15} />
         </button>
@@ -2436,6 +2613,7 @@ function AudioPlayer({
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const pipWindowRef = useRef(null);
+  const reopenPipAfterFullscreen = useRef(false);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -2458,10 +2636,25 @@ function AudioPlayer({
   }, []);
 
   useEffect(() => {
-    if (!pipContainer) {
+    if (!pipContainer && !document.fullscreenElement) {
       setFullscreenPlayer(false);
     }
   }, [pipContainer]);
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      const active = Boolean(document.fullscreenElement);
+      setFullscreenPlayer(active);
+      if (!active && reopenPipAfterFullscreen.current) {
+        reopenPipAfterFullscreen.current = false;
+        window.setTimeout(() => {
+          openPictureInPicture().catch(() => {});
+        }, 50);
+      }
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
+  }, [queue.length]);
 
   useEffect(() => {
     const measureCompactHeight = () => (coreRef.current ? coreRef.current.offsetHeight + 36 : dockRef.current?.offsetHeight || 0);
@@ -2514,21 +2707,32 @@ function AudioPlayer({
     pipWindow.document.body.style.margin = "0";
     pipWindow.document.body.style.padding = "0";
     pipWindow.document.body.style.width = "100vw";
+    pipWindow.document.body.style.height = "100vh";
     pipWindow.document.body.style.minHeight = "100vh";
     pipWindow.document.body.style.overflow = "hidden";
+    pipWindow.document.body.style.background = "transparent";
     pipWindow.document.documentElement.style.margin = "0";
     pipWindow.document.documentElement.style.padding = "0";
     pipWindow.document.documentElement.style.width = "100vw";
+    pipWindow.document.documentElement.style.height = "100vh";
     pipWindow.document.documentElement.style.minHeight = "100vh";
+    pipWindow.document.documentElement.style.overflow = "hidden";
+    pipWindow.document.documentElement.style.background = "transparent";
     copyStylesToWindow(pipWindow);
     const container = pipWindow.document.createElement("div");
-    container.className = document.querySelector("main")?.className || "app";
+    container.className = `${document.querySelector("main")?.className || "app"} pip-root`;
+    container.style.width = "100vw";
+    container.style.height = "100vh";
     container.style.minHeight = "100vh";
+    container.style.overflow = "hidden";
     container.style.display = "block";
     pipWindow.document.body.appendChild(container);
     const handleFullscreenChange = () => setFullscreenPlayer(Boolean(pipWindow.document.fullscreenElement));
     const closePip = () => {
-      setFullscreenPlayer(false);
+      if (!document.fullscreenElement) {
+        setFullscreenPlayer(false);
+      }
+      pipWindowRef.current = null;
       pipWindow.document.removeEventListener("fullscreenchange", handleFullscreenChange);
       setPipContainer(null);
     };
@@ -2542,23 +2746,40 @@ function AudioPlayer({
     const pipWindow = pipWindowRef.current;
     const targetDocument = pipWindow?.document || document;
     try {
-      if (targetDocument.fullscreenElement) {
-        await targetDocument.exitFullscreen?.();
+      if (targetDocument.fullscreenElement || document.fullscreenElement) {
+        await (targetDocument.fullscreenElement ? targetDocument : document).exitFullscreen?.();
         setFullscreenPlayer(false);
         return;
       }
-      await targetDocument.documentElement.requestFullscreen?.();
-      setFullscreenPlayer(Boolean(targetDocument.fullscreenElement));
+      if (pipWindow) {
+        try {
+          await targetDocument.documentElement.requestFullscreen?.();
+          if (targetDocument.fullscreenElement) {
+            setFullscreenPlayer(true);
+            return;
+          }
+        } catch {
+          // Fall back to fullscreening the main window below.
+        }
+        reopenPipAfterFullscreen.current = true;
+        setFullscreenPlayer(true);
+        pipWindow.close?.();
+        setPipContainer(null);
+        await document.documentElement.requestFullscreen?.();
+        return;
+      }
+      await document.documentElement.requestFullscreen?.();
+      setFullscreenPlayer(Boolean(document.fullscreenElement));
     } catch {
-      setFullscreenPlayer(Boolean(targetDocument.fullscreenElement));
+      setFullscreenPlayer(Boolean(targetDocument.fullscreenElement || document.fullscreenElement));
     }
   }
 
   function surface({ popped = false } = {}) {
-    const pipLayout = popped;
+    const pipLayout = popped || fullscreenPlayer;
     return (
       <div
-        className={`${popped ? "audio-player popped pip-player" : "audio-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${pipLayout && showUpNext ? " has-up-next" : ""}`}
+        className={`${popped ? "audio-player popped pip-player" : fullscreenPlayer ? "audio-player pip-player main-fullscreen-player" : "audio-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${pipLayout && showUpNext ? " has-up-next" : ""}`}
         ref={popped ? null : dockRef}
         style={pipLayout && currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
@@ -2572,13 +2793,16 @@ function AudioPlayer({
             </div>
             {pipLayout && showUpNext && (
               <div className="fullscreen-next">
-                <span>Up next</span>
-                <strong>{nextTrack.title}</strong>
-                <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+                <div className="up-next-art">{nextTrack._coverUrl ? <img src={nextTrack._coverUrl} alt="" /> : <Music size={18} />}</div>
+                <div>
+                  <span>Up next</span>
+                  <strong>{nextTrack.title}</strong>
+                  <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+                </div>
               </div>
             )}
             <div className="player-window-actions">
-              {popped ? (
+              {popped || fullscreenPlayer ? (
                 <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
                   {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
                 </button>
@@ -3112,6 +3336,57 @@ function groupRequestedAlbums(albums) {
       artistMap.get(album.artist).albums.push(album);
     });
   return [...artistMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildWishlistTree(items) {
+  const artistMap = new Map();
+  items.forEach((item) => {
+    const artistName = item.artist || "Unknown Artist";
+    const albumName = item.album || "Singles";
+    if (!artistMap.has(artistName)) {
+      artistMap.set(artistName, { name: artistName, albumMap: new Map() });
+    }
+    const artist = artistMap.get(artistName);
+    if (!artist.albumMap.has(albumName)) {
+      artist.albumMap.set(albumName, { name: albumName, request: null, tracks: [] });
+    }
+    const album = artist.albumMap.get(albumName);
+    if (item.track) {
+      album.tracks.push(item);
+    } else {
+      album.request = item;
+    }
+  });
+  return [...artistMap.values()]
+    .map((artist) => ({
+      name: artist.name,
+      albums: [...artist.albumMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function countAcousticStatuses(results) {
+  return results.reduce(
+    (counts, result) => {
+      if (result.status === "matched") counts.matched += 1;
+      else if (result.status === "changed") counts.changed += 1;
+      else if (result.status === "unmatched") counts.unmatched += 1;
+      else counts.failed += 1;
+      return counts;
+    },
+    { matched: 0, changed: 0, unmatched: 0, failed: 0 },
+  );
+}
+
+function acousticResultMeta(result) {
+  if (result.status === "matched") return `Matched${result.score ? ` ${result.score}%` : ""}`;
+  if (result.status === "changed") {
+    const candidateTitle = result.candidate?.title || "different recording";
+    return `Changed: ${candidateTitle}${result.score ? ` ${result.score}%` : ""}`;
+  }
+  if (result.status === "missing_file") return "Missing file";
+  if (result.status === "error") return result.error || "Lookup failed";
+  return "No match";
 }
 
 function toggleSet(setter, value) {

@@ -1,5 +1,6 @@
 import secrets
 import json
+import re
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -228,6 +229,60 @@ def propose_library_remove(
     return serialize_batch(batch)
 
 
+@router.post("/library/albums/{album_id}/acoustic-match", tags=["library"])
+def acoustic_match_library_album(
+    album_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+
+    api_key = integration_value(session, "acoustid_api_key")
+    results = []
+    for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999, track.title.lower())):
+        result = {
+            "track_id": track.id,
+            "title": track.title,
+            "track_number": track.track_number,
+            "status": "unmatched",
+            "score": None,
+            "candidate": None,
+            "error": None,
+        }
+        if not track.path or not Path(track.path).exists():
+            result["status"] = "missing_file"
+            result["error"] = "Track file is missing"
+            results.append(result)
+            continue
+        try:
+            candidates = lookup_recording_by_fingerprint({"path": track.path}, api_key)
+        except (ValueError, httpx.HTTPError) as error:
+            result["status"] = "error"
+            result["error"] = str(error)
+            results.append(result)
+            continue
+        candidate = candidates[0] if candidates else None
+        if not candidate:
+            results.append(result)
+            continue
+        metadata = candidate.get("metadata") or {}
+        candidate_title = metadata.get("title") or ""
+        same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
+        same_recording = track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id")
+        result.update(
+            {
+                "status": "matched" if same_recording or same_title else "changed",
+                "score": round((candidate.get("score") or 0) * 100),
+                "candidate": metadata,
+            }
+        )
+        results.append(result)
+
+    return {"album_id": album.id, "album": album.title, "tracks": results}
+
+
 @router.get("/library/tracks/{track_id}/stream", tags=["library"])
 def stream_track(
     track_id: str,
@@ -332,6 +387,21 @@ def create_wishlist_item(
 ) -> WishlistOut:
     item = WishlistItem(user_id=user.id, **payload.model_dump())
     session.add(item)
+    session.commit()
+    session.refresh(item)
+    return WishlistOut.model_validate(item, from_attributes=True)
+
+
+@router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"])
+def remove_wishlist_item(
+    item_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+) -> WishlistOut:
+    item = session.get(WishlistItem, item_id)
+    if not item or (not user.is_admin and item.user_id != user.id):
+        raise HTTPException(status_code=404, detail="Wishlist item not found")
+    item.status = "removed"
     session.commit()
     session.refresh(item)
     return WishlistOut.model_validate(item, from_attributes=True)
@@ -627,6 +697,10 @@ def metadata_target_title(target_type: str, target) -> str:
     if target_type == "album":
         return f"Album: {target.title}"
     return f"Track: {target.title}"
+
+
+def normalized_music_name(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
 
 def library_target_tracks(target) -> list[Track]:
