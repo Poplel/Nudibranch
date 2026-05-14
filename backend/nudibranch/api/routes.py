@@ -428,7 +428,15 @@ def propose_import(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> TaskOut:
-    task = enqueue_task(session, "propose_import", {"path": payload.path, "files": payload.files})
+    task = enqueue_task(
+        session,
+        "propose_import",
+        {
+            "path": payload.path,
+            "files": payload.files,
+            "download_requests": payload.download_requests or [],
+        },
+    )
     return serialize_task(task)
 
 
