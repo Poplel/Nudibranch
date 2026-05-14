@@ -32,6 +32,10 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
     response = httpx.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20, headers={"User-Agent": USER_AGENT})
     response.raise_for_status()
     payload = response.json()
+    if payload.get("status") == "error":
+        error = payload.get("error") or {}
+        message = error.get("message") or "AcoustID rejected the lookup request"
+        raise ValueError(f"AcoustID lookup failed: {message}")
     candidates = []
     for result in payload.get("results", []):
         for recording in result.get("recordings", []):

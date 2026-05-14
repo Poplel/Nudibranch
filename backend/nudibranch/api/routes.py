@@ -279,8 +279,10 @@ def acoustic_match(
         candidates = lookup_recording_by_fingerprint(payload.file, integration_value(session, "acoustid_api_key"))
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=502, detail=f"Metadata lookup failed: {error}") from error
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=lookup_error_detail("AcoustID", error)) from error
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=503, detail="AcoustID could not be reached from the server") from error
     return {"candidates": candidates}
 
 
@@ -291,8 +293,10 @@ def album_lookup(
 ) -> dict:
     try:
         return lookup_album_tracks(payload.artist, payload.album, payload.release_id)
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=502, detail=f"Album lookup failed: {error}") from error
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
 @router.post("/imports/album-search", tags=["imports"])
@@ -302,8 +306,10 @@ def album_search(
 ) -> dict:
     try:
         return {"results": search_album_releases(payload.artist, payload.album)}
-    except httpx.HTTPError as error:
-        raise HTTPException(status_code=502, detail=f"Album search failed: {error}") from error
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"])
@@ -681,6 +687,24 @@ def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
         tracks=tracks,
         track_count=len(track_ids),
     )
+
+
+def lookup_error_detail(service: str, error: httpx.HTTPStatusError) -> str:
+    response = error.response
+    detail = None
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            detail = payload.get("error") or payload.get("message")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("code")
+    except ValueError:
+        detail = response.text[:160] if response.text else None
+    if response.status_code in {401, 403}:
+        return f"{service} rejected the configured API key"
+    if detail:
+        return f"{service} lookup failed: {detail}"
+    return f"{service} lookup failed with HTTP {response.status_code}"
 
 
 def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:

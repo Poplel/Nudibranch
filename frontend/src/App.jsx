@@ -114,6 +114,7 @@ function App() {
   const [error, setError] = useState("");
   const trayRef = useRef(null);
   const syncToastTaskIds = useRef(new Set());
+  const localNotificationCounter = useRef(0);
 
   const theme = dark ? "app dark" : "app";
   const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
@@ -269,7 +270,7 @@ function App() {
           syncToastTaskIds.current.add(task.id);
         }
       });
-      setNotifications(visibleTrayNotifications(notificationData));
+      setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
@@ -318,10 +319,28 @@ function App() {
 
   async function refreshNotifications() {
     try {
-      setNotifications(visibleTrayNotifications(await api("/notifications")));
+      const notificationData = await api("/notifications");
+      setNotifications((current) => mergeTrayNotifications(notificationData, current));
     } catch {
       // Notification polling is best-effort.
     }
+  }
+
+  function notify(title, body, eventType = "ui_notice") {
+    const notification = {
+      id: `local:${Date.now()}:${localNotificationCounter.current++}`,
+      user_id: user?.id || null,
+      title,
+      body,
+      event_type: eventType,
+      target_url: null,
+      status: "unread",
+      deliver_web: true,
+      deliver_apns: false,
+      created_at: new Date().toISOString(),
+    };
+    setToast({ title, body });
+    setNotifications((current) => [notification, ...current]);
   }
 
   async function refreshIntegrationSettings() {
@@ -344,6 +363,7 @@ function App() {
       setToast({ title: "Settings saved", body: "Integration settings were updated." });
     } catch (settingsError) {
       setError(settingsError.message);
+      notify("Settings failed", settingsError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -374,7 +394,7 @@ function App() {
       });
     } catch (favoriteError) {
       setError(favoriteError.message);
-      setToast({ title: "Favorite failed", body: favoriteError.message });
+      notify("Favorite failed", favoriteError.message, "ui_error");
     }
   }
 
@@ -397,6 +417,7 @@ function App() {
       await api("/notifications", { method: "DELETE" });
     } catch (clearError) {
       setError(clearError.message);
+      notify("Notifications failed", clearError.message, "ui_error");
     }
   }
 
@@ -421,7 +442,7 @@ function App() {
       return created;
     } catch (wishlistError) {
       setError(wishlistError.message);
-      setToast({ title: "Wishlist failed", body: wishlistError.message });
+      notify("Wishlist failed", wishlistError.message, "ui_error");
       throw wishlistError;
     } finally {
       setLoading(false);
@@ -440,6 +461,7 @@ function App() {
       setToast({ title: "Import scan complete", body: `${data.count} audio files found.` });
     } catch (scanError) {
       setError(scanError.message);
+      notify("Import scan failed", scanError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -462,6 +484,7 @@ function App() {
       }, 2500);
     } catch (proposeError) {
       setError(proposeError.message);
+      notify("Import review failed", proposeError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -485,7 +508,7 @@ function App() {
       setToast({ title: "Metadata updated", body: "The most likely acoustic match was applied." });
     } catch (lookupError) {
       setError(lookupError.message);
-      setToast({ title: "Metadata lookup failed", body: lookupError.message });
+      notify("Metadata lookup failed", lookupError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -503,7 +526,7 @@ function App() {
       return data;
     } catch (lookupError) {
       setError(lookupError.message);
-      setToast({ title: "Album lookup failed", body: lookupError.message });
+      notify("Album lookup failed", lookupError.message, "ui_error");
       return null;
     } finally {
       setLoading(false);
@@ -521,7 +544,7 @@ function App() {
       return data.results || [];
     } catch (lookupError) {
       setError(lookupError.message);
-      setToast({ title: "Album search failed", body: lookupError.message });
+      notify("Album search failed", lookupError.message, "ui_error");
       return [];
     } finally {
       setLoading(false);
@@ -541,7 +564,7 @@ function App() {
       return batch;
     } catch (metadataError) {
       setError(metadataError.message);
-      setToast({ title: "Metadata queue failed", body: metadataError.message });
+      notify("Metadata queue failed", metadataError.message, "ui_error");
       throw metadataError;
     } finally {
       setLoading(false);
@@ -561,7 +584,7 @@ function App() {
       return batch;
     } catch (removeError) {
       setError(removeError.message);
-      setToast({ title: "Queue request failed", body: removeError.message });
+      notify("Queue request failed", removeError.message, "ui_error");
       throw removeError;
     } finally {
       setLoading(false);
@@ -581,7 +604,7 @@ function App() {
       return batch;
     } catch (playlistError) {
       setError(playlistError.message);
-      setToast({ title: "Playlist queue failed", body: playlistError.message });
+      notify("Playlist queue failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
       setLoading(false);
@@ -598,7 +621,7 @@ function App() {
       return task;
     } catch (syncError) {
       setError(syncError.message);
-      setToast({ title: "Playlist sync failed", body: syncError.message });
+      notify("Playlist sync failed", syncError.message, "ui_error");
       throw syncError;
     } finally {
       setLoading(false);
@@ -629,7 +652,7 @@ function App() {
       setCurrentTrack(track);
     } catch (playError) {
       setError(`Playback failed: ${playError.message}`);
-      setToast({ title: "Playback failed", body: playError.message });
+      notify("Playback failed", playError.message, "ui_error");
     }
   }
 
@@ -674,6 +697,7 @@ function App() {
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
       setError(approvalError.message);
+      notify("Task queue failed", approvalError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -693,6 +717,7 @@ function App() {
       await refreshApprovals();
     } catch (rejectError) {
       setError(rejectError.message);
+      notify("Reject failed", rejectError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -757,7 +782,6 @@ function App() {
         <div className="content-grid">
           <section className="panel main-panel">
             <PanelHeader page={page} queueSummary={queueSummary} />
-            {error && <div className="error-banner">{error}</div>}
             {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && (
               <LibraryTree
@@ -2967,6 +2991,12 @@ function upsertTask(tasks, task) {
 
 function visibleTrayNotifications(notifications) {
   return notifications.filter((notification) => notification.title !== "Favorites synced");
+}
+
+function mergeTrayNotifications(serverNotifications, currentNotifications) {
+  const localNotifications = currentNotifications.filter((notification) => String(notification.id).startsWith("local:"));
+  const serverVisible = visibleTrayNotifications(serverNotifications);
+  return [...localNotifications, ...serverVisible].sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 }
 
 function buildAppearanceVars(dark, accentColor, backgroundTint) {
