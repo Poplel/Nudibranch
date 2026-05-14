@@ -96,6 +96,7 @@ function App() {
   const [backgroundTint, setBackgroundTint] = useState("#356df3");
   const [library, setLibrary] = useState([]);
   const [importFiles, setImportFiles] = useState([]);
+  const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
@@ -121,6 +122,7 @@ function App() {
   const [error, setError] = useState("");
   const trayRef = useRef(null);
   const syncToastTaskIds = useRef(new Set());
+  const checkFileTaskIds = useRef(new Set());
   const localNotificationCounter = useRef(0);
 
   const theme = dark ? "app dark" : "app";
@@ -286,7 +288,7 @@ function App() {
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
       setTasks(taskData);
-      showCompletedSyncToasts(taskData);
+      handleCompletedTaskEffects(taskData);
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
       setWishlistApprovals(wishlistApprovalData);
@@ -315,23 +317,47 @@ function App() {
   async function refreshTasks() {
     try {
       const taskData = await api("/tasks");
-      showCompletedSyncToasts(taskData);
+      handleCompletedTaskEffects(taskData);
       setTasks(taskData);
     } catch {
       // Task polling should not disrupt the page the user is working in.
     }
   }
 
-  function showCompletedSyncToasts(taskData) {
+  function handleCompletedTaskEffects(taskData) {
     taskData.forEach((task) => {
-      if (task.type !== "sync_favorites_jellyfin") return;
       if (task.status !== "completed") return;
-      if (syncToastTaskIds.current.has(task.id)) return;
-      syncToastTaskIds.current.add(task.id);
-      setToast({
-        title: "Playlists synced",
-        body: `${task.result?.synced || 0} tracks were sent to Jellyfin.`,
-      });
+      if (task.type === "sync_favorites_jellyfin") {
+        if (syncToastTaskIds.current.has(task.id)) return;
+        syncToastTaskIds.current.add(task.id);
+        setToast({
+          title: "Playlists synced",
+          body: `${task.result?.synced || 0} tracks were sent to Jellyfin.`,
+        });
+      }
+      if (task.type === "check_files") {
+        if (checkFileTaskIds.current.has(task.id)) return;
+        checkFileTaskIds.current.add(task.id);
+        sendFileCheckToImport(task.result || {});
+      }
+    });
+  }
+
+  function sendFileCheckToImport(result) {
+    const files = result.missing_records || [];
+    const downloads = (result.missing_files || []).map((record) => ({
+      artist: record.artist,
+      album: record.album,
+      track: record.title,
+      track_number: record.track_number,
+    }));
+    if (files.length === 0 && downloads.length === 0) return;
+    setImportFiles(files);
+    setImportSeedDownloads(downloads);
+    setPage("Import/Add");
+    setToast({
+      title: "File check ready",
+      body: `${files.length} files and ${downloads.length} missing records were sent to Import/Add.`,
     });
   }
 
@@ -648,16 +674,20 @@ function App() {
     }
   }
 
-  async function submitWishlistApprovals() {
+  async function submitWishlistApprovals(itemIds = null) {
     setLoading(true);
     setError("");
     try {
-      const batch = await api("/wishlist/approvals", { method: "POST" });
+      const wantedItems = itemIds?.length ? wishlist.filter((item) => itemIds.includes(item.id)) : wishlist.filter((item) => item.status === "wanted");
+      const batch = await api("/wishlist/approvals", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds?.length ? itemIds : null }),
+      });
       setWishlistApprovals((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
       await refreshApprovals();
       const wishlistData = await api("/wishlist");
       setWishlist(wishlistData);
-      setToast({ title: "Wishlist review queued", body: "Wishlist items were added for approval." });
+      setToast({ title: "Wishlist review queued", body: `${wantedItems.length} wishlist items were submitted.` });
       return batch;
     } catch (wishlistError) {
       notify("Wishlist review failed", wishlistError.message, "ui_error");
@@ -1062,6 +1092,31 @@ function App() {
     await refreshApprovals();
   }
 
+  async function selectOnlyApprovalItem(batchId, siblingIds, itemId) {
+    await api(`/approvals/${batchId}/selection`, {
+      method: "POST",
+      body: JSON.stringify({ item_ids: siblingIds, selected: false }),
+    });
+    await api(`/approvals/${batchId}/selection`, {
+      method: "POST",
+      body: JSON.stringify({ item_ids: [itemId], selected: true }),
+    });
+    await refreshApprovals();
+  }
+
+  async function cancelTask(taskId) {
+    try {
+      const task = await api(`/tasks/${taskId}/cancel`, { method: "POST" });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Task canceled", body: task.type });
+      await refreshTasks();
+      await refreshApprovals();
+    } catch (cancelError) {
+      setError(cancelError.message);
+      notify("Cancel failed", cancelError.message, "ui_error");
+    }
+  }
+
   async function approveItems(items) {
     setLoading(true);
     try {
@@ -1095,10 +1150,10 @@ function App() {
       for (const [batchId, batchItems] of itemsByBatch) {
         await api(`/approvals/${batchId}/reject`, {
           method: "POST",
-          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), suppress_for: "week" }),
+          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), suppress_for: "none" }),
         });
       }
-      setToast({ title: "Changes rejected", body: "Selected items were suppressed for one week." });
+      setToast({ title: "Changes rejected", body: "Selected items were removed from the queue." });
       await refreshApprovals();
     } catch (rejectError) {
       setError(rejectError.message);
@@ -1186,6 +1241,7 @@ function App() {
               <Approvals
                 approvals={approvals}
                 onSelection={setApprovalSelection}
+                onSelectOnly={selectOnlyApprovalItem}
                 onApprove={approveItems}
                 onReject={rejectItems}
               />
@@ -1193,9 +1249,12 @@ function App() {
             {page === "Downloads" && (
               <DownloadsView
                 approvals={approvals}
+                tasks={tasks}
                 onSelection={setApprovalSelection}
+                onSelectOnly={selectOnlyApprovalItem}
                 onApprove={approveItems}
                 onReject={rejectItems}
+                onCancelTask={cancelTask}
               />
             )}
             {page === "Import/Add" && (
@@ -1211,9 +1270,10 @@ function App() {
                 onSearchAlbums={searchImportAlbums}
                 loading={loading}
                 activeImportTask={activeImportTask}
+                seedDownloadRequests={importSeedDownloads}
               />
             )}
-            {page === "Activity" && <TasksView tasks={tasks} />}
+            {page === "Activity" && <TasksView tasks={tasks} onCancel={cancelTask} />}
             {page === "Settings" && (
               <SettingsPanel
                 accentColor={accentColor}
@@ -1236,7 +1296,6 @@ function App() {
                 user={user}
                 backups={backups}
                 onRun={runTool}
-                onFixCheckFile={proposeCheckFileFix}
               />
             )}
             {page === "Wishlist" && (
@@ -1630,7 +1689,7 @@ function RemoveChoice({ title, onChoose, onCancel }) {
   );
 }
 
-function Approvals({ approvals, onSelection, onApprove, onReject }) {
+function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }) {
   const groups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
 
   if (groups.length === 0) {
@@ -1640,31 +1699,54 @@ function Approvals({ approvals, onSelection, onApprove, onReject }) {
   return (
     <div className="approval-tree">
       {groups.map((group) => (
-        <ApprovalBatch key={group.id} batch={group} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
+        <ApprovalBatch key={group.id} batch={group} onSelection={onSelection} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
   );
 }
 
-function DownloadsView({ approvals, onSelection, onApprove, onReject }) {
+function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove, onReject, onCancelTask }) {
   const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  if (downloadBatches.length === 0) {
+  const activeTasks = tasks.filter((task) => task.type === "execute_proposal_batch" && ["queued", "running"].includes(task.status));
+  if (downloadBatches.length === 0 && activeTasks.length === 0) {
     return <EmptyState title="No download candidates" body="Approved wishlist requests will add download candidates here." />;
   }
   return (
     <div className="approval-tree">
+      {activeTasks.length > 0 && (
+        <section className="batch running-downloads">
+          <div className="batch-header">
+            <div>
+              <h2>Running downloads</h2>
+              <p>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</p>
+            </div>
+          </div>
+          {activeTasks.map((task) => (
+            <div className="task-row task-row-inline" key={task.id}>
+              <strong>{task.type}</strong>
+              <span>{task.status}</span>
+              <small>{task.payload?.batch_id || taskSummary(task)}</small>
+              <button className="row-icon-button" onClick={() => onCancelTask(task.id)} title="Cancel task">
+                <X size={14} />
+              </button>
+            </div>
+          ))}
+        </section>
+      )}
       {downloadBatches.map((batch) => (
-        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onApprove={onApprove} onReject={onReject} />
+        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
   );
 }
 
-function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
+function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }) {
   const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
+  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
   const selectedItems = batch.items.filter((item) => item.selected);
   const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
+  const locked = batch.status === "executing";
 
   useEffect(() => {
     setOpenItems(new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
@@ -1680,12 +1762,12 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           </p>
         </div>
         <div className="approval-actions">
-          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={selectedItems.length === 0}>
+          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={selectedItems.length === 0}>
+          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={locked || selectedItems.length === 0}>
             <Check size={16} />
-            Run selected
+            {locked ? "Running" : "Run selected"}
           </button>
         </div>
       </div>
@@ -1716,6 +1798,9 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           openItems={openItems}
           setOpenItems={setOpenItems}
           onSelection={onSelection}
+          onSelectOnly={onSelectOnly}
+          openCandidatePickers={openCandidatePickers}
+          setOpenCandidatePickers={setOpenCandidatePickers}
           key={item.id}
         />
       ))}
@@ -1723,17 +1808,33 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
   );
 }
 
-function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection, depth = 0 }) {
+function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection, onSelectOnly, openCandidatePickers, setOpenCandidatePickers, depth = 0 }) {
   const children = childrenById.get(item.id) || [];
   const metadataChanges = metadataChangeRows(item);
   const hasChildren = children.length > 0 || metadataChanges.length > 0;
   const open = openItems.has(item.id);
   const descendantIds = collectItemIds(item, childrenById);
+  const leafDownloadCandidate = item.kind === "download" && children.length === 0 && (item.old_value || item.new_value);
+  const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.old_value || sibling.new_value)) : [];
+  const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
+  const pickerOpen = leafDownloadCandidate && openCandidatePickers?.has(item.parent_id);
+  const firstSelectedSibling = siblingCandidates.find((sibling) => sibling.selected);
+  const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
+  const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
+  if (hiddenAlternateCandidate) return null;
+
+  function updateChecked(checked) {
+    if (leafDownloadCandidate && checked) {
+      onSelectOnly?.(item.batch_id, siblingIds, item.id);
+    } else {
+      onSelection(item.batch_id, descendantIds, checked);
+    }
+  }
 
   return (
     <>
       <div className="proposal-row" style={{ "--depth": depth }}>
-        <input type="checkbox" checked={item.selected} onChange={(event) => onSelection(item.batch_id, descendantIds, event.target.checked)} />
+        <input type="checkbox" checked={item.selected} onChange={(event) => updateChecked(event.target.checked)} />
         <button
           className="row-toggle"
           disabled={!hasChildren}
@@ -1743,7 +1844,16 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
           {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
         </button>
         <span className="proposal-title">{item.title}</span>
-        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : item.kind}</small>
+        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : item.kind}</small>
+        {leafDownloadCandidate && item.selected && (
+          <button
+            className="row-icon-button"
+            onClick={() => toggleSet(setOpenCandidatePickers, item.parent_id)}
+            title={pickerOpen ? "Hide candidates" : "Choose candidate"}
+          >
+            <Pencil size={14} />
+          </button>
+        )}
       </div>
       {open &&
         metadataChanges.map((change) => (
@@ -1762,6 +1872,9 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
             openItems={openItems}
             setOpenItems={setOpenItems}
             onSelection={onSelection}
+            onSelectOnly={onSelectOnly}
+            openCandidatePickers={openCandidatePickers}
+            setOpenCandidatePickers={setOpenCandidatePickers}
             depth={depth + 1}
             key={child.id}
           />
@@ -1782,12 +1895,15 @@ function ImportWizard({
   onSearchAlbums,
   loading,
   activeImportTask,
+  seedDownloadRequests = [],
 }) {
   const [manualAlbums, setManualAlbums] = useState([]);
   const [albumRecords, setAlbumRecords] = useState({});
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [downloadRequests, setDownloadRequests] = useState([]);
   const downloadRequestsRef = useRef([]);
+  const seedKey = useMemo(() => stableDownloadRequestKey(seedDownloadRequests), [seedDownloadRequests]);
+  const appliedSeedKey = useRef("");
 
   const updateDownloadRequests = useCallback((requests) => {
     downloadRequestsRef.current = requests;
@@ -1802,6 +1918,17 @@ function ImportWizard({
     }));
     setAlbumSearchOpen(false);
   }
+
+  useEffect(() => {
+    if (!seedKey || appliedSeedKey.current === seedKey) return;
+    appliedSeedKey.current = seedKey;
+    const albums = manualAlbumsFromDownloadRequests(seedDownloadRequests);
+    setManualAlbums((current) => mergeManualAlbums(current, albums));
+    setAlbumRecords((current) => ({
+      ...current,
+      ...Object.fromEntries(albums.map((album) => [albumRecordKey(album.artist, album.name), album.tracks])),
+    }));
+  }, [seedKey, seedDownloadRequests]);
 
   function removeManualAlbum(artist, album) {
     setManualAlbums((current) => current.filter((entry) => entry.artist !== artist || entry.name !== album));
@@ -1861,6 +1988,7 @@ function ImportWizard({
           onRemoveManualAlbum={removeManualAlbum}
           onRemoveManualArtist={removeManualArtist}
           onDownloadRequestsChange={updateDownloadRequests}
+          seedDownloadRequests={seedDownloadRequests}
         />
       )}
     </div>
@@ -1946,7 +2074,9 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [selectedItems, setSelectedItems] = useState(() => new Set());
   const tree = useMemo(() => buildWishlistTree(wishlist), [wishlist]);
+  const wantedItems = useMemo(() => wishlist.filter((item) => item.status === "wanted"), [wishlist]);
   const treeKey = useMemo(
     () => tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
     [tree],
@@ -1955,7 +2085,8 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
   useEffect(() => {
     setOpenArtists(new Set(tree.map((artist) => artist.name)));
     setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
-  }, [treeKey]);
+    setSelectedItems(new Set(wantedItems.map((item) => item.id)));
+  }, [treeKey, wantedItems.length]);
 
   async function addAlbumToWishlist(album) {
     if (album.tracks?.length) {
@@ -1975,9 +2106,13 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
           <Plus size={16} />
           Add album
         </button>
-        <button className="primary" onClick={onSubmit} disabled={wishlist.filter((item) => item.status === "wanted").length === 0}>
+        <button
+          className="primary"
+          onClick={() => onSubmit([...selectedItems])}
+          disabled={selectedItems.size === 0}
+        >
           <ListChecks size={16} />
-          Add to approvals
+          Add selected to approvals
         </button>
       </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
@@ -2022,6 +2157,12 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
                         (album.tracks.length > 0 ? (
                           album.tracks.map((track) => (
                             <div className={track.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"} key={track.id}>
+                              <DownloadBranchToggle
+                                checked={selectedItems.has(track.id)}
+                                disabled={track.status !== "wanted"}
+                                onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
+                                title="Select wishlist track"
+                              />
                               <TreeRow depth={2} icon={FileAudio} title={track.track || "Track"} meta={track.status} />
                               {track.status !== "removed" && (
                                 <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
@@ -2032,6 +2173,14 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
                           ))
                         ) : (
                           <div className={album.request?.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"}>
+                            {album.request && (
+                              <DownloadBranchToggle
+                                checked={selectedItems.has(album.request.id)}
+                                disabled={album.request.status !== "wanted"}
+                                onChange={(checked) => toggleWishlistItem(setSelectedItems, album.request.id, checked)}
+                                title="Select wishlist request"
+                              />
+                            )}
                             <TreeRow depth={2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request?.status || "wanted"} />
                             {album.request && album.request.status !== "removed" && (
                               <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
@@ -2284,6 +2433,7 @@ function ImportTree({
   onRemoveManualAlbum,
   onRemoveManualArtist,
   onDownloadRequestsChange,
+  seedDownloadRequests = [],
 }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2295,6 +2445,8 @@ function ImportTree({
   const [dismissedGhosts, setDismissedGhosts] = useState(() => new Set());
   const [extraGhosts, setExtraGhosts] = useState({});
   const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums, albumRecords), [files, library, manualAlbums, albumRecords]);
+  const seedKey = useMemo(() => stableDownloadRequestKey(seedDownloadRequests), [seedDownloadRequests]);
+  const appliedSeedKey = useRef("");
 
   useEffect(() => {
     setOpenArtists(new Set(grouped.map((artist) => artist.name)));
@@ -2304,6 +2456,15 @@ function ImportTree({
   useEffect(() => {
     emitDownloadRequests(downloadSelections, dismissedGhosts, extraGhosts);
   }, [grouped, downloadSelections, dismissedGhosts, extraGhosts, onDownloadRequestsChange]);
+
+  useEffect(() => {
+    if (!seedKey || appliedSeedKey.current === seedKey) return;
+    const selected = selectedSlotIdsForRequests(grouped, seedDownloadRequests);
+    if (selected.size === 0) return;
+    appliedSeedKey.current = seedKey;
+    setDownloadSelections(selected);
+    emitDownloadRequests(selected);
+  }, [seedKey, grouped, seedDownloadRequests]);
 
   function emitDownloadRequests(selections = downloadSelections, dismissed = dismissedGhosts, extra = extraGhosts) {
     onDownloadRequestsChange?.(buildImportDownloadRequests(grouped, selections, dismissed, extra));
@@ -2372,18 +2533,20 @@ function ImportTree({
               }}
             >
               <div className="tree-action-row one-action">
-                <TreeRow
+                <SelectableTreeRow
                   icon={Folder}
                   open={openArtists.has(artist.name)}
                   title={artist.name}
                   meta={`${artist.count} files`}
                   onToggle={() => toggleSet(setOpenArtists, artist.name)}
-                />
-                <DownloadBranchToggle
-                  checked={artistGhostSlots(artist, dismissedGhosts).every((slot) => downloadSelections.has(slot.id))}
-                  disabled={artistGhostSlots(artist, dismissedGhosts).length === 0}
-                  onChange={(checked) => setSlotDownloadSelections(artistGhostSlots(artist, dismissedGhosts), checked)}
-                  title="Select downloads for this artist"
+                  control={
+                    <DownloadBranchToggle
+                      checked={artistGhostSlots(artist, dismissedGhosts).every((slot) => downloadSelections.has(slot.id))}
+                      disabled={artistGhostSlots(artist, dismissedGhosts).length === 0}
+                      onChange={(checked) => setSlotDownloadSelections(artistGhostSlots(artist, dismissedGhosts), checked)}
+                      title="Select downloads for this artist"
+                    />
+                  }
                 />
                 <button
                   className="row-icon-button"
@@ -2426,7 +2589,7 @@ function ImportTree({
                     }}
                   >
                     <div className="tree-action-row">
-                      <TreeRow
+                      <SelectableTreeRow
                         depth={1}
                         icon={Folder}
                         open={openAlbums.has(albumId)}
@@ -2434,12 +2597,14 @@ function ImportTree({
                         meta={`${album.files.length}/${album.slots.length} matched · ${album.matchStatus}`}
                         warning={album.matchStatus === "partial"}
                         onToggle={() => toggleSet(setOpenAlbums, albumId)}
-                      />
-                      <DownloadBranchToggle
-                        checked={visibleSlots.filter((slot) => !slot.file).length > 0 && visibleSlots.filter((slot) => !slot.file).every((slot) => downloadSelections.has(slot.id))}
-                        disabled={visibleSlots.filter((slot) => !slot.file).length === 0}
-                        onChange={(checked) => setSlotDownloadSelections(visibleSlots.filter((slot) => !slot.file), checked)}
-                        title="Select downloads for this album"
+                        control={
+                          <DownloadBranchToggle
+                            checked={visibleSlots.filter((slot) => !slot.file).length > 0 && visibleSlots.filter((slot) => !slot.file).every((slot) => downloadSelections.has(slot.id))}
+                            disabled={visibleSlots.filter((slot) => !slot.file).length === 0}
+                            onChange={(checked) => setSlotDownloadSelections(visibleSlots.filter((slot) => !slot.file), checked)}
+                            title="Select downloads for this album"
+                          />
+                        }
                       />
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
                         <Search size={15} />
@@ -3083,11 +3248,82 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
   return requests;
 }
 
+function stableDownloadRequestKey(requests = []) {
+  return requests
+    .map((request) => [request.artist || "", request.album || "", request.track || request.title || "", request.track_number || ""].join("::"))
+    .sort()
+    .join("|");
+}
+
+function manualAlbumsFromDownloadRequests(requests = []) {
+  const albumMap = new Map();
+  requests.forEach((request, index) => {
+    const artist = request.artist || "Unknown Artist";
+    const album = request.album || "Singles";
+    const key = albumRecordKey(artist, album);
+    if (!albumMap.has(key)) {
+      albumMap.set(key, { id: `seed:${key}`, artist, name: album, tracks: [] });
+    }
+    const entry = albumMap.get(key);
+    entry.tracks.push({
+      track_number: request.track_number || entry.tracks.length + 1,
+      title: request.track || request.title || `Track ${index + 1}`,
+    });
+  });
+  return [...albumMap.values()];
+}
+
+function mergeManualAlbums(current, incoming) {
+  const albumMap = new Map(current.map((album) => [albumRecordKey(album.artist, album.name), { ...album, tracks: [...(album.tracks || [])] }]));
+  incoming.forEach((album) => {
+    const key = albumRecordKey(album.artist, album.name);
+    if (!albumMap.has(key)) {
+      albumMap.set(key, album);
+      return;
+    }
+    const existing = albumMap.get(key);
+    const seenTracks = new Set((existing.tracks || []).map((track) => downloadTrackKey(track)));
+    const tracks = [...(existing.tracks || [])];
+    (album.tracks || []).forEach((track) => {
+      const key = downloadTrackKey(track);
+      if (seenTracks.has(key)) return;
+      seenTracks.add(key);
+      tracks.push(track);
+    });
+    albumMap.set(key, { ...existing, tracks });
+  });
+  return [...albumMap.values()];
+}
+
+function selectedSlotIdsForRequests(grouped, requests = []) {
+  const selected = new Set();
+  grouped.forEach((artist) => {
+    artist.albums.forEach((album) => {
+      album.slots.forEach((slot) => {
+        if (slot.file) return;
+        const match = requests.some((request) => {
+          const sameArtist = normalizeName(request.artist || "Unknown Artist") === normalizeName(artist.name);
+          const sameAlbum = normalizeName(request.album || "Singles") === normalizeName(album.name);
+          const sameNumber = request.track_number && Number(request.track_number) === Number(slot.track_number);
+          const sameTitle = normalizeName(request.track || request.title || "") === normalizeName(slot.title);
+          return sameArtist && sameAlbum && (sameNumber || sameTitle);
+        });
+        if (match) selected.add(slot.id);
+      });
+    });
+  });
+  return selected;
+}
+
+function downloadTrackKey(track) {
+  return `${track.track_number || ""}:${normalizeName(track.title || track.track || "")}`;
+}
+
 function artistGhostSlots(artist, dismissedGhosts) {
   return artist.albums.flatMap((album) => album.slots.filter((slot) => !slot.file && !dismissedGhosts.has(slot.id)));
 }
 
-function TasksView({ tasks }) {
+function TasksView({ tasks, onCancel }) {
   const [openTasks, setOpenTasks] = useState(() => new Set());
   if (tasks.length === 0) {
     return <EmptyState title="No activity" body="Scans, queued changes, downloads, and notifications will appear here." />;
@@ -3102,6 +3338,12 @@ function TasksView({ tasks }) {
             <span>{task.status}</span>
             <small>{taskSummary(task)}</small>
           </button>
+          {["queued", "running"].includes(task.status) && (
+            <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
+              <X size={14} />
+              Cancel
+            </button>
+          )}
           {openTasks.has(task.id) && (
             <pre className="task-detail">{JSON.stringify({ payload: task.payload, result: task.result, error: task.error }, null, 2)}</pre>
           )}
@@ -3111,19 +3353,19 @@ function TasksView({ tasks }) {
   );
 }
 
-function ToolsView({ tasks, notifications, user, backups, onRun, onFixCheckFile }) {
+function ToolsView({ tasks, notifications, user, backups, onRun }) {
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
-    ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks", "downloads:manage"],
+    ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "downloads:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
+    ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
-  const latestCheckFiles = latestTaskResult(tasks, "check_files");
 
   return (
     <div className="tools-view">
@@ -3162,9 +3404,6 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFixCheckFile 
             </button>
           </div>
         </section>
-      )}
-      {hasPermission(user, "library:manage") && latestCheckFiles && (
-        <CheckFilesResult result={latestCheckFiles.result} onFix={onFixCheckFile} />
       )}
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
@@ -3869,6 +4108,23 @@ function TreeRow({ depth = 0, icon: Icon, open, title, meta, warning = false, on
   );
 }
 
+function SelectableTreeRow({ depth = 0, icon: Icon, open, title, meta, warning = false, onToggle, control }) {
+  const Chevron = open ? ChevronDown : ChevronRight;
+  return (
+    <div className="tree-row selectable-tree-row" style={{ "--depth": depth }}>
+      <button className="selectable-tree-main" onClick={onToggle}>
+        <span className="chevron">{onToggle ? <Chevron size={15} /> : null}</span>
+        <Icon size={17} />
+      </button>
+      {control}
+      <button className="selectable-tree-title" onClick={onToggle}>
+        <span className="tree-title">{title}</span>
+        <small className={warning ? "warning" : ""}>{meta}</small>
+      </button>
+    </div>
+  );
+}
+
 function EmptyState({ title, body }) {
   return (
     <div className="empty-panel">
@@ -3896,9 +4152,10 @@ function groupApprovalBatches(batches) {
   const groups = new Map();
   const seen = new Set();
   batches.forEach((batch) => {
+    if (batch.status === "executing") return;
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
-      if (!["pending", "approved", "executing", "failed"].includes(item.status)) return;
+      if (!["pending", "approved", "failed"].includes(item.status)) return;
       const groupKind = batchGroupKind || item.kind;
       const key = `${groupKind}:${item.kind}:${item.title}:${item.old_value || ""}:${item.new_value || ""}`;
       if (seen.has(key)) return;
@@ -3920,6 +4177,19 @@ function groupApprovalBatches(batches) {
 function collectItemIds(item, childrenById) {
   const children = childrenById.get(item.id) || [];
   return [item.id, ...children.flatMap((child) => collectItemIds(child, childrenById))];
+}
+
+function siblingItems(item, childrenById) {
+  for (const siblings of childrenById.values()) {
+    if (siblings.some((sibling) => sibling.id === item.id)) {
+      return siblings;
+    }
+  }
+  return [item];
+}
+
+function candidateMeta(item) {
+  return item.new_value ? `candidate · ${item.new_value}` : "candidate";
 }
 
 function updateImportFile(files, onFilesChange, path, metadataPatch) {
@@ -4401,6 +4671,15 @@ function toggleSet(setter, value) {
     const next = new Set(current);
     if (next.has(value)) next.delete(value);
     else next.add(value);
+    return next;
+  });
+}
+
+function toggleWishlistItem(setter, id, checked) {
+  setter((current) => {
+    const next = new Set(current);
+    if (checked) next.add(id);
+    else next.delete(id);
     return next;
   });
 }

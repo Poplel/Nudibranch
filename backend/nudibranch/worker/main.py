@@ -12,11 +12,11 @@ from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track, User, WishlistItem
+from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
-from nudibranch.services.imports import discover_import_files
+from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import lookup_album_tracks
+from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
@@ -445,13 +445,33 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
 
 def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:
     grouped: dict[tuple[str, str], list[dict]] = {}
+    approved_by_user: dict[str, list[str]] = {}
+    wishlist_item_ids = []
     for item in items:
         payload = json.loads(item.payload_json or "{}")
         artist = payload.get("artist") or "Unknown Artist"
         album = payload.get("album") or "Singles"
+        if payload.get("wishlist_item_id"):
+            wishlist_item_ids.append(payload["wishlist_item_id"])
+        if payload.get("user_id"):
+            approved_by_user.setdefault(payload["user_id"], []).append(payload.get("track") or payload.get("album") or payload.get("artist") or item.title)
         grouped.setdefault((artist, album), []).append(payload)
     for (artist, album), requests in grouped.items():
         create_album_download_candidate_batch(session, artist, album, requests)
+    if wishlist_item_ids:
+        for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
+            wishlist_item.status = "approved"
+    for user_id, titles in approved_by_user.items():
+        shown = ", ".join(titles[:5])
+        extra = "" if len(titles) <= 5 else f" and {len(titles) - 5} more"
+        create_notification(
+            session,
+            title="Wishlist request approved",
+            body=f"{shown}{extra}",
+            event_type="wishlist_approved",
+            target_url="/downloads",
+            user_id=user_id,
+        )
 
 
 def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
@@ -496,6 +516,16 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     )
     session.add(album_item)
     session.flush()
+    searching_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=album_item.id,
+        title="Searching download candidates...",
+        kind=ProposalKind.download,
+        selected=False,
+        payload_json=json.dumps({"status": "searching"}),
+    )
+    session.add(searching_item)
+    session.commit()
 
     slskd_tracks = 0
     fallback_tracks = 0
@@ -517,13 +547,14 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
         if candidates:
             slskd_tracks += 1
-            for candidate in candidates:
+            for index, candidate in enumerate(candidates):
                 session.add(
                     ProposalItem(
                         batch_id=batch.id,
                         parent_id=track_item.id,
                         title=f"slskd: {candidate.get('filename') or query}",
                         kind=ProposalKind.download,
+                        selected=index == 0,
                         old_value=query,
                         new_value=candidate.get("username"),
                         payload_json=json.dumps(
@@ -553,6 +584,8 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     ),
                 )
             )
+    session.delete(searching_item)
+    session.flush()
     create_notification(
         session,
         title="Download candidates ready",
@@ -582,13 +615,24 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     session.add(batch)
     session.flush()
     track_parent = add_download_tree_parents(session, batch, request, query)
-    for candidate in candidates:
+    searching_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=track_parent.id,
+        title="Searching download candidates...",
+        kind=ProposalKind.download,
+        selected=False,
+        payload_json=json.dumps({"status": "searching"}),
+    )
+    session.add(searching_item)
+    session.commit()
+    for index, candidate in enumerate(candidates):
         session.add(
             ProposalItem(
                 batch_id=batch.id,
                 parent_id=track_parent.id,
                 title=candidate.get("filename") or query,
                 kind=ProposalKind.download,
+                selected=index == 0,
                 old_value=query,
                 new_value=candidate.get("username"),
                 payload_json=json.dumps(
@@ -600,6 +644,8 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
                 ),
             )
         )
+    session.delete(searching_item)
+    session.flush()
     create_notification(
         session,
         title="Download candidates ready",
@@ -989,10 +1035,11 @@ def run_check_files(session: Session, _payload: dict) -> dict:
             "title": tracks_by_path[path].title,
             "artist": tracks_by_path[path].album.artist.name,
             "album": tracks_by_path[path].album.title,
+            "track_number": tracks_by_path[path].track_number,
         }
         for path in missing_file_paths
     ]
-    missing_records = [{"path": path, "name": Path(path).name} for path in missing_record_paths]
+    missing_records = [file_info_for_existing_library_file(Path(path)) for path in missing_record_paths]
     create_notification(
         session,
         title="File check complete",
@@ -1001,6 +1048,28 @@ def run_check_files(session: Session, _payload: dict) -> dict:
         target_url="/tools",
     )
     return {"missing_files": missing_files, "missing_records": missing_records}
+
+
+def file_info_for_existing_library_file(file_path: Path) -> dict:
+    settings = get_settings()
+    stat = file_path.stat()
+    metadata = read_audio_metadata(file_path)
+    try:
+        relative_path = str(file_path.relative_to(settings.library_path))
+    except ValueError:
+        relative_path = file_path.name
+    return {
+        "path": str(file_path),
+        "relative_path": relative_path,
+        "extension": file_path.suffix.lower(),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "metadata": metadata,
+        "fingerprint": None,
+        "suggested_library_path": str(file_path),
+        "action": "create_library_record",
+        "name": file_path.name,
+    }
 
 
 def run_check_lyrics(session: Session, _payload: dict) -> dict:
@@ -1067,6 +1136,61 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
     return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
 
 
+def run_check_album_covers(session: Session, _payload: dict) -> dict:
+    albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist))
+            .where((Album.cover_path.is_(None)) | (Album.cover_path == ""))
+            .order_by(Album.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Download missing album covers", kind=ProposalKind.artwork, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    found = 0
+    for album in albums:
+        results = search_album_releases(album.artist.name, album.title)
+        cover_url = next((result.get("cover_art_url") for result in results if result.get("cover_art_url")), None)
+        if not cover_url:
+            continue
+        found += 1
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=f"{album.artist.name} / {album.title}",
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"cover_path": album.cover_path}),
+                new_value=json.dumps({"cover_path": cover_url}),
+                payload_json=json.dumps(
+                    {
+                        "target_type": "album",
+                        "target_id": album.id,
+                        "changes": {"cover_path": cover_url},
+                    }
+                ),
+            )
+        )
+    if found == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Album cover check complete",
+            body=f"{len(albums)} albums checked. No missing covers were found online.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"albums_checked": len(albums), "cover_changes": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Album cover review ready",
+        body=f"{found} album cover changes were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"albums_checked": len(albums), "cover_changes": found, "batch_id": batch.id}
+
+
 def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     albums = list(
         session.scalars(
@@ -1077,6 +1201,11 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     )
     created = 0
     checked = 0
+    batch = ProposalBatch(title="Missing album tracks", kind=ProposalKind.download, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
     for album in albums:
         checked += 1
         record = lookup_album_tracks(album.artist.name, album.title, album.musicbrainz_release_id)
@@ -1085,33 +1214,71 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
             track_number = track.get("track_number")
             if not track_number or track_number in existing_numbers:
                 continue
-            if session.scalar(
-                select(WishlistItem).where(
-                    WishlistItem.artist == album.artist.name,
-                    WishlistItem.album == album.title,
-                    WishlistItem.track == track.get("title"),
-                    WishlistItem.status.in_(["wanted", "review"]),
-                )
-            ):
-                continue
-            session.add(
-                WishlistItem(
-                    user_id=first_admin_id(session),
-                    kind="track",
-                    artist=album.artist.name,
-                    album=album.title,
-                    track=track.get("title"),
-                )
-            )
+            add_download_request_item(session, batch, artist_items, album_items, album.artist.name, album.title, track.get("title"))
             created += 1
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Missing track check complete",
+            body=f"{checked} albums checked. No missing tracks were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
     create_notification(
         session,
-        title="Missing track check complete",
-        body=f"{created} missing tracks added to wishlist.",
-        event_type="tool_completed",
-        target_url="/wishlist",
+        title="Missing track review ready",
+        body=f"{created} missing tracks were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
     )
-    return {"albums_checked": checked, "wishlist_items_created": created}
+    return {"albums_checked": checked, "download_items_created": created, "batch_id": batch.id}
+
+
+def add_download_request_item(
+    session: Session,
+    batch: ProposalBatch,
+    artist_items: dict[str, ProposalItem],
+    album_items: dict[tuple[str, str], ProposalItem],
+    artist: str,
+    album: str,
+    track: str | None,
+) -> None:
+    if artist not in artist_items:
+        artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
+        session.add(artist_item)
+        session.flush()
+        artist_items[artist] = artist_item
+    album_key = (artist, album)
+    if album_key not in album_items:
+        album_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=artist_items[artist].id,
+            title=album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album}),
+        )
+        session.add(album_item)
+        session.flush()
+        album_items[album_key] = album_item
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_items[album_key].id,
+            title=track or album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps(
+                {
+                    "action": "wishlist_request",
+                    "kind": "track",
+                    "artist": artist,
+                    "album": album,
+                    "track": track,
+                }
+            ),
+        )
+    )
 
 
 def run_backup_now(session: Session, _payload: dict) -> dict:
@@ -1197,6 +1364,7 @@ TASK_HANDLERS = {
     "jellyfin_scan": run_jellyfin_scan,
     "check_files": run_check_files,
     "check_lyrics": run_check_lyrics,
+    "check_album_covers": run_check_album_covers,
     "check_missing_tracks": run_check_missing_tracks,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
@@ -1221,6 +1389,9 @@ async def worker_loop() -> None:
                 if not handler:
                     raise ValueError(f"No handler registered for task type {task.type}")
                 result = handler(session, task_to_payload(task))
+                session.refresh(task)
+                if task.status == TaskStatus.canceled:
+                    continue
                 complete_task(session, task, result)
             except Exception as error:  # noqa: BLE001 - worker must persist task failures.
                 create_notification(

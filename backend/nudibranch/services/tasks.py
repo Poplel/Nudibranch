@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from nudibranch.db.models import Task, TaskStatus
+from nudibranch.db.models import ProposalBatch, ProposalStatus, Task, TaskStatus
 
 
 def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
@@ -95,3 +95,24 @@ def fail_task(session: Session, task: Task, error: str) -> None:
     task.error = error
     task.lease_until = None
     session.commit()
+
+
+def cancel_task(session: Session, task_id: str) -> Task:
+    task = session.get(Task, task_id)
+    if not task:
+        raise ValueError("Task not found")
+    if task.status not in {TaskStatus.queued, TaskStatus.running}:
+        raise ValueError("Only queued or running tasks can be canceled")
+    payload = task_to_payload(task)
+    if task.type == "execute_proposal_batch" and payload.get("batch_id"):
+        batch = session.get(ProposalBatch, payload["batch_id"])
+        if batch and batch.status in {ProposalStatus.approved, ProposalStatus.executing}:
+            batch.status = ProposalStatus.pending
+            for item in batch.items:
+                if item.status in {ProposalStatus.approved, ProposalStatus.executing}:
+                    item.status = ProposalStatus.pending
+    task.status = TaskStatus.canceled
+    task.lease_until = None
+    session.commit()
+    session.refresh(task)
+    return task

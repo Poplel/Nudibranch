@@ -97,6 +97,10 @@ class WishlistOut(WishlistCreate):
     created_at: datetime
 
 
+class WishlistApprovalRequest(BaseModel):
+    item_ids: list[str] | None = None
+
+
 class ProposalItemOut(BaseModel):
     id: str
     batch_id: str
@@ -132,7 +136,7 @@ class ProposalApproveRequest(BaseModel):
 
 class ProposalRejectRequest(BaseModel):
     item_ids: list[str] | None = None
-    suppress_for: str = Field("week", pattern="^(day|week|forever|none)$")
+    suppress_for: str = Field("none", pattern="^(day|week|forever|none)$")
 
 
 class TaskCreate(BaseModel):

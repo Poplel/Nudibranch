@@ -772,6 +772,7 @@ nav button:hover,
   grid-template-columns: 52px minmax(0, 1fr);
   gap: 10px;
   align-items: center;
+  height: 64px;
   min-height: 64px;
   border: 1px solid var(--line);
   border-radius: 4px;
@@ -1438,6 +1439,21 @@ nav button:hover,
   gap: 4px;
 }
 
+.task-cancel {
+  justify-self: end;
+}
+
+.task-row-inline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 90px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  background: var(--panel);
+}
+
 .task-detail {
   overflow: auto;
   max-height: 320px;
@@ -1494,6 +1510,20 @@ nav button:hover,
   text-align: left;
 }
 
+.selectable-tree-row {
+  grid-template-columns: 18px 18px 18px minmax(0, 1fr) auto;
+}
+
+.selectable-tree-main,
+.selectable-tree-title {
+  display: contents;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
 .tree-row:hover,
 .proposal-row:hover,
 .bulk-row:hover {
@@ -1524,7 +1554,7 @@ nav button:hover,
 }
 
 .proposal-row {
-  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto auto;
   padding-left: calc(14px + var(--depth, 0) * 24px);
 }
 

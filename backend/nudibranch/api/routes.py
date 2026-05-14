@@ -44,6 +44,7 @@ from nudibranch.api.schemas import (
     UserOut,
     UserPinUpdate,
     UserUpdate,
+    WishlistApprovalRequest,
     WishlistCreate,
     WishlistOut,
 )
@@ -73,7 +74,7 @@ from nudibranch.services.imports import discover_import_files, read_audio_metada
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
-from nudibranch.services.tasks import enqueue_task, task_result, task_to_payload
+from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 
 router = APIRouter(prefix="/api/v1")
 
@@ -489,7 +490,7 @@ def list_wishlist(
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> list[WishlistOut]:
     query = select(WishlistItem)
-    if not user.is_admin:
+    if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
     return [WishlistOut.model_validate(item, from_attributes=True) for item in items]
@@ -536,7 +537,7 @@ def list_wishlist_approvals(
         .order_by(ProposalBatch.created_at.desc())
     )
     batches = list(session.scalars(query))
-    if user.is_admin:
+    if user_has_permission(user, Permission.wishlist_manage_all):
         return [serialize_batch(batch) for batch in batches]
     visible_batches = []
     for batch in batches:
@@ -547,12 +548,15 @@ def list_wishlist_approvals(
 
 @router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"])
 def propose_wishlist_items(
+    payload: WishlistApprovalRequest | None = None,
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> ProposalBatchOut:
     query = select(WishlistItem).where(WishlistItem.status == "wanted")
-    if not user.is_admin:
+    if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
+    if payload and payload.item_ids:
+        query = query.where(WishlistItem.id.in_(payload.item_ids))
     items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
     if not items:
         raise HTTPException(status_code=400, detail="No wishlist items are ready")
@@ -929,6 +933,14 @@ def tool_check_lyrics(
     return serialize_task(enqueue_task(session, "check_lyrics", {}))
 
 
+@router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"])
+def tool_check_album_covers(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_album_covers", {}))
+
+
 @router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"])
 def propose_check_file_fix(
     payload: CheckFileFixRequest,
@@ -1131,7 +1143,7 @@ def reject(
     _: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> dict:
     count = reject_items(session, batch_id, payload.item_ids, payload.suppress_for)
-    return {"batch_id": batch_id, "rejected": count, "suppress_for": payload.suppress_for}
+    return {"batch_id": batch_id, "removed": count}
 
 
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"])
@@ -1141,6 +1153,19 @@ def list_tasks(
 ) -> list[TaskOut]:
     tasks = list(session.scalars(select(Task).order_by(Task.created_at.desc()).limit(100)))
     return [serialize_task(task) for task in tasks]
+
+
+@router.post("/tasks/{task_id}/cancel", response_model=TaskOut, tags=["tasks"])
+def cancel_existing_task(
+    task_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.activity_read)),
+) -> TaskOut:
+    try:
+        task = cancel_task(session, task_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return serialize_task(task)
 
 
 @router.post("/tasks", response_model=TaskOut, tags=["tasks"])
@@ -1363,6 +1388,10 @@ def effective_permission_values(user: User) -> list[str]:
     if user.is_admin:
         return [permission.value for permission in Permission]
     return sorted({permission.permission.value for permission in user.permissions})
+
+
+def user_has_permission(user: User, permission: Permission) -> bool:
+    return user.is_admin or any(user_permission.permission == permission for user_permission in user.permissions)
 
 
 def permission_label(permission: Permission) -> str:
