@@ -1914,7 +1914,7 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initi
           ) : (
             results.map((result) => (
               <button className="album-result" key={result.id} onClick={() => addResult(result)}>
-                <img src={result.cover_art_url || ""} alt="" />
+                <AlbumResultArt src={result.cover_art_url} />
                 <span>
                   <strong>{result.title}</strong>
                   <small>
@@ -1928,6 +1928,18 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initi
       )}
     </div>
   );
+}
+
+function AlbumResultArt({ src }) {
+  const [failed, setFailed] = useState(false);
+  if (!src || failed) {
+    return (
+      <span className="album-result-art placeholder">
+        <Music size={19} />
+      </span>
+    );
+  }
+  return <img src={src} alt="" onError={() => setFailed(true)} />;
 }
 
 function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearchAlbums, onLookupAlbum }) {

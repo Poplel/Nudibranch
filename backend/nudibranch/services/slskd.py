@@ -9,6 +9,10 @@ def slskd_headers(api_key: str) -> dict[str, str]:
 
 
 def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
+    return search_slskd_detailed(slskd_url, api_key, query, limit)["candidates"]
+
+
+def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 8) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
     if not api_key:
@@ -22,15 +26,39 @@ def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 8) -> li
             raise ValueError("slskd did not return a search id")
 
         payload: dict[str, Any] = {}
+        diagnostics: dict[str, Any] = {"search_id": search_id, "polls": 0, "responses": 0, "files": 0, "candidates": 0}
         for _ in range(6):
-            response = client.get(f"/api/v0/searches/{search_id}")
-            response.raise_for_status()
-            payload = response.json()
+            diagnostics["polls"] += 1
+            payload = search_payload(client, search_id)
+            diagnostics.update(search_diagnostics(payload))
             candidates = extract_candidates(payload, query)
             if candidates:
-                return rank_candidates(candidates)[:limit]
+                ranked = rank_candidates(candidates)[:limit]
+                diagnostics["candidates"] = len(ranked)
+                return {"candidates": ranked, "diagnostics": diagnostics}
             time.sleep(1)
-        return rank_candidates(extract_candidates(payload, query))[:limit]
+        ranked = rank_candidates(extract_candidates(payload, query))[:limit]
+        diagnostics["candidates"] = len(ranked)
+        return {"candidates": ranked, "diagnostics": diagnostics}
+
+
+def search_payload(client: httpx.Client, search_id: str) -> Any:
+    state_response = client.get(f"/api/v0/searches/{search_id}", params={"includeResponses": "true"})
+    state_response.raise_for_status()
+    state_payload = state_response.json()
+    responses = response_list(state_payload)
+    if responses:
+        return state_payload
+
+    responses_response = client.get(f"/api/v0/searches/{search_id}/responses")
+    if responses_response.status_code in {404, 405}:
+        return state_payload
+    responses_response.raise_for_status()
+    responses_payload = responses_response.json()
+    if isinstance(state_payload, dict):
+        state_payload = {**state_payload, "responses": response_list(responses_payload)}
+        return state_payload
+    return responses_payload
 
 
 def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]) -> dict[str, Any]:
@@ -63,11 +91,7 @@ def search_identifier(payload: Any) -> str | None:
 
 
 def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
-    responses = []
-    if isinstance(payload, dict):
-        responses = payload.get("responses") or payload.get("Responses") or payload.get("results") or []
-    elif isinstance(payload, list):
-        responses = payload
+    responses = response_list(payload)
 
     candidates: list[dict[str, Any]] = []
     for response in responses:
@@ -90,6 +114,31 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                 }
             )
     return candidates
+
+
+def response_list(payload: Any) -> list[Any]:
+    if isinstance(payload, dict):
+        for key in ("responses", "Responses", "results", "Results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        if isinstance(payload.get("data"), list):
+            return payload["data"]
+    if isinstance(payload, list):
+        return payload
+    return []
+
+
+def search_diagnostics(payload: Any) -> dict[str, int]:
+    responses = response_list(payload)
+    file_count = 0
+    for response in responses:
+        if not isinstance(response, dict):
+            continue
+        files = response.get("files") or response.get("Files") or []
+        if isinstance(files, list):
+            file_count += len(files)
+    return {"responses": len(responses), "files": file_count}
 
 
 def normalize_file(file_info: Any) -> dict[str, Any] | None:

@@ -70,7 +70,7 @@ def search_album_releases(artist: str, album: str) -> list[dict]:
             "country": release.get("country"),
             "score": release.get("score"),
             "track_count": release.get("track-count"),
-            "cover_art_url": cover_art_url(release.get("id")),
+            "cover_art_url": cover_art_url(release.get("id"), release),
         }
         for release in releases
         if release.get("id")
@@ -174,8 +174,11 @@ def escape_query(value: str) -> str:
     return value.replace('"', "")
 
 
-def cover_art_url(release_id: str | None) -> str | None:
+def cover_art_url(release_id: str | None, release: dict | None = None) -> str | None:
     if not release_id:
+        return None
+    archive = (release or {}).get("cover-art-archive") or {}
+    if archive and not archive.get("front"):
         return None
     return f"https://coverartarchive.org/release/{release_id}/front-250"
 

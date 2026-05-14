@@ -18,7 +18,7 @@ from nudibranch.services.imports import discover_import_files
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import lookup_album_tracks
 from nudibranch.services.settings_store import integration_settings
-from nudibranch.services.slskd import queue_slskd_download, search_slskd
+from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
 
 
@@ -449,18 +449,29 @@ def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
 def create_download_candidate_batch(session: Session, request: dict) -> None:
     query = download_query(request)
     settings = integration_settings(session)
-    candidates = search_slskd(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), query)
+    search_result = search_slskd_detailed(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), query)
+    candidates = search_result["candidates"]
+    diagnostics = search_result["diagnostics"]
     if not candidates:
+        create_notification(
+            session,
+            title="slskd search found no candidates",
+            body=slskd_diagnostic_body(query, diagnostics),
+            event_type="download_empty",
+            target_url="/activity",
+        )
         create_ytdlp_fallback_batch(session, request, query)
         return
 
     batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, tree_path="/downloads")
     session.add(batch)
     session.flush()
+    track_parent = add_download_tree_parents(session, batch, request, query)
     for candidate in candidates:
         session.add(
             ProposalItem(
                 batch_id=batch.id,
+                parent_id=track_parent.id,
                 title=candidate.get("filename") or query,
                 kind=ProposalKind.download,
                 old_value=query,
@@ -477,7 +488,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     create_notification(
         session,
         title="Download candidates ready",
-        body=f"{len(candidates)} candidates found for {query}.",
+        body=f"{len(candidates)} slskd candidates found for {query}. {slskd_diagnostic_body(query, diagnostics)}",
         event_type="approval_needed",
         target_url="/downloads",
     )
@@ -487,9 +498,11 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
     batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, tree_path="/downloads")
     session.add(batch)
     session.flush()
+    track_parent = add_download_tree_parents(session, batch, request, query)
     session.add(
         ProposalItem(
             batch_id=batch.id,
+            parent_id=track_parent.id,
             title=f"YouTube fallback: {query}",
             kind=ProposalKind.download,
             old_value=query,
@@ -508,6 +521,50 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
         body=query,
         event_type="approval_needed",
         target_url="/downloads",
+    )
+
+
+def add_download_tree_parents(session: Session, batch: ProposalBatch, request: dict, query: str) -> ProposalItem:
+    artist = request.get("artist") or "Unknown Artist"
+    album = request.get("album") or "Singles"
+    track = request.get("track") or request.get("title") or query
+    artist_item = ProposalItem(
+        batch_id=batch.id,
+        title=artist,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist}),
+    )
+    session.add(artist_item)
+    session.flush()
+    album_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=artist_item.id,
+        title=album,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist, "album": album}),
+    )
+    session.add(album_item)
+    session.flush()
+    track_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=album_item.id,
+        title=track,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist, "album": album, "track": track}),
+    )
+    session.add(track_item)
+    session.flush()
+    return track_item
+
+
+def slskd_diagnostic_body(query: str, diagnostics: dict) -> str:
+    return (
+        f"{query}: search {diagnostics.get('search_id', 'unknown')} returned "
+        f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
+        f"{diagnostics.get('candidates', 0)} candidates after {diagnostics.get('polls', 0)} polls."
     )
 
 
