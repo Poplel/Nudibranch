@@ -178,6 +178,14 @@ class PlaylistPositionProposalRequest(BaseModel):
     position: int = Field(ge=1)
 
 
+class PlaylistCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+
+
+class PlaylistAddTracks(BaseModel):
+    track_ids: list[str] = Field(min_length=1)
+
+
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None

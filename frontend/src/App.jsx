@@ -47,7 +47,7 @@ const APPEARANCE_KEY = "nudibranch_appearance";
 
 const navItems = [
   ["Library", Music],
-  ["Import", HardDriveUpload],
+  ["Import/Add", HardDriveUpload],
   ["Wishlist", Sparkles],
   ["Task Queue", ListChecks],
   ["Downloads", Download],
@@ -60,8 +60,9 @@ const navItems = [
 
 const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the managed library.",
-  Import: "Scan new files and prepare them for review.",
-  Wishlist: "Request artists, albums, and tracks for download.",
+  "Import/Add": "Scan new files, add album records, and prepare them for review.",
+  Wishlist: "Prepare wishlist requests and submit them for approval.",
+  "Wishlist Approvals": "Prepare wishlist requests and submit them for approval.",
   "Task Queue": "Review requested changes before they run.",
   Downloads: "Review download searches, candidates, and completed transfers.",
   Playlists: "Create, import, and manage playlists.",
@@ -86,7 +87,7 @@ const approvalTypeLabels = {
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
-  const [page, setPage] = useState("Import");
+  const [page, setPage] = useState("Import/Add");
   const [dark, setDark] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -98,6 +99,8 @@ function App() {
   const [tasks, setTasks] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
+  const [wishlistApprovals, setWishlistApprovals] = useState([]);
+  const [playlists, setPlaylists] = useState([]);
   const [favoritesPlaylist, setFavoritesPlaylist] = useState(null);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
@@ -171,6 +174,7 @@ function App() {
       refreshApprovals();
       refreshNotifications();
       refreshFavorites();
+      refreshWishlistApprovals();
     }, 10000);
     return () => window.clearInterval(interval);
   }, [token]);
@@ -254,17 +258,16 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const [me, libraryTree, approvalData, taskData, notificationData, wishlistData] = await Promise.all([
+      const [me, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData] = await Promise.all([
         api("/me"),
         api("/library/tree"),
-        api("/approvals"),
         api("/tasks"),
         api("/notifications"),
         api("/wishlist"),
+        api("/wishlist/approvals"),
       ]);
       setUser(me);
       setLibrary(libraryTree);
-      setApprovals(approvalData);
       setTasks(taskData);
       taskData.forEach((task) => {
         if (task.type === "sync_favorites_jellyfin" && task.status === "completed") {
@@ -273,14 +276,18 @@ function App() {
       });
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
+      setWishlistApprovals(wishlistApprovalData);
+      refreshApprovals();
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
       refreshFavorites();
     } catch (refreshError) {
-      setError(refreshError.message);
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
+        setError("");
         logout();
+      } else {
+        setError(refreshError.message);
       }
     } finally {
       setLoading(false);
@@ -372,11 +379,56 @@ function App() {
 
   async function refreshFavorites() {
     try {
-      const favorites = await api("/playlists/favorites");
+      const playlistData = await api("/playlists");
+      setPlaylists(playlistData);
+      const favorites = playlistData.find((playlist) => playlist.name === "Favorites") || (await api("/playlists/favorites"));
       setFavoritesPlaylist(favorites);
       setFavoriteTrackIds(new Set(favorites.track_ids || []));
     } catch {
       // Favorites are optional for users without playlist permissions.
+    }
+  }
+
+  async function createPlaylist(name) {
+    setLoading(true);
+    setError("");
+    try {
+      const playlist = await api("/playlists", {
+        method: "POST",
+        body: JSON.stringify({ name }),
+      });
+      setPlaylists((current) => upsertPlaylist(current, playlist));
+      setToast({ title: "Playlist created", body: playlist.name });
+      return playlist;
+    } catch (playlistError) {
+      notify("Playlist failed", playlistError.message, "ui_error");
+      throw playlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function addTracksToPlaylist(playlistId, trackIds) {
+    if (!playlistId || trackIds.length === 0) return null;
+    setLoading(true);
+    setError("");
+    try {
+      const playlist = await api(`/playlists/${playlistId}/tracks`, {
+        method: "POST",
+        body: JSON.stringify({ track_ids: trackIds }),
+      });
+      setPlaylists((current) => upsertPlaylist(current, playlist));
+      if (playlist.name === "Favorites") {
+        setFavoritesPlaylist(playlist);
+        setFavoriteTrackIds(new Set(playlist.track_ids || []));
+      }
+      setToast({ title: "Playlist updated", body: `${trackIds.length} item${trackIds.length === 1 ? "" : "s"} added to ${playlist.name}.` });
+      return playlist;
+    } catch (playlistError) {
+      notify("Playlist failed", playlistError.message, "ui_error");
+      throw playlistError;
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -388,6 +440,7 @@ function App() {
         method: wasFavorite ? "DELETE" : "POST",
       });
       setFavoritesPlaylist(favorites);
+      setPlaylists((current) => upsertPlaylist(current, favorites));
       setFavoriteTrackIds(new Set(favorites.track_ids || []));
       setToast({
         title: wasFavorite ? "Removed from Favorites" : "Added to Favorites",
@@ -430,6 +483,14 @@ function App() {
     }
   }
 
+  async function refreshWishlistApprovals() {
+    try {
+      setWishlistApprovals(await api("/wishlist/approvals"));
+    } catch {
+      // Wishlist approval polling is best-effort.
+    }
+  }
+
   async function createWishlistItem(item) {
     setLoading(true);
     setError("");
@@ -461,6 +522,25 @@ function App() {
     } catch (wishlistError) {
       setError(wishlistError.message);
       notify("Wishlist failed", wishlistError.message, "ui_error");
+      throw wishlistError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function submitWishlistApprovals() {
+    setLoading(true);
+    setError("");
+    try {
+      const batch = await api("/wishlist/approvals", { method: "POST" });
+      setWishlistApprovals((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
+      await refreshApprovals();
+      const wishlistData = await api("/wishlist");
+      setWishlist(wishlistData);
+      setToast({ title: "Wishlist review queued", body: "Wishlist items were added for approval." });
+      return batch;
+    } catch (wishlistError) {
+      notify("Wishlist review failed", wishlistError.message, "ui_error");
       throw wishlistError;
     } finally {
       setLoading(false);
@@ -678,7 +758,7 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const batch = await api(`/playlists/favorites/entries/${entryId}/position`, {
+      const batch = await api(`/playlists/entries/${entryId}/position`, {
         method: "POST",
         body: JSON.stringify({ position }),
       });
@@ -830,7 +910,7 @@ function App() {
           {navItems.map(([label, Icon]) => (
             <button className={page === label ? "active" : ""} key={label} onClick={() => setPage(label)}>
               <Icon size={17} />
-              {label}
+              {label === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : label}
             </button>
           ))}
         </nav>
@@ -864,7 +944,7 @@ function App() {
 
         <div className="content-grid">
           <section className="panel main-panel">
-            <PanelHeader page={page} queueSummary={queueSummary} />
+            <PanelHeader page={page === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && (
               <LibraryTree
@@ -875,6 +955,8 @@ function App() {
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
                 onQueueRemove={proposeLibraryRemove}
+                playlists={playlists}
+                onAddToPlaylist={addTracksToPlaylist}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
               />
@@ -887,7 +969,7 @@ function App() {
                 onReject={rejectItems}
               />
             )}
-            {page === "Import" && (
+            {page === "Import/Add" && (
               <ImportWizard
                 files={importFiles}
                 onScan={scanImportFolder}
@@ -909,6 +991,8 @@ function App() {
                 setAccentColor={setAccentColor}
                 backgroundTint={backgroundTint}
                 setBackgroundTint={setBackgroundTint}
+                dark={dark}
+                setDark={setDark}
                 user={user}
                 apiKey={token}
                 integrationSettings={integrationSettings}
@@ -919,22 +1003,27 @@ function App() {
             {page === "Wishlist" && (
               <WishlistView
                 wishlist={wishlist}
+                approvals={wishlistApprovals}
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
+                onSubmit={submitWishlistApprovals}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
               />
             )}
             {page === "Playlists" && (
               <PlaylistsView
-                favorites={favoritesPlaylist}
+                playlists={playlists.length ? playlists : favoritesPlaylist ? [favoritesPlaylist] : []}
+                library={library}
+                onCreatePlaylist={createPlaylist}
+                onAddToPlaylist={addTracksToPlaylist}
                 onQueuePosition={proposePlaylistPosition}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
                 onSync={syncPlaylists}
               />
             )}
-            {!["Library", "Task Queue", "Import", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
+            {!["Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
@@ -1045,7 +1134,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1068,7 +1157,8 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
         <EmptyState title="No library records" body="Import queued music to populate the managed library." />
       )}
       {visibleArtists.length > 0 && (
-        <TreeControls
+        <TreeToolbar
+          expanded={openArtists.size > 0 || openAlbums.size > 0}
           onExpand={() => {
             setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
             setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
@@ -1115,6 +1205,9 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                 targetId={artist.id}
                 title={artist.name}
                 fields={artistFields(artist)}
+                playlists={playlists}
+                targetTrackIds={artistTracks(artist).map((track) => track.id)}
+                onAddToPlaylist={onAddToPlaylist}
                 onQueue={onQueueMetadata}
                 onClose={() => toggleSet(setOpenArtistDetails, artist.id)}
               />
@@ -1134,11 +1227,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                     <QuickLibraryActions
                       onPlay={() => onPlay(albumTracks(artist, album))}
                       onQueue={() => onQueue(albumTracks(artist, album))}
-                      onRemove={() => setRemoveTarget(removeKey("album", album.id))}
                     />
-                    <button className="row-icon-button" onClick={() => onCheckAlbumAcoustID(album)} title="Check album tracks with AcoustID">
-                      <Sparkles size={15} />
-                    </button>
                     <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
                       <Pencil size={15} />
                     </button>
@@ -1177,6 +1266,11 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                       details={{ artist: artist.name, tracks: album.tracks.length }}
                       onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
                       onSearchAlbums={onSearchAlbums}
+                      playlists={playlists}
+                      targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
+                      onAddToPlaylist={onAddToPlaylist}
+                      onAcousticCheck={() => onCheckAlbumAcoustID(album)}
+                      onRemove={() => setRemoveTarget(removeKey("album", album.id))}
                       onQueue={onQueueMetadata}
                       onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
                     />
@@ -1220,6 +1314,9 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                             details={{ artist: artist.name, album: album.title }}
                             onAutoLookup={(field, draft) => trackAutoLookup(field, draft, artist.name, album.title, onCheckAlbum)}
                             onSearchAlbums={onSearchAlbums}
+                            playlists={playlists}
+                            targetTrackIds={[track.id]}
+                            onAddToPlaylist={onAddToPlaylist}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
@@ -1244,9 +1341,11 @@ function QuickLibraryActions({ onPlay, onQueue, onRemove }) {
       <button className="row-icon-button" onClick={onQueue} title="Add to local queue">
         <ListPlus size={14} />
       </button>
-      <button className="row-icon-button" onClick={onRemove} title="Remove">
-        <Trash2 size={14} />
-      </button>
+      {onRemove && (
+        <button className="row-icon-button" onClick={onRemove} title="Remove">
+          <Trash2 size={14} />
+        </button>
+      )}
     </div>
   );
 }
@@ -1328,7 +1427,8 @@ function ApprovalBatch({ batch, onSelection, onApprove, onReject }) {
           Select all visible
         </label>
         <span>{selectedItems.length} selected</span>
-        <TreeControls
+        <TreeToolbar
+          expanded={openItems.size > 0}
           onExpand={() => setOpenItems(new Set(batch.items.map((item) => item.id)))}
           onCollapse={() => setOpenItems(new Set())}
         />
@@ -1546,7 +1646,7 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initi
   );
 }
 
-function WishlistView({ wishlist, onAdd, onRemove, onSearchAlbums, onLookupAlbum }) {
+function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearchAlbums, onLookupAlbum }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -1579,13 +1679,18 @@ function WishlistView({ wishlist, onAdd, onRemove, onSearchAlbums, onLookupAlbum
           <Plus size={16} />
           Add album
         </button>
+        <button className="primary" onClick={onSubmit} disabled={wishlist.filter((item) => item.status === "wanted").length === 0}>
+          <ListChecks size={16} />
+          Add to approvals
+        </button>
       </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
       {wishlist.length === 0 ? (
         <EmptyState title="No wishlist items" body="Add music here before sending wishlist work to the task queue." />
       ) : (
         <div className="tree">
-          <TreeControls
+          <TreeToolbar
+            expanded={openArtists.size > 0 || openAlbums.size > 0}
             onExpand={() => {
               setOpenArtists(new Set(tree.map((artist) => artist.name)));
               setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
@@ -1646,21 +1751,33 @@ function WishlistView({ wishlist, onAdd, onRemove, onSearchAlbums, onLookupAlbum
           ))}
         </div>
       )}
+      {approvals.length > 0 && (
+        <div className="wishlist-approval-list">
+          <h2>Submitted approvals</h2>
+          {approvals.map((batch) => (
+            <div className="task-row" key={batch.id}>
+              <strong>{batch.title}</strong>
+              <span>{batch.status} · {batch.items.length} items</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
-function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue, onSync }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onPlay, onQueue, onSync }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
+  const [addOpen, setAddOpen] = useState(null);
+  const [playlistName, setPlaylistName] = useState("");
+  const [playlistSearch, setPlaylistSearch] = useState("");
   const [draftPositions, setDraftPositions] = useState({});
-  const tracks = favorites?.tracks || [];
-  const playableTracks = tracks.map(playlistPlayableTrack);
 
   useEffect(() => {
     setDraftPositions(
-      Object.fromEntries(tracks.map((track) => [track.id, String(track.position || "")])),
+      Object.fromEntries(playlists.flatMap((playlist) => playlist.tracks.map((track) => [track.id, String(track.position || "")]))),
     );
-  }, [favorites?.id, favorites?.track_count]);
+  }, [playlists.map((playlist) => `${playlist.id}:${playlist.track_count}`).join("|")]);
 
   function updateDraft(entryId, value) {
     setDraftPositions((current) => ({ ...current, [entryId]: value }));
@@ -1681,70 +1798,123 @@ function PlaylistsView({ favorites, onQueuePosition, onPlay, onQueue, onSync }) 
 
   return (
     <div className="playlist-view">
-      <div className="tree-toolbar">
-        <TreeControls
-          onExpand={() => setOpenPlaylists(new Set(["Favorites"]))}
-          onCollapse={() => setOpenPlaylists(new Set())}
-        />
+      <TreeToolbar
+        expanded={openPlaylists.size > 0}
+        onExpand={() => setOpenPlaylists(new Set(playlists.map((playlist) => playlist.name)))}
+        onCollapse={() => setOpenPlaylists(new Set())}
+      >
+        <form
+          className="playlist-create"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!playlistName.trim()) return;
+            onCreatePlaylist(playlistName.trim()).then(() => setPlaylistName(""));
+          }}
+        >
+          <input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="New playlist" />
+          <button className="secondary compact">
+            <Plus size={15} />
+            Create
+          </button>
+        </form>
         <button className="secondary compact" onClick={onSync}>
           <RefreshCw size={15} />
           Sync
         </button>
-      </div>
-      <div className="tree-action-row library-row-actions">
-        <TreeRow
-          icon={Heart}
-          open={openPlaylists.has("Favorites")}
-          title="Favorites"
-          meta={favorites ? `${favorites.track_count || 0} tracks` : "Created when the first track is favorited"}
-          onToggle={() => toggleSet(setOpenPlaylists, "Favorites")}
-        />
-        <PlaylistPlayActions
-          disabled={playableTracks.length === 0}
-          onPlay={() => onPlay(playableTracks)}
-          onQueue={() => onQueue(playableTracks)}
-        />
-      </div>
-      {openPlaylists.has("Favorites") &&
-        (tracks.length === 0 ? (
-          <EmptyState title="No favorite tracks" body="Favorite a song to add it here." />
-        ) : (
-          <div className="playlist-track-tree">
-            {tracks.map((track) => (
-              <div className="tree-action-row library-row-actions" key={track.id}>
-                <TreeRow
-                  depth={1}
-                  icon={FileAudio}
-                  title={track.title}
-                  meta={[track.artist, track.album, track.format].filter(Boolean).join(" / ")}
-                />
-                <PlaylistPlayActions
-                  onPlay={() => onPlay([playlistPlayableTrack(track)])}
-                  onQueue={() => onQueue([playlistPlayableTrack(track)])}
-                />
-                <label className="playlist-order-field">
-                  <span>Order</span>
-                  <input
-                    value={draftPositions[track.id] ?? String(track.position || "")}
-                    inputMode="numeric"
-                    onChange={(event) => updateDraft(track.id, event.target.value)}
-                    onBlur={() => submitPosition(track)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        event.currentTarget.blur();
-                      }
-                      if (event.key === "Escape") {
-                        updateDraft(track.id, String(track.position || ""));
-                        event.currentTarget.blur();
-                      }
-                    }}
-                  />
-                </label>
-              </div>
-            ))}
+      </TreeToolbar>
+      {playlists.map((playlist) => {
+        const tracks = playlist.tracks || [];
+        const playableTracks = tracks.map(playlistPlayableTrack);
+        return (
+          <div key={playlist.id}>
+            <div className="tree-action-row library-row-actions">
+              <TreeRow
+                icon={playlist.name === "Favorites" ? Heart : FileAudio}
+                open={openPlaylists.has(playlist.name)}
+                title={playlist.name}
+                meta={`${playlist.track_count || 0} tracks`}
+                onToggle={() => toggleSet(setOpenPlaylists, playlist.name)}
+              />
+              <PlaylistPlayActions
+                disabled={playableTracks.length === 0}
+                onPlay={() => onPlay(playableTracks)}
+                onQueue={() => onQueue(playableTracks)}
+              />
+              <button className="row-icon-button" onClick={() => setAddOpen(addOpen === playlist.id ? null : playlist.id)} title="Add music">
+                <Plus size={14} />
+              </button>
+            </div>
+            {addOpen === playlist.id && (
+              <PlaylistAddPanel
+                library={library}
+                search={playlistSearch}
+                setSearch={setPlaylistSearch}
+                onAdd={(trackIds) => onAddToPlaylist(playlist.id, trackIds)}
+              />
+            )}
+            {openPlaylists.has(playlist.name) &&
+              (tracks.length === 0 ? (
+                <EmptyState title="No playlist tracks" body="Add tracks to populate this playlist." />
+              ) : (
+                <div className="playlist-track-tree">
+                  {tracks.map((track) => (
+                    <div className="tree-action-row library-row-actions" key={track.id}>
+                      <TreeRow
+                        depth={1}
+                        icon={FileAudio}
+                        title={track.title}
+                        meta={[track.artist, track.album, track.format].filter(Boolean).join(" / ")}
+                      />
+                      <PlaylistPlayActions
+                        onPlay={() => onPlay([playlistPlayableTrack(track)])}
+                        onQueue={() => onQueue([playlistPlayableTrack(track)])}
+                      />
+                      <label className="playlist-order-field">
+                        <span>Order</span>
+                        <input
+                          value={draftPositions[track.id] ?? String(track.position || "")}
+                          inputMode="numeric"
+                          onChange={(event) => updateDraft(track.id, event.target.value)}
+                          onBlur={() => submitPosition(track)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") event.currentTarget.blur();
+                            if (event.key === "Escape") {
+                              updateDraft(track.id, String(track.position || ""));
+                              event.currentTarget.blur();
+                            }
+                          }}
+                        />
+                      </label>
+                    </div>
+                  ))}
+                </div>
+              ))}
           </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function PlaylistAddPanel({ library, search, setSearch, onAdd }) {
+  const results = useMemo(() => searchLibraryTargets(library, search), [library, search]);
+  return (
+    <div className="album-search-panel playlist-add-panel">
+      <label>
+        Search library
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Song, artist, or album" />
+      </label>
+      <div className="album-results">
+        {results.map((result) => (
+          <button className="album-result" key={result.id} onClick={() => onAdd(result.trackIds)}>
+            <span>
+              <strong>{result.title}</strong>
+              <small>{result.meta}</small>
+            </span>
+          </button>
         ))}
-        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1792,7 +1962,8 @@ function ImportTree({
   return (
     <div className="tree">
       {grouped.length > 0 && (
-        <TreeControls
+        <TreeToolbar
+          expanded={openArtists.size > 0 || openAlbums.size > 0}
           onExpand={() => {
             setOpenArtists(new Set(grouped.map((artist) => artist.name)));
             setOpenAlbums(new Set(grouped.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
@@ -2130,6 +2301,11 @@ function LibraryMetadataEditor({
   details = {},
   onAutoLookup,
   onSearchAlbums,
+  playlists = [],
+  targetTrackIds = [],
+  onAddToPlaylist,
+  onAcousticCheck,
+  onRemove,
   onQueue,
   onClose,
 }) {
@@ -2217,6 +2393,39 @@ function LibraryMetadataEditor({
             onLookup={async (artist, album, releaseId) => ({ artist, album, musicbrainz_album_id: releaseId, tracks: [] })}
             onSearch={onSearchAlbums}
           />
+        )}
+        {(onAcousticCheck || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
+          <div className="metadata-menu-actions">
+            {onAcousticCheck && (
+              <button className="secondary compact" onClick={onAcousticCheck}>
+                <Sparkles size={15} />
+                Check AcoustID
+              </button>
+            )}
+            {playlists.length > 0 && targetTrackIds.length > 0 && (
+              <select
+                defaultValue=""
+                onChange={(event) => {
+                  if (!event.target.value) return;
+                  onAddToPlaylist?.(event.target.value, targetTrackIds);
+                  event.target.value = "";
+                }}
+              >
+                <option value="">Add to playlist</option>
+                {playlists.map((playlist) => (
+                  <option key={playlist.id} value={playlist.id}>
+                    {playlist.name}
+                  </option>
+                ))}
+              </select>
+            )}
+            {onRemove && (
+              <button className="secondary compact danger" onClick={onRemove}>
+                <Trash2 size={15} />
+                Remove
+              </button>
+            )}
+          </div>
         )}
       </div>
       <button className="primary compact-button" onClick={queueChanges} disabled={!hasChanges}>
@@ -2343,6 +2552,29 @@ function playlistPlayableTrack(track) {
     _artist: track.artist,
     _album: track.album,
   };
+}
+
+function searchLibraryTargets(library, search) {
+  const needle = normalizeName(search || "");
+  const targets = [];
+  library.forEach((artist) => {
+    const artistTrackIds = artistTracks(artist).map((track) => track.id);
+    if (!needle || normalizeName(artist.name).includes(needle)) {
+      targets.push({ id: `artist:${artist.id}`, title: artist.name, meta: `${artistTrackIds.length} tracks`, trackIds: artistTrackIds });
+    }
+    artist.albums.forEach((album) => {
+      const albumTrackIds = album.tracks.map((track) => track.id);
+      if (!needle || normalizeName(`${artist.name} ${album.title}`).includes(needle)) {
+        targets.push({ id: `album:${album.id}`, title: album.title, meta: `${artist.name} / ${albumTrackIds.length} tracks`, trackIds: albumTrackIds });
+      }
+      album.tracks.forEach((track) => {
+        if (!needle || normalizeName(`${artist.name} ${album.title} ${track.title}`).includes(needle)) {
+          targets.push({ id: `track:${track.id}`, title: track.title, meta: `${artist.name} / ${album.title}`, trackIds: [track.id] });
+        }
+      });
+    });
+  });
+  return targets.slice(0, 40);
 }
 
 function removeKey(type, id) {
@@ -2480,12 +2712,15 @@ function SettingsPanel({
   setAccentColor,
   backgroundTint,
   setBackgroundTint,
+  dark,
+  setDark,
   user,
   apiKey,
   integrationSettings,
   onSaveIntegrations,
 }) {
   const [showApiKey, setShowApiKey] = useState(false);
+  const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
   const canViewApiKey =
     user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
@@ -2498,6 +2733,16 @@ function SettingsPanel({
     <div className="settings-grid">
       <section className="settings-section">
         <h2>Appearance</h2>
+        <label className="setting-row">
+          <span>
+            Theme
+            <small>Switch between light and dark interface colors.</small>
+          </span>
+          <button className="secondary compact" onClick={() => setDark((value) => !value)}>
+            {dark ? <Sun size={15} /> : <Moon size={15} />}
+            {dark ? "Light mode" : "Dark mode"}
+          </button>
+        </label>
         <label className="setting-row">
           <span>
             Accent color
@@ -2548,10 +2793,15 @@ function SettingsPanel({
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
               <input
-                type={key.endsWith("api_key") ? "password" : "text"}
+                type={key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
                 value={integrationDraft[key] || ""}
                 onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
               />
+              {key.endsWith("api_key") && (
+                <button className="secondary compact" type="button" onClick={() => setShownIntegrationKeys((current) => ({ ...current, [key]: !current[key] }))}>
+                  {shownIntegrationKeys[key] ? "Hide" : "Show"}
+                </button>
+              )}
             </label>
           ))}
           <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
@@ -2869,14 +3119,13 @@ function AudioPlayer({
   );
 }
 
-function TreeControls({ onExpand, onCollapse }) {
+function TreeToolbar({ expanded, onExpand, onCollapse, children }) {
+  const nextExpanded = !expanded;
   return (
-    <div className="tree-controls">
-      <button className="secondary compact" onClick={onExpand}>
-        Expand all
-      </button>
-      <button className="secondary compact" onClick={onCollapse}>
-        Collapse all
+    <div className="tree-toolbar">
+      <div className="tree-toolbar-actions">{children}</div>
+      <button className="secondary compact" onClick={nextExpanded ? onExpand : onCollapse}>
+        {nextExpanded ? "Expand all" : "Collapse all"}
       </button>
     </div>
   );
@@ -3211,6 +3460,11 @@ function coerceMetadataValue(key, value) {
 function upsertTask(tasks, task) {
   const withoutTask = tasks.filter((current) => current.id !== task.id);
   return [task, ...withoutTask];
+}
+
+function upsertPlaylist(playlists, playlist) {
+  const withoutPlaylist = playlists.filter((current) => current.id !== playlist.id);
+  return [...withoutPlaylist, playlist].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function visibleTrayNotifications(notifications) {

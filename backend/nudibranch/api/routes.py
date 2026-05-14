@@ -25,6 +25,8 @@ from nudibranch.api.schemas import (
     LoginRequest,
     LoginResponse,
     NotificationOut,
+    PlaylistAddTracks,
+    PlaylistCreate,
     PlaylistPositionProposalRequest,
     PlaylistTrackOut,
     ProposalBatchOut,
@@ -407,12 +409,155 @@ def remove_wishlist_item(
     return WishlistOut.model_validate(item, from_attributes=True)
 
 
+@router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"])
+def list_wishlist_approvals(
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+) -> list[ProposalBatchOut]:
+    query = (
+        select(ProposalBatch)
+        .options(selectinload(ProposalBatch.items))
+        .where(ProposalBatch.kind == ProposalKind.download)
+        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+        .order_by(ProposalBatch.created_at.desc())
+    )
+    batches = list(session.scalars(query))
+    if user.is_admin:
+        return [serialize_batch(batch) for batch in batches]
+    visible_batches = []
+    for batch in batches:
+        if any((json.loads(item.payload_json or "{}").get("user_id") == user.id) for item in batch.items):
+            visible_batches.append(batch)
+    return [serialize_batch(batch) for batch in visible_batches]
+
+
+@router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"])
+def propose_wishlist_items(
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+) -> ProposalBatchOut:
+    query = select(WishlistItem).where(WishlistItem.status == "wanted")
+    if not user.is_admin:
+        query = query.where(WishlistItem.user_id == user.id)
+    items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
+    if not items:
+        raise HTTPException(status_code=400, detail="No wishlist items are ready")
+
+    batch = ProposalBatch(title="Wishlist download review", kind=ProposalKind.download, tree_path="/wishlist")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    for wishlist_item in items:
+        artist_name = wishlist_item.artist
+        album_name = wishlist_item.album or "Singles"
+        if artist_name not in artist_items:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist_name,
+                kind=ProposalKind.download,
+                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "artist", "artist": artist_name}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        album_key = (artist_name, album_name)
+        if album_key not in album_items:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_items[artist_name].id,
+                title=album_name,
+                kind=ProposalKind.download,
+                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "album", "artist": artist_name, "album": album_name}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_items[album_key].id,
+                title=wishlist_item.track or wishlist_item.album or wishlist_item.artist,
+                kind=ProposalKind.download,
+                payload_json=json.dumps(
+                    {
+                        "user_id": wishlist_item.user_id,
+                        "wishlist_item_id": wishlist_item.id,
+                        "kind": wishlist_item.kind,
+                        "artist": wishlist_item.artist,
+                        "album": wishlist_item.album,
+                        "track": wishlist_item.track,
+                    }
+                ),
+            )
+        )
+        wishlist_item.status = "review"
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
 @router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"])
 def favorites_playlist(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
     playlist = get_or_create_favorites(session)
+    return serialize_favorites(session, playlist)
+
+
+@router.get("/playlists", response_model=list[FavoritesOut], tags=["playlists"])
+def list_playlists(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> list[FavoritesOut]:
+    playlists = list(session.scalars(select(Playlist).order_by(Playlist.name.asc())))
+    if not any(playlist.name == "Favorites" for playlist in playlists):
+        playlists.insert(0, get_or_create_favorites(session))
+    return [serialize_favorites(session, playlist) for playlist in playlists]
+
+
+@router.post("/playlists", response_model=FavoritesOut, tags=["playlists"])
+def create_playlist(
+    payload: PlaylistCreate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Playlist name is required")
+    existing = session.scalar(select(Playlist).where(Playlist.name == name))
+    if existing:
+        return serialize_favorites(session, existing)
+    playlist = Playlist(name=name)
+    session.add(playlist)
+    session.commit()
+    session.refresh(playlist)
+    return serialize_favorites(session, playlist)
+
+
+@router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"])
+def add_playlist_tracks(
+    playlist_id: str,
+    payload: PlaylistAddTracks,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> FavoritesOut:
+    playlist = session.get(Playlist, playlist_id)
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    existing_track_ids = {entry.track_id for entry in playlist.tracks}
+    tracks = list(session.scalars(select(Track).where(Track.id.in_(payload.track_ids))))
+    next_position = max([entry.position for entry in playlist.tracks] or [0]) + 1
+    for track in tracks:
+        if track.id in existing_track_ids:
+            continue
+        session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=next_position))
+        next_position += 1
+    session.commit()
+    session.refresh(playlist)
+    if playlist.name == "Favorites":
+        enqueue_task(session, "sync_favorites_jellyfin", {})
     return serialize_favorites(session, playlist)
 
 
@@ -500,6 +645,45 @@ def propose_favorite_position(
                     "position": payload.position,
                 }
             ),
+        )
+    )
+    session.commit()
+    session.refresh(batch)
+    return serialize_batch(batch)
+
+
+@router.post("/playlists/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"])
+def propose_playlist_position(
+    entry_id: str,
+    payload: PlaylistPositionProposalRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.playlists_manage)),
+) -> ProposalBatchOut:
+    entry = session.scalar(
+        select(PlaylistTrack)
+        .where(PlaylistTrack.id == entry_id)
+        .options(selectinload(PlaylistTrack.track), selectinload(PlaylistTrack.playlist))
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Playlist entry not found")
+    if entry.position == payload.position:
+        raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
+
+    batch = ProposalBatch(
+        title=f"Update {entry.playlist.name} order",
+        kind=ProposalKind.playlist,
+        tree_path=f"/playlists/{entry.playlist.name}",
+    )
+    session.add(batch)
+    session.flush()
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            title=entry.track.title,
+            kind=ProposalKind.playlist,
+            old_value=str(entry.position),
+            new_value=str(payload.position),
+            payload_json=json.dumps({"action": "set_position", "playlist_track_id": entry.id, "position": payload.position}),
         )
     )
     session.commit()
