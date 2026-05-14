@@ -465,7 +465,6 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
 
 def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:
     grouped: dict[tuple[str, str], list[dict]] = {}
-    approved_by_user: dict[str, list[str]] = {}
     wishlist_item_ids = []
     for item in items:
         payload = json.loads(item.payload_json or "{}")
@@ -473,25 +472,12 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem]) 
         album = payload.get("album") or "Singles"
         if payload.get("wishlist_item_id"):
             wishlist_item_ids.append(payload["wishlist_item_id"])
-        if payload.get("user_id"):
-            approved_by_user.setdefault(payload["user_id"], []).append(payload.get("track") or payload.get("album") or payload.get("artist") or item.title)
         grouped.setdefault((artist, album), []).append(payload)
     for (artist, album), requests in grouped.items():
         create_album_download_candidate_batch(session, artist, album, requests)
     if wishlist_item_ids:
         for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
             wishlist_item.status = "approved"
-    for user_id, titles in approved_by_user.items():
-        shown = ", ".join(titles[:5])
-        extra = "" if len(titles) <= 5 else f" and {len(titles) - 5} more"
-        create_notification(
-            session,
-            title="Wishlist request approved",
-            body=f"{shown}{extra}",
-            event_type="wishlist_approved",
-            target_url="/downloads",
-            user_id=user_id,
-        )
 
 
 def apply_lyrics_item(session: Session, item: ProposalItem) -> None:

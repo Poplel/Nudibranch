@@ -288,7 +288,7 @@ function App() {
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
       setTasks(taskData);
-      handleCompletedTaskEffects(taskData);
+      handleCompletedTaskEffects(taskData, { emit: false });
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
       setWishlistApprovals(wishlistApprovalData);
@@ -324,12 +324,13 @@ function App() {
     }
   }
 
-  function handleCompletedTaskEffects(taskData) {
+  function handleCompletedTaskEffects(taskData, { emit = true } = {}) {
     taskData.forEach((task) => {
       if (task.status !== "completed") return;
       if (task.type === "sync_favorites_jellyfin") {
         if (syncToastTaskIds.current.has(task.id)) return;
         syncToastTaskIds.current.add(task.id);
+        if (!emit) return;
         setToast({
           title: "Playlists synced",
           body: `${task.result?.synced || 0} tracks were sent to Jellyfin.`,
@@ -338,6 +339,7 @@ function App() {
       if (task.type === "check_files") {
         if (checkFileTaskIds.current.has(task.id)) return;
         checkFileTaskIds.current.add(task.id);
+        if (!emit) return;
         sendFileCheckToImport(task.result || {});
       }
     });
@@ -674,14 +676,14 @@ function App() {
     }
   }
 
-  async function submitWishlistApprovals(itemIds = null) {
+  async function submitWishlistApprovals(itemIds = null, options = {}) {
     setLoading(true);
     setError("");
     try {
       const wantedItems = itemIds?.length ? wishlist.filter((item) => itemIds.includes(item.id)) : wishlist.filter((item) => item.status === "wanted");
       const batch = await api("/wishlist/approvals", {
         method: "POST",
-        body: JSON.stringify({ item_ids: itemIds?.length ? itemIds : null }),
+        body: JSON.stringify({ item_ids: itemIds?.length ? itemIds : null, deny_unselected: Boolean(options.denyUnselected) }),
       });
       setWishlistApprovals((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
       await refreshApprovals();
@@ -1302,6 +1304,7 @@ function App() {
               <WishlistView
                 wishlist={wishlist}
                 approvals={wishlistApprovals}
+                user={user}
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onSubmit={submitWishlistApprovals}
@@ -2193,21 +2196,34 @@ function AlbumResultArt({ src }) {
   return <img src={src} alt="" onError={() => setFailed(true)} />;
 }
 
-function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearchAlbums, onLookupAlbum }) {
+function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onSubmit, onSearchAlbums, onLookupAlbum }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [openOwners, setOpenOwners] = useState(() => new Set());
   const [selectedItems, setSelectedItems] = useState(() => new Set());
+  const canApproveAll = hasPermission(user, "wishlist:manage_all");
   const tree = useMemo(() => buildWishlistTree(wishlist), [wishlist]);
+  const ownerTree = useMemo(() => buildWishlistOwnerTree(wishlist), [wishlist]);
   const wantedItems = useMemo(() => wishlist.filter((item) => item.status === "wanted"), [wishlist]);
   const treeKey = useMemo(
-    () => tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
-    [tree],
+    () =>
+      canApproveAll
+        ? ownerTree.map((owner) => `${owner.name}:${owner.artists.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|")}`).join("|")
+        : tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
+    [canApproveAll, ownerTree, tree],
   );
 
   useEffect(() => {
-    setOpenArtists(new Set(tree.map((artist) => artist.name)));
-    setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+    setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
+    setOpenArtists(new Set(canApproveAll ? ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`)) : tree.map((artist) => artist.name)));
+    setOpenAlbums(
+      new Set(
+        (canApproveAll ? ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))) : tree.map((artist) => ({ ownerId: "", artist }))).flatMap(
+          ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId ? `${ownerId}:` : ""}${artist.name}/${album.name}`),
+        ),
+      ),
+    );
     setSelectedItems(new Set(wantedItems.map((item) => item.id)));
   }, [treeKey, wantedItems.length]);
 
@@ -2231,11 +2247,11 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
         </button>
         <button
           className="primary"
-          onClick={() => onSubmit([...selectedItems])}
+          onClick={() => onSubmit([...selectedItems], { denyUnselected: canApproveAll })}
           disabled={selectedItems.size === 0}
         >
           <ListChecks size={16} />
-          Add selected to approvals
+          {canApproveAll ? "Approve selected" : "Add selected to approvals"}
         </button>
       </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
@@ -2246,77 +2262,39 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
           <TreeToolbar
             expanded={openArtists.size > 0 || openAlbums.size > 0}
             onExpand={() => {
-              setOpenArtists(new Set(tree.map((artist) => artist.name)));
-              setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
+              setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
+              setOpenArtists(new Set((canApproveAll ? ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`)) : tree.map((artist) => artist.name))));
+              setOpenAlbums(
+                new Set(
+                  (canApproveAll ? ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))) : tree.map((artist) => ({ ownerId: "", artist }))).flatMap(
+                    ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId ? `${ownerId}:` : ""}${artist.name}/${album.name}`),
+                  ),
+                ),
+              );
             }}
             onCollapse={() => {
+              setOpenOwners(new Set());
               setOpenArtists(new Set());
               setOpenAlbums(new Set());
             }}
           />
-          {tree.map((artist) => (
-            <div key={artist.name}>
-              <TreeRow
-                icon={Sparkles}
-                open={openArtists.has(artist.name)}
-                title={artist.name}
-                meta={`${artist.albums.length} albums`}
-                onToggle={() => toggleSet(setOpenArtists, artist.name)}
-              />
-              {openArtists.has(artist.name) &&
-                artist.albums.map((album) => {
-                  const albumId = `${artist.name}/${album.name}`;
-                  return (
-                    <div key={albumId}>
-                      <TreeRow
-                        depth={1}
-                        icon={Folder}
-                        open={openAlbums.has(albumId)}
-                        title={album.name}
-                        meta={`${album.tracks.length || 1} requested`}
-                        onToggle={() => toggleSet(setOpenAlbums, albumId)}
-                      />
-                      {openAlbums.has(albumId) &&
-                        (album.tracks.length > 0 ? (
-                          album.tracks.map((track) => (
-                            <div className={track.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"} key={track.id}>
-                              <DownloadBranchToggle
-                                checked={selectedItems.has(track.id)}
-                                disabled={track.status !== "wanted"}
-                                onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
-                                title="Select wishlist track"
-                              />
-                              <TreeRow depth={2} icon={FileAudio} title={track.track || "Track"} meta={track.status} />
-                              {track.status !== "removed" && (
-                                <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
-                                  <X size={15} />
-                                </button>
-                              )}
-                            </div>
-                          ))
-                        ) : (
-                          <div className={album.request?.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"}>
-                            {album.request && (
-                              <DownloadBranchToggle
-                                checked={selectedItems.has(album.request.id)}
-                                disabled={album.request.status !== "wanted"}
-                                onChange={(checked) => toggleWishlistItem(setSelectedItems, album.request.id, checked)}
-                                title="Select wishlist request"
-                              />
-                            )}
-                            <TreeRow depth={2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request?.status || "wanted"} />
-                            {album.request && album.request.status !== "removed" && (
-                              <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
-                                <X size={15} />
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                    </div>
-                  );
-                })}
-            </div>
-          ))}
+          {canApproveAll
+            ? ownerTree.map((owner) => (
+                <div key={owner.id}>
+                  <TreeRow
+                    icon={Users}
+                    open={openOwners.has(owner.id)}
+                    title={owner.name}
+                    meta={`${owner.itemCount} items`}
+                    onToggle={() => toggleSet(setOpenOwners, owner.id)}
+                  />
+                  {openOwners.has(owner.id) &&
+                    owner.artists.map((artist) =>
+                      renderWishlistArtist(artist, 1, owner.id, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove),
+                    )}
+                </div>
+              ))
+            : tree.map((artist) => renderWishlistArtist(artist, 0, "", openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove))}
         </div>
       )}
       {approvals.length > 0 && (
@@ -2330,6 +2308,74 @@ function WishlistView({ wishlist, approvals, onAdd, onRemove, onSubmit, onSearch
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove) {
+  const artistId = `${prefix ? `${prefix}:` : ""}${artist.name}`;
+  return (
+    <div key={`${depth}:${artistId}`}>
+      <TreeRow
+        depth={depth}
+        icon={Sparkles}
+        open={openArtists.has(artistId)}
+        title={artist.name}
+        meta={`${artist.albums.length} albums`}
+        onToggle={() => toggleSet(setOpenArtists, artistId)}
+      />
+      {openArtists.has(artistId) &&
+        artist.albums.map((album) => {
+          const albumId = `${artistId}/${album.name}`;
+          return (
+            <div key={albumId}>
+              <TreeRow
+                depth={depth + 1}
+                icon={Folder}
+                open={openAlbums.has(albumId)}
+                title={album.name}
+                meta={`${album.tracks.length || 1} requested`}
+                onToggle={() => toggleSet(setOpenAlbums, albumId)}
+              />
+              {openAlbums.has(albumId) &&
+                (album.tracks.length > 0 ? (
+                  album.tracks.map((track) => (
+                    <div className={track.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"} key={track.id}>
+                      <DownloadBranchToggle
+                        checked={selectedItems.has(track.id)}
+                        disabled={track.status !== "wanted"}
+                        onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
+                        title="Select wishlist track"
+                      />
+                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={track.status} />
+                      {track.status !== "removed" && (
+                        <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
+                          <X size={15} />
+                        </button>
+                      )}
+                    </div>
+                  ))
+                ) : (
+                  <div className={album.request?.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"}>
+                    {album.request && (
+                      <DownloadBranchToggle
+                        checked={selectedItems.has(album.request.id)}
+                        disabled={album.request.status !== "wanted"}
+                        onChange={(checked) => toggleWishlistItem(setSelectedItems, album.request.id, checked)}
+                        title="Select wishlist request"
+                      />
+                    )}
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request?.status || "wanted"} />
+                    {album.request && album.request.status !== "removed" && (
+                      <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
+                        <X size={15} />
+                      </button>
+                    )}
+                  </div>
+                ))}
+            </div>
+          );
+        })}
     </div>
   );
 }
@@ -2570,6 +2616,11 @@ function ImportTree({
   const grouped = useMemo(() => groupImportFiles(files, library, manualAlbums, albumRecords), [files, library, manualAlbums, albumRecords]);
   const seedKey = useMemo(() => stableDownloadRequestKey(seedDownloadRequests), [seedDownloadRequests]);
   const appliedSeedKey = useRef("");
+  const manualDownloadKey = useMemo(
+    () => manualAlbums.map((album) => `${album.artist}/${album.name}:${(album.tracks || []).length}`).join("|"),
+    [manualAlbums],
+  );
+  const appliedManualDownloadKey = useRef("");
 
   useEffect(() => {
     setOpenArtists(new Set(grouped.map((artist) => artist.name)));
@@ -2588,6 +2639,27 @@ function ImportTree({
     setDownloadSelections(selected);
     emitDownloadRequests(selected);
   }, [seedKey, grouped, seedDownloadRequests]);
+
+  useEffect(() => {
+    if (!manualDownloadKey || appliedManualDownloadKey.current === manualDownloadKey) return;
+    const manualSlotIds = new Set();
+    grouped.forEach((artist) => {
+      artist.albums.forEach((album) => {
+        if (!album.manual) return;
+        album.slots.forEach((slot) => {
+          if (!slot.file && !dismissedGhosts.has(slot.id)) manualSlotIds.add(slot.id);
+        });
+      });
+    });
+    if (manualSlotIds.size === 0) return;
+    appliedManualDownloadKey.current = manualDownloadKey;
+    setDownloadSelections((current) => {
+      const next = new Set(current);
+      manualSlotIds.forEach((id) => next.add(id));
+      emitDownloadRequests(next);
+      return next;
+    });
+  }, [manualDownloadKey, grouped, dismissedGhosts]);
 
   function emitDownloadRequests(selections = downloadSelections, dismissed = dismissedGhosts, extra = extraGhosts) {
     onDownloadRequestsChange?.(buildImportDownloadRequests(grouped, selections, dismissed, extra));
@@ -4798,6 +4870,24 @@ function buildWishlistTree(items) {
     .map((artist) => ({
       name: artist.name,
       albums: [...artist.albumMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildWishlistOwnerTree(items) {
+  const ownerMap = new Map();
+  items.forEach((item) => {
+    const ownerId = item.user_id || "unknown";
+    if (!ownerMap.has(ownerId)) {
+      ownerMap.set(ownerId, { id: ownerId, name: item.owner_name || "Unknown User", items: [] });
+    }
+    ownerMap.get(ownerId).items.push(item);
+  });
+  return [...ownerMap.values()]
+    .map((owner) => ({
+      ...owner,
+      itemCount: owner.items.length,
+      artists: buildWishlistTree(owner.items),
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }

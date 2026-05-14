@@ -93,12 +93,14 @@ class WishlistCreate(BaseModel):
 class WishlistOut(WishlistCreate):
     id: str
     user_id: str
+    owner_name: str | None = None
     status: str
     created_at: datetime
 
 
 class WishlistApprovalRequest(BaseModel):
     item_ids: list[str] | None = None
+    deny_unselected: bool = False
 
 
 class ProposalItemOut(BaseModel):

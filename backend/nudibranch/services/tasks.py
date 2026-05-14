@@ -17,8 +17,7 @@ def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
         .order_by(Task.created_at.asc())
         .limit(1)
     )
-    if task_type not in {"propose_import"}:
-        existing_query = existing_query.where(Task.payload_json == payload_json)
+    existing_query = existing_query.where(Task.payload_json == payload_json)
 
     existing = session.scalar(
         existing_query

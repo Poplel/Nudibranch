@@ -72,6 +72,7 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
+from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
@@ -489,11 +490,11 @@ def list_wishlist(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> list[WishlistOut]:
-    query = select(WishlistItem)
+    query = select(WishlistItem).options(selectinload(WishlistItem.user))
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
-    return [WishlistOut.model_validate(item, from_attributes=True) for item in items]
+    return [serialize_wishlist_item(item) for item in items]
 
 
 @router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"])
@@ -506,7 +507,7 @@ def create_wishlist_item(
     session.add(item)
     session.commit()
     session.refresh(item)
-    return WishlistOut.model_validate(item, from_attributes=True)
+    return serialize_wishlist_item(item)
 
 
 @router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"])
@@ -516,12 +517,12 @@ def remove_wishlist_item(
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> WishlistOut:
     item = session.get(WishlistItem, item_id)
-    if not item or (not user.is_admin and item.user_id != user.id):
+    if not item or (not user_has_permission(user, Permission.wishlist_manage_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     item.status = "removed"
     session.commit()
     session.refresh(item)
-    return WishlistOut.model_validate(item, from_attributes=True)
+    return serialize_wishlist_item(item)
 
 
 @router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"])
@@ -552,12 +553,18 @@ def propose_wishlist_items(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> ProposalBatchOut:
-    query = select(WishlistItem).where(WishlistItem.status == "wanted")
+    query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
+    all_wanted_items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
+    denied_items: list[WishlistItem] = []
     if payload and payload.item_ids:
-        query = query.where(WishlistItem.id.in_(payload.item_ids))
-    items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
+        selected_ids = set(payload.item_ids)
+        items = [item for item in all_wanted_items if item.id in selected_ids]
+        if payload.deny_unselected and user_has_permission(user, Permission.wishlist_manage_all):
+            denied_items = [item for item in all_wanted_items if item.id not in selected_ids]
+    else:
+        items = all_wanted_items
     if not items:
         raise HTTPException(status_code=400, detail="No wishlist items are ready")
 
@@ -611,6 +618,11 @@ def propose_wishlist_items(
             )
         )
         wishlist_item.status = "review"
+    notify_wishlist_decisions(session, items, "Wishlist request approved", "added to the task queue", "wishlist_approved", "/downloads")
+    for denied_item in denied_items:
+        denied_item.status = "removed"
+    if denied_items:
+        notify_wishlist_decisions(session, denied_items, "Wishlist request denied", "not selected for download", "wishlist_denied", "/wishlist")
     session.commit()
     session.refresh(batch)
     return serialize_batch(batch)
@@ -1375,6 +1387,45 @@ def serialize_user(user: User) -> UserOut:
         is_admin=user.is_admin,
         permissions=effective_permission_values(user),
     )
+
+
+def serialize_wishlist_item(item: WishlistItem) -> WishlistOut:
+    return WishlistOut(
+        id=item.id,
+        user_id=item.user_id,
+        owner_name=item.user.display_name if item.user else None,
+        kind=item.kind,
+        artist=item.artist,
+        album=item.album,
+        track=item.track,
+        status=item.status,
+        created_at=item.created_at,
+    )
+
+
+def notify_wishlist_decisions(
+    session: Session,
+    items: list[WishlistItem],
+    title: str,
+    action_text: str,
+    event_type: str,
+    target_url: str,
+) -> None:
+    items_by_user: dict[str, list[WishlistItem]] = {}
+    for item in items:
+        items_by_user.setdefault(item.user_id, []).append(item)
+    for user_id, user_items in items_by_user.items():
+        names = [item.track or item.album or item.artist for item in user_items]
+        shown = ", ".join(names[:5])
+        extra = "" if len(names) <= 5 else f" and {len(names) - 5} more"
+        create_notification(
+            session,
+            title=title,
+            body=f"{shown}{extra} {action_text}.",
+            event_type=event_type,
+            target_url=target_url,
+            user_id=user_id,
+        )
 
 
 def load_user(session: Session, user_id: str) -> User:
