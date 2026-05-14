@@ -1940,8 +1940,8 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
   const hasChildren = children.length > 0 || metadataChanges.length > 0;
   const open = openItems.has(item.id);
   const descendantIds = collectItemIds(item, childrenById);
-  const leafDownloadCandidate = item.kind === "download" && children.length === 0 && (item.old_value || item.new_value);
-  const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.old_value || sibling.new_value)) : [];
+  const leafDownloadCandidate = item.kind === "download" && children.length === 0 && Boolean(item.new_value);
+  const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && sibling.new_value) : [];
   const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
   const pickerOpen = leafDownloadCandidate && openCandidatePickers?.has(item.parent_id);
   const firstSelectedSibling = siblingCandidates.find((sibling) => sibling.selected);

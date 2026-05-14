@@ -824,6 +824,8 @@ def download_query_variants(request: dict) -> list[str]:
     return [
         " ".join(part for part in [artist, album, track] if part),
         " ".join(part for part in [artist, track] if part),
+        f"{artist} - {track}".strip(" -"),
+        " ".join(part for part in [album, track] if part),
         track,
     ]
 

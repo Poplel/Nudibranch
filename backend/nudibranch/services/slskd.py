@@ -12,7 +12,7 @@ def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 4) -> li
     return search_slskd_detailed(slskd_url, api_key, query, limit)["candidates"]
 
 
-def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 4, poll_count: int = 3, poll_interval: float = 0.5) -> dict[str, Any]:
+def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 4, poll_count: int = 6, poll_interval: float = 0.75) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
     if not api_key:
