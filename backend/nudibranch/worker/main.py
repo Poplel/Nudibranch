@@ -191,6 +191,12 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.download and json.loads(item.payload_json or "{}").get("action")
     ]
+    wishlist_download_items = [
+        item for item in download_items if json.loads(item.payload_json or "{}").get("action") == "wishlist_request"
+    ]
+    direct_download_items = [
+        item for item in download_items if json.loads(item.payload_json or "{}").get("action") != "wishlist_request"
+    ]
     lyrics_items = [
         item
         for item in selected_items
@@ -240,7 +246,19 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             errors.append(f"{item.title}: {error}")
 
     download_changes = 0
-    for item in download_items:
+    for item in wishlist_download_items:
+        try:
+            process_wishlist_request_items(session, wishlist_download_items)
+            for wishlist_item in wishlist_download_items:
+                wishlist_item.status = ProposalStatus.completed
+            download_changes += len(wishlist_download_items)
+            break
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            for wishlist_item in wishlist_download_items:
+                wishlist_item.status = ProposalStatus.failed
+            errors.append(f"Download search: {error}")
+
+    for item in direct_download_items:
         try:
             apply_download_item(session, item)
             item.status = ProposalStatus.completed
@@ -425,6 +443,17 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
     raise ValueError("Unsupported download action")
 
 
+def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for item in items:
+        payload = json.loads(item.payload_json or "{}")
+        artist = payload.get("artist") or "Unknown Artist"
+        album = payload.get("album") or "Singles"
+        grouped.setdefault((artist, album), []).append(payload)
+    for (artist, album), requests in grouped.items():
+        create_album_download_candidate_batch(session, artist, album, requests)
+
+
 def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     if payload.get("action") != "download_lyrics":
@@ -446,10 +475,96 @@ def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
     lrc_path.write_text(lyric_text, encoding="utf-8")
 
 
+def create_album_download_candidate_batch(session: Session, artist: str, album: str, requests: list[dict]) -> None:
+    batch = ProposalBatch(title=f"Download candidates: {artist} / {album}", kind=ProposalKind.download, tree_path="/downloads")
+    session.add(batch)
+    session.flush()
+    artist_item = ProposalItem(
+        batch_id=batch.id,
+        title=artist,
+        kind=ProposalKind.download,
+        payload_json=json.dumps({"artist": artist}),
+    )
+    session.add(artist_item)
+    session.flush()
+    album_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=artist_item.id,
+        title=album,
+        kind=ProposalKind.download,
+        payload_json=json.dumps({"artist": artist, "album": album}),
+    )
+    session.add(album_item)
+    session.flush()
+
+    slskd_tracks = 0
+    fallback_tracks = 0
+    diagnostic_lines = []
+    for request in requests:
+        query = download_query(request)
+        track_title = request.get("track") or request.get("title") or query
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=track_title,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album, "track": track_title}),
+        )
+        session.add(track_item)
+        session.flush()
+        search_result = search_slskd_for_request(session, request)
+        candidates = search_result["candidates"]
+        diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
+        if candidates:
+            slskd_tracks += 1
+            for candidate in candidates:
+                session.add(
+                    ProposalItem(
+                        batch_id=batch.id,
+                        parent_id=track_item.id,
+                        title=f"slskd: {candidate.get('filename') or query}",
+                        kind=ProposalKind.download,
+                        old_value=query,
+                        new_value=candidate.get("username"),
+                        payload_json=json.dumps(
+                            {
+                                "action": "queue_download",
+                                "request": request,
+                                "candidate": candidate,
+                            }
+                        ),
+                    )
+                )
+        else:
+            fallback_tracks += 1
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=track_item.id,
+                    title=f"YouTube fallback: {query}",
+                    kind=ProposalKind.download,
+                    old_value=query,
+                    new_value="yt-dlp",
+                    payload_json=json.dumps(
+                        {
+                            "action": "queue_ytdlp_download",
+                            "request": request,
+                        }
+                    ),
+                )
+            )
+    create_notification(
+        session,
+        title="Download candidates ready",
+        body=f"{album}: {slskd_tracks} tracks with slskd candidates. {fallback_tracks} tracks using YouTube fallback. {' '.join(diagnostic_lines[:3])}",
+        event_type="approval_needed",
+        target_url="/downloads",
+    )
+
+
 def create_download_candidate_batch(session: Session, request: dict) -> None:
     query = download_query(request)
-    settings = integration_settings(session)
-    search_result = search_slskd_detailed(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), query)
+    search_result = search_slskd_for_request(session, request)
     candidates = search_result["candidates"]
     diagnostics = search_result["diagnostics"]
     if not candidates:
@@ -524,6 +639,26 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
     )
 
 
+def search_slskd_for_request(session: Session, request: dict) -> dict:
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    attempted = []
+    last_result = {"candidates": [], "diagnostics": {"queries": []}}
+    for query in download_query_variants(request):
+        if not query or query in attempted:
+            continue
+        attempted.append(query)
+        result = search_slskd_detailed(slskd_url, api_key, query)
+        result["diagnostics"]["query"] = query
+        result["diagnostics"]["queries"] = attempted.copy()
+        last_result = result
+        if result["candidates"]:
+            return result
+    last_result["diagnostics"]["queries"] = attempted
+    return last_result
+
+
 def add_download_tree_parents(session: Session, batch: ProposalBatch, request: dict, query: str) -> ProposalItem:
     artist = request.get("artist") or "Unknown Artist"
     album = request.get("album") or "Singles"
@@ -561,8 +696,10 @@ def add_download_tree_parents(session: Session, batch: ProposalBatch, request: d
 
 
 def slskd_diagnostic_body(query: str, diagnostics: dict) -> str:
+    queries = diagnostics.get("queries") or [diagnostics.get("query") or query]
     return (
-        f"{query}: search {diagnostics.get('search_id', 'unknown')} returned "
+        f"{query}: searched {', '.join(str(item) for item in queries if item)}; "
+        f"last search {diagnostics.get('search_id', 'unknown')} returned "
         f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
         f"{diagnostics.get('candidates', 0)} candidates after {diagnostics.get('polls', 0)} polls."
     )
@@ -612,6 +749,19 @@ def fetch_lrclib_lyrics(track: Track) -> str | None:
 
 def download_query(request: dict) -> str:
     return " ".join(str(part) for part in [request.get("artist"), request.get("album"), request.get("track")] if part).strip()
+
+
+def download_query_variants(request: dict) -> list[str]:
+    artist = str(request.get("artist") or "").strip()
+    album = str(request.get("album") or "").strip()
+    track = str(request.get("track") or request.get("title") or "").strip()
+    return [
+        " ".join(part for part in [artist, album, track] if part),
+        " ".join(part for part in [artist, track] if part),
+        f"{artist} - {track}".strip(" -"),
+        " ".join(part for part in [album, track] if part),
+        track,
+    ]
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:

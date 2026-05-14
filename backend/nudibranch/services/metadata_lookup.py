@@ -61,6 +61,7 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
 
 def search_album_releases(artist: str, album: str) -> list[dict]:
     releases = find_releases(artist, album, limit=10)
+    itunes_art = itunes_album_artwork(artist, album)
     return [
         {
             "id": release.get("id"),
@@ -70,7 +71,7 @@ def search_album_releases(artist: str, album: str) -> list[dict]:
             "country": release.get("country"),
             "score": release.get("score"),
             "track_count": release.get("track-count"),
-            "cover_art_url": cover_art_url(release.get("id"), release),
+            "cover_art_url": cover_art_url(release.get("id"), release) or itunes_art,
         }
         for release in releases
         if release.get("id")
@@ -181,6 +182,34 @@ def cover_art_url(release_id: str | None, release: dict | None = None) -> str | 
     if archive and not archive.get("front"):
         return None
     return f"https://coverartarchive.org/release/{release_id}/front-250"
+
+
+def itunes_album_artwork(artist: str, album: str) -> str | None:
+    try:
+        response = httpx.get(
+            "https://itunes.apple.com/search",
+            params={"term": f"{artist} {album}", "entity": "album", "limit": 5},
+            timeout=10,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    normalized_album = normalize(album)
+    normalized_artist = normalize(artist)
+    for result in response.json().get("results", []):
+        if normalize(result.get("collectionName")) != normalized_album:
+            continue
+        if normalized_artist and normalized_artist not in normalize(result.get("artistName")):
+            continue
+        artwork = result.get("artworkUrl100")
+        if artwork:
+            return artwork.replace("100x100bb", "600x600bb")
+    for result in response.json().get("results", []):
+        artwork = result.get("artworkUrl100")
+        if artwork:
+            return artwork.replace("100x100bb", "600x600bb")
+    return None
 
 
 def normalize(value: str | None) -> str:
