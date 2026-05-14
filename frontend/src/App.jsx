@@ -1707,7 +1707,10 @@ function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }
 
 function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove, onReject, onCancelTask }) {
   const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  const activeTasks = tasks.filter((task) => task.type === "execute_proposal_batch" && ["queued", "running"].includes(task.status));
+  const downloadBatchIds = new Set(downloadBatches.map((batch) => batch.id));
+  const activeTasks = tasks.filter(
+    (task) => task.type === "execute_proposal_batch" && ["queued", "running"].includes(task.status) && downloadBatchIds.has(task.payload?.batch_id),
+  );
   if (downloadBatches.length === 0 && activeTasks.length === 0) {
     return <EmptyState title="No download candidates" body="Approved wishlist requests will add download candidates here." />;
   }
@@ -1733,10 +1736,130 @@ function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove,
           ))}
         </section>
       )}
-      {downloadBatches.map((batch) => (
-        <ApprovalBatch key={batch.id} batch={batch} onSelection={onSelection} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} />
-      ))}
+      {downloadBatches.length > 0 && (
+        <DownloadCandidateTree
+          batches={downloadBatches}
+          onSelection={onSelection}
+          onSelectOnly={onSelectOnly}
+          onApprove={onApprove}
+          onReject={onReject}
+        />
+      )}
     </div>
+  );
+}
+
+function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, onReject }) {
+  const [openItems, setOpenItems] = useState(() => new Set());
+  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
+  const trees = useMemo(() => batches.map((batch) => ({ batch, tree: buildItemTree(batch.items) })), [batches]);
+  const visibleItems = useMemo(() => visibleDownloadItems(batches), [batches]);
+  const selectedItems = visibleItems.filter((item) => item.selected);
+  const allSelected = selectedItems.length === visibleItems.length && visibleItems.length > 0;
+  const locked = batches.some((batch) => batch.status === "executing");
+
+  useEffect(() => {
+    setOpenItems(new Set(batches.map((batch) => downloadBatchNodeId(batch.id))));
+  }, [batches.map((batch) => `${batch.id}:${batch.items.length}:${batch.status}`).join("|")]);
+
+  function expandAll() {
+    setOpenItems(new Set(batches.flatMap((batch) => [downloadBatchNodeId(batch.id), ...batch.items.map((item) => item.id)])));
+  }
+
+  function collapseAll() {
+    setOpenItems(new Set());
+  }
+
+  return (
+    <section className="batch">
+      <div className="batch-header">
+        <div>
+          <h2>Download candidates</h2>
+          <p>
+            {selectedItems.length} of {visibleItems.length} visible items selected across {batches.length} batch{batches.length === 1 ? "" : "es"}
+          </p>
+        </div>
+        <div className="approval-actions">
+          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
+            Reject selected
+          </button>
+          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={locked || selectedItems.length === 0}>
+            <Check size={16} />
+            {locked ? "Running" : "Run selected"}
+          </button>
+        </div>
+      </div>
+      <div className="bulk-row">
+        <label>
+          <input
+            type="checkbox"
+            checked={allSelected}
+            onChange={(event) => {
+              for (const [batchId, items] of groupBy(visibleItems, (item) => item.batch_id)) {
+                onSelection(batchId, items.map((item) => item.id), event.target.checked);
+              }
+            }}
+          />
+          Select all visible
+        </label>
+        <span>{selectedItems.length} selected</span>
+        <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
+      </div>
+      {trees.map(({ batch, tree }) => (
+        <DownloadBatchBranch
+          key={batch.id}
+          batch={batch}
+          tree={tree}
+          openItems={openItems}
+          setOpenItems={setOpenItems}
+          openCandidatePickers={openCandidatePickers}
+          setOpenCandidatePickers={setOpenCandidatePickers}
+          onSelection={onSelection}
+          onSelectOnly={onSelectOnly}
+        />
+      ))}
+    </section>
+  );
+}
+
+function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandidatePickers, setOpenCandidatePickers, onSelection, onSelectOnly }) {
+  const batchNodeId = downloadBatchNodeId(batch.id);
+  const open = openItems.has(batchNodeId);
+  const visibleItems = visibleDownloadItems([batch]);
+  const selectedCount = visibleItems.filter((item) => item.selected).length;
+  const hasChildren = tree.roots.length > 0;
+  return (
+    <>
+      <div className="proposal-row download-batch-row" style={{ "--depth": 0 }}>
+        <input
+          type="checkbox"
+          checked={selectedCount === visibleItems.length && visibleItems.length > 0}
+          onChange={(event) => onSelection(batch.id, visibleItems.map((item) => item.id), event.target.checked)}
+        />
+        <button className="row-toggle" disabled={!hasChildren} onClick={() => toggleSet(setOpenItems, batchNodeId)} title={hasChildren ? "Toggle batch" : ""}>
+          {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
+        </button>
+        <span className="proposal-title">{batch.title}</span>
+        <small>
+          {batch.status} · {selectedCount} of {visibleItems.length} visible selected
+        </small>
+      </div>
+      {open &&
+        tree.roots.map((item) => (
+          <ApprovalNode
+            item={item}
+            childrenById={tree.childrenById}
+            openItems={openItems}
+            setOpenItems={setOpenItems}
+            onSelection={onSelection}
+            onSelectOnly={onSelectOnly}
+            openCandidatePickers={openCandidatePickers}
+            setOpenCandidatePickers={setOpenCandidatePickers}
+            depth={1}
+            key={item.id}
+          />
+        ))}
+    </>
   );
 }
 
@@ -4152,6 +4275,7 @@ function groupApprovalBatches(batches) {
   const groups = new Map();
   const seen = new Set();
   batches.forEach((batch) => {
+    if (batch.tree_path === "/downloads") return;
     if (batch.status === "executing") return;
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
@@ -4188,8 +4312,29 @@ function siblingItems(item, childrenById) {
   return [item];
 }
 
+function visibleDownloadItems(batches) {
+  return batches.flatMap((batch) => {
+    const tree = buildItemTree(batch.items);
+    const candidateIds = new Set();
+    for (const siblings of tree.childrenById.values()) {
+      const candidates = siblings.filter((item) => item.kind === "download" && (item.old_value || item.new_value));
+      if (candidates.length === 0) continue;
+      const selected = candidates.find((item) => item.selected);
+      candidateIds.add((selected || candidates[0]).id);
+    }
+    return batch.items.filter((item) => {
+      const leafCandidate = item.kind === "download" && !(tree.childrenById.get(item.id) || []).length && (item.old_value || item.new_value);
+      return !leafCandidate || candidateIds.has(item.id);
+    });
+  });
+}
+
 function candidateMeta(item) {
   return item.new_value ? `candidate · ${item.new_value}` : "candidate";
+}
+
+function downloadBatchNodeId(batchId) {
+  return `download-batch:${batchId}`;
 }
 
 function updateImportFile(files, onFilesChange, path, metadataPatch) {

@@ -8,17 +8,17 @@ def slskd_headers(api_key: str) -> dict[str, str]:
     return {"X-API-Key": api_key} if api_key else {}
 
 
-def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 8) -> list[dict[str, Any]]:
+def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 4) -> list[dict[str, Any]]:
     return search_slskd_detailed(slskd_url, api_key, query, limit)["candidates"]
 
 
-def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 8) -> dict[str, Any]:
+def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 4, poll_count: int = 3, poll_interval: float = 0.5) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
     if not api_key:
         raise ValueError("slskd API key is required")
 
-    with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=20) as client:
+    with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
         created = client.post("/api/v0/searches", json={"searchText": query})
         created.raise_for_status()
         search_id = search_identifier(created.json())
@@ -27,7 +27,7 @@ def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int =
 
         payload: dict[str, Any] = {}
         diagnostics: dict[str, Any] = {"search_id": search_id, "polls": 0, "responses": 0, "files": 0, "candidates": 0}
-        for _ in range(6):
+        for _ in range(poll_count):
             diagnostics["polls"] += 1
             payload = search_payload(client, search_id)
             diagnostics.update(search_diagnostics(payload))
@@ -36,7 +36,7 @@ def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int =
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "diagnostics": diagnostics}
-            time.sleep(1)
+            time.sleep(poll_interval)
         ranked = rank_candidates(extract_candidates(payload, query))[:limit]
         diagnostics["candidates"] = len(ranked)
         return {"candidates": ranked, "diagnostics": diagnostics}
