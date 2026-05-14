@@ -878,6 +878,22 @@ function App() {
     }
   }
 
+  async function runTool(action) {
+    setLoading(true);
+    setError("");
+    try {
+      const task = await api(`/tools/${action}`, { method: "POST" });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Tool queued", body: task.type });
+      return task;
+    } catch (toolError) {
+      notify("Tool failed", toolError.message, "ui_error");
+      throw toolError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function playTracks(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
@@ -1094,7 +1110,7 @@ function App() {
                 onSaveIntegrations={saveIntegrationSettings}
               />
             )}
-            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} />}
+            {page === "Tools" && <ToolsView tasks={tasks} notifications={notifications} onRun={runTool} />}
             {page === "Wishlist" && (
               <WishlistView
                 wishlist={wishlist}
@@ -2781,13 +2797,13 @@ function TasksView({ tasks }) {
   );
 }
 
-function ToolsView({ tasks, notifications }) {
+function ToolsView({ tasks, notifications, onRun }) {
   const [query, setQuery] = useState("");
   const tools = [
-    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library."],
-    ["Find missing album tracks", "Compare known albums against library records and queue download searches."],
-    ["Check files against database", "Find library files missing from the database and records with missing files."],
-    ["Backup now", "Create a manual backup when no file operations are running."],
+    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan"],
+    ["Find missing album tracks", "Compare known albums against library records and add missing tracks to the wishlist.", "check-missing-tracks"],
+    ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files"],
+    ["Backup now", "Create a manual SQLite backup.", "backup"],
   ];
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
@@ -2795,8 +2811,8 @@ function ToolsView({ tasks, notifications }) {
   return (
     <div className="tools-view">
       <div className="tool-grid">
-        {tools.map(([title, body]) => (
-          <button className="tool-card" key={title} disabled>
+        {tools.map(([title, body, action]) => (
+          <button className="tool-card" key={title} onClick={() => onRun(action)}>
             <Wrench size={18} />
             <span>
               <strong>{title}</strong>

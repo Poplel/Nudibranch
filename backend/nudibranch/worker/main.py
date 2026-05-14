@@ -2,17 +2,20 @@ import asyncio
 import json
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
+from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track, WishlistItem
+from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import discover_import_files
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
+from nudibranch.services.metadata_lookup import lookup_album_tracks
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd
 from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
@@ -559,6 +562,109 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     return {"synced": len(item_ids), "playlist": "Favorites"}
 
 
+def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        raise ValueError("Jellyfin URL and API key are required")
+    with httpx.Client(base_url=jellyfin_url, headers={"X-Emby-Token": jellyfin_api_key}, timeout=25) as client:
+        response = client.post("/Library/Refresh")
+        response.raise_for_status()
+    create_notification(session, title="Jellyfin scan queued", body="Library refresh was requested.", event_type="tool_completed", target_url="/tools")
+    return {"requested": True}
+
+
+def run_check_files(session: Session, _payload: dict) -> dict:
+    settings = get_settings()
+    audio_suffixes = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac"}
+    db_paths = {str(path) for path in session.scalars(select(Track.path).where(Track.path.is_not(None)))}
+    disk_paths = {
+        str(path)
+        for path in settings.library_path.rglob("*")
+        if path.is_file() and path.suffix.lower() in audio_suffixes
+    }
+    missing_files = sorted(path for path in db_paths if not Path(path).exists())
+    missing_records = sorted(path for path in disk_paths if path not in db_paths)
+    create_notification(
+        session,
+        title="File check complete",
+        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records.",
+        event_type="tool_completed",
+        target_url="/tools",
+    )
+    return {"missing_files": missing_files, "missing_records": missing_records}
+
+
+def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
+    albums = list(
+        session.scalars(
+            select(Album)
+            .where(Album.musicbrainz_release_id.is_not(None))
+            .options(selectinload(Album.artist), selectinload(Album.tracks))
+        )
+    )
+    created = 0
+    checked = 0
+    for album in albums:
+        checked += 1
+        record = lookup_album_tracks(album.artist.name, album.title, album.musicbrainz_release_id)
+        existing_numbers = {track.track_number for track in album.tracks if track.track_number}
+        for track in record.get("tracks", []):
+            track_number = track.get("track_number")
+            if not track_number or track_number in existing_numbers:
+                continue
+            if session.scalar(
+                select(WishlistItem).where(
+                    WishlistItem.artist == album.artist.name,
+                    WishlistItem.album == album.title,
+                    WishlistItem.track == track.get("title"),
+                    WishlistItem.status.in_(["wanted", "review"]),
+                )
+            ):
+                continue
+            session.add(
+                WishlistItem(
+                    user_id=first_admin_id(session),
+                    kind="track",
+                    artist=album.artist.name,
+                    album=album.title,
+                    track=track.get("title"),
+                )
+            )
+            created += 1
+    create_notification(
+        session,
+        title="Missing track check complete",
+        body=f"{created} missing tracks added to wishlist.",
+        event_type="tool_completed",
+        target_url="/wishlist",
+    )
+    return {"albums_checked": checked, "wishlist_items_created": created}
+
+
+def run_backup_now(session: Session, _payload: dict) -> dict:
+    settings = get_settings()
+    settings.backups_path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = settings.backups_path / f"nudibranch-{timestamp}.sqlite"
+    session.commit()
+    shutil.copy2(settings.db_path, backup_path)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{settings.db_path}{suffix}")
+        if sidecar.exists():
+            shutil.copy2(sidecar, settings.backups_path / f"{backup_path.name}{suffix}")
+    create_notification(session, title="Backup complete", body=str(backup_path), event_type="tool_completed", target_url="/tools")
+    return {"backup_path": str(backup_path)}
+
+
+def first_admin_id(session: Session) -> str:
+    admin_id = session.scalar(select(User.id).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
+    if not admin_id:
+        raise ValueError("No admin user exists for generated wishlist items")
+    return admin_id
+
+
 def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str | None:
     response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist", "SearchTerm": name})
     response.raise_for_status()
@@ -587,6 +693,10 @@ TASK_HANDLERS = {
     "execute_proposal_batch": run_execute_proposal_batch,
     "process_wishlist": run_process_wishlist,
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
+    "jellyfin_scan": run_jellyfin_scan,
+    "check_files": run_check_files,
+    "check_missing_tracks": run_check_missing_tracks,
+    "backup_now": run_backup_now,
 }
 
 

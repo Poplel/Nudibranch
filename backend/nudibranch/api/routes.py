@@ -815,6 +815,38 @@ def process_wishlist(
     return serialize_task(task)
 
 
+@router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"])
+def tool_jellyfin_scan(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.jellyfin_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
+
+
+@router.post("/tools/check-files", response_model=TaskOut, tags=["tools"])
+def tool_check_files(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_files", {}))
+
+
+@router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"])
+def tool_check_missing_tracks(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.downloads_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
+
+
+@router.post("/tools/backup", response_model=TaskOut, tags=["tools"])
+def tool_backup(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.backups_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "backup_now", {}))
+
+
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"])
 def list_approvals(
     session: Session = Depends(get_session),
