@@ -697,11 +697,17 @@ def search_slskd_for_request(session: Session, request: dict) -> dict:
     api_key = settings.get("slskd_api_key", "")
     attempted = []
     last_result = {"candidates": [], "diagnostics": {"queries": []}}
-    for query in download_query_variants(request):
+    for index, query in enumerate(download_query_variants(request)):
         if not query or query in attempted:
             continue
         attempted.append(query)
-        result = search_slskd_detailed(slskd_url, api_key, query)
+        result = search_slskd_detailed(
+            slskd_url,
+            api_key,
+            query,
+            timeout_seconds=12 if index == 0 else 6,
+            timeout_buffer_seconds=3,
+        )
         result["diagnostics"]["query"] = query
         result["diagnostics"]["queries"] = attempted.copy()
         last_result = result
@@ -753,7 +759,8 @@ def slskd_diagnostic_body(query: str, diagnostics: dict) -> str:
         f"{query}: searched {', '.join(str(item) for item in queries if item)}; "
         f"last search {diagnostics.get('search_id', 'unknown')} returned "
         f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
-        f"{diagnostics.get('candidates', 0)} candidates after {diagnostics.get('polls', 0)} polls."
+        f"{diagnostics.get('candidates', 0)} candidates after {diagnostics.get('polls', 0)} polls "
+        f"(state: {diagnostics.get('state') or 'unknown'}, timeout: {diagnostics.get('timeout_seconds', 'unknown')}s)."
     )
 
 

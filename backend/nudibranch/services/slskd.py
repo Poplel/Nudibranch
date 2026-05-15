@@ -12,53 +12,102 @@ def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 4) -> li
     return search_slskd_detailed(slskd_url, api_key, query, limit)["candidates"]
 
 
-def search_slskd_detailed(slskd_url: str, api_key: str, query: str, limit: int = 4, poll_count: int = 6, poll_interval: float = 0.75) -> dict[str, Any]:
+def search_slskd_detailed(
+    slskd_url: str,
+    api_key: str,
+    query: str,
+    limit: int = 4,
+    poll_count: int | None = None,
+    poll_interval: float = 1.0,
+    timeout_seconds: int = 12,
+    timeout_buffer_seconds: int = 3,
+) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
     if not api_key:
         raise ValueError("slskd API key is required")
 
     with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
-        created = client.post("/api/v0/searches", json={"searchText": query})
+        created = create_search(client, query, timeout_seconds)
         created.raise_for_status()
         search_id = search_identifier(created.json())
         if not search_id:
             raise ValueError("slskd did not return a search id")
 
         payload: dict[str, Any] = {}
-        diagnostics: dict[str, Any] = {"search_id": search_id, "polls": 0, "responses": 0, "files": 0, "candidates": 0}
-        for _ in range(poll_count):
+        responses: list[Any] = []
+        diagnostics: dict[str, Any] = {
+            "search_id": search_id,
+            "polls": 0,
+            "responses": 0,
+            "files": 0,
+            "candidates": 0,
+            "timeout_seconds": timeout_seconds,
+            "timeout_buffer_seconds": timeout_buffer_seconds,
+            "response_growth": 0,
+            "state": "created",
+        }
+        max_polls = poll_count or max(1, int((timeout_seconds + timeout_buffer_seconds) / poll_interval))
+        settled_polls = 0
+        last_response_count = 0
+        for _ in range(max_polls):
             diagnostics["polls"] += 1
             payload = search_payload(client, search_id)
+            current_responses = response_list(payload)
+            if len(current_responses) > len(responses):
+                responses = current_responses
+            if isinstance(payload, dict):
+                diagnostics["state"] = str(payload.get("state") or payload.get("State") or payload.get("status") or payload.get("Status") or "")
             diagnostics.update(search_diagnostics(payload))
-            candidates = extract_candidates(payload, query)
-            if candidates:
+            diagnostics["response_growth"] = len(responses) - last_response_count
+            candidates = extract_candidates(responses, query)
+            if len(responses) == last_response_count:
+                settled_polls += 1
+            else:
+                settled_polls = 0
+            last_response_count = len(responses)
+            if candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "diagnostics": diagnostics}
             time.sleep(poll_interval)
-        ranked = rank_candidates(extract_candidates(payload, query))[:limit]
+        ranked = rank_candidates(extract_candidates(responses or payload, query))[:limit]
         diagnostics["candidates"] = len(ranked)
         return {"candidates": ranked, "diagnostics": diagnostics}
 
 
+def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> httpx.Response:
+    payload = {
+        "searchText": query,
+        "timeout": timeout_seconds * 1000,
+        "filterResponses": True,
+        "minimumResponseFileCount": 1,
+        "minimumPeerUploadSpeed": 0,
+    }
+    response = client.post("/api/v0/searches", json=payload)
+    if response.status_code in {400, 415, 422}:
+        return client.post("/api/v0/searches", json={"searchText": query})
+    return response
+
+
 def search_payload(client: httpx.Client, search_id: str) -> Any:
+    responses_response = client.get(f"/api/v0/searches/{search_id}/responses")
+    if responses_response.status_code not in {404, 405}:
+        responses_response.raise_for_status()
+        responses_payload = responses_response.json()
+        responses = response_list(responses_payload)
+        if responses:
+            return {"responses": responses}
+
     state_response = client.get(f"/api/v0/searches/{search_id}", params={"includeResponses": "true"})
     state_response.raise_for_status()
     state_payload = state_response.json()
     responses = response_list(state_payload)
     if responses:
         return state_payload
-
-    responses_response = client.get(f"/api/v0/searches/{search_id}/responses")
-    if responses_response.status_code in {404, 405}:
-        return state_payload
-    responses_response.raise_for_status()
-    responses_payload = responses_response.json()
     if isinstance(state_payload, dict):
-        state_payload = {**state_payload, "responses": response_list(responses_payload)}
-        return state_payload
-    return responses_payload
+        return {**state_payload, "responses": responses}
+    return state_payload
 
 
 def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]) -> dict[str, Any]:
@@ -97,11 +146,15 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
     for response in responses:
         if not isinstance(response, dict):
             continue
-        username = response.get("username") or response.get("user") or response.get("UserName")
-        files = response.get("files") or response.get("Files") or []
+        username = response_username(response)
+        if not username:
+            continue
+        files = response_files(response)
         for file_info in files:
             normalized = normalize_file(file_info)
             if not normalized:
+                continue
+            if not is_audio_file(normalized["filename"]):
                 continue
             candidates.append(
                 {
@@ -118,15 +171,27 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
 
 def response_list(payload: Any) -> list[Any]:
     if isinstance(payload, dict):
-        for key in ("responses", "Responses", "results", "Results"):
+        for key in ("responses", "Responses", "results", "Results", "data"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
-        if isinstance(payload.get("data"), list):
-            return payload["data"]
+            if isinstance(value, dict):
+                return response_mapping_to_list(value)
     if isinstance(payload, list):
         return payload
     return []
+
+
+def response_mapping_to_list(mapping: dict[str, Any]) -> list[Any]:
+    responses: list[Any] = []
+    for username, response in mapping.items():
+        if isinstance(response, dict):
+            if not response_username(response):
+                response = {**response, "username": username}
+            responses.append(response)
+        elif isinstance(response, list):
+            responses.append({"username": username, "files": response})
+    return responses
 
 
 def search_diagnostics(payload: Any) -> dict[str, int]:
@@ -135,10 +200,32 @@ def search_diagnostics(payload: Any) -> dict[str, int]:
     for response in responses:
         if not isinstance(response, dict):
             continue
-        files = response.get("files") or response.get("Files") or []
+        files = response_files(response)
         if isinstance(files, list):
             file_count += len(files)
     return {"responses": len(responses), "files": file_count}
+
+
+def response_username(response: dict[str, Any]) -> str | None:
+    user = response.get("username") or response.get("userName") or response.get("UserName")
+    if isinstance(user, str):
+        return user
+    user = response.get("user") or response.get("User")
+    if isinstance(user, str):
+        return user
+    if isinstance(user, dict):
+        return user.get("username") or user.get("userName") or user.get("name") or user.get("Name")
+    return None
+
+
+def response_files(response: dict[str, Any]) -> list[Any]:
+    for key in ("files", "Files", "results", "Results"):
+        value = response.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return list(value.values())
+    return []
 
 
 def normalize_file(file_info: Any) -> dict[str, Any] | None:
@@ -154,6 +241,10 @@ def normalize_file(file_info: Any) -> dict[str, Any] | None:
         "filename": filename,
         "size": file_info.get("size") or file_info.get("Size"),
     }
+
+
+def is_audio_file(filename: str) -> bool:
+    return filename.lower().endswith((".flac", ".wav", ".aiff", ".alac", ".mp3", ".m4a", ".ogg", ".opus", ".aac", ".wma"))
 
 
 def quality_label(file_info: dict[str, Any]) -> str:
