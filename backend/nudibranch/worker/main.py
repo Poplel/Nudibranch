@@ -29,7 +29,12 @@ def run_propose_import(session: Session, payload: dict) -> dict:
     download_requests = payload.get("download_requests") or []
     if not files and not download_requests:
         raise ValueError("No import files or downloads were selected")
-    batch = ProposalBatch(title="Import folder review", kind=ProposalKind.import_files, tree_path="/app/import")
+    batch_title = "Import folder review"
+    if download_requests and not files:
+        batch_title = "Import/Add download review"
+    elif download_requests:
+        batch_title = "Import/Add review"
+    batch = ProposalBatch(title=batch_title, kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
 
@@ -246,6 +251,8 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             errors.append(f"{item.title}: {error}")
 
     download_changes = 0
+    download_errors: list[str] = []
+    failed_download_requests: list[dict] = []
     for item in wishlist_download_items:
         try:
             process_wishlist_request_items(session, wishlist_download_items)
@@ -265,7 +272,10 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
             download_changes += 1
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
-            errors.append(f"{item.title}: {error}")
+            download_errors.append(f"{item.title}: {error}")
+            failed_request = download_request_from_item(item)
+            if failed_request:
+                failed_download_requests.append(failed_request)
 
     lyric_changes = 0
     for item in lyrics_items:
@@ -283,9 +293,12 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
             skipped += 1
 
+    if failed_download_requests:
+        create_download_retry_import_batch(session, failed_download_requests)
+
     if errors:
         batch.status = ProposalStatus.failed
-    elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected} or not item.selected for item in batch.items):
+    elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed} or not item.selected for item in batch.items):
         batch.status = ProposalStatus.completed
     else:
         batch.status = ProposalStatus.pending
@@ -294,7 +307,17 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
     create_notification(
         session,
         title="Task queue item failed" if errors else "Task queue item completed",
-        body=task_queue_notification_body(imported, metadata_updated, file_actions, playlist_changes, download_changes, lyric_changes, skipped, errors),
+        body=task_queue_notification_body(
+            imported,
+            metadata_updated,
+            file_actions,
+            playlist_changes,
+            download_changes,
+            lyric_changes,
+            skipped,
+            errors,
+            download_errors,
+        ),
         event_type="task_completed",
         target_url="/activity",
     )
@@ -308,10 +331,21 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         "lyric_changes": lyric_changes,
         "skipped": skipped,
         "errors": errors,
+        "download_errors": download_errors,
     }
 
 
-def task_queue_notification_body(imported: int, metadata_updated: int, file_actions: int, playlist_changes: int, download_changes: int, lyric_changes: int, skipped: int, errors: list[str]) -> str:
+def task_queue_notification_body(
+    imported: int,
+    metadata_updated: int,
+    file_actions: int,
+    playlist_changes: int,
+    download_changes: int,
+    lyric_changes: int,
+    skipped: int,
+    errors: list[str],
+    download_errors: list[str] | None = None,
+) -> str:
     parts = [
         f"{imported} tracks imported",
         f"{metadata_updated} metadata changes applied",
@@ -325,7 +359,15 @@ def task_queue_notification_body(imported: int, metadata_updated: int, file_acti
     body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
+    if download_errors:
+        return f"{body} {len(download_errors)} downloads need another candidate and were sent back to Import/Add. First download issue: {trim_message(download_errors[0])}"
     return body
+
+
+def trim_message(message: str, limit: int = 700) -> str:
+    if len(message) <= limit:
+        return message
+    return f"{message[:limit].rstrip()}..."
 
 
 def should_count_skipped_item(item: ProposalItem) -> bool:
@@ -455,12 +497,99 @@ def apply_download_item(session: Session, item: ProposalItem) -> None:
         return
     if action == "queue_download":
         settings = integration_settings(session)
-        queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), payload.get("candidate") or {})
+        queue_slskd_download_with_candidate_fallbacks(session, item, settings.get("slskd_url", ""), settings.get("slskd_api_key", ""))
         return
     if action == "queue_ytdlp_download":
         queue_ytdlp_download(session, payload.get("request") or {})
         return
     raise ValueError("Unsupported download action")
+
+
+def queue_slskd_download_with_candidate_fallbacks(session: Session, item: ProposalItem, slskd_url: str, api_key: str) -> dict:
+    attempts: list[str] = []
+    for candidate_item in download_candidate_attempt_order(session, item):
+        payload = json.loads(candidate_item.payload_json or "{}")
+        candidate = payload.get("candidate") or {}
+        label = candidate.get("filename") or candidate_item.title
+        try:
+            result = queue_slskd_download(slskd_url, api_key, candidate)
+            if candidate_item.id != item.id:
+                candidate_item.status = ProposalStatus.completed
+                item.new_value = candidate_item.new_value
+                item.payload_json = candidate_item.payload_json
+            return result
+        except Exception as error:  # noqa: BLE001 - try the next available candidate for this track.
+            attempts.append(f"{label}: {error}")
+            candidate_item.status = ProposalStatus.failed
+    raise RuntimeError("All slskd candidates failed. " + " | ".join(attempts))
+
+
+def download_candidate_attempt_order(session: Session, item: ProposalItem) -> list[ProposalItem]:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download":
+        return [item]
+    siblings = list(
+        session.scalars(
+            select(ProposalItem)
+            .where(ProposalItem.batch_id == item.batch_id)
+            .where(ProposalItem.parent_id == item.parent_id)
+            .where(ProposalItem.kind == ProposalKind.download)
+        )
+    )
+    candidates = [
+        candidate
+        for candidate in siblings
+        if json.loads(candidate.payload_json or "{}").get("action") == "queue_download"
+    ]
+    if not candidates:
+        return [item]
+
+    def candidate_sort_key(candidate: ProposalItem) -> tuple[int, str]:
+        if candidate.id == item.id:
+            return (0, candidate.id)
+        if candidate.selected:
+            return (1, candidate.id)
+        return (2, candidate.id)
+
+    return sorted(candidates, key=candidate_sort_key)
+
+
+def download_request_from_item(item: ProposalItem) -> dict | None:
+    payload = json.loads(item.payload_json or "{}")
+    request = payload.get("request")
+    if isinstance(request, dict):
+        return request
+    candidate = payload.get("candidate") or {}
+    if payload.get("action") == "queue_ytdlp_download":
+        return None
+    parent = item.parent
+    if parent:
+        parent_payload = json.loads(parent.payload_json or "{}")
+        artist = parent_payload.get("artist")
+        album = parent_payload.get("album")
+        track = parent_payload.get("track") or parent.title
+        if artist or album or track:
+            return {"artist": artist, "album": album, "track": track}
+    if candidate.get("query"):
+        return {"track": candidate["query"]}
+    return None
+
+
+def create_download_retry_import_batch(session: Session, requests: list[dict]) -> None:
+    unique_requests: list[dict] = []
+    seen = set()
+    for request in requests:
+        key = (
+            str(request.get("artist") or "Unknown Artist").casefold(),
+            str(request.get("album") or "Unknown Album").casefold(),
+            str(request.get("track") or request.get("title") or "Unknown Track").casefold(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_requests.append(request)
+    if unique_requests:
+        run_propose_import(session, {"files": [], "download_requests": unique_requests})
 
 
 def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:

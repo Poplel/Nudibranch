@@ -120,13 +120,15 @@ def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]
     if not username or not files:
         raise ValueError("Download candidate is missing a username or files")
 
+    errors: list[str] = []
     with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=20) as client:
         endpoint = f"/api/v0/transfers/downloads/{username}"
-        response = client.post(endpoint, json={"files": files})
-        if response.status_code in {400, 415, 422}:
-            response = client.post(endpoint, json=files)
-        response.raise_for_status()
-        return {"username": username, "files": len(files), "response": response.json() if response.content else {}}
+        for payload in (files, {"files": files}):
+            response = client.post(endpoint, json=payload)
+            if response.is_success:
+                return {"username": username, "files": len(files), "response": response.json() if response.content else {}}
+            errors.append(f"{response.status_code}: {response.text[-500:]}")
+    raise RuntimeError("; ".join(errors))
 
 
 def search_identifier(payload: Any) -> str | None:
