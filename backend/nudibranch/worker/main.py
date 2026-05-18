@@ -1237,6 +1237,20 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         payload_json=json.dumps({"status": "searching"}),
     )
     session.add(searching_item)
+    track_items: list[tuple[dict, ProposalItem]] = []
+    for request in requests:
+        query = download_query(request)
+        track_title = request.get("track") or request.get("title") or query
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=track_title,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album, "track": track_title, "status": "queued"}),
+        )
+        session.add(track_item)
+        session.flush()
+        track_items.append((request, track_item))
     session.commit()
 
     slskd_tracks = 0
@@ -1247,20 +1261,11 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         diagnostic_lines.append(
             f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
         )
-    for request in requests:
+    for request, track_item in track_items:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
         searching_item.title = f"Searching {track_title}"
         session.commit()
-        track_item = ProposalItem(
-            batch_id=batch.id,
-            parent_id=album_item.id,
-            title=track_title,
-            kind=ProposalKind.download,
-            payload_json=json.dumps({"artist": artist, "album": album, "track": track_title}),
-        )
-        session.add(track_item)
-        session.flush()
         folder_candidate = candidate_from_folder_pool(folder_pool, request) if folder_pool else None
         if folder_candidate:
             candidates = [folder_candidate]
@@ -1739,6 +1744,16 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
         session.delete(track)
         session.flush()
         cleanup_empty_album_artist(session, album)
+        return
+    if payload.get("action") == "delete_file":
+        settings = get_settings()
+        library_root = settings.library_path.resolve()
+        resolved = source_path.resolve()
+        if library_root not in [resolved, *resolved.parents]:
+            raise ValueError("File must be inside the library folder")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"{resolved} no longer exists")
+        resolved.unlink()
         return
     target_path = unique_destination(Path(item.new_value or ""))
     if not source_path.exists():

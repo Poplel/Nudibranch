@@ -252,7 +252,7 @@ class LibraryRemoveProposalRequest(BaseModel):
 
 
 class CheckFileFixRequest(BaseModel):
-    action: str = Field(pattern="^(remove_record|download_record|create_record)$")
+    action: str = Field(pattern="^(remove_record|download_record|create_record|delete_file)$")
     path: str | None = None
     track_id: str | None = None
 

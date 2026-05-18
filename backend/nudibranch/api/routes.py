@@ -1015,6 +1015,22 @@ def propose_check_file_fix(
         library_root = settings.library_path.resolve()
         if library_root not in [file_path, *file_path.parents] or not file_path.exists() or not file_path.is_file():
             raise HTTPException(status_code=400, detail="File must be inside the library folder")
+        if payload.action == "delete_file":
+            batch = ProposalBatch(title=f"Delete untracked file {file_path.name}", kind=ProposalKind.delete, tree_path="/library")
+            session.add(batch)
+            session.flush()
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    title=file_path.name,
+                    kind=ProposalKind.delete,
+                    old_value=str(file_path),
+                    payload_json=json.dumps({"action": "delete_file", "path": str(file_path)}),
+                )
+            )
+            session.commit()
+            session.refresh(batch)
+            return serialize_batch(batch)
         metadata = read_audio_metadata(file_path)
         batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files, tree_path="/library")
         session.add(batch)

@@ -1308,6 +1308,7 @@ function App() {
                 user={user}
                 backups={backups}
                 onRun={runTool}
+                onFix={proposeCheckFileFix}
               />
             )}
             {page === "Wishlist" && (
@@ -1745,7 +1746,9 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   const trees = useMemo(() => batches.map((batch) => ({ batch, tree: buildItemTree(batch.items) })), [batches]);
   const visibleItems = useMemo(() => visibleDownloadItems(batches), [batches]);
   const selectedItems = visibleItems.filter((item) => item.selected);
-  const actionableSelectedItems = selectedItems.filter((item) => !["executing", "completed"].includes(item.status));
+  const selectedActionItems = selectedItems.filter((item) => isDownloadActionItem(item));
+  const actionableSelectedItems = selectedActionItems.filter((item) => !["executing", "completed"].includes(item.status));
+  const visibleActionItems = visibleItems.filter((item) => isDownloadActionItem(item));
   const allSelected = selectedItems.length === visibleItems.length && visibleItems.length > 0;
 
   useEffect(() => {
@@ -1766,7 +1769,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
         <div>
           <h2>Download candidates</h2>
           <p>
-            {selectedItems.length} of {visibleItems.length} visible items selected across {batches.length} batch{batches.length === 1 ? "" : "es"}
+            {selectedActionItems.length} of {visibleActionItems.length} actions selected across {batches.length} batch{batches.length === 1 ? "" : "es"}
           </p>
         </div>
         <div className="approval-actions">
@@ -1792,7 +1795,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           />
           Select all visible
         </label>
-        <span>{selectedItems.length} selected · {actionableSelectedItems.length} ready</span>
+        <span>{selectedActionItems.length} selected · {actionableSelectedItems.length} ready</span>
         <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
       </div>
       {trees.map(({ batch, tree }) => (
@@ -1986,7 +1989,7 @@ function ApprovalNode({
             <Pencil size={14} />
           </button>
         )}
-        {allowBranchDelete && (
+        {allowBranchDelete && !leafDownloadCandidate && (
           <button className="row-icon-button danger" onClick={() => onReject?.([item])} title="Delete branch and files">
             <Trash2 size={14} />
           </button>
@@ -3610,7 +3613,7 @@ function InlineProgress({ value = 0, label = "", indeterminate = false }) {
   );
 }
 
-function ToolsView({ tasks, notifications, user, backups, onRun }) {
+function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
@@ -3623,6 +3626,7 @@ function ToolsView({ tasks, notifications, user, backups, onRun }) {
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
+  const latestCheckFilesResult = tasks.find((task) => task.type === "check_files" && task.status === "completed" && task.result)?.result;
 
   return (
     <div className="tools-view">
@@ -3662,6 +3666,7 @@ function ToolsView({ tasks, notifications, user, backups, onRun }) {
           </div>
         </section>
       )}
+      {hasPermission(user, "library:manage") && latestCheckFilesResult && <CheckFilesResult result={latestCheckFilesResult} onFix={onFix} />}
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
           <div className="log-header">
@@ -3725,6 +3730,10 @@ function CheckFilesResult({ result, onFix }) {
               <button className="secondary compact" onClick={() => onFix({ action: "create_record", path: file.path })}>
                 <Plus size={15} />
                 Create record
+              </button>
+              <button className="secondary compact danger" onClick={() => onFix({ action: "delete_file", path: file.path })}>
+                <Trash2 size={15} />
+                Delete file
               </button>
             </div>
           ))}
@@ -4472,11 +4481,19 @@ function visibleDownloadItems(batches) {
   });
 }
 
+function isDownloadActionItem(item) {
+  if (item.kind !== "download") return false;
+  const payload = parseJsonObject(item.payload_json);
+  return ["queue_download", "queue_ytdlp_download", "wishlist_request"].includes(payload.action);
+}
+
 function candidateMeta(item) {
   return item.new_value ? `candidate · ${item.new_value}` : "candidate";
 }
 
 function itemStatusMeta(item) {
+  const payload = parseJsonObject(item.payload_json);
+  if (payload.status) return payload.status;
   if (item.status === "executing") return "working";
   if (item.status === "completed") return "done";
   if (item.status === "failed") return "needs attention";
