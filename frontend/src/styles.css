@@ -1768,6 +1768,16 @@ nav button:hover,
   width: 100%;
 }
 
+.inspector-actions input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
 .diff {
   display: grid;
   gap: 6px;

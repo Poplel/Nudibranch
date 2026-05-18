@@ -114,6 +114,8 @@ function App() {
   const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
   const [importAlbumSearchOpen, setImportAlbumSearchOpen] = useState(false);
   const [importDownloadRequests, setImportDownloadRequests] = useState([]);
+  const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
+  const [playlistInspectorActions, setPlaylistInspectorActions] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -354,20 +356,16 @@ function App() {
 
   function sendFileCheckToImport(result) {
     const files = result.missing_records || [];
-    const downloads = (result.missing_files || []).map((record) => ({
-      artist: record.artist,
-      album: record.album,
-      track: record.title,
-      track_number: record.track_number,
-    }));
-    if (files.length === 0 && downloads.length === 0) return;
+    const queuedDownloads = result.queued_missing_files || 0;
+    if (files.length === 0 && queuedDownloads === 0) return;
     setImportFiles(files);
-    setImportSeedDownloads(downloads);
-    setPage("Import/Add");
+    setImportSeedDownloads([]);
+    setPage(files.length ? "Import/Add" : "Task Queue");
     setToast({
       title: "File check ready",
-      body: `${files.length} files and ${downloads.length} missing records were sent to Import/Add.`,
+      body: `${files.length} files were sent to Import/Add. ${queuedDownloads} missing records were added to the task queue.`,
     });
+    refreshApprovals();
   }
 
   async function refreshLibrary() {
@@ -1326,6 +1324,7 @@ function App() {
                 onSubmit={submitWishlistApprovals}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
+                onInspectorActionsChange={setWishlistInspectorActions}
               />
             )}
             {page === "Playlists" && (
@@ -1340,6 +1339,7 @@ function App() {
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
                 onSync={syncPlaylists}
+                onInspectorActionsChange={setPlaylistInspectorActions}
               />
             )}
             {page === "Users" && (
@@ -1372,6 +1372,8 @@ function App() {
               downloadCount: importDownloadRequests.length,
               disabled: loading || activeImportTask || (importFiles.length === 0 && importDownloadRequests.length === 0),
             }}
+            wishlistActions={wishlistInspectorActions}
+            playlistActions={playlistInspectorActions}
           />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
@@ -1764,11 +1766,14 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
   const trees = useMemo(() => batches.map((batch) => ({ batch, tree: buildItemTree(batch.items) })), [batches]);
   const visibleItems = useMemo(() => visibleDownloadItems(batches), [batches]);
+  const allItems = useMemo(() => batches.flatMap((batch) => batch.items), [batches]);
+  const leafItems = useMemo(() => lowestLevelItems(visibleItems), [visibleItems]);
   const selectedItems = visibleItems.filter((item) => item.selected);
+  const selectedLeafItems = leafItems.filter((item) => item.selected);
   const selectedActionItems = selectedItems.filter((item) => isDownloadActionItem(item));
   const actionableSelectedItems = selectedActionItems.filter((item) => !["executing", "completed"].includes(item.status));
-  const visibleActionItems = visibleItems.filter((item) => isDownloadActionItem(item));
-  const allSelected = selectedItems.length === visibleItems.length && visibleItems.length > 0;
+  const readyLeafItems = selectedLeafItems.filter((item) => !["executing", "completed"].includes(item.status));
+  const allSelected = leafItems.length > 0 && leafItems.every((item) => item.selected);
 
   useEffect(() => {
     setOpenItems(new Set(batches.map((batch) => downloadBatchNodeId(batch.id))));
@@ -1788,7 +1793,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
         <div>
           <h2>Download candidates</h2>
           <p>
-            {selectedActionItems.length} of {visibleActionItems.length} actions selected across {batches.length} batch{batches.length === 1 ? "" : "es"}
+            {selectedLeafItems.length} of {leafItems.length} tracks selected across {batches.length} batch{batches.length === 1 ? "" : "es"}
           </p>
         </div>
         <div className="approval-actions">
@@ -1807,14 +1812,14 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
             type="checkbox"
             checked={allSelected}
             onChange={(event) => {
-              for (const [batchId, items] of groupBy(visibleItems, (item) => item.batch_id)) {
+              for (const [batchId, items] of groupBy(allItems, (item) => item.batch_id)) {
                 onSelection(batchId, items.map((item) => item.id), event.target.checked);
               }
             }}
           />
-          Select all visible
+          Select all
         </label>
-        <span>{selectedActionItems.length} selected · {actionableSelectedItems.length} ready</span>
+        <span>{selectedLeafItems.length} selected · {readyLeafItems.length} ready</span>
         <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
       </div>
       {trees.map(({ batch, tree }) => (
@@ -2213,7 +2218,7 @@ function AlbumResultArt({ src }) {
   return <img src={src} alt="" onError={() => setFailed(true)} />;
 }
 
-function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum }) {
+function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2255,22 +2260,18 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
     setAlbumSearchOpen(false);
   }
 
+  useEffect(() => {
+    onInspectorActionsChange?.({
+      selectedCount: selectedItems.size,
+      canApproveAll,
+      onToggleAlbumSearch: () => setAlbumSearchOpen((value) => !value),
+      onSubmitSelected: () => onSubmit([...selectedItems], { denyUnselected: canApproveAll }),
+    });
+    return () => onInspectorActionsChange?.(null);
+  }, [selectedItems.size, canApproveAll]);
+
   return (
     <div className="wishlist-view">
-      <div className="action-bar">
-        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
-          <Plus size={16} />
-          Add album
-        </button>
-        <button
-          className="primary"
-          onClick={() => onSubmit([...selectedItems], { denyUnselected: canApproveAll })}
-          disabled={selectedItems.size === 0}
-        >
-          <ListChecks size={16} />
-          {canApproveAll ? "Approve selected" : "Add selected to approvals"}
-        </button>
-      </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
       {wishlist.length === 0 ? (
         <EmptyState title="No wishlist items" body="Add music here before sending wishlist work to the task queue." />
@@ -2396,7 +2397,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onQueueRename, onQueueDelete, onPlay, onQueue, onSync }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onQueueRename, onQueueDelete, onPlay, onQueue, onSync, onInspectorActionsChange }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
   const [addOpen, setAddOpen] = useState(null);
   const [editOpen, setEditOpen] = useState(null);
@@ -2428,32 +2429,26 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
     updateDraft(track.id, String(track.position || ""));
   }
 
+  useEffect(() => {
+    onInspectorActionsChange?.({
+      playlistName,
+      onPlaylistNameChange: setPlaylistName,
+      onCreate: () => {
+        if (!playlistName.trim()) return;
+        onCreatePlaylist(playlistName.trim()).then(() => setPlaylistName(""));
+      },
+      onSync,
+    });
+    return () => onInspectorActionsChange?.(null);
+  }, [playlistName]);
+
   return (
     <div className="playlist-view">
       <TreeToolbar
         expanded={openPlaylists.size > 0}
         onExpand={() => setOpenPlaylists(new Set(playlists.map((playlist) => playlist.name)))}
         onCollapse={() => setOpenPlaylists(new Set())}
-      >
-        <form
-          className="playlist-create"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!playlistName.trim()) return;
-            onCreatePlaylist(playlistName.trim()).then(() => setPlaylistName(""));
-          }}
-        >
-          <input value={playlistName} onChange={(event) => setPlaylistName(event.target.value)} placeholder="New playlist" />
-          <button className="secondary compact">
-            <Plus size={15} />
-            Create
-          </button>
-        </form>
-        <button className="secondary compact" onClick={onSync}>
-          <RefreshCw size={15} />
-          Sync
-        </button>
-      </TreeToolbar>
+      />
       {playlists.map((playlist) => {
         const tracks = playlist.tracks || [];
         const playableTracks = tracks.map(playlistPlayableTrack);
@@ -3688,38 +3683,23 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
 function CheckFilesResult({ result, onFix }) {
   const missingFiles = result?.missing_files || [];
   const missingRecords = result?.missing_records || [];
-  if (missingFiles.length === 0 && missingRecords.length === 0) {
+  if (missingRecords.length === 0) {
     return (
       <section className="check-files-panel">
         <h2>File Check</h2>
-        <p>No mismatches found.</p>
+        <p>
+          {missingFiles.length
+            ? `${missingFiles.length} records with missing files were added to the task queue.`
+            : "No untracked library files found."}
+        </p>
       </section>
     );
   }
   return (
     <section className="check-files-panel">
       <h2>File Check</h2>
+      {missingFiles.length > 0 && <p>{missingFiles.length} records with missing files were added to the task queue.</p>}
       <div className="check-files-grid">
-        <div>
-          <h3>Records With No Files</h3>
-          {missingFiles.map((record) => (
-            <div className="check-file-row" key={record.track_id || record.path}>
-              <span>
-                <strong>{record.title}</strong>
-                <small>{record.artist} / {record.album}</small>
-                <small>{record.path}</small>
-              </span>
-              <button className="secondary compact" onClick={() => onFix({ action: "remove_record", track_id: record.track_id })}>
-                <Trash2 size={15} />
-                Remove record
-              </button>
-              <button className="secondary compact" onClick={() => onFix({ action: "download_record", track_id: record.track_id })}>
-                <Download size={15} />
-                Download
-              </button>
-            </div>
-          ))}
-        </div>
         <div>
           <h3>Files With No Records</h3>
           {missingRecords.map((file) => (
@@ -4057,7 +4037,7 @@ function SettingsPanel({
   );
 }
 
-function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, importActions }) {
+function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, importActions, wishlistActions, playlistActions }) {
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
@@ -4073,6 +4053,38 @@ function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tas
           </button>
           <button className="secondary" onClick={importActions.onPropose} disabled={importActions.disabled}>
             {importActions.activeImportTask ? "Import review running" : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
+          </button>
+        </div>
+      )}
+      {page === "Wishlist" && wishlistActions && (
+        <div className="inspector-actions">
+          <button className="secondary" onClick={wishlistActions.onToggleAlbumSearch}>
+            <Plus size={16} />
+            Add album
+          </button>
+          <button className="primary" onClick={wishlistActions.onSubmitSelected} disabled={wishlistActions.selectedCount === 0}>
+            <ListChecks size={16} />
+            {wishlistActions.canApproveAll ? "Approve selected" : "Add selected to approvals"}
+          </button>
+        </div>
+      )}
+      {page === "Playlists" && playlistActions && (
+        <div className="inspector-actions">
+          <input
+            value={playlistActions.playlistName}
+            onChange={(event) => playlistActions.onPlaylistNameChange(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") playlistActions.onCreate();
+            }}
+            placeholder="New playlist"
+          />
+          <button className="secondary" onClick={playlistActions.onCreate} disabled={!playlistActions.playlistName.trim()}>
+            <Plus size={16} />
+            Create playlist
+          </button>
+          <button className="secondary" onClick={playlistActions.onSync}>
+            <RefreshCw size={16} />
+            Sync playlists
           </button>
         </div>
       )}
@@ -4502,6 +4514,11 @@ function isDownloadActionItem(item) {
   if (item.kind !== "download") return false;
   const payload = parseJsonObject(item.payload_json);
   return ["queue_download", "queue_ytdlp_download", "wishlist_request"].includes(payload.action);
+}
+
+function lowestLevelItems(items) {
+  const parentIds = new Set(items.map((item) => item.parent_id).filter(Boolean));
+  return items.filter((item) => !parentIds.has(item.id));
 }
 
 function candidateMeta(item) {

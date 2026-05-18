@@ -1278,15 +1278,6 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     )
     session.add(album_item)
     session.flush()
-    searching_item = ProposalItem(
-        batch_id=batch.id,
-        parent_id=album_item.id,
-        title="Searching download candidates...",
-        kind=ProposalKind.download,
-        selected=False,
-        payload_json=json.dumps({"status": "searching"}),
-    )
-    session.add(searching_item)
     track_items: list[tuple[dict, ProposalItem]] = []
     for request in requests:
         query = download_query(request)
@@ -1314,7 +1305,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     for request, track_item in track_items:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
-        searching_item.title = f"Searching {track_title}"
+        set_item_payload_status(track_item, f"searching {track_title}")
         session.commit()
         folder_candidate = candidate_from_folder_pool(folder_pool, request) if folder_pool else None
         if folder_candidate:
@@ -1329,6 +1320,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                 folder_pool = download_folder_pool(candidates[0])
         if candidates:
             slskd_tracks += 1
+            set_item_payload_status(track_item, "candidate ready")
             for index, candidate in enumerate(candidates):
                 session.add(
                     ProposalItem(
@@ -1350,6 +1342,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                 )
         else:
             fallback_tracks += 1
+            set_item_payload_status(track_item, "fallback ready")
             session.add(
                 ProposalItem(
                     batch_id=batch.id,
@@ -1367,7 +1360,6 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                 )
             )
         session.commit()
-    session.delete(searching_item)
     session.flush()
     create_notification(
         session,
@@ -1384,15 +1376,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     session.add(batch)
     session.flush()
     track_parent = add_download_tree_parents(session, batch, request, query)
-    searching_item = ProposalItem(
-        batch_id=batch.id,
-        parent_id=track_parent.id,
-        title="Searching download candidates...",
-        kind=ProposalKind.download,
-        selected=False,
-        payload_json=json.dumps({"status": "searching"}),
-    )
-    session.add(searching_item)
+    set_item_payload_status(track_parent, f"searching {query}")
     session.commit()
     search_result = search_slskd_for_request(session, request, limit=4 if request.get("multiple_candidates") else 1)
     candidates = search_result["candidates"]
@@ -1428,7 +1412,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
             )
         )
         session.commit()
-    session.delete(searching_item)
+    set_item_payload_status(track_parent, "candidate ready")
     session.flush()
     create_notification(
         session,
@@ -1467,6 +1451,12 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
         event_type="approval_needed",
         target_url="/downloads",
     )
+
+
+def set_item_payload_status(item: ProposalItem, status: str) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    payload["status"] = status
+    item.payload_json = json.dumps(payload)
 
 
 def download_folder_pool(candidate: dict) -> dict | None:
@@ -2018,14 +2008,75 @@ def run_check_files(session: Session, _payload: dict) -> dict:
         for path in missing_file_paths
     ]
     missing_records = [file_info_for_existing_library_file(Path(path)) for path in missing_record_paths]
+    queued_missing_files = queue_missing_file_downloads(session, missing_files)
     create_notification(
         session,
         title="File check complete",
-        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records.",
+        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records. {queued_missing_files} downloads added to the task queue.",
         event_type="tool_completed",
         target_url="/tools",
     )
-    return {"missing_files": missing_files, "missing_records": missing_records}
+    return {"missing_files": missing_files, "missing_records": missing_records, "queued_missing_files": queued_missing_files}
+
+
+def queue_missing_file_downloads(session: Session, missing_files: list[dict]) -> int:
+    if not missing_files:
+        return 0
+    existing = existing_missing_file_download_keys(session)
+    rows = []
+    for record in missing_files:
+        key = missing_file_download_key(record.get("artist"), record.get("album"), record.get("title"))
+        if key in existing:
+            continue
+        rows.append(record)
+        existing.add(key)
+    if not rows:
+        return 0
+    batch = ProposalBatch(title="Download missing library files", kind=ProposalKind.download, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    for record in rows:
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=record["title"],
+                kind=ProposalKind.download,
+                payload_json=json.dumps(
+                    {
+                        "action": "wishlist_request",
+                        "kind": "track",
+                        "track_id": record.get("track_id"),
+                        "artist": record.get("artist"),
+                        "album": record.get("album"),
+                        "track": record.get("title"),
+                        "track_number": record.get("track_number"),
+                    }
+                ),
+            )
+        )
+    session.flush()
+    return len(rows)
+
+
+def existing_missing_file_download_keys(session: Session) -> set[tuple[str, str, str]]:
+    keys = set()
+    items = session.scalars(
+        select(ProposalItem)
+        .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+        .where(ProposalItem.kind == ProposalKind.download)
+        .where(ProposalItem.payload_json.is_not(None))
+        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+    )
+    for item in items:
+        payload = json.loads(item.payload_json or "{}")
+        if payload.get("action") != "wishlist_request":
+            continue
+        keys.add(missing_file_download_key(payload.get("artist"), payload.get("album"), payload.get("track") or item.title))
+    return keys
+
+
+def missing_file_download_key(artist: str | None, album: str | None, title: str | None) -> tuple[str, str, str]:
+    return (normalize_match_text(artist), normalize_match_text(album), normalize_match_text(title))
 
 
 def file_info_for_existing_library_file(file_path: Path) -> dict:
