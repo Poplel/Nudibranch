@@ -1,6 +1,7 @@
 import secrets
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -494,6 +495,8 @@ def list_wishlist(
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
+    expire_old_terminal_wishlist_items(session, items)
+    items = [item for item in items if item.status != "removed" and not terminal_wishlist_expired(item)]
     return [serialize_wishlist_item(item) for item in items]
 
 
@@ -504,6 +507,7 @@ def create_wishlist_item(
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> WishlistOut:
     item = WishlistItem(user_id=user.id, **payload.model_dump())
+    item.status_changed_at = datetime.now(timezone.utc)
     session.add(item)
     session.commit()
     session.refresh(item)
@@ -520,6 +524,7 @@ def remove_wishlist_item(
     if not item or (not user_has_permission(user, Permission.wishlist_manage_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     item.status = "removed"
+    item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(item)
     return serialize_wishlist_item(item)
@@ -618,9 +623,11 @@ def propose_wishlist_items(
             )
         )
         wishlist_item.status = "review"
+        wishlist_item.status_changed_at = datetime.now(timezone.utc)
     notify_wishlist_decisions(session, items, "Wishlist request approved", "added to the task queue", "wishlist_approved", "/downloads")
     for denied_item in denied_items:
-        denied_item.status = "removed"
+        denied_item.status = "rejected"
+        denied_item.status_changed_at = datetime.now(timezone.utc)
     if denied_items:
         notify_wishlist_decisions(session, denied_items, "Wishlist request denied", "not selected for download", "wishlist_denied", "/wishlist")
     session.commit()
@@ -1400,7 +1407,25 @@ def serialize_wishlist_item(item: WishlistItem) -> WishlistOut:
         track=item.track,
         status=item.status,
         created_at=item.created_at,
+        status_changed_at=item.status_changed_at or item.created_at,
     )
+
+
+def terminal_wishlist_expired(item: WishlistItem) -> bool:
+    if item.status not in {"rejected", "completed", "removed"}:
+        return False
+    changed_at = item.status_changed_at or item.created_at
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=timezone.utc)
+    return changed_at < datetime.now(timezone.utc) - timedelta(hours=48)
+
+
+def expire_old_terminal_wishlist_items(session: Session, items: list[WishlistItem]) -> None:
+    expired = [item for item in items if terminal_wishlist_expired(item)]
+    for item in expired:
+        session.delete(item)
+    if expired:
+        session.commit()
 
 
 def notify_wishlist_decisions(

@@ -661,13 +661,21 @@ function App() {
   }
 
   async function removeWishlistItem(itemId) {
+    return removeWishlistItems([itemId]);
+  }
+
+  async function removeWishlistItems(itemIds) {
     setLoading(true);
     setError("");
     try {
-      const updated = await api(`/wishlist/${itemId}`, { method: "DELETE" });
-      setWishlist((current) => current.map((item) => (item.id === updated.id ? updated : item)));
-      setToast({ title: "Wishlist updated", body: "The track was removed." });
-      return updated;
+      const updatedItems = [];
+      for (const itemId of itemIds) {
+        updatedItems.push(await api(`/wishlist/${itemId}`, { method: "DELETE" }));
+      }
+      const updatedIds = new Set(updatedItems.map((item) => item.id));
+      setWishlist((current) => current.filter((item) => !updatedIds.has(item.id)));
+      setToast({ title: "Wishlist updated", body: `${updatedItems.length} item${updatedItems.length === 1 ? "" : "s"} removed.` });
+      return updatedItems;
     } catch (wishlistError) {
       setError(wishlistError.message);
       notify("Wishlist failed", wishlistError.message, "ui_error");
@@ -1309,6 +1317,7 @@ function App() {
                 user={user}
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
+                onRemoveMany={removeWishlistItems}
                 onSubmit={submitWishlistApprovals}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
@@ -2200,7 +2209,7 @@ function AlbumResultArt({ src }) {
   return <img src={src} alt="" onError={() => setFailed(true)} />;
 }
 
-function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onSubmit, onSearchAlbums, onLookupAlbum }) {
+function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2294,53 +2303,52 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onSubmit, on
                   />
                   {openOwners.has(owner.id) &&
                     owner.artists.map((artist) =>
-                      renderWishlistArtist(artist, 1, owner.id, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove),
+                      renderWishlistArtist(artist, 1, owner.id, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany),
                     )}
                 </div>
               ))
-            : tree.map((artist) => renderWishlistArtist(artist, 0, "", openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove))}
-        </div>
-      )}
-      {approvals.length > 0 && (
-        <div className="wishlist-approval-list">
-          <h2>Submitted approvals</h2>
-          {approvals.map((batch) => (
-            <div className="task-row" key={batch.id}>
-              <strong>{batch.title}</strong>
-              <span>{batch.status} · {batch.items.length} items</span>
-            </div>
-          ))}
+            : tree.map((artist) => renderWishlistArtist(artist, 0, "", openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany))}
         </div>
       )}
     </div>
   );
 }
 
-function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove) {
+function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany) {
   const artistId = `${prefix ? `${prefix}:` : ""}${artist.name}`;
   return (
     <div key={`${depth}:${artistId}`}>
-      <TreeRow
-        depth={depth}
-        icon={Sparkles}
-        open={openArtists.has(artistId)}
-        title={artist.name}
-        meta={`${artist.albums.length} albums`}
-        onToggle={() => toggleSet(setOpenArtists, artistId)}
-      />
+      <div className="tree-action-row library-row-actions">
+        <TreeRow
+          depth={depth}
+          icon={Sparkles}
+          open={openArtists.has(artistId)}
+          title={artist.name}
+          meta={`${artist.albums.length} albums`}
+          onToggle={() => toggleSet(setOpenArtists, artistId)}
+        />
+        <button className="row-icon-button" onClick={() => onRemoveMany(artist.itemIds)} title="Remove artist requests">
+          <X size={15} />
+        </button>
+      </div>
       {openArtists.has(artistId) &&
         artist.albums.map((album) => {
           const albumId = `${artistId}/${album.name}`;
           return (
             <div key={albumId}>
-              <TreeRow
-                depth={depth + 1}
-                icon={Folder}
-                open={openAlbums.has(albumId)}
-                title={album.name}
-                meta={`${album.tracks.length || 1} requested`}
-                onToggle={() => toggleSet(setOpenAlbums, albumId)}
-              />
+              <div className="tree-action-row library-row-actions">
+                <TreeRow
+                  depth={depth + 1}
+                  icon={Folder}
+                  open={openAlbums.has(albumId)}
+                  title={album.name}
+                  meta={wishlistAlbumMeta(album)}
+                  onToggle={() => toggleSet(setOpenAlbums, albumId)}
+                />
+                <button className="row-icon-button" onClick={() => onRemoveMany(album.itemIds)} title="Remove album requests">
+                  <X size={15} />
+                </button>
+              </div>
               {openAlbums.has(albumId) &&
                 (album.tracks.length > 0 ? (
                   album.tracks.map((track) => (
@@ -2351,7 +2359,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
                         onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
                         title="Select wishlist track"
                       />
-                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={track.status} />
+                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistStatusLabel(track.status)} />
                       {track.status !== "removed" && (
                         <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
                           <X size={15} />
@@ -2369,7 +2377,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
                         title="Select wishlist request"
                       />
                     )}
-                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request?.status || "wanted"} />
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={wishlistStatusLabel(album.request?.status || "wanted")} />
                     {album.request && album.request.status !== "removed" && (
                       <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
                         <X size={15} />
@@ -4920,16 +4928,19 @@ function groupRequestedAlbums(albums) {
 function buildWishlistTree(items) {
   const artistMap = new Map();
   items.forEach((item) => {
+    if (item.status === "removed") return;
     const artistName = item.artist || "Unknown Artist";
     const albumName = item.album || "Singles";
     if (!artistMap.has(artistName)) {
-      artistMap.set(artistName, { name: artistName, albumMap: new Map() });
+      artistMap.set(artistName, { name: artistName, albumMap: new Map(), itemIds: [] });
     }
     const artist = artistMap.get(artistName);
     if (!artist.albumMap.has(albumName)) {
-      artist.albumMap.set(albumName, { name: albumName, request: null, tracks: [] });
+      artist.albumMap.set(albumName, { name: albumName, request: null, tracks: [], itemIds: [] });
     }
     const album = artist.albumMap.get(albumName);
+    artist.itemIds.push(item.id);
+    album.itemIds.push(item.id);
     if (item.track) {
       album.tracks.push(item);
     } else {
@@ -4939,14 +4950,23 @@ function buildWishlistTree(items) {
   return [...artistMap.values()]
     .map((artist) => ({
       name: artist.name,
-      albums: [...artist.albumMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
+      itemIds: artist.itemIds,
+      albums: [...artist.albumMap.values()]
+        .filter((album) => album.itemIds.length > 0)
+        .map((album) => ({
+          ...album,
+          tracks: [...album.tracks].sort((a, b) => (a.track || "").localeCompare(b.track || "")),
+        }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
     }))
+    .filter((artist) => artist.albums.length > 0)
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function buildWishlistOwnerTree(items) {
   const ownerMap = new Map();
   items.forEach((item) => {
+    if (item.status === "removed") return;
     const ownerId = item.user_id || "unknown";
     if (!ownerMap.has(ownerId)) {
       ownerMap.set(ownerId, { id: ownerId, name: item.owner_name || "Unknown User", items: [] });
@@ -4959,7 +4979,26 @@ function buildWishlistOwnerTree(items) {
       itemCount: owner.items.length,
       artists: buildWishlistTree(owner.items),
     }))
+    .filter((owner) => owner.itemCount > 0)
     .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function wishlistStatusLabel(status) {
+  if (status === "approved") return "Awaiting Download";
+  if (status === "completed") return "Completed";
+  if (status === "rejected") return "Rejected";
+  if (status === "review" || status === "wanted") return "Awaiting Approval";
+  if (status === "removed") return "Removed";
+  return status || "Awaiting Approval";
+}
+
+function wishlistAlbumMeta(album) {
+  const count = album.tracks.length || (album.request ? 1 : 0);
+  const statuses = new Set(
+    [...album.tracks.map((track) => track.status), album.request?.status].filter(Boolean).map(wishlistStatusLabel),
+  );
+  const label = count === 1 ? "request" : "requests";
+  return `${count} ${label}${statuses.size ? ` · ${[...statuses].join(", ")}` : ""}`;
 }
 
 function countAcousticStatuses(results) {

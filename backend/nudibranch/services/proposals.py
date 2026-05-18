@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -72,13 +73,15 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
     removed_download_files = remove_rejected_download_files(items)
     for item in items:
         payload = json.loads(item.payload_json or "{}")
-        wishlist_item_id = payload.get("wishlist_item_id")
+        request_payload = payload.get("request") or {}
+        wishlist_item_id = payload.get("wishlist_item_id") or request_payload.get("wishlist_item_id")
         user_id = payload.get("user_id")
         if wishlist_item_id and user_id:
             rejected_wishlist_items.setdefault(user_id, []).append(str(item.title))
             wishlist_item = session.get(WishlistItem, wishlist_item_id)
             if wishlist_item:
-                wishlist_item.status = "removed"
+                wishlist_item.status = "rejected"
+                wishlist_item.status_changed_at = datetime.now(timezone.utc)
         session.delete(item)
     session.flush()
 

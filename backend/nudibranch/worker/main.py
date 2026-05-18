@@ -289,20 +289,19 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     download_changes = 0
     download_errors: list[str] = []
     failed_download_requests: list[dict] = []
-    for item in wishlist_download_items:
+    if wishlist_download_items:
         try:
-            note_progress("Searching wishlist downloads", item)
+            note_progress("Preparing download candidates", wishlist_download_items[0])
             process_wishlist_request_items(session, wishlist_download_items)
             for wishlist_item in wishlist_download_items:
                 wishlist_item.status = ProposalStatus.completed
             download_changes += len(wishlist_download_items)
-            finish_progress_step("Wishlist download candidates created")
-            break
+            finish_progress_step("Download candidates created")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             for wishlist_item in wishlist_download_items:
                 wishlist_item.status = ProposalStatus.failed
             errors.append(f"Download search: {error}")
-            finish_progress_step("Wishlist download search failed")
+            finish_progress_step("Download candidate search failed")
 
     for item in direct_download_items:
         try:
@@ -677,6 +676,7 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
             continue
         try:
             import_file_to_library(session, file_path, target_path, payload)
+            mark_matching_wishlist_completed(session, metadata)
             imported += 1
         except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
             errors.append(f"{file_path.name}: {error}")
@@ -691,6 +691,30 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         )
         enqueue_task(session, "jellyfin_scan", {})
     return {"imported": imported, "errors": errors}
+
+
+def mark_matching_wishlist_completed(session: Session, metadata: dict) -> None:
+    artist = normalize_match_text(metadata.get("albumartist") or metadata.get("artist"))
+    album = normalize_match_text(metadata.get("album"))
+    title = normalize_match_text(metadata.get("title"))
+    if not artist or not title:
+        return
+    candidates = list(
+        session.scalars(
+            select(WishlistItem).where(WishlistItem.status.in_(["wanted", "review", "approved"]))
+        )
+    )
+    for item in candidates:
+        same_artist = normalize_match_text(item.artist) == artist
+        same_album = not item.album or not album or normalize_match_text(item.album) == album
+        same_track = normalize_match_text(item.track or item.album or item.artist) == title
+        if same_artist and same_album and same_track:
+            item.status = "completed"
+            item.status_changed_at = datetime.now(timezone.utc)
+
+
+def normalize_match_text(value: str | None) -> str:
+    return " ".join(str(value or "").casefold().split())
 
 
 def existing_library_and_proposal_paths(session: Session) -> set[str]:
@@ -727,6 +751,7 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem]) 
     if wishlist_item_ids:
         for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
             wishlist_item.status = "approved"
+            wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
 def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
@@ -1227,9 +1252,10 @@ def run_process_wishlist(session: Session, _payload: dict) -> dict:
             )
         )
         wishlist_item.status = "review"
+        wishlist_item.status_changed_at = datetime.now(timezone.utc)
     create_notification(
         session,
-        title="Wishlist search finished",
+        title="Wishlist review ready",
         body=f"{len(items)} wishlist items are ready for approval.",
         event_type="approval_needed",
         target_url="/task-queue",

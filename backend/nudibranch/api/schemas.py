@@ -96,6 +96,7 @@ class WishlistOut(WishlistCreate):
     owner_name: str | None = None
     status: str
     created_at: datetime
+    status_changed_at: datetime
 
 
 class WishlistApprovalRequest(BaseModel):
