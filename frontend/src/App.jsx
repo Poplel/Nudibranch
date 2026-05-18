@@ -45,6 +45,8 @@ import "./styles.css";
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
 const APPEARANCE_KEY = "nudibranch_appearance";
+const APPEARANCE_LAST_KEY = "nudibranch_appearance_last";
+const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
 
 const navItems = [
   ["Library", Music],
@@ -86,14 +88,15 @@ const approvalTypeLabels = {
 };
 
 function App() {
+  const initialAppearance = readInitialAppearance();
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("Import/Add");
-  const [dark, setDark] = useState(false);
+  const [dark, setDark] = useState(initialAppearance.dark);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toast, setToast] = useState(null);
-  const [accentColor, setAccentColor] = useState("#356df3");
-  const [backgroundTint, setBackgroundTint] = useState("#356df3");
+  const [accentColor, setAccentColor] = useState(initialAppearance.accentColor);
+  const [backgroundTint, setBackgroundTint] = useState(initialAppearance.backgroundTint);
   const [library, setLibrary] = useState([]);
   const [importFiles, setImportFiles] = useState([]);
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
@@ -204,8 +207,8 @@ function App() {
     try {
       const appearance = JSON.parse(saved);
       setDark(Boolean(appearance.dark));
-      setAccentColor(appearance.accentColor || "#356df3");
-      setBackgroundTint(appearance.backgroundTint || "#356df3");
+      setAccentColor(appearance.accentColor || DEFAULT_APPEARANCE.accentColor);
+      setBackgroundTint(appearance.backgroundTint || DEFAULT_APPEARANCE.backgroundTint);
     } catch {
       localStorage.removeItem(`${APPEARANCE_KEY}_${user.id}`);
     }
@@ -219,6 +222,7 @@ function App() {
       `${APPEARANCE_KEY}_${user.id}`,
       JSON.stringify({ dark, accentColor, backgroundTint }),
     );
+    localStorage.setItem(APPEARANCE_LAST_KEY, JSON.stringify({ dark, accentColor, backgroundTint }));
   }, [user?.id, appearanceReady, dark, accentColor, backgroundTint]);
 
   async function api(path, options = {}) {
@@ -4830,6 +4834,20 @@ function buildAppearanceVars(dark, accentColor, backgroundTint) {
     "--accent-soft": `color-mix(in srgb, ${accentColor} 13%, transparent)`,
     "--soft": `color-mix(in srgb, ${backgroundTint} 11%, #ffffff)`,
   };
+}
+
+function readInitialAppearance() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(APPEARANCE_LAST_KEY) || "null");
+    if (!parsed || typeof parsed !== "object") return DEFAULT_APPEARANCE;
+    return {
+      dark: Boolean(parsed.dark),
+      accentColor: parsed.accentColor || DEFAULT_APPEARANCE.accentColor,
+      backgroundTint: parsed.backgroundTint || DEFAULT_APPEARANCE.backgroundTint,
+    };
+  } catch {
+    return DEFAULT_APPEARANCE;
+  }
 }
 
 function metadataChangeRows(item) {

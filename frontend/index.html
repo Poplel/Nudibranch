@@ -4,10 +4,30 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Nudibranch</title>
+    <script>
+      (() => {
+        try {
+          const appearance = JSON.parse(localStorage.getItem("nudibranch_appearance_last") || "null");
+          if (!appearance || typeof appearance !== "object") return;
+          const accent = appearance.accentColor || "#356df3";
+          const tint = appearance.backgroundTint || "#356df3";
+          const dark = Boolean(appearance.dark);
+          const root = document.documentElement;
+          const bg = dark ? `color-mix(in srgb, ${tint} 10%, #101216)` : `color-mix(in srgb, ${tint} 7%, #f1f2f4)`;
+          root.style.setProperty("--accent-color", accent);
+          root.style.setProperty("--background-tint", tint);
+          root.style.setProperty("--bg", bg);
+          root.style.setProperty("--text", dark ? "#f4f2ec" : "#202124");
+          root.style.background = bg;
+          root.dataset.theme = dark ? "dark" : "light";
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
     <script type="module" src="/src/App.jsx"></script>
   </body>
 </html>
-

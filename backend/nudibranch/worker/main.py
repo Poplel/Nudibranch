@@ -589,9 +589,10 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
         label = candidate.get("filename") or candidate_item.title
         try:
             result = queue_slskd_download(slskd_url, api_key, candidate)
-            record_download_manifest_entry(request, candidate, candidate_item)
+            record_download_manifest_entry(request, candidate, item)
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
+                item.title = candidate_item.title
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
             return result
@@ -744,12 +745,26 @@ def find_download_manifest_entry(file_path: Path) -> dict | None:
 def update_download_manifest_entry(target: dict, status: str, **fields: object) -> None:
     entries = load_download_manifest()
     for entry in entries:
-        if entry == target:
+        if entry == target or same_manifest_entry(entry, target):
+            if target.get("item_id"):
+                entry["item_id"] = target["item_id"]
+            if target.get("parent_id"):
+                entry["parent_id"] = target["parent_id"]
             entry["status"] = status
             entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
             entry.update(fields)
             break
     save_download_manifest(entries)
+
+
+def same_manifest_entry(entry: dict, target: dict) -> bool:
+    target_item_id = target.get("_original_item_id") or target.get("item_id")
+    return bool(
+        entry.get("batch_id") == target.get("batch_id")
+        and entry.get("item_id") == target_item_id
+        and entry.get("basename")
+        and entry.get("basename") == target.get("basename")
+    )
 
 
 def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) -> dict:
@@ -839,6 +854,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     expected_item_ids = selected_slskd_download_item_ids(batch)
     if not expected_item_ids:
         return {"imported": 0, "errors": []}
+    entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     manifest_item_ids = {entry.get("item_id") for entry in entries}
     if not expected_item_ids.issubset(manifest_item_ids):
@@ -884,13 +900,47 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     return {"imported": imported, "errors": errors}
 
 
+def reconcile_manifest_entries_to_selected_items(session: Session, batch: ProposalBatch, entries: list[dict], expected_item_ids: set[str]) -> list[dict]:
+    selected_by_parent = {
+        item.parent_id: item
+        for item in batch.items
+        if item.parent_id and item.id in expected_item_ids
+    }
+    reconciled = []
+    changed = False
+    for entry in entries:
+        if entry.get("item_id") in expected_item_ids:
+            reconciled.append(entry)
+            continue
+        manifest_item = session.get(ProposalItem, entry.get("item_id"))
+        selected_item = selected_by_parent.get(manifest_item.parent_id) if manifest_item and manifest_item.parent_id else None
+        if not selected_item:
+            reconciled.append(entry)
+            continue
+        patched = {
+            **entry,
+            "_original_item_id": entry.get("item_id"),
+            "item_id": selected_item.id,
+            "parent_id": selected_item.parent_id,
+        }
+        selected_item.title = manifest_item.title
+        selected_item.new_value = manifest_item.new_value
+        selected_item.payload_json = manifest_item.payload_json
+        update_download_manifest_entry(patched, entry.get("status") or "queued")
+        reconciled.append(patched)
+        changed = True
+    if changed:
+        session.flush()
+    return reconciled
+
+
 def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
     blockers = []
     for item in batch.items:
         if not item.selected or item.kind != ProposalKind.download:
             continue
         action = json.loads(item.payload_json or "{}").get("action")
-        if action == "queue_ytdlp_download" and item.status != ProposalStatus.rejected:
+        if action == "queue_ytdlp_download" and item.status not in {ProposalStatus.completed, ProposalStatus.rejected}:
             blockers.append(item)
         elif action == "queue_download" and item.status == ProposalStatus.failed:
             blockers.append(item)
