@@ -4855,6 +4855,7 @@ function proposalTaskSummary(result) {
   if (result.file_actions) parts.push(`${result.file_actions} files`);
   if (result.playlist_changes) parts.push(`${result.playlist_changes} playlists`);
   if (result.download_changes) parts.push(`${result.download_changes} downloads`);
+  if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);
   return parts.length ? parts.join(", ") : "No changes applied";

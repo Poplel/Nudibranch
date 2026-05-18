@@ -19,7 +19,7 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
-from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload, update_task_progress
+from nudibranch.services.tasks import claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -340,7 +340,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     if failed_download_requests:
         create_download_retry_import_batch(session, failed_download_requests)
-    downloaded_review = scan_downloads_to_import_review(session)
+    downloaded_import = import_completed_downloads(session)
 
     if errors:
         batch.status = ProposalStatus.failed
@@ -363,6 +363,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             skipped,
             errors,
             download_errors,
+            downloaded_import,
         ),
         event_type="task_completed",
         target_url="/activity",
@@ -378,7 +379,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         "skipped": skipped,
         "errors": errors,
         "download_errors": download_errors,
-        "downloaded_review": downloaded_review,
+        "downloaded_import": downloaded_import,
     }
 
 
@@ -392,6 +393,7 @@ def task_queue_notification_body(
     skipped: int,
     errors: list[str],
     download_errors: list[str] | None = None,
+    downloaded_import: dict | None = None,
 ) -> str:
     parts = [
         f"{imported} tracks imported",
@@ -403,6 +405,8 @@ def task_queue_notification_body(
     ]
     if skipped:
         parts.append(f"{skipped} items skipped")
+    if downloaded_import and downloaded_import.get("imported"):
+        parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
     body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
@@ -429,10 +433,11 @@ def should_count_skipped_item(item: ProposalItem) -> bool:
 
 def import_track_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
-    source_path = Path(item.old_value)
-    target_path = Path(item.new_value)
-    metadata = payload.get("metadata", {})
+    import_file_to_library(session, Path(item.old_value), Path(item.new_value), payload)
 
+
+def import_file_to_library(session: Session, source_path: Path, target_path: Path, payload: dict) -> None:
+    metadata = payload.get("metadata", {})
     if not source_path.exists():
         raise FileNotFoundError(f"{source_path} no longer exists")
 
@@ -639,43 +644,62 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
         run_propose_import(session, {"files": [], "download_requests": unique_requests})
 
 
-def scan_downloads_to_import_review(session: Session, minimum_age_seconds: int = 20) -> dict:
+def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) -> dict:
     settings = get_settings()
     root = settings.downloads_path
     if not root.exists():
-        return {"files": 0, "batch_id": None}
+        return {"imported": 0, "errors": []}
     now = time.time()
-    pending_paths = existing_proposal_source_paths(session)
-    files = []
+    known_paths = existing_library_and_proposal_paths(session)
+    imported = 0
+    errors: list[str] = []
     for file_path in sorted(root.rglob("*")):
         if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             continue
-        if str(file_path) in pending_paths:
+        if str(file_path) in known_paths:
             continue
         stat = file_path.stat()
         if now - stat.st_mtime < minimum_age_seconds:
             continue
         metadata = read_audio_metadata(file_path)
-        files.append(
-            {
-                "path": str(file_path),
-                "relative_path": str(file_path.relative_to(root)),
-                "extension": file_path.suffix.lower(),
-                "size_bytes": stat.st_size,
-                "mtime_ns": stat.st_mtime_ns,
-                "metadata": metadata,
-                "fingerprint": None,
-                "suggested_library_path": str(suggest_library_path(metadata, file_path)),
-            }
+        payload = {
+            "path": str(file_path),
+            "relative_path": str(file_path.relative_to(root)),
+            "extension": file_path.suffix.lower(),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "metadata": metadata,
+            "fingerprint": None,
+            "suggested_library_path": str(suggest_library_path(metadata, file_path)),
+        }
+        target_path = Path(payload["suggested_library_path"])
+        if str(target_path) in known_paths or target_path.exists():
+            continue
+        try:
+            import_file_to_library(session, file_path, target_path, payload)
+            imported += 1
+        except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
+            errors.append(f"{file_path.name}: {error}")
+    if imported:
+        session.flush()
+        create_notification(
+            session,
+            title="Downloaded files imported",
+            body=f"{imported} files were added to the library.",
+            event_type="tool_completed",
+            target_url="/library",
         )
-    if not files:
-        return {"files": 0, "batch_id": None}
-    result = run_propose_import(session, {"files": files, "download_requests": []})
-    return {"files": len(files), "batch_id": result.get("batch_id")}
+        enqueue_task(session, "jellyfin_scan", {})
+    return {"imported": imported, "errors": errors}
 
 
-def existing_proposal_source_paths(session: Session) -> set[str]:
-    return {
+def existing_library_and_proposal_paths(session: Session) -> set[str]:
+    paths = {
+        str(path)
+        for path in session.scalars(select(Track.path).where(Track.path.is_not(None)))
+        if path
+    }
+    paths.update(
         str(path)
         for path in session.scalars(
             select(ProposalItem.old_value)
@@ -684,7 +708,8 @@ def existing_proposal_source_paths(session: Session) -> set[str]:
             .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
         )
         if path
-    }
+    )
+    return paths
 
 
 def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:
@@ -1636,9 +1661,9 @@ async def worker_loop() -> None:
         with SessionLocal() as session:
             task = claim_next_task(session)
             if not task:
-                if time.time() - last_download_scan > 45:
+                if time.time() - last_download_scan > 15:
                     try:
-                        scan_downloads_to_import_review(session)
+                        import_completed_downloads(session)
                     except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
