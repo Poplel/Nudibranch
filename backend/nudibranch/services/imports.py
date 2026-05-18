@@ -77,6 +77,41 @@ def read_audio_metadata(file_path: Path) -> dict:
     return metadata
 
 
+def write_audio_metadata(file_path: Path, metadata: dict) -> None:
+    audio = File(file_path, easy=True)
+    if audio is None:
+        raise ValueError(f"{file_path} is not a supported audio file")
+    if audio.tags is None:
+        audio.add_tags()
+    tag_values = {
+        "artist": metadata.get("artist"),
+        "albumartist": metadata.get("albumartist") or metadata.get("artist"),
+        "album": metadata.get("album"),
+        "title": metadata.get("title"),
+        "tracknumber": metadata_number(metadata.get("track_number")),
+        "discnumber": metadata_number(metadata.get("disc_number")),
+        "date": metadata.get("date"),
+        "genre": metadata.get("genre"),
+        "musicbrainz_trackid": metadata.get("musicbrainz_recording_id"),
+        "musicbrainz_albumid": metadata.get("musicbrainz_album_id"),
+        "musicbrainz_artistid": metadata.get("musicbrainz_artist_id"),
+    }
+    for key, value in tag_values.items():
+        if value is None or value == "":
+            continue
+        try:
+            audio[key] = [str(value)]
+        except Exception:
+            continue
+    audio.save()
+
+
+def metadata_number(value: object) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
 def metadata_from_path(file_path: Path) -> dict:
     settings = get_settings()
     try:

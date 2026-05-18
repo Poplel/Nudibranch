@@ -15,7 +15,7 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
 from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
-from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path
+from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
 from nudibranch.services.settings_store import integration_settings
@@ -146,6 +146,10 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                         "artist": artist,
                         "album": album,
                         "track": title,
+                        "track_number": request.get("track_number"),
+                        "disc_number": request.get("disc_number"),
+                        "musicbrainz_album_id": request.get("musicbrainz_album_id"),
+                        "musicbrainz_recording_id": request.get("musicbrainz_recording_id"),
                     }
                 ),
             )
@@ -308,7 +312,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         try:
             note_progress(f"Queueing download for {item.title}", item)
             apply_download_item(session, item)
-            item.status = ProposalStatus.completed
+            item.status = ProposalStatus.executing if keeps_download_batch_open(item) else ProposalStatus.completed
             download_changes += 1
             finish_progress_step(f"Queued download for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
@@ -344,6 +348,8 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     if errors:
         batch.status = ProposalStatus.failed
+    elif batch_has_open_downloads(batch):
+        batch.status = ProposalStatus.executing
     elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed} or not item.selected for item in batch.items):
         batch.status = ProposalStatus.completed
     else:
@@ -431,6 +437,15 @@ def should_count_skipped_item(item: ProposalItem) -> bool:
     return True
 
 
+def keeps_download_batch_open(item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    return item.kind == ProposalKind.download and payload.get("action") == "queue_download"
+
+
+def batch_has_open_downloads(batch: ProposalBatch) -> bool:
+    return any(keeps_download_batch_open(item) and item.status == ProposalStatus.executing for item in batch.items)
+
+
 def import_track_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     import_file_to_library(session, Path(item.old_value), Path(item.new_value), payload)
@@ -462,12 +477,21 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
         artist = Artist(name=artist_name)
         session.add(artist)
         session.flush()
+    if metadata.get("musicbrainz_artist_id"):
+        artist.musicbrainz_id = metadata.get("musicbrainz_artist_id")
 
     album = session.scalar(select(Album).where(Album.artist_id == artist.id, Album.title == album_title))
     if not album:
-        album = Album(artist_id=artist.id, title=album_title, path=str(target_path.parent))
+        album = Album(
+            artist_id=artist.id,
+            title=album_title,
+            path=str(target_path.parent),
+            musicbrainz_release_id=metadata.get("musicbrainz_album_id"),
+        )
         session.add(album)
         session.flush()
+    elif metadata.get("musicbrainz_album_id"):
+        album.musicbrainz_release_id = metadata.get("musicbrainz_album_id")
 
     existing_track = session.scalar(select(Track).where(Track.path == str(target_path)))
     if existing_track:
@@ -566,9 +590,9 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
         label = candidate.get("filename") or candidate_item.title
         try:
             result = queue_slskd_download(slskd_url, api_key, candidate)
-            record_download_manifest_entry(request, candidate)
+            record_download_manifest_entry(request, candidate, candidate_item)
             if candidate_item.id != item.id:
-                candidate_item.status = ProposalStatus.completed
+                candidate_item.status = ProposalStatus.executing
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
             return result
@@ -667,13 +691,25 @@ def save_download_manifest(entries: list[dict]) -> None:
     path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
 
 
-def record_download_manifest_entry(request: dict, candidate: dict) -> None:
+def record_download_manifest_entry(request: dict, candidate: dict, item: ProposalItem) -> None:
     if not request or not candidate:
         return
     filename = str(candidate.get("filename") or "")
     entries = load_download_manifest()
+    entries = [
+        entry
+        for entry in entries
+        if not (
+            entry.get("batch_id") == item.batch_id
+            and entry.get("item_id") == item.id
+            and entry.get("status") in {"queued", "verified"}
+        )
+    ]
     entries.append(
         {
+            "batch_id": item.batch_id,
+            "item_id": item.id,
+            "parent_id": item.parent_id,
             "request": request,
             "candidate": {
                 "username": candidate.get("username"),
@@ -694,7 +730,7 @@ def remote_basename(filename: str) -> str:
 
 def find_download_manifest_entry(file_path: Path) -> dict | None:
     basename = file_path.name.casefold()
-    candidates = [entry for entry in load_download_manifest() if entry.get("status") == "queued"]
+    candidates = [entry for entry in load_download_manifest() if entry.get("status") in {"queued", "verified"}]
     for entry in candidates:
         if entry.get("basename") == basename:
             return entry
@@ -706,12 +742,13 @@ def find_download_manifest_entry(file_path: Path) -> dict | None:
     return None
 
 
-def update_download_manifest_entry(target: dict, status: str) -> None:
+def update_download_manifest_entry(target: dict, status: str, **fields: object) -> None:
     entries = load_download_manifest()
     for entry in entries:
         if entry == target:
             entry["status"] = status
             entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+            entry.update(fields)
             break
     save_download_manifest(entries)
 
@@ -721,10 +758,13 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
     root = settings.downloads_path
     if not root.exists():
         return {"imported": 0, "errors": []}
-    now = time.time()
-    known_paths = existing_library_and_proposal_paths(session)
     imported = 0
     errors: list[str] = []
+    manifest_result = import_manifest_download_batches(session, minimum_age_seconds)
+    imported += manifest_result["imported"]
+    errors.extend(manifest_result["errors"])
+    now = time.time()
+    known_paths = existing_library_and_proposal_paths(session)
     for file_path in sorted(root.rglob("*")):
         if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             continue
@@ -735,28 +775,8 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
             continue
         metadata = read_audio_metadata(file_path)
         manifest_entry = find_download_manifest_entry(file_path)
-        verification = verify_downloaded_file(session, file_path, manifest_entry)
-        if verification["status"] == "mismatch":
-            request = verification.get("request") or {}
-            try:
-                file_path.unlink()
-            except OSError as error:
-                errors.append(f"{file_path.name}: matched the wrong track but could not be removed: {error}")
-                continue
-            if manifest_entry:
-                update_download_manifest_entry(manifest_entry, "mismatch")
-            if request:
-                create_download_retry_import_batch(session, [{**request, "multiple_candidates": True}])
-            create_notification(
-                session,
-                title="Downloaded track did not match",
-                body=verification["message"],
-                event_type="task_failed",
-                target_url="/downloads",
-            )
+        if manifest_entry:
             continue
-        if verification["status"] == "verified":
-            metadata = {**metadata, **verification.get("metadata", {})}
         payload = {
             "path": str(file_path),
             "relative_path": str(file_path.relative_to(root)),
@@ -773,8 +793,6 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         try:
             import_file_to_library(session, file_path, target_path, payload)
             mark_matching_wishlist_completed(session, metadata)
-            if manifest_entry:
-                update_download_manifest_entry(manifest_entry, "completed")
             imported += 1
         except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
             errors.append(f"{file_path.name}: {error}")
@@ -789,6 +807,180 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         )
         enqueue_task(session, "jellyfin_scan", {})
     return {"imported": imported, "errors": errors}
+
+
+def import_manifest_download_batches(session: Session, minimum_age_seconds: int) -> dict:
+    entries_by_batch: dict[str, list[dict]] = {}
+    for entry in load_download_manifest():
+        batch_id = entry.get("batch_id")
+        if batch_id and entry.get("status") in {"queued", "verified"}:
+            entries_by_batch.setdefault(batch_id, []).append(entry)
+    imported = 0
+    errors: list[str] = []
+    for batch_id, entries in entries_by_batch.items():
+        batch = session.get(ProposalBatch, batch_id)
+        if not batch or batch.status not in {ProposalStatus.executing, ProposalStatus.failed, ProposalStatus.pending, ProposalStatus.approved}:
+            continue
+        result = process_download_manifest_batch(session, batch, entries, minimum_age_seconds)
+        imported += result["imported"]
+        errors.extend(result["errors"])
+    return {"imported": imported, "errors": errors}
+
+
+def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
+    ready_entries = []
+    errors: list[str] = []
+    for entry in entries:
+        file_path = manifest_entry_file_path(entry, minimum_age_seconds)
+        if not file_path:
+            return {"imported": 0, "errors": []}
+        ready_entries.append((entry, file_path))
+
+    verified_entries = []
+    for entry, file_path in ready_entries:
+        if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
+            verified_entries.append((entry, Path(entry["path"]), entry["metadata"]))
+            continue
+        verification = verify_downloaded_file(session, file_path, entry)
+        if verification["status"] == "mismatch":
+            handle_download_mismatch(session, batch, entry, file_path, verification)
+            return {"imported": 0, "errors": [verification["message"]]}
+        metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
+        if verification["status"] != "verified":
+            metadata = normalize_download_metadata(metadata, entry.get("request") or {})
+        update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
+        verified_entries.append((entry, file_path, metadata))
+
+    try:
+        imported = import_verified_download_batch(session, batch, verified_entries)
+    except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
+        batch.status = ProposalStatus.failed
+        create_notification(
+            session,
+            title="Download import failed",
+            body=str(error),
+            event_type="task_failed",
+            target_url="/downloads",
+        )
+        session.commit()
+        return {"imported": 0, "errors": [str(error)]}
+    return {"imported": imported, "errors": errors}
+
+
+def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> Path | None:
+    root = get_settings().downloads_path
+    known_path = entry.get("path")
+    candidates = []
+    if known_path:
+        candidates.append(Path(known_path))
+    candidates.extend(root.rglob("*"))
+    now = time.time()
+    for file_path in candidates:
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            continue
+        if not manifest_entry_matches_path(entry, file_path):
+            continue
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if now - stat.st_mtime < minimum_age_seconds:
+            return None
+        return file_path
+    return None
+
+
+def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
+    basename = file_path.name.casefold()
+    if entry.get("basename") == basename:
+        return True
+    filename = str((entry.get("candidate") or {}).get("filename") or "").replace("\\", "/").casefold()
+    return bool(filename and str(file_path).replace("\\", "/").casefold().endswith(filename))
+
+
+def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, verification: dict) -> None:
+    try:
+        file_path.unlink()
+    except OSError as error:
+        verification["message"] = f"{verification['message']} Could not remove {file_path.name}: {error}"
+    update_download_manifest_entry(entry, "mismatch", path=str(file_path), metadata=verification.get("metadata"))
+    item = session.get(ProposalItem, entry.get("item_id"))
+    if item:
+        item.status = ProposalStatus.failed
+        item.selected = False
+    batch.status = ProposalStatus.failed
+    request = entry.get("request") or verification.get("request") or {}
+    if request:
+        add_replacement_candidates_to_download_batch(session, batch, entry, request)
+    create_notification(
+        session,
+        title="Downloaded track did not match",
+        body=verification["message"],
+        event_type="task_failed",
+        target_url="/downloads",
+    )
+    session.commit()
+
+
+def add_replacement_candidates_to_download_batch(session: Session, batch: ProposalBatch, entry: dict, request: dict) -> None:
+    query = download_query(request)
+    search_result = search_slskd_for_request(session, {**request, "multiple_candidates": True}, limit=4)
+    parent_id = entry.get("parent_id")
+    if not parent_id:
+        parent = add_download_tree_parents(session, batch, request, query)
+        parent_id = parent.id
+    for index, candidate in enumerate(search_result["candidates"]):
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=parent_id,
+                title=f"Replacement: {candidate.get('filename') or query}",
+                kind=ProposalKind.download,
+                selected=index == 0,
+                old_value=query,
+                new_value=candidate.get("username"),
+                payload_json=json.dumps(
+                    {
+                        "action": "queue_download",
+                        "request": {**request, "multiple_candidates": True},
+                        "candidate": candidate,
+                    }
+                ),
+            )
+        )
+
+
+def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
+    known_paths = existing_library_and_proposal_paths(session)
+    imported = 0
+    for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
+        normalized_metadata = normalize_download_metadata(metadata, entry.get("request") or {})
+        write_audio_metadata(file_path, normalized_metadata)
+        target_path = unique_destination(suggest_library_path(normalized_metadata, file_path))
+        if str(target_path) in known_paths:
+            update_download_manifest_entry(entry, "completed", path=str(file_path), metadata=normalized_metadata)
+            continue
+        payload = {
+            "path": str(file_path),
+            "relative_path": str(file_path.relative_to(get_settings().downloads_path)),
+            "extension": file_path.suffix.lower(),
+            "size_bytes": file_path.stat().st_size,
+            "mtime_ns": file_path.stat().st_mtime_ns,
+            "metadata": normalized_metadata,
+            "fingerprint": None,
+            "suggested_library_path": str(target_path),
+        }
+        import_file_to_library(session, file_path, target_path, payload)
+        mark_matching_wishlist_completed(session, normalized_metadata)
+        update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
+        imported += 1
+        known_paths.add(str(target_path))
+    for item in batch.items:
+        if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
+            item.status = ProposalStatus.completed
+    batch.status = ProposalStatus.completed
+    session.flush()
+    return imported
 
 
 def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: dict | None) -> dict:
@@ -823,6 +1015,10 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
 
 
 def metadata_matches_request(metadata: dict, request: dict) -> bool:
+    request_recording_id = normalize_match_text(request.get("musicbrainz_recording_id"))
+    metadata_recording_id = normalize_match_text(metadata.get("musicbrainz_recording_id"))
+    if request_recording_id and metadata_recording_id:
+        return request_recording_id == metadata_recording_id
     request_artist = normalize_match_text(request.get("artist"))
     request_track = normalize_match_text(request.get("track") or request.get("title"))
     metadata_artist = normalize_match_text(metadata.get("albumartist") or metadata.get("artist"))
@@ -843,6 +1039,26 @@ def verified_download_metadata(metadata: dict, request: dict) -> dict:
         "album": request.get("album") or metadata.get("album"),
         "title": request.get("track") or request.get("title") or metadata.get("title"),
     }
+
+
+def normalize_download_metadata(metadata: dict, request: dict) -> dict:
+    artist = request.get("artist") or metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+    album = request.get("album") or metadata.get("album") or "Unknown Album"
+    title = request.get("track") or request.get("title") or metadata.get("title") or "Unknown Title"
+    normalized = {
+        **metadata,
+        "artist": artist,
+        "albumartist": artist,
+        "album": album,
+        "title": title,
+        "track_number": request.get("track_number") or metadata.get("track_number"),
+        "disc_number": request.get("disc_number") or metadata.get("disc_number"),
+        "musicbrainz_album_id": request.get("musicbrainz_album_id") or metadata.get("musicbrainz_album_id"),
+        "musicbrainz_recording_id": request.get("musicbrainz_recording_id") or metadata.get("musicbrainz_recording_id"),
+    }
+    normalized["format"] = metadata.get("format")
+    normalized["is_lossless"] = metadata.get("is_lossless", False)
+    return normalized
 
 
 def loose_text_match(left: str, right: str) -> bool:
