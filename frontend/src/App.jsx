@@ -112,6 +112,8 @@ function App() {
   const [integrationSettings, setIntegrationSettings] = useState(null);
   const [backups, setBackups] = useState([]);
   const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
+  const [importAlbumSearchOpen, setImportAlbumSearchOpen] = useState(false);
+  const [importDownloadRequests, setImportDownloadRequests] = useState([]);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -1236,7 +1238,6 @@ function App() {
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {loading && <div className="loading-line">Working...</div>}
-            <ActiveWorkBar tasks={tasks} />
             {page === "Library" && (
               <LibraryTree
                 artists={library}
@@ -1276,17 +1277,16 @@ function App() {
             {page === "Import/Add" && (
               <ImportWizard
                 files={importFiles}
-                onScan={scanImportFolder}
-                onPropose={proposeImport}
                 onFilesChange={setImportFiles}
                 library={library}
                 onRecheckTrack={recheckImportTrack}
                 onRecheckAlbum={recheckImportAlbum}
                 onCheckAlbum={lookupImportAlbum}
                 onSearchAlbums={searchImportAlbums}
-                loading={loading}
-                activeImportTask={activeImportTask}
                 seedDownloadRequests={importSeedDownloads}
+                albumSearchOpen={importAlbumSearchOpen}
+                setAlbumSearchOpen={setImportAlbumSearchOpen}
+                onDownloadRequestsChange={setImportDownloadRequests}
               />
             )}
             {page === "Activity" && <TasksView tasks={tasks} onCancel={cancelTask} />}
@@ -1357,7 +1357,22 @@ function App() {
             {!["Library", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
           </section>
 
-          <Inspector page={page} importFiles={importFiles} queueItemCount={queueItemCount} queueSelectionCount={queueSelectionCount} tasks={tasks} />
+          <Inspector
+            page={page}
+            importFiles={importFiles}
+            queueItemCount={queueItemCount}
+            queueSelectionCount={queueSelectionCount}
+            tasks={tasks}
+            importActions={{
+              onScan: scanImportFolder,
+              onToggleAlbumSearch: () => setImportAlbumSearchOpen((value) => !value),
+              onPropose: () => proposeImport(importDownloadRequests),
+              loading,
+              activeImportTask,
+              downloadCount: importDownloadRequests.length,
+              disabled: loading || activeImportTask || (importFiles.length === 0 && importDownloadRequests.length === 0),
+            }}
+          />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
         {playerOpen && (
@@ -2031,30 +2046,25 @@ function ApprovalNode({
 
 function ImportWizard({
   files,
-  onScan,
-  onPropose,
   onFilesChange,
   library,
   onRecheckTrack,
   onRecheckAlbum,
   onCheckAlbum,
   onSearchAlbums,
-  loading,
-  activeImportTask,
   seedDownloadRequests = [],
+  albumSearchOpen,
+  setAlbumSearchOpen,
+  onDownloadRequestsChange,
 }) {
   const [manualAlbums, setManualAlbums] = useState([]);
   const [albumRecords, setAlbumRecords] = useState({});
-  const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
-  const [downloadRequests, setDownloadRequests] = useState([]);
-  const downloadRequestsRef = useRef([]);
   const seedKey = useMemo(() => stableDownloadRequestKey(seedDownloadRequests), [seedDownloadRequests]);
   const appliedSeedKey = useRef("");
 
   const updateDownloadRequests = useCallback((requests) => {
-    downloadRequestsRef.current = requests;
-    setDownloadRequests(requests);
-  }, []);
+    onDownloadRequestsChange?.(requests);
+  }, [onDownloadRequestsChange]);
 
   function addManualAlbum(album) {
     setManualAlbums((current) => [...current, album]);
@@ -2105,19 +2115,6 @@ function ImportWizard({
 
   return (
     <div className="import-view">
-      <div className="action-bar">
-        <button className="primary" onClick={onScan} disabled={loading}>
-          <RefreshCw size={16} />
-          Scan import folder
-        </button>
-        <button className="secondary" onClick={() => setAlbumSearchOpen((value) => !value)}>
-          <Plus size={16} />
-          Add album
-        </button>
-        <button className="secondary" onClick={() => onPropose(downloadRequestsRef.current)} disabled={loading || activeImportTask || (files.length === 0 && downloadRequests.length === 0)}>
-          {activeImportTask ? "Import review running" : `Add to task queue${downloadRequests.length ? ` (${downloadRequests.length} downloads)` : ""}`}
-        </button>
-      </div>
       {albumSearchOpen && <AlbumSearchPanel onAdd={addManualAlbum} onLookup={checkAlbum} onSearch={onSearchAlbums} />}
       {files.length === 0 && manualAlbums.length === 0 ? (
         <EmptyState title="No scanned files" body="Place audio files in /app/import, then scan the import folder." />
@@ -4060,10 +4057,26 @@ function SettingsPanel({
   );
 }
 
-function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks }) {
+function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, importActions }) {
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
+      {page === "Import/Add" && importActions && (
+        <div className="inspector-actions">
+          <button className="primary" onClick={importActions.onScan} disabled={importActions.loading}>
+            <RefreshCw size={16} />
+            Scan import folder
+          </button>
+          <button className="secondary" onClick={importActions.onToggleAlbumSearch}>
+            <Plus size={16} />
+            Add album
+          </button>
+          <button className="secondary" onClick={importActions.onPropose} disabled={importActions.disabled}>
+            {importActions.activeImportTask ? "Import review running" : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
+          </button>
+        </div>
+      )}
+      <ActiveWorkBar tasks={tasks} />
       <div className="metadata-grid">
         <label>Page</label>
         <strong>{page}</strong>

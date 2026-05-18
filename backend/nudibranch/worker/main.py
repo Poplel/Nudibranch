@@ -1500,7 +1500,7 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
     except Exception:
         return None
     pools: dict[tuple[str, str], dict] = {}
-    for candidate in result.get("candidates", []):
+    for candidate in result.get("folder_candidates") or result.get("candidates", []):
         pool = download_folder_pool(candidate)
         if not pool:
             continue
@@ -1521,6 +1521,7 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
         return None
     best_score, best_pool = ranked[0]
     best_pool["matched_tracks"] = best_score[0]
+    best_pool["album_query"] = query
     return best_pool
 
 

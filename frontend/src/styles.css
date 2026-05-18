@@ -521,6 +521,14 @@ nav button:hover,
   font-size: 12px;
 }
 
+.inspector .active-work-bar {
+  margin: 14px 0 0;
+}
+
+.inspector .active-work-item {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .file-row {
   grid-template-columns: 18px minmax(0, 1fr) auto;
 }
@@ -1747,6 +1755,17 @@ nav button:hover,
   overflow: auto;
   max-height: calc(100vh - 92px - var(--player-dock-height, 0px) - 22px);
   margin-bottom: calc(var(--player-dock-height, 0px) + 22px);
+}
+
+.inspector-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.inspector-actions button {
+  justify-content: center;
+  width: 100%;
 }
 
 .diff {

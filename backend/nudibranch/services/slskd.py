@@ -61,6 +61,7 @@ def search_slskd_detailed(
             diagnostics.update(search_diagnostics(payload))
             diagnostics["response_growth"] = len(responses) - last_response_count
             candidates = extract_candidates(responses, query)
+            folder_candidates = extract_folder_candidates(responses, query)
             if len(responses) == last_response_count:
                 settled_polls += 1
             else:
@@ -69,15 +70,19 @@ def search_slskd_detailed(
             if candidates and limit == 1:
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
-                return {"candidates": ranked, "diagnostics": diagnostics}
+                return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
             if candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
-                return {"candidates": ranked, "diagnostics": diagnostics}
+                return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
+            if folder_candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+                diagnostics["candidates"] = 0
+                return {"candidates": [], "folder_candidates": folder_candidates, "diagnostics": diagnostics}
             time.sleep(poll_interval)
         ranked = rank_candidates(extract_candidates(responses or payload, query))[:limit]
+        folder_candidates = extract_folder_candidates(responses or payload, query)
         diagnostics["candidates"] = len(ranked)
-        return {"candidates": ranked, "diagnostics": diagnostics}
+        return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
 
 
 def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> httpx.Response:
@@ -174,6 +179,40 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                     "size": file_info.get("size"),
                     "quality": quality_label(file_info),
                     "relevance": relevance,
+                    "files": [file_info],
+                    "folder_files": folder_files,
+                }
+            )
+    return candidates
+
+
+def extract_folder_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for response in response_list(payload):
+        if not isinstance(response, dict):
+            continue
+        username = response_username(response)
+        if not username:
+            continue
+        files = [normalized for file_info in response_files(response) if (normalized := normalize_file(file_info))]
+        audio_files = [file_info for file_info in files if is_audio_file(file_info["filename"])]
+        for file_info in audio_files:
+            folder = remote_folder(file_info["filename"])
+            key = (username, folder, file_info["filename"])
+            if key in seen:
+                continue
+            seen.add(key)
+            folder_files = [audio_file for audio_file in audio_files if remote_folder(audio_file["filename"]) == folder]
+            candidates.append(
+                {
+                    "username": username,
+                    "query": query,
+                    "filename": file_info["filename"],
+                    "folder": folder,
+                    "size": file_info.get("size"),
+                    "quality": quality_label(file_info),
+                    "relevance": query_match_score(query, file_info["filename"]),
                     "files": [file_info],
                     "folder_files": folder_files,
                 }
