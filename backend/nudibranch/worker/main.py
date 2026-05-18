@@ -12,14 +12,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, TaskStatus, Track, User, WishlistItem
+from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
-from nudibranch.services.imports import discover_import_files, read_audio_metadata
+from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
-from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload
+from nudibranch.services.tasks import claim_next_task, complete_task, fail_task, task_to_payload, update_task_progress
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -34,6 +34,8 @@ def run_propose_import(session: Session, payload: dict) -> dict:
         batch_title = "Import/Add download review"
     elif download_requests:
         batch_title = "Import/Add review"
+    elif files and all(str(file_info.get("path") or "").startswith(str(get_settings().downloads_path)) for file_info in files):
+        batch_title = "Downloaded files review"
     batch = ProposalBatch(title=batch_title, kind=ProposalKind.import_files, tree_path="/app/import")
     session.add(batch)
     session.flush()
@@ -157,7 +159,7 @@ def run_propose_import(session: Session, payload: dict) -> dict:
     return {"batch_id": batch.id, "files": len(files), "downloads": len(download_requests)}
 
 
-def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
+def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
     batch_id = payload["batch_id"]
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
@@ -207,85 +209,128 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         for item in selected_items
         if item.kind == ProposalKind.lyrics and json.loads(item.payload_json or "{}").get("action")
     ]
+    progress_items = executable_items + metadata_items + file_action_items + playlist_items + wishlist_download_items[:1] + direct_download_items + lyrics_items
+    progress_total = max(1, len(progress_items))
+    progress_current = 0
+
+    def note_progress(message: str, item: ProposalItem | None = None) -> None:
+        nonlocal progress_current
+        if item is not None:
+            item.status = ProposalStatus.executing
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, message)
+        else:
+            session.commit()
+
+    def finish_progress_step(message: str) -> None:
+        nonlocal progress_current
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, message)
+        else:
+            session.commit()
+
+    note_progress(f"Preparing {len(progress_items)} selected changes")
 
     if batch.kind == ProposalKind.import_files and not executable_items and not download_items:
         errors.append("No approved import file operations were selected.")
 
     for item in executable_items:
         try:
+            note_progress(f"Importing {item.title}", item)
             import_track_item(session, item)
             item.status = ProposalStatus.completed
             imported += 1
+            finish_progress_step(f"Imported {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Import failed for {item.title}")
 
     metadata_updated = 0
     for item in metadata_items:
         try:
+            note_progress(f"Applying metadata for {item.title}", item)
             apply_metadata_item(session, item)
             item.status = ProposalStatus.completed
             metadata_updated += 1
+            finish_progress_step(f"Updated metadata for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Metadata failed for {item.title}")
 
     file_actions = 0
     for item in file_action_items:
         try:
+            note_progress(f"Handling file action for {item.title}", item)
             apply_file_action_item(session, item)
             item.status = ProposalStatus.completed
             file_actions += 1
+            finish_progress_step(f"Handled file action for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"File action failed for {item.title}")
 
     playlist_changes = 0
     for item in playlist_items:
         try:
+            note_progress(f"Updating playlist item {item.title}", item)
             apply_playlist_item(session, item)
             item.status = ProposalStatus.completed
             playlist_changes += 1
+            finish_progress_step(f"Updated playlist item {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Playlist update failed for {item.title}")
 
     download_changes = 0
     download_errors: list[str] = []
     failed_download_requests: list[dict] = []
     for item in wishlist_download_items:
         try:
+            note_progress("Searching wishlist downloads", item)
             process_wishlist_request_items(session, wishlist_download_items)
             for wishlist_item in wishlist_download_items:
                 wishlist_item.status = ProposalStatus.completed
             download_changes += len(wishlist_download_items)
+            finish_progress_step("Wishlist download candidates created")
             break
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             for wishlist_item in wishlist_download_items:
                 wishlist_item.status = ProposalStatus.failed
             errors.append(f"Download search: {error}")
+            finish_progress_step("Wishlist download search failed")
 
     for item in direct_download_items:
         try:
+            note_progress(f"Queueing download for {item.title}", item)
             apply_download_item(session, item)
             item.status = ProposalStatus.completed
             download_changes += 1
+            finish_progress_step(f"Queued download for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             download_errors.append(f"{item.title}: {error}")
             failed_request = download_request_from_item(item)
             if failed_request:
                 failed_download_requests.append(failed_request)
+            finish_progress_step(f"Download needs attention for {item.title}")
 
     lyric_changes = 0
     for item in lyrics_items:
         try:
+            note_progress(f"Downloading lyrics for {item.title}", item)
             apply_lyrics_item(session, item)
             item.status = ProposalStatus.completed
             lyric_changes += 1
+            finish_progress_step(f"Downloaded lyrics for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             item.status = ProposalStatus.failed
             errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Lyrics failed for {item.title}")
 
     for item in batch.items:
         if not errors and item.status == ProposalStatus.approved:
@@ -295,6 +340,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
 
     if failed_download_requests:
         create_download_retry_import_batch(session, failed_download_requests)
+    downloaded_review = scan_downloads_to_import_review(session)
 
     if errors:
         batch.status = ProposalStatus.failed
@@ -332,6 +378,7 @@ def run_execute_proposal_batch(session: Session, payload: dict) -> dict:
         "skipped": skipped,
         "errors": errors,
         "download_errors": download_errors,
+        "downloaded_review": downloaded_review,
     }
 
 
@@ -592,6 +639,54 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
         run_propose_import(session, {"files": [], "download_requests": unique_requests})
 
 
+def scan_downloads_to_import_review(session: Session, minimum_age_seconds: int = 20) -> dict:
+    settings = get_settings()
+    root = settings.downloads_path
+    if not root.exists():
+        return {"files": 0, "batch_id": None}
+    now = time.time()
+    pending_paths = existing_proposal_source_paths(session)
+    files = []
+    for file_path in sorted(root.rglob("*")):
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            continue
+        if str(file_path) in pending_paths:
+            continue
+        stat = file_path.stat()
+        if now - stat.st_mtime < minimum_age_seconds:
+            continue
+        metadata = read_audio_metadata(file_path)
+        files.append(
+            {
+                "path": str(file_path),
+                "relative_path": str(file_path.relative_to(root)),
+                "extension": file_path.suffix.lower(),
+                "size_bytes": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+                "metadata": metadata,
+                "fingerprint": None,
+                "suggested_library_path": str(suggest_library_path(metadata, file_path)),
+            }
+        )
+    if not files:
+        return {"files": 0, "batch_id": None}
+    result = run_propose_import(session, {"files": files, "download_requests": []})
+    return {"files": len(files), "batch_id": result.get("batch_id")}
+
+
+def existing_proposal_source_paths(session: Session) -> set[str]:
+    return {
+        str(path)
+        for path in session.scalars(
+            select(ProposalItem.old_value)
+            .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+            .where(ProposalItem.old_value.is_not(None))
+            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+        )
+        if path
+    }
+
+
 def process_wishlist_request_items(session: Session, items: list[ProposalItem]) -> None:
     grouped: dict[tuple[str, str], list[dict]] = {}
     wishlist_item_ids = []
@@ -668,6 +763,8 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     for request in requests:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
+        searching_item.title = f"Searching {track_title}"
+        session.commit()
         track_item = ProposalItem(
             batch_id=batch.id,
             parent_id=album_item.id,
@@ -719,6 +816,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     ),
                 )
             )
+        session.commit()
     session.delete(searching_item)
     session.flush()
     create_notification(
@@ -732,20 +830,6 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
 
 def create_download_candidate_batch(session: Session, request: dict) -> None:
     query = download_query(request)
-    search_result = search_slskd_for_request(session, request)
-    candidates = search_result["candidates"]
-    diagnostics = search_result["diagnostics"]
-    if not candidates:
-        create_notification(
-            session,
-            title="slskd search found no candidates",
-            body=slskd_diagnostic_body(query, diagnostics),
-            event_type="download_empty",
-            target_url="/activity",
-        )
-        create_ytdlp_fallback_batch(session, request, query)
-        return
-
     batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, tree_path="/downloads")
     session.add(batch)
     session.flush()
@@ -760,6 +844,20 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     )
     session.add(searching_item)
     session.commit()
+    search_result = search_slskd_for_request(session, request)
+    candidates = search_result["candidates"]
+    diagnostics = search_result["diagnostics"]
+    if not candidates:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="slskd search found no candidates",
+            body=slskd_diagnostic_body(query, diagnostics),
+            event_type="download_empty",
+            target_url="/activity",
+        )
+        create_ytdlp_fallback_batch(session, request, query)
+        return
     for index, candidate in enumerate(candidates):
         session.add(
             ProposalItem(
@@ -779,6 +877,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
                 ),
             )
         )
+        session.commit()
     session.delete(searching_item)
     session.flush()
     create_notification(
@@ -1532,10 +1631,17 @@ async def worker_loop() -> None:
     with SessionLocal() as session:
         init_db(session)
 
+    last_download_scan = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
             if not task:
+                if time.time() - last_download_scan > 45:
+                    try:
+                        scan_downloads_to_import_review(session)
+                    except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
+                        create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
+                    last_download_scan = time.time()
                 await deliver_apns_notifications(session)
                 time.sleep(2)
                 continue
@@ -1544,7 +1650,10 @@ async def worker_loop() -> None:
                 handler = TASK_HANDLERS.get(task.type)
                 if not handler:
                     raise ValueError(f"No handler registered for task type {task.type}")
-                result = handler(session, task_to_payload(task))
+                if task.type == "execute_proposal_batch":
+                    result = handler(session, task_to_payload(task), task)
+                else:
+                    result = handler(session, task_to_payload(task))
                 session.refresh(task)
                 if task.status == TaskStatus.canceled:
                     continue

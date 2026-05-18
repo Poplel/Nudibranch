@@ -89,6 +89,21 @@ def complete_task(session: Session, task: Task, result: dict) -> None:
     session.commit()
 
 
+def update_task_progress(session: Session, task: Task, current: int, total: int, message: str, **extra: object) -> None:
+    task.result_json = json.dumps(
+        {
+            "progress": {
+                "current": current,
+                "total": total,
+                "percent": round((current / total) * 100, 1) if total else 0,
+                "message": message,
+                **extra,
+            }
+        }
+    )
+    session.commit()
+
+
 def fail_task(session: Session, task: Task, error: str) -> None:
     task.status = TaskStatus.failed
     task.error = error

@@ -145,6 +145,7 @@ function App() {
   );
   const visibleNavItems = useMemo(() => navItems.filter(([label]) => canViewPage(user, label)), [user]);
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
+  const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing");
   const unreadNotifications = useMemo(() => notifications.filter((notification) => notification.status === "unread"), [notifications]);
   const activeSeverity = useMemo(
     () => unreadNotifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
@@ -181,9 +182,9 @@ function App() {
       if (hasPermission(user, "notifications:read")) refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
       if (hasPermission(user, "wishlist:manage_own")) refreshWishlistApprovals();
-    }, 10000);
+    }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
-  }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || [])]);
+  }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || []), activeWork]);
 
   useEffect(() => {
     if (!user || visibleNavItems.length === 0) return;
@@ -1223,6 +1224,7 @@ function App() {
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {loading && <div className="loading-line">Working...</div>}
+            <ActiveWorkBar tasks={tasks} />
             {page === "Library" && (
               <LibraryTree
                 artists={library}
@@ -1735,6 +1737,7 @@ function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove,
               <button className="row-icon-button" onClick={() => onCancelTask(task.id)} title="Cancel task">
                 <X size={14} />
               </button>
+              <TaskProgress task={task} />
             </div>
           ))}
         </section>
@@ -1774,7 +1777,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   }
 
   return (
-    <section className="batch">
+    <section className="batch download-tree">
       <div className="batch-header">
         <div>
           <h2>Download candidates</h2>
@@ -1808,6 +1811,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
         <span>{selectedItems.length} selected</span>
         <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
       </div>
+      {batches.some((batch) => batch.status === "executing") && <InlineProgress label="Running selected downloads" indeterminate />}
       {trees.map(({ batch, tree }) => (
         <DownloadBatchBranch
           key={batch.id}
@@ -1833,7 +1837,7 @@ function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandida
   const hasChildren = tree.roots.length > 0;
   return (
     <>
-      <div className="proposal-row download-batch-row" style={{ "--depth": 0 }}>
+      <div className={`proposal-row download-batch-row status-${batch.status}`} style={{ "--depth": 0 }}>
         <input
           type="checkbox"
           checked={selectedCount === visibleItems.length && visibleItems.length > 0}
@@ -1959,7 +1963,7 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
 
   return (
     <>
-      <div className="proposal-row" style={{ "--depth": depth }}>
+      <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
         <input type="checkbox" checked={item.selected} onChange={(event) => updateChecked(event.target.checked)} />
         <button
           className="row-toggle"
@@ -1970,7 +1974,7 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
           {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
         </button>
         <span className="proposal-title">{item.title}</span>
-        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : item.kind}</small>
+        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : itemStatusMeta(item)}</small>
         {leafDownloadCandidate && item.selected && (
           <button
             className="row-icon-button"
@@ -3532,6 +3536,7 @@ function TasksView({ tasks, onCancel }) {
             <strong>{task.type}</strong>
             <span>{task.status}</span>
             <small>{taskSummary(task)}</small>
+            <TaskProgress task={task} />
           </button>
           {["queued", "running"].includes(task.status) && (
             <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
@@ -3544,6 +3549,49 @@ function TasksView({ tasks, onCancel }) {
           )}
         </section>
       ))}
+    </div>
+  );
+}
+
+function ActiveWorkBar({ tasks }) {
+  const activeTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
+  if (activeTasks.length === 0) return null;
+  return (
+    <div className="active-work-bar">
+      {activeTasks.slice(0, 3).map((task) => {
+        const progress = taskProgress(task);
+        return (
+          <div className="active-work-item" key={task.id}>
+            <strong>{task.type}</strong>
+            <InlineProgress
+              value={progress?.percent || 0}
+              label={progress?.message || task.status}
+              indeterminate={!progress}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function TaskProgress({ task }) {
+  const progress = taskProgress(task);
+  if (!progress) return null;
+  return <InlineProgress value={progress.percent} label={progress.message} />;
+}
+
+function InlineProgress({ value = 0, label = "", indeterminate = false }) {
+  const clamped = Math.max(0, Math.min(100, Number(value) || 0));
+  return (
+    <div className={indeterminate ? "inline-progress indeterminate" : "inline-progress"}>
+      <div className="inline-progress-label">
+        <span>{label || "Working"}</span>
+        {!indeterminate && <span>{Math.round(clamped)}%</span>}
+      </div>
+      <div className="inline-progress-track">
+        <span style={{ width: indeterminate ? "42%" : `${clamped}%` }} />
+      </div>
     </div>
   );
 }
@@ -4405,6 +4453,14 @@ function candidateMeta(item) {
   return item.new_value ? `candidate · ${item.new_value}` : "candidate";
 }
 
+function itemStatusMeta(item) {
+  if (item.status === "executing") return "working";
+  if (item.status === "completed") return "done";
+  if (item.status === "failed") return "needs attention";
+  if (item.status === "rejected") return "rejected";
+  return item.kind;
+}
+
 function downloadBatchNodeId(batchId) {
   return `download-batch:${batchId}`;
 }
@@ -4777,6 +4833,19 @@ function taskSummary(task) {
   }
   if (task.result?.imported !== undefined) return `${task.result.imported} imported${task.result.skipped ? `, ${task.result.skipped} skipped` : ""}`;
   return new Date(task.created_at).toLocaleString();
+}
+
+function taskProgress(task) {
+  const progress = task.result?.progress;
+  if (!progress) return null;
+  const total = Number(progress.total) || 0;
+  const current = Number(progress.current) || 0;
+  return {
+    current,
+    total,
+    percent: Number(progress.percent ?? (total ? (current / total) * 100 : 0)),
+    message: progress.message || taskSummary({ ...task, result: null }),
+  };
 }
 
 function proposalTaskSummary(result) {

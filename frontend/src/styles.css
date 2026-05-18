@@ -87,6 +87,7 @@ button:disabled {
   --soft: color-mix(in srgb, var(--background-tint) 11%, #ffffff);
   --warn: #a75d08;
   --danger: #b3404a;
+  --ok: #2d7d54;
   display: grid;
   grid-template-columns: 248px 1fr;
   min-height: 100vh;
@@ -107,6 +108,7 @@ button:disabled {
   --soft: color-mix(in srgb, var(--background-tint) 18%, #16191e);
   --warn: #ffc15d;
   --danger: #ff7b86;
+  --ok: #78d99f;
 }
 
 .sidebar {
@@ -485,6 +487,35 @@ nav button:hover,
   border-radius: 4px;
   padding: 8px 10px;
   background: var(--panel-strong);
+}
+
+.task-row .inline-progress {
+  grid-column: 1 / -1;
+}
+
+.active-work-bar {
+  display: grid;
+  gap: 8px;
+  margin: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.active-work-item {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.35fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.active-work-item strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
 }
 
 .file-row {
@@ -1556,6 +1587,79 @@ nav button:hover,
 .proposal-row {
   grid-template-columns: 18px 18px minmax(0, 1fr) auto auto;
   padding-left: calc(14px + var(--depth, 0) * 24px);
+}
+
+.download-tree {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  background: color-mix(in srgb, var(--panel) 72%, transparent);
+}
+
+.download-tree .proposal-row {
+  min-height: 36px;
+  border-radius: 3px;
+}
+
+.download-batch-row {
+  margin-top: 4px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-strong);
+}
+
+.proposal-row.status-executing {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.proposal-row.status-completed {
+  color: color-mix(in srgb, var(--text) 82%, var(--ok));
+}
+
+.proposal-row.status-failed {
+  color: var(--danger);
+}
+
+.inline-progress {
+  display: grid;
+  gap: 5px;
+  min-width: min(320px, 100%);
+}
+
+.inline-progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.inline-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--soft);
+}
+
+.inline-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.inline-progress.indeterminate .inline-progress-track span {
+  animation: progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
 }
 
 .metadata-change-row {
