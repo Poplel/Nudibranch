@@ -729,7 +729,7 @@ def remote_basename(filename: str) -> str:
 
 def find_download_manifest_entry(file_path: Path) -> dict | None:
     basename = file_path.name.casefold()
-    candidates = [entry for entry in load_download_manifest() if entry.get("status") in {"queued", "verified"}]
+    candidates = [entry for entry in load_download_manifest() if entry.get("status") in {"queued", "verified", "rejected"}]
     for entry in candidates:
         if entry.get("basename") == basename:
             return entry
@@ -775,6 +775,12 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         metadata = read_audio_metadata(file_path)
         manifest_entry = find_download_manifest_entry(file_path)
         if manifest_entry:
+            if manifest_entry.get("status") == "rejected":
+                try:
+                    file_path.unlink()
+                    update_download_manifest_entry(manifest_entry, "rejected_removed")
+                except OSError as error:
+                    errors.append(f"{file_path.name}: failed to remove rejected download: {error}")
             continue
         payload = {
             "path": str(file_path),
@@ -1907,6 +1913,7 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
 
 def run_check_files(session: Session, _payload: dict) -> dict:
     settings = get_settings()
+    library_root = settings.library_path.resolve()
     audio_suffixes = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac"}
     tracks = list(
         session.scalars(
@@ -1915,10 +1922,19 @@ def run_check_files(session: Session, _payload: dict) -> dict:
             .options(selectinload(Track.album).selectinload(Album.artist))
         )
     )
-    tracks_by_path = {str(track.path): track for track in tracks if track.path}
+    tracks_by_path: dict[str, Track] = {}
+    for track in tracks:
+        if not track.path:
+            continue
+        try:
+            track_path = Path(track.path).resolve()
+            track_path.relative_to(library_root)
+        except (OSError, ValueError):
+            continue
+        tracks_by_path[str(track_path)] = track
     db_paths = set(tracks_by_path)
     disk_paths = {
-        str(path)
+        str(path.resolve())
         for path in settings.library_path.rglob("*")
         if path.is_file() and path.suffix.lower() in audio_suffixes
     }

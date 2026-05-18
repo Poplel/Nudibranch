@@ -1770,8 +1770,8 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           </p>
         </div>
         <div className="approval-actions">
-          <button className="secondary" onClick={() => onReject(actionableSelectedItems)} disabled={actionableSelectedItems.length === 0}>
-            Reject selected
+          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={selectedItems.length === 0}>
+            Delete selected
           </button>
           <button className="primary" onClick={() => onApprove(actionableSelectedItems)} disabled={actionableSelectedItems.length === 0}>
             <Check size={16} />
@@ -1806,13 +1806,14 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           setOpenCandidatePickers={setOpenCandidatePickers}
           onSelection={onSelection}
           onSelectOnly={onSelectOnly}
+          onReject={onReject}
         />
       ))}
     </section>
   );
 }
 
-function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandidatePickers, setOpenCandidatePickers, onSelection, onSelectOnly }) {
+function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandidatePickers, setOpenCandidatePickers, onSelection, onSelectOnly, onReject }) {
   const batchNodeId = downloadBatchNodeId(batch.id);
   const open = openItems.has(batchNodeId);
   const visibleItems = visibleDownloadItems([batch]);
@@ -1833,6 +1834,9 @@ function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandida
         <small>
           {batch.status} · {selectedCount} of {visibleItems.length} visible selected
         </small>
+        <button className="row-icon-button danger" onClick={() => onReject(batch.items)} title="Delete batch and files">
+          <Trash2 size={14} />
+        </button>
       </div>
       {open &&
         tree.roots.map((item) => (
@@ -1843,6 +1847,8 @@ function DownloadBatchBranch({ batch, tree, openItems, setOpenItems, openCandida
             setOpenItems={setOpenItems}
             onSelection={onSelection}
             onSelectOnly={onSelectOnly}
+            onReject={onReject}
+            allowBranchDelete
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
             depth={1}
@@ -1912,6 +1918,7 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
           setOpenItems={setOpenItems}
           onSelection={onSelection}
           onSelectOnly={onSelectOnly}
+          onReject={onReject}
           openCandidatePickers={openCandidatePickers}
           setOpenCandidatePickers={setOpenCandidatePickers}
           key={item.id}
@@ -1921,7 +1928,19 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
   );
 }
 
-function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection, onSelectOnly, openCandidatePickers, setOpenCandidatePickers, depth = 0 }) {
+function ApprovalNode({
+  item,
+  childrenById,
+  openItems,
+  setOpenItems,
+  onSelection,
+  onSelectOnly,
+  onReject,
+  allowBranchDelete = false,
+  openCandidatePickers,
+  setOpenCandidatePickers,
+  depth = 0,
+}) {
   const children = childrenById.get(item.id) || [];
   const metadataChanges = metadataChangeRows(item);
   const hasChildren = children.length > 0 || metadataChanges.length > 0;
@@ -1967,6 +1986,11 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
             <Pencil size={14} />
           </button>
         )}
+        {allowBranchDelete && (
+          <button className="row-icon-button danger" onClick={() => onReject?.([item])} title="Delete branch and files">
+            <Trash2 size={14} />
+          </button>
+        )}
       </div>
       {open &&
         metadataChanges.map((change) => (
@@ -1986,6 +2010,8 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
             setOpenItems={setOpenItems}
             onSelection={onSelection}
             onSelectOnly={onSelectOnly}
+            onReject={onReject}
+            allowBranchDelete={allowBranchDelete}
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
             depth={depth + 1}
