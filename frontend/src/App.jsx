@@ -3952,6 +3952,7 @@ function SettingsPanel({
             ["acoustid_api_key", "AcoustID API key"],
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
+            ["playlist_conflict_winner", "Conflicting playlist entries"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
@@ -3970,6 +3971,14 @@ function SettingsPanel({
                       {browser}
                     </option>
                   ))}
+                </select>
+              ) : key === "playlist_conflict_winner" ? (
+                <select
+                  value={integrationDraft[key] || "nudibranch"}
+                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+                >
+                  <option value="nudibranch">Nudibranch</option>
+                  <option value="jellyfin">Jellyfin</option>
                 </select>
               ) : (
                 <input

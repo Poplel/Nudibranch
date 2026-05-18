@@ -183,6 +183,7 @@ class IntegrationSettings(BaseModel):
     jellyfin_api_key: str = ""
     slskd_url: str = ""
     slskd_api_key: str = ""
+    playlist_conflict_winner: str = "nudibranch"
     youtube_cookies_browser: str = ""
     youtube_cookies_path: str = ""
 

@@ -760,8 +760,7 @@ def add_playlist_tracks(
         next_position += 1
     session.commit()
     session.refresh(playlist)
-    if playlist.name == "Favorites":
-        enqueue_task(session, "sync_favorites_jellyfin", {})
+    enqueue_task(session, "sync_favorites_jellyfin", {})
     return serialize_favorites(session, playlist)
 
 
@@ -784,8 +783,7 @@ def remove_playlist_track(
         session.delete(item)
     session.commit()
     session.refresh(playlist)
-    if playlist.name == "Favorites":
-        enqueue_task(session, "sync_favorites_jellyfin", {})
+    enqueue_task(session, "sync_favorites_jellyfin", {})
     return serialize_favorites(session, playlist)
 
 

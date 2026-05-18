@@ -1819,17 +1819,25 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
     jellyfin_api_key = settings.get("jellyfin_api_key", "")
     if not jellyfin_url or not jellyfin_api_key:
-        raise ValueError("Jellyfin URL and API key are required to sync Favorites")
+        raise ValueError("Jellyfin URL and API key are required to sync playlists")
 
-    playlist = session.scalar(
-        select(Playlist)
-        .where(Playlist.name == "Favorites")
-        .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track))
+    conflict_winner = settings.get("playlist_conflict_winner") or "nudibranch"
+    if conflict_winner not in {"nudibranch", "jellyfin"}:
+        conflict_winner = "nudibranch"
+
+    ensure_favorites_playlist(session)
+    playlists = list(
+        session.scalars(
+            select(Playlist)
+            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+            .order_by(Playlist.name.asc())
+        )
     )
-    if not playlist:
-        return {"synced": 0, "message": "Favorites playlist has not been created yet"}
 
     headers = {"X-Emby-Token": jellyfin_api_key}
+    synced_playlists = 0
+    pushed_tracks = 0
+    pulled_tracks = 0
     with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
         users = client.get("/Users")
         users.raise_for_status()
@@ -1837,21 +1845,50 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         if not user_id:
             raise ValueError("No Jellyfin user was found for playlist sync")
 
-        jellyfin_playlist_id = playlist.jellyfin_playlist_id or find_jellyfin_playlist(client, user_id, "Favorites")
-        if not jellyfin_playlist_id:
-            created = client.post("/Playlists", params={"Name": "Favorites", "UserId": user_id})
-            created.raise_for_status()
-            jellyfin_playlist_id = created.json().get("Id")
-            playlist.jellyfin_playlist_id = jellyfin_playlist_id
-            session.commit()
+        jellyfin_playlists = list_jellyfin_playlists(client, user_id)
+        local_by_name = {playlist.name: playlist for playlist in playlists}
+        imported_playlist_names = set()
+        for jellyfin_playlist in jellyfin_playlists.values():
+            name = jellyfin_playlist.get("Name")
+            if not name or name in local_by_name:
+                continue
+            playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"), protected=name == "Favorites")
+            session.add(playlist)
+            session.flush()
+            local_by_name[name] = playlist
+            playlists.append(playlist)
+            imported_playlist_names.add(name)
 
-        item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
-        existing_ids = jellyfin_playlist_item_ids(client, user_id, jellyfin_playlist_id)
-        missing_ids = [item_id for item_id in item_ids if item_id not in existing_ids]
-        if missing_ids:
-            add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
-
-    return {"synced": len(item_ids), "playlist": "Favorites"}
+        for playlist in playlists:
+            jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
+            if not jellyfin_playlist_id:
+                created = client.post("/Playlists", params={"Name": playlist.name, "UserId": user_id})
+                created.raise_for_status()
+                jellyfin_playlist_id = created.json().get("Id")
+                playlist.jellyfin_playlist_id = jellyfin_playlist_id
+                session.flush()
+            jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
+            local_item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at))) if item_id]
+            jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
+            if conflict_winner == "jellyfin" or playlist.name in imported_playlist_names:
+                pulled_tracks += sync_playlist_from_jellyfin(session, playlist, jellyfin_items)
+            else:
+                removed = remove_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, set(local_item_ids))
+                missing_ids = [item_id for item_id in local_item_ids if item_id not in set(jellyfin_item_ids)]
+                if missing_ids:
+                    add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
+                pushed_tracks += len(missing_ids) + removed
+            synced_playlists += 1
+    session.commit()
+    create_notification(
+        session,
+        title="Playlists synced",
+        body=f"{synced_playlists} playlists synced. {pushed_tracks} Jellyfin changes. {pulled_tracks} Nudibranch changes.",
+        event_type="tool_completed",
+        target_url="/playlists",
+        deliver_apns=False,
+    )
+    return {"synced": synced_playlists, "pushed_tracks": pushed_tracks, "pulled_tracks": pulled_tracks}
 
 
 def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
@@ -2200,15 +2237,41 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
     return None
 
 
+def ensure_favorites_playlist(session: Session) -> Playlist:
+    playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+    if not playlist:
+        playlist = Playlist(name="Favorites", protected=True)
+        session.add(playlist)
+        session.flush()
+    elif not playlist.protected:
+        playlist.protected = True
+    return playlist
+
+
+def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
+    response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist"})
+    response.raise_for_status()
+    playlists = {}
+    for item in response.json().get("Items", []):
+        name = item.get("Name")
+        if name:
+            playlists[name] = item
+    return playlists
+
+
 def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: str) -> set[str]:
+    return {item.get("Id") for item in jellyfin_playlist_items(client, user_id, playlist_id) if item.get("Id")}
+
+
+def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str) -> list[dict]:
     try:
         response = client.get(f"/Playlists/{playlist_id}/Items", params={"UserId": user_id})
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
         if error.response.status_code in {404, 405}:
-            return set()
+            return []
         raise
-    return {item.get("Id") for item in response.json().get("Items", []) if item.get("Id")}
+    return response.json().get("Items", [])
 
 
 def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
@@ -2224,6 +2287,76 @@ def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id:
             failures.append(f"{item_id}: {single.status_code} {single.text[-300:]}")
     if failures:
         raise RuntimeError(f"Jellyfin playlist sync failed for {len(failures)} item(s): {'; '.join(failures[:3])}")
+
+
+def remove_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, items: list[dict], keep_item_ids: set[str]) -> int:
+    entry_ids = [
+        str(item.get("PlaylistItemId") or item.get("PlaylistItemID") or "")
+        for item in items
+        if item.get("Id") not in keep_item_ids and (item.get("PlaylistItemId") or item.get("PlaylistItemID"))
+    ]
+    if not entry_ids:
+        return 0
+    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"EntryIds": ",".join(entry_ids), "UserId": user_id})
+    if response.status_code in {404, 405, 501}:
+        return 0
+    response.raise_for_status()
+    return len(entry_ids)
+
+
+def sync_playlist_from_jellyfin(session: Session, playlist: Playlist, jellyfin_items: list[dict]) -> int:
+    next_entries: list[tuple[Track, int]] = []
+    for index, item in enumerate(jellyfin_items, start=1):
+        track = find_local_track_for_jellyfin_item(session, item)
+        if track:
+            next_entries.append((track, index))
+    current_entries = list(playlist.tracks)
+    current_by_track_id = {entry.track_id: entry for entry in current_entries}
+    next_track_ids = {track.id for track, _ in next_entries}
+    changes = 0
+    for entry in current_entries:
+        if entry.track_id not in next_track_ids:
+            session.delete(entry)
+            changes += 1
+    for track, position in next_entries:
+        entry = current_by_track_id.get(track.id)
+        if not entry:
+            session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=position))
+            changes += 1
+        elif entry.position != position:
+            entry.position = position
+            changes += 1
+    return changes
+
+
+def find_local_track_for_jellyfin_item(session: Session, item: dict) -> Track | None:
+    path = item.get("Path")
+    if path:
+        track = session.scalar(select(Track).where(Track.path == path))
+        if track:
+            return track
+    name = item.get("Name")
+    if not name:
+        return None
+    candidates = list(
+        session.scalars(
+            select(Track)
+            .where(Track.title == name)
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    artist_names = {
+        normalize_match_text(value)
+        for value in [item.get("AlbumArtist"), item.get("Artist"), *(item.get("Artists") or [])]
+        if value
+    }
+    album_name = normalize_match_text(item.get("Album"))
+    for track in candidates:
+        artist_match = not artist_names or normalize_match_text(track.album.artist.name) in artist_names
+        album_match = not album_name or normalize_match_text(track.album.title) == album_name
+        if artist_match and album_match:
+            return track
+    return candidates[0] if candidates else None
 
 
 def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -> str | None:
