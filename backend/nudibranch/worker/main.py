@@ -828,6 +828,16 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
+    blocking_items = selected_download_blockers(batch)
+    if blocking_items:
+        return {"imported": 0, "errors": []}
+    expected_item_ids = selected_slskd_download_item_ids(batch)
+    if not expected_item_ids:
+        return {"imported": 0, "errors": []}
+    entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
+    manifest_item_ids = {entry.get("item_id") for entry in entries}
+    if not expected_item_ids.issubset(manifest_item_ids):
+        return {"imported": 0, "errors": []}
     ready_entries = []
     errors: list[str] = []
     for entry in entries:
@@ -845,9 +855,11 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if verification["status"] == "mismatch":
             handle_download_mismatch(session, batch, entry, file_path, verification)
             return {"imported": 0, "errors": [verification["message"]]}
-        metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         if verification["status"] != "verified":
-            metadata = normalize_download_metadata(metadata, entry.get("request") or {})
+            message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
+            handle_download_verification_issue(session, batch, entry, file_path, message, verification)
+            return {"imported": 0, "errors": [message]}
+        metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
         verified_entries.append((entry, file_path, metadata))
 
@@ -865,6 +877,29 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         session.commit()
         return {"imported": 0, "errors": [str(error)]}
     return {"imported": imported, "errors": errors}
+
+
+def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
+    blockers = []
+    for item in batch.items:
+        if not item.selected or item.kind != ProposalKind.download:
+            continue
+        action = json.loads(item.payload_json or "{}").get("action")
+        if action == "queue_ytdlp_download" and item.status != ProposalStatus.rejected:
+            blockers.append(item)
+        elif action == "queue_download" and item.status == ProposalStatus.failed:
+            blockers.append(item)
+    return blockers
+
+
+def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
+    ids = set()
+    for item in batch.items:
+        if not item.selected or item.kind != ProposalKind.download:
+            continue
+        if json.loads(item.payload_json or "{}").get("action") == "queue_download":
+            ids.add(item.id)
+    return ids
 
 
 def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> Path | None:
@@ -916,6 +951,22 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
         session,
         title="Downloaded track did not match",
         body=verification["message"],
+        event_type="task_failed",
+        target_url="/downloads",
+    )
+    session.commit()
+
+
+def handle_download_verification_issue(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, message: str, verification: dict) -> None:
+    update_download_manifest_entry(entry, "queued", path=str(file_path), verification_error=message, metadata=verification.get("metadata"))
+    item = session.get(ProposalItem, entry.get("item_id"))
+    if item:
+        item.status = ProposalStatus.failed
+    batch.status = ProposalStatus.failed
+    create_notification(
+        session,
+        title="Download verification failed",
+        body=message,
         event_type="task_failed",
         target_url="/downloads",
     )
@@ -989,13 +1040,13 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
     request = manifest_entry.get("request") or {}
     api_key = integration_settings(session).get("acoustid_api_key", "")
     if not api_key:
-        return {"status": "unknown", "request": request}
+        return {"status": "unknown", "request": request, "message": "AcoustID API key is required before downloaded batches can be verified."}
     try:
         candidates = lookup_recording_by_fingerprint({"path": str(file_path)}, api_key)
     except Exception as error:  # noqa: BLE001 - verification should not block an otherwise usable download when AcoustID is unavailable.
-        return {"status": "unknown", "request": request, "error": str(error)}
+        return {"status": "unknown", "request": request, "error": str(error), "message": f"AcoustID lookup failed for {file_path.name}: {error}"}
     if not candidates:
-        return {"status": "unknown", "request": request}
+        return {"status": "unknown", "request": request, "message": f"AcoustID did not return a match for {file_path.name}."}
     best = candidates[0]
     candidate_metadata = best.get("metadata") or {}
     if metadata_matches_request(candidate_metadata, request):
@@ -1184,7 +1235,11 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     slskd_tracks = 0
     fallback_tracks = 0
     diagnostic_lines = []
-    folder_pool: dict | None = None
+    folder_pool = search_album_folder_pool(session, artist, album, requests)
+    if folder_pool:
+        diagnostic_lines.append(
+            f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
+        )
     for request in requests:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
@@ -1208,7 +1263,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
             search_result = search_slskd_for_request(session, request, limit=candidate_limit)
             candidates = search_result["candidates"]
             diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
-            if candidates and not request.get("multiple_candidates"):
+            if candidates and not request.get("multiple_candidates") and not folder_pool:
                 folder_pool = download_folder_pool(candidates[0])
         if candidates:
             slskd_tracks += 1
@@ -1362,6 +1417,62 @@ def download_folder_pool(candidate: dict) -> dict | None:
         "files": folder_files,
         "query": candidate.get("query"),
     }
+
+
+def search_album_folder_pool(session: Session, artist: str, album: str, requests: list[dict]) -> dict | None:
+    if not requests:
+        return None
+    settings = integration_settings(session)
+    query = " ".join(part for part in [artist, album] if part).strip()
+    if not query:
+        return None
+    try:
+        result = search_slskd_detailed(
+            settings.get("slskd_url", ""),
+            settings.get("slskd_api_key", ""),
+            query,
+            limit=40,
+            timeout_seconds=12,
+            timeout_buffer_seconds=2,
+        )
+    except Exception:
+        return None
+    pools: dict[tuple[str, str], dict] = {}
+    for candidate in result.get("candidates", []):
+        pool = download_folder_pool(candidate)
+        if not pool:
+            continue
+        key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+        current = pools.setdefault(key, {**pool, "files": []})
+        known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
+        for file_info in pool.get("files") or []:
+            filename = str(file_info.get("filename") or "")
+            if filename and filename not in known_filenames:
+                current["files"].append(file_info)
+                known_filenames.add(filename)
+    ranked = sorted(
+        ((score_album_folder_pool(pool, requests), pool) for pool in pools.values()),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    if not ranked or ranked[0][0][0] == 0:
+        return None
+    best_score, best_pool = ranked[0]
+    best_pool["matched_tracks"] = best_score[0]
+    return best_pool
+
+
+def score_album_folder_pool(pool: dict, requests: list[dict]) -> tuple[int, int, int]:
+    matched = 0
+    lossless = 0
+    for request in requests:
+        candidate = candidate_from_folder_pool(pool, request)
+        if not candidate:
+            continue
+        matched += 1
+        if candidate.get("quality") == "lossless":
+            lossless += 1
+    return (matched, lossless, len(pool.get("files") or []))
 
 
 def candidate_from_folder_pool(pool: dict | None, request: dict) -> dict | None:
@@ -1735,9 +1846,10 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             session.commit()
 
         item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in playlist.tracks) if item_id]
-        if item_ids:
-            response = client.post(f"/Playlists/{jellyfin_playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
-            response.raise_for_status()
+        existing_ids = jellyfin_playlist_item_ids(client, user_id, jellyfin_playlist_id)
+        missing_ids = [item_id for item_id in item_ids if item_id not in existing_ids]
+        if missing_ids:
+            add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
 
     return {"synced": len(item_ids), "playlist": "Favorites"}
 
@@ -2086,6 +2198,32 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
         if item.get("Name") == name:
             return item.get("Id")
     return None
+
+
+def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: str) -> set[str]:
+    try:
+        response = client.get(f"/Playlists/{playlist_id}/Items", params={"UserId": user_id})
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code in {404, 405}:
+            return set()
+        raise
+    return {item.get("Id") for item in response.json().get("Items", []) if item.get("Id")}
+
+
+def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
+    response = client.post(f"/Playlists/{playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
+    if response.is_success:
+        return
+    if response.status_code < 500:
+        response.raise_for_status()
+    failures = []
+    for item_id in item_ids:
+        single = client.post(f"/Playlists/{playlist_id}/Items", params={"Ids": item_id, "UserId": user_id})
+        if not single.is_success:
+            failures.append(f"{item_id}: {single.status_code} {single.text[-300:]}")
+    if failures:
+        raise RuntimeError(f"Jellyfin playlist sync failed for {len(failures)} item(s): {'; '.join(failures[:3])}")
 
 
 def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -> str | None:

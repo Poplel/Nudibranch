@@ -1721,36 +1721,11 @@ function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }
 
 function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove, onReject, onCancelTask }) {
   const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  const downloadBatchIds = new Set(downloadBatches.map((batch) => batch.id));
-  const activeTasks = tasks.filter(
-    (task) => task.type === "execute_proposal_batch" && ["queued", "running"].includes(task.status) && downloadBatchIds.has(task.payload?.batch_id),
-  );
-  if (downloadBatches.length === 0 && activeTasks.length === 0) {
+  if (downloadBatches.length === 0) {
     return <EmptyState title="No download candidates" body="Approved wishlist requests will add download candidates here." />;
   }
   return (
     <div className="approval-tree">
-      {activeTasks.length > 0 && (
-        <section className="batch running-downloads">
-          <div className="batch-header">
-            <div>
-              <h2>Running downloads</h2>
-              <p>{activeTasks.length} active task{activeTasks.length === 1 ? "" : "s"}</p>
-            </div>
-          </div>
-          {activeTasks.map((task) => (
-            <div className="task-row task-row-inline" key={task.id}>
-              <strong>{task.type}</strong>
-              <span>{task.status}</span>
-              <small>{task.payload?.batch_id || taskSummary(task)}</small>
-              <button className="row-icon-button" onClick={() => onCancelTask(task.id)} title="Cancel task">
-                <X size={14} />
-              </button>
-              <TaskProgress task={task} />
-            </div>
-          ))}
-        </section>
-      )}
       {downloadBatches.length > 0 && (
         <DownloadCandidateTree
           batches={downloadBatches}
@@ -1820,7 +1795,6 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
         <span>{selectedItems.length} selected</span>
         <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
       </div>
-      {batches.some((batch) => batch.status === "executing") && <InlineProgress label="Running selected downloads" indeterminate />}
       {trees.map(({ batch, tree }) => (
         <DownloadBatchBranch
           key={batch.id}
@@ -3570,7 +3544,7 @@ function ActiveWorkBar({ tasks }) {
         const progress = taskProgress(task);
         return (
           <div className="active-work-item" key={task.id}>
-            <strong>{task.type}</strong>
+            <strong>{taskDisplayName(task)}</strong>
             <InlineProgress
               value={progress?.percent || 0}
               label={progress?.message || task.status}
@@ -3587,6 +3561,12 @@ function TaskProgress({ task }) {
   const progress = taskProgress(task);
   if (!progress) return null;
   return <InlineProgress value={progress.percent} label={progress.message} />;
+}
+
+function taskDisplayName(task) {
+  if (task.type === "execute_proposal_batch") return "Processing task queue";
+  if (task.type === "sync_favorites_jellyfin") return "Syncing playlists";
+  return task.type;
 }
 
 function InlineProgress({ value = 0, label = "", indeterminate = false }) {

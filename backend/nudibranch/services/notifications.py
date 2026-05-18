@@ -1,7 +1,9 @@
 from datetime import datetime, timedelta, timezone
+import time
 
 import httpx
 import jwt
+from sqlalchemy.exc import OperationalError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -18,18 +20,26 @@ def create_notification(
     user_id: str | None = None,
     deliver_apns: bool = True,
 ) -> Notification:
-    notification = Notification(
-        user_id=user_id,
-        title=title,
-        body=body,
-        event_type=event_type,
-        target_url=target_url,
-        deliver_apns=deliver_apns,
-    )
-    session.add(notification)
-    session.commit()
-    session.refresh(notification)
-    return notification
+    for attempt in range(3):
+        notification = Notification(
+            user_id=user_id,
+            title=title,
+            body=body,
+            event_type=event_type,
+            target_url=target_url,
+            deliver_apns=deliver_apns,
+        )
+        session.add(notification)
+        try:
+            session.commit()
+            session.refresh(notification)
+            return notification
+        except OperationalError as error:
+            if "database is locked" not in str(error).lower() or attempt == 2:
+                raise
+            session.rollback()
+            time.sleep(0.25 * (attempt + 1))
+    raise RuntimeError("Notification could not be created")
 
 
 async def deliver_apns_notifications(session: Session) -> int:
