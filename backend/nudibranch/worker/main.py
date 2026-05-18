@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import shutil
 import subprocess
 import time
@@ -16,7 +17,7 @@ from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, Proposa
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
@@ -561,9 +562,11 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
     for candidate_item in download_candidate_attempt_order(session, item):
         payload = json.loads(candidate_item.payload_json or "{}")
         candidate = payload.get("candidate") or {}
+        request = payload.get("request") or {}
         label = candidate.get("filename") or candidate_item.title
         try:
             result = queue_slskd_download(slskd_url, api_key, candidate)
+            record_download_manifest_entry(request, candidate)
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.completed
                 item.new_value = candidate_item.new_value
@@ -643,6 +646,76 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
         run_propose_import(session, {"files": [], "download_requests": unique_requests})
 
 
+def download_manifest_path() -> Path:
+    return get_settings().downloads_path / ".nudibranch-downloads.json"
+
+
+def load_download_manifest() -> list[dict]:
+    path = download_manifest_path()
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def save_download_manifest(entries: list[dict]) -> None:
+    path = download_manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+
+
+def record_download_manifest_entry(request: dict, candidate: dict) -> None:
+    if not request or not candidate:
+        return
+    filename = str(candidate.get("filename") or "")
+    entries = load_download_manifest()
+    entries.append(
+        {
+            "request": request,
+            "candidate": {
+                "username": candidate.get("username"),
+                "filename": filename,
+                "folder": candidate.get("folder"),
+            },
+            "basename": remote_basename(filename),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "status": "queued",
+        }
+    )
+    save_download_manifest(entries[-500:])
+
+
+def remote_basename(filename: str) -> str:
+    return str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def find_download_manifest_entry(file_path: Path) -> dict | None:
+    basename = file_path.name.casefold()
+    candidates = [entry for entry in load_download_manifest() if entry.get("status") == "queued"]
+    for entry in candidates:
+        if entry.get("basename") == basename:
+            return entry
+    normalized_path = str(file_path).replace("\\", "/").casefold()
+    for entry in candidates:
+        filename = str((entry.get("candidate") or {}).get("filename") or "").replace("\\", "/").casefold()
+        if filename and normalized_path.endswith(filename):
+            return entry
+    return None
+
+
+def update_download_manifest_entry(target: dict, status: str) -> None:
+    entries = load_download_manifest()
+    for entry in entries:
+        if entry == target:
+            entry["status"] = status
+            entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+            break
+    save_download_manifest(entries)
+
+
 def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) -> dict:
     settings = get_settings()
     root = settings.downloads_path
@@ -661,6 +734,29 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         if now - stat.st_mtime < minimum_age_seconds:
             continue
         metadata = read_audio_metadata(file_path)
+        manifest_entry = find_download_manifest_entry(file_path)
+        verification = verify_downloaded_file(session, file_path, manifest_entry)
+        if verification["status"] == "mismatch":
+            request = verification.get("request") or {}
+            try:
+                file_path.unlink()
+            except OSError as error:
+                errors.append(f"{file_path.name}: matched the wrong track but could not be removed: {error}")
+                continue
+            if manifest_entry:
+                update_download_manifest_entry(manifest_entry, "mismatch")
+            if request:
+                create_download_retry_import_batch(session, [{**request, "multiple_candidates": True}])
+            create_notification(
+                session,
+                title="Downloaded track did not match",
+                body=verification["message"],
+                event_type="task_failed",
+                target_url="/downloads",
+            )
+            continue
+        if verification["status"] == "verified":
+            metadata = {**metadata, **verification.get("metadata", {})}
         payload = {
             "path": str(file_path),
             "relative_path": str(file_path.relative_to(root)),
@@ -677,6 +773,8 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         try:
             import_file_to_library(session, file_path, target_path, payload)
             mark_matching_wishlist_completed(session, metadata)
+            if manifest_entry:
+                update_download_manifest_entry(manifest_entry, "completed")
             imported += 1
         except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
             errors.append(f"{file_path.name}: {error}")
@@ -691,6 +789,66 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
         )
         enqueue_task(session, "jellyfin_scan", {})
     return {"imported": imported, "errors": errors}
+
+
+def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: dict | None) -> dict:
+    if not manifest_entry:
+        return {"status": "unknown"}
+    request = manifest_entry.get("request") or {}
+    api_key = integration_settings(session).get("acoustid_api_key", "")
+    if not api_key:
+        return {"status": "unknown", "request": request}
+    try:
+        candidates = lookup_recording_by_fingerprint({"path": str(file_path)}, api_key)
+    except Exception as error:  # noqa: BLE001 - verification should not block an otherwise usable download when AcoustID is unavailable.
+        return {"status": "unknown", "request": request, "error": str(error)}
+    if not candidates:
+        return {"status": "unknown", "request": request}
+    best = candidates[0]
+    candidate_metadata = best.get("metadata") or {}
+    if metadata_matches_request(candidate_metadata, request):
+        return {"status": "verified", "request": request, "metadata": verified_download_metadata(candidate_metadata, request)}
+    expected = download_query(request)
+    found = " ".join(
+        str(part)
+        for part in [candidate_metadata.get("artist"), candidate_metadata.get("album"), candidate_metadata.get("title")]
+        if part
+    ).strip()
+    return {
+        "status": "mismatch",
+        "request": request,
+        "metadata": candidate_metadata,
+        "message": f"{file_path.name} matched {found or 'a different recording'} instead of {expected or 'the requested track'}.",
+    }
+
+
+def metadata_matches_request(metadata: dict, request: dict) -> bool:
+    request_artist = normalize_match_text(request.get("artist"))
+    request_track = normalize_match_text(request.get("track") or request.get("title"))
+    metadata_artist = normalize_match_text(metadata.get("albumartist") or metadata.get("artist"))
+    metadata_track = normalize_match_text(metadata.get("title"))
+    if request_track and metadata_track and not loose_text_match(request_track, metadata_track):
+        return False
+    if request_artist and metadata_artist and not loose_text_match(request_artist, metadata_artist):
+        return False
+    return bool((request_track and metadata_track) or (request_artist and metadata_artist))
+
+
+def verified_download_metadata(metadata: dict, request: dict) -> dict:
+    artist = request.get("artist") or metadata.get("artist")
+    return {
+        **metadata,
+        "artist": artist,
+        "albumartist": artist,
+        "album": request.get("album") or metadata.get("album"),
+        "title": request.get("track") or request.get("title") or metadata.get("title"),
+    }
+
+
+def loose_text_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return left in right or right in left
 
 
 def mark_matching_wishlist_completed(session: Session, metadata: dict) -> None:
@@ -810,6 +968,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     slskd_tracks = 0
     fallback_tracks = 0
     diagnostic_lines = []
+    folder_pool: dict | None = None
     for request in requests:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
@@ -824,9 +983,17 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         )
         session.add(track_item)
         session.flush()
-        search_result = search_slskd_for_request(session, request)
-        candidates = search_result["candidates"]
-        diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
+        folder_candidate = candidate_from_folder_pool(folder_pool, request) if folder_pool else None
+        if folder_candidate:
+            candidates = [folder_candidate]
+            diagnostic_lines.append(f"{query}: reused {folder_candidate.get('folder') or 'the same folder'} from {folder_candidate.get('username')}.")
+        else:
+            candidate_limit = 4 if request.get("multiple_candidates") else 1
+            search_result = search_slskd_for_request(session, request, limit=candidate_limit)
+            candidates = search_result["candidates"]
+            diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
+            if candidates and not request.get("multiple_candidates"):
+                folder_pool = download_folder_pool(candidates[0])
         if candidates:
             slskd_tracks += 1
             for index, candidate in enumerate(candidates):
@@ -894,7 +1061,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     )
     session.add(searching_item)
     session.commit()
-    search_result = search_slskd_for_request(session, request)
+    search_result = search_slskd_for_request(session, request, limit=4 if request.get("multiple_candidates") else 1)
     candidates = search_result["candidates"]
     diagnostics = search_result["diagnostics"]
     if not candidates:
@@ -969,7 +1136,63 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
     )
 
 
-def search_slskd_for_request(session: Session, request: dict) -> dict:
+def download_folder_pool(candidate: dict) -> dict | None:
+    folder_files = candidate.get("folder_files") or []
+    if not folder_files:
+        return None
+    return {
+        "username": candidate.get("username"),
+        "folder": candidate.get("folder"),
+        "files": folder_files,
+        "query": candidate.get("query"),
+    }
+
+
+def candidate_from_folder_pool(pool: dict | None, request: dict) -> dict | None:
+    if not pool:
+        return None
+    track = normalize_match_text(request.get("track") or request.get("title"))
+    if not track:
+        return None
+    files = pool.get("files") or []
+    ranked = sorted(
+        (file_info for file_info in files if filename_matches_track(file_info.get("filename"), track)),
+        key=lambda file_info: folder_file_score(file_info, track),
+    )
+    if not ranked:
+        return None
+    file_info = ranked[0]
+    return {
+        "username": pool.get("username"),
+        "query": download_query(request),
+        "filename": file_info.get("filename"),
+        "folder": pool.get("folder"),
+        "size": file_info.get("size"),
+        "quality": "lossless" if str(file_info.get("filename") or "").lower().endswith((".flac", ".wav", ".aiff", ".alac")) else "unknown",
+        "files": [file_info],
+        "folder_files": files,
+    }
+
+
+def filename_matches_track(filename: str | None, normalized_track: str) -> bool:
+    stem = Path(str(filename or "").replace("\\", "/")).stem
+    normalized_stem = normalize_match_text(stem)
+    if not normalized_stem:
+        return False
+    if normalized_track in normalized_stem or normalized_stem in normalized_track:
+        return True
+    stripped_stem = normalize_match_text(re.sub(r"^\d+\s*[-_. ]\s*", "", stem))
+    return normalized_track in stripped_stem or stripped_stem in normalized_track
+
+
+def folder_file_score(file_info: dict, normalized_track: str) -> tuple[int, int, str]:
+    filename = str(file_info.get("filename") or "")
+    stem = normalize_match_text(Path(filename.replace("\\", "/")).stem)
+    quality_rank = 0 if filename.lower().endswith((".flac", ".wav", ".aiff", ".alac")) else 1
+    return (quality_rank, abs(len(stem) - len(normalized_track)), filename)
+
+
+def search_slskd_for_request(session: Session, request: dict, limit: int = 1) -> dict:
     settings = integration_settings(session)
     slskd_url = settings.get("slskd_url", "")
     api_key = settings.get("slskd_api_key", "")
@@ -983,6 +1206,7 @@ def search_slskd_for_request(session: Session, request: dict) -> dict:
             slskd_url,
             api_key,
             query,
+            limit=limit,
             timeout_seconds=12 if index == 0 else 6,
             timeout_buffer_seconds=3,
         )

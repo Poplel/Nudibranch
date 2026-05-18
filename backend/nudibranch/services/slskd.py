@@ -66,6 +66,10 @@ def search_slskd_detailed(
             else:
                 settled_polls = 0
             last_response_count = len(responses)
+            if candidates and limit == 1:
+                ranked = rank_candidates(candidates)[:limit]
+                diagnostics["candidates"] = len(ranked)
+                return {"candidates": ranked, "diagnostics": diagnostics}
             if candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
@@ -80,7 +84,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
     payload = {
         "searchText": query,
         "timeout": timeout_seconds * 1000,
-        "filterResponses": True,
+        "filterResponses": False,
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
     }
@@ -151,21 +155,27 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
         username = response_username(response)
         if not username:
             continue
-        files = response_files(response)
+        files = [normalized for file_info in response_files(response) if (normalized := normalize_file(file_info))]
+        audio_files = [file_info for file_info in files if is_audio_file(file_info["filename"])]
         for file_info in files:
-            normalized = normalize_file(file_info)
-            if not normalized:
+            if not is_audio_file(file_info["filename"]):
                 continue
-            if not is_audio_file(normalized["filename"]):
+            folder = remote_folder(file_info["filename"])
+            folder_files = [audio_file for audio_file in audio_files if remote_folder(audio_file["filename"]) == folder]
+            relevance = query_match_score(query, file_info["filename"])
+            if relevance <= 0:
                 continue
             candidates.append(
                 {
                     "username": username,
                     "query": query,
-                    "filename": normalized["filename"],
-                    "size": normalized.get("size"),
-                    "quality": quality_label(normalized),
-                    "files": [normalized],
+                    "filename": file_info["filename"],
+                    "folder": folder,
+                    "size": file_info.get("size"),
+                    "quality": quality_label(file_info),
+                    "relevance": relevance,
+                    "files": [file_info],
+                    "folder_files": folder_files,
                 }
             )
     return candidates
@@ -260,11 +270,25 @@ def quality_label(file_info: dict[str, Any]) -> str:
     return "unknown"
 
 
+def remote_folder(filename: str) -> str:
+    normalized = str(filename or "").replace("\\", "/")
+    if "/" not in normalized:
+        return ""
+    return normalized.rsplit("/", 1)[0]
+
+
 def rank_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def score(candidate: dict[str, Any]) -> tuple[int, int]:
+    def score(candidate: dict[str, Any]) -> tuple[int, int, int]:
+        relevance = int(candidate.get("relevance") or 0)
         quality = candidate.get("quality")
         quality_score = 2 if quality == "lossless" else 1 if quality == "lossy" else 0
         size = int(candidate.get("size") or 0)
-        return quality_score, size
+        return relevance, quality_score, size
 
     return sorted(candidates, key=score, reverse=True)
+
+
+def query_match_score(query: str, filename: str) -> int:
+    haystack = " ".join(str(filename or "").replace("\\", "/").replace("_", " ").replace("-", " ").casefold().split())
+    tokens = [token for token in str(query or "").casefold().replace("-", " ").split() if len(token) > 2]
+    return sum(1 for token in tokens if token in haystack)
