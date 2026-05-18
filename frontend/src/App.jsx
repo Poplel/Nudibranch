@@ -1745,8 +1745,8 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   const trees = useMemo(() => batches.map((batch) => ({ batch, tree: buildItemTree(batch.items) })), [batches]);
   const visibleItems = useMemo(() => visibleDownloadItems(batches), [batches]);
   const selectedItems = visibleItems.filter((item) => item.selected);
+  const actionableSelectedItems = selectedItems.filter((item) => !["executing", "completed"].includes(item.status));
   const allSelected = selectedItems.length === visibleItems.length && visibleItems.length > 0;
-  const locked = batches.some((batch) => batch.status === "executing");
 
   useEffect(() => {
     setOpenItems(new Set(batches.map((batch) => downloadBatchNodeId(batch.id))));
@@ -1770,12 +1770,12 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           </p>
         </div>
         <div className="approval-actions">
-          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
+          <button className="secondary" onClick={() => onReject(actionableSelectedItems)} disabled={actionableSelectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={locked || selectedItems.length === 0}>
+          <button className="primary" onClick={() => onApprove(actionableSelectedItems)} disabled={actionableSelectedItems.length === 0}>
             <Check size={16} />
-            {locked ? "Running" : "Run selected"}
+            Run selected
           </button>
         </div>
       </div>
@@ -1792,7 +1792,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           />
           Select all visible
         </label>
-        <span>{selectedItems.length} selected</span>
+        <span>{selectedItems.length} selected · {actionableSelectedItems.length} ready</span>
         <TreeToolbar expanded={openItems.size > 0} onExpand={expandAll} onCollapse={collapseAll} />
       </div>
       {trees.map(({ batch, tree }) => (
@@ -1928,7 +1928,7 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
   const open = openItems.has(item.id);
   const descendantIds = collectItemIds(item, childrenById);
   const leafDownloadCandidate = item.kind === "download" && children.length === 0 && Boolean(item.new_value);
-  const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && sibling.new_value) : [];
+  const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.new_value || sibling.old_value)) : [];
   const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
   const pickerOpen = leafDownloadCandidate && openCandidatePickers?.has(item.parent_id);
   const firstSelectedSibling = siblingCandidates.find((sibling) => sibling.selected);
@@ -1958,7 +1958,7 @@ function ApprovalNode({ item, childrenById, openItems, setOpenItems, onSelection
         </button>
         <span className="proposal-title">{item.title}</span>
         <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : itemStatusMeta(item)}</small>
-        {leafDownloadCandidate && item.selected && (
+        {leafDownloadCandidate && (
           <button
             className="row-icon-button"
             onClick={() => toggleSet(setOpenCandidatePickers, item.parent_id)}

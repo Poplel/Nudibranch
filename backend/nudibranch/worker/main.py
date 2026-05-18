@@ -293,7 +293,6 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     download_changes = 0
     download_errors: list[str] = []
-    failed_download_requests: list[dict] = []
     if wishlist_download_items:
         try:
             note_progress("Preparing download candidates", wishlist_download_items[0])
@@ -320,7 +319,9 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             download_errors.append(f"{item.title}: {error}")
             failed_request = download_request_from_item(item)
             if failed_request:
-                failed_download_requests.append(failed_request)
+                replacements = add_replacement_candidates_to_download_batch(session, batch, {"parent_id": item.parent_id}, {**failed_request, "multiple_candidates": True})
+                if replacements:
+                    item.selected = False
             finish_progress_step(f"Download needs attention for {item.title}")
 
     lyric_changes = 0
@@ -342,8 +343,6 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
             skipped += 1
 
-    if failed_download_requests:
-        create_download_retry_import_batch(session, failed_download_requests)
     downloaded_import = import_completed_downloads(session)
 
     if errors:
@@ -417,7 +416,7 @@ def task_queue_notification_body(
     if errors:
         return f"{body} First failure: {errors[0]}"
     if download_errors:
-        return f"{body} {len(download_errors)} downloads need another candidate and were sent back to Import/Add. First download issue: {trim_message(download_errors[0])}"
+        return f"{body} {len(download_errors)} downloads need another candidate in Downloads. First download issue: {trim_message(download_errors[0])}"
     return body
 
 
@@ -973,14 +972,15 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
     session.commit()
 
 
-def add_replacement_candidates_to_download_batch(session: Session, batch: ProposalBatch, entry: dict, request: dict) -> None:
+def add_replacement_candidates_to_download_batch(session: Session, batch: ProposalBatch, entry: dict, request: dict) -> int:
     query = download_query(request)
     search_result = search_slskd_for_request(session, {**request, "multiple_candidates": True}, limit=4)
     parent_id = entry.get("parent_id")
     if not parent_id:
         parent = add_download_tree_parents(session, batch, request, query)
         parent_id = parent.id
-    for index, candidate in enumerate(search_result["candidates"]):
+    candidates = search_result["candidates"]
+    for index, candidate in enumerate(candidates):
         session.add(
             ProposalItem(
                 batch_id=batch.id,
@@ -999,6 +999,7 @@ def add_replacement_candidates_to_download_batch(session: Session, batch: Propos
                 ),
             )
         )
+    return len(candidates)
 
 
 def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:

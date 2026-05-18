@@ -32,7 +32,8 @@ def approve_batch(session: Session, batch_id: str, item_ids: list[str] | None = 
     if not batch:
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.approved
-    normalize_download_candidate_selection(batch.items)
+    preferred_ids = set(item_ids or [])
+    normalize_download_candidate_selection(batch.items, preferred_ids)
     for item in batch.items:
         if item_ids is not None and item.id not in item_ids:
             continue
@@ -42,7 +43,8 @@ def approve_batch(session: Session, batch_id: str, item_ids: list[str] | None = 
     return enqueue_task(session, "execute_proposal_batch", {"batch_id": batch_id})
 
 
-def normalize_download_candidate_selection(items: list[ProposalItem]) -> None:
+def normalize_download_candidate_selection(items: list[ProposalItem], preferred_ids: set[str] | None = None) -> None:
+    preferred_ids = preferred_ids or set()
     candidates_by_parent: dict[str, list[ProposalItem]] = {}
     for item in items:
         if item.kind != "download" or not item.parent_id:
@@ -55,6 +57,7 @@ def normalize_download_candidate_selection(items: list[ProposalItem]) -> None:
         selected = [item for item in candidates if item.selected]
         if len(selected) <= 1:
             continue
+        selected.sort(key=lambda item: (item.id not in preferred_ids, item.status == ProposalStatus.executing, item.id))
         for item in selected[1:]:
             item.selected = False
 
@@ -70,7 +73,7 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
         items = list(batch.items)
     rejected_ids = {item.id for item in items}
     rejected_wishlist_items: dict[str, list[str]] = {}
-    removed_download_files = remove_rejected_download_files(items)
+    removed_download_files = remove_rejected_download_files(items) + remove_rejected_manifest_downloads(items)
     for item in items:
         payload = json.loads(item.payload_json or "{}")
         request_payload = payload.get("request") or {}
@@ -153,6 +156,55 @@ def remove_rejected_download_files(items: list[ProposalItem]) -> int:
         prune_empty_download_dirs(file_path.parent, downloads_root)
         removed += 1
     return removed
+
+
+def remove_rejected_manifest_downloads(items: list[ProposalItem]) -> int:
+    rejected_item_ids = {item.id for item in items}
+    if not rejected_item_ids:
+        return 0
+    settings = get_settings()
+    downloads_root = settings.downloads_path.resolve()
+    manifest_path = settings.downloads_path / ".nudibranch-downloads.json"
+    if not manifest_path.exists():
+        return 0
+    try:
+        entries = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    if not isinstance(entries, list):
+        return 0
+    removed = 0
+    changed = False
+    for entry in entries:
+        if entry.get("item_id") not in rejected_item_ids or entry.get("status") == "rejected":
+            continue
+        entry["status"] = "rejected"
+        entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+        changed = True
+        removed += remove_manifest_entry_file(entry, downloads_root)
+    if changed:
+        manifest_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    return removed
+
+
+def remove_manifest_entry_file(entry: dict, downloads_root: Path) -> int:
+    candidates: list[Path] = []
+    if entry.get("path"):
+        candidates.append(Path(entry["path"]))
+    basename = entry.get("basename")
+    if basename:
+        candidates.extend(path for path in downloads_root.rglob("*") if path.is_file() and path.name.casefold() == basename)
+    for file_path in candidates:
+        try:
+            resolved = file_path.resolve()
+        except OSError:
+            continue
+        if downloads_root not in [resolved, *resolved.parents] or not resolved.is_file():
+            continue
+        resolved.unlink()
+        prune_empty_download_dirs(resolved.parent, downloads_root)
+        return 1
+    return 0
 
 
 def prune_empty_download_dirs(path: Path, stop_at: Path) -> None:
