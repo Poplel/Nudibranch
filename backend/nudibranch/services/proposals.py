@@ -1,9 +1,11 @@
 import json
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nudibranch.db.models import ProposalBatch, ProposalItem, ProposalStatus, Task, WishlistItem
+from nudibranch.core.config import get_settings
+from nudibranch.db.models import ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, WishlistItem
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.tasks import enqueue_task
 
@@ -57,13 +59,17 @@ def normalize_download_candidate_selection(items: list[ProposalItem]) -> None:
 
 
 def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, suppress_for: str) -> int:
-    query = select(ProposalItem).where(ProposalItem.batch_id == batch_id)
-    if item_ids:
-        query = query.where(ProposalItem.id.in_(item_ids))
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise ValueError("Proposal batch not found")
 
-    items = list(session.scalars(query))
+    if item_ids:
+        items = rejected_items_with_descendants(batch.items, set(item_ids))
+    else:
+        items = list(batch.items)
     rejected_ids = {item.id for item in items}
     rejected_wishlist_items: dict[str, list[str]] = {}
+    removed_download_files = remove_rejected_download_files(items)
     for item in items:
         payload = json.loads(item.payload_json or "{}")
         wishlist_item_id = payload.get("wishlist_item_id")
@@ -76,7 +82,6 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
         session.delete(item)
     session.flush()
 
-    batch = session.get(ProposalBatch, batch_id)
     if batch:
         session.expire(batch, ["items"])
         cleanup_empty_container_items(session, batch)
@@ -84,6 +89,14 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
         if not batch.items:
             batch.status = ProposalStatus.rejected
     session.commit()
+    if removed_download_files:
+        create_notification(
+            session,
+            title="Downloaded files removed",
+            body=f"{removed_download_files} rejected files were removed from downloads.",
+            event_type="tool_completed",
+            target_url="/downloads",
+        )
     for user_id, titles in rejected_wishlist_items.items():
         shown = ", ".join(titles[:5])
         extra = "" if len(titles) <= 5 else f" and {len(titles) - 5} more"
@@ -96,6 +109,57 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
             user_id=user_id,
         )
     return len(rejected_ids)
+
+
+def rejected_items_with_descendants(items: list[ProposalItem], rejected_ids: set[str]) -> list[ProposalItem]:
+    children_by_parent: dict[str, list[ProposalItem]] = {}
+    item_by_id = {item.id: item for item in items}
+    for item in items:
+        if item.parent_id:
+            children_by_parent.setdefault(item.parent_id, []).append(item)
+
+    expanded_ids = set(rejected_ids)
+    stack = list(rejected_ids)
+    while stack:
+        current_id = stack.pop()
+        for child in children_by_parent.get(current_id, []):
+            if child.id in expanded_ids:
+                continue
+            expanded_ids.add(child.id)
+            stack.append(child.id)
+    return [item for item_id, item in item_by_id.items() if item_id in expanded_ids]
+
+
+def remove_rejected_download_files(items: list[ProposalItem]) -> int:
+    settings = get_settings()
+    downloads_root = settings.downloads_path.resolve()
+    removed = 0
+    seen_paths: set[Path] = set()
+    for item in items:
+        if item.kind != ProposalKind.import_files or not item.old_value:
+            continue
+        file_path = Path(item.old_value).resolve()
+        if file_path in seen_paths:
+            continue
+        if downloads_root not in [file_path, *file_path.parents]:
+            continue
+        seen_paths.add(file_path)
+        if not file_path.is_file():
+            continue
+        file_path.unlink()
+        prune_empty_download_dirs(file_path.parent, downloads_root)
+        removed += 1
+    return removed
+
+
+def prune_empty_download_dirs(path: Path, stop_at: Path) -> None:
+    current = path
+    while current != stop_at and stop_at in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
 
 
 def cleanup_empty_container_items(session: Session, batch: ProposalBatch) -> None:
