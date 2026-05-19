@@ -4936,6 +4936,7 @@ function taskProgress(task) {
 }
 
 function proposalTaskSummary(result) {
+  if (result.progress?.message) return result.progress.message;
   const parts = [];
   if (result.imported) parts.push(`${result.imported} imported`);
   if (result.metadata_updated) parts.push(`${result.metadata_updated} metadata`);

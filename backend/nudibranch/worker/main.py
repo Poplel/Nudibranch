@@ -18,6 +18,7 @@ from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
+from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
@@ -170,6 +171,12 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     if not batch:
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.executing
+    approved_roots = {item.id for item in batch.items if item.selected and item.status == ProposalStatus.approved}
+    if approved_roots:
+        approved_ids = item_ids_with_descendants(batch.items, approved_roots)
+        for item in batch.items:
+            if item.id in approved_ids and item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
+                item.status = ProposalStatus.approved
     selected_items = [
         item
         for item in batch.items
@@ -237,7 +244,9 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     note_progress(f"Preparing {len(progress_items)} selected changes")
 
-    if batch.kind == ProposalKind.import_files and not executable_items and not download_items:
+    if not progress_items:
+        errors.append("No approved executable changes were selected.")
+    elif batch.kind == ProposalKind.import_files and not executable_items and not download_items:
         errors.append("No approved import file operations were selected.")
 
     for item in executable_items:

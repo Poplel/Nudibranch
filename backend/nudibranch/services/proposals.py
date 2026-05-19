@@ -33,9 +33,10 @@ def approve_batch(session: Session, batch_id: str, item_ids: list[str] | None = 
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.approved
     preferred_ids = set(item_ids or [])
+    approved_ids = item_ids_with_descendants(batch.items, preferred_ids) if item_ids is not None else None
     normalize_download_candidate_selection(batch.items, preferred_ids)
     for item in batch.items:
-        if item_ids is not None and item.id not in item_ids:
+        if approved_ids is not None and item.id not in approved_ids:
             continue
         if item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
             item.status = ProposalStatus.approved
@@ -118,14 +119,18 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, su
 
 
 def rejected_items_with_descendants(items: list[ProposalItem], rejected_ids: set[str]) -> list[ProposalItem]:
+    expanded_ids = item_ids_with_descendants(items, rejected_ids)
+    return [item for item in items if item.id in expanded_ids]
+
+
+def item_ids_with_descendants(items: list[ProposalItem], root_ids: set[str]) -> set[str]:
     children_by_parent: dict[str, list[ProposalItem]] = {}
-    item_by_id = {item.id: item for item in items}
     for item in items:
         if item.parent_id:
             children_by_parent.setdefault(item.parent_id, []).append(item)
 
-    expanded_ids = set(rejected_ids)
-    stack = list(rejected_ids)
+    expanded_ids = set(root_ids)
+    stack = list(root_ids)
     while stack:
         current_id = stack.pop()
         for child in children_by_parent.get(current_id, []):
@@ -133,7 +138,7 @@ def rejected_items_with_descendants(items: list[ProposalItem], rejected_ids: set
                 continue
             expanded_ids.add(child.id)
             stack.append(child.id)
-    return [item for item_id, item in item_by_id.items() if item_id in expanded_ids]
+    return expanded_ids
 
 
 def remove_rejected_download_files(items: list[ProposalItem]) -> int:
