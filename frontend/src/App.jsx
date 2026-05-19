@@ -4536,7 +4536,10 @@ function lowestLevelItems(items) {
 }
 
 function candidateMeta(item) {
-  return item.new_value ? `candidate · ${item.new_value}` : "candidate";
+  const status = itemStatusMeta(item);
+  const source = item.new_value ? ` · ${item.new_value}` : "";
+  if (["working", "done", "needs attention", "pending"].includes(status)) return `candidate${source}`;
+  return `${status}${source}`;
 }
 
 function itemStatusMeta(item) {

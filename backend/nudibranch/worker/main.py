@@ -901,18 +901,24 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     if not expected_item_ids.issubset(manifest_item_ids):
         for item_id in expected_item_ids - manifest_item_ids:
             set_download_item_status(session.get(ProposalItem, item_id), "waiting for slskd queue record")
+        update_download_container_statuses(batch)
         session.flush()
         return {"imported": 0, "errors": []}
     ready_entries = []
     errors: list[str] = []
+    waiting = False
     for entry in entries:
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
         if not file_path:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), wait_status)
-            session.flush()
-            return {"imported": 0, "errors": []}
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), manifest_wait_status(entry, wait_status))
+            waiting = True
+            continue
         set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for batch verification")
         ready_entries.append((entry, file_path))
+    update_download_container_statuses(batch)
+    session.flush()
+    if waiting:
+        return {"imported": 0, "errors": []}
 
     verified_entries = []
     for entry, file_path in ready_entries:
@@ -1028,8 +1034,68 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Pat
             continue
         if now - stat.st_mtime < minimum_age_seconds:
             return None, "downloaded; waiting for file to settle"
-        return file_path
+        return file_path, "downloaded; ready for verification"
     return None, "waiting for downloaded file"
+
+
+def manifest_wait_status(entry: dict, wait_status: str) -> str:
+    queued_at = entry.get("queued_at")
+    if not queued_at:
+        return wait_status
+    try:
+        queued_at_dt = datetime.fromisoformat(str(queued_at))
+    except ValueError:
+        return wait_status
+    seconds = max(0, int((datetime.now(timezone.utc) - queued_at_dt).total_seconds()))
+    if seconds < 90:
+        elapsed = f"{seconds}s"
+    else:
+        elapsed = f"{seconds // 60}m"
+    return f"{wait_status} ({elapsed})"
+
+
+def update_download_container_statuses(batch: ProposalBatch) -> None:
+    children_by_parent: dict[str, list[ProposalItem]] = {}
+    for item in batch.items:
+        if item.parent_id:
+            children_by_parent.setdefault(item.parent_id, []).append(item)
+
+    def selected_action_descendants(item: ProposalItem) -> list[ProposalItem]:
+        children = children_by_parent.get(item.id, [])
+        if not children:
+            payload = json.loads(item.payload_json or "{}")
+            if item.selected and item.kind == ProposalKind.download and payload.get("action") == "queue_download":
+                return [item]
+            return []
+        descendants: list[ProposalItem] = []
+        for child in children:
+            descendants.extend(selected_action_descendants(child))
+        return descendants
+
+    for item in batch.items:
+        if item.id not in children_by_parent:
+            continue
+        leaves = selected_action_descendants(item)
+        if not leaves:
+            continue
+        statuses = [
+            json.loads(leaf.payload_json or "{}").get("status")
+            or (leaf.status.value if hasattr(leaf.status, "value") else str(leaf.status))
+            for leaf in leaves
+        ]
+        downloaded = sum(1 for status in statuses if "downloaded" in status or "verifying" in status or "verified" in status or "importing" in status)
+        verified = sum(1 for status in statuses if "verified" in status or "importing" in status)
+        failed = sum(1 for status in statuses if "failed" in status or "mismatch" in status or "could not be verified" in status)
+        total = len(leaves)
+        if failed:
+            status = f"{failed} of {total} need attention"
+        elif verified == total:
+            status = "verified; ready to import"
+        elif downloaded:
+            status = f"{downloaded} of {total} downloaded"
+        else:
+            status = f"waiting for downloads ({total} queued)"
+        set_item_payload_status(item, status)
 
 
 def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
