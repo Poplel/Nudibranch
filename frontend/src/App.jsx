@@ -733,6 +733,8 @@ function App() {
     setLoading(true);
     setError("");
     try {
+      setImportDownloadRequests([]);
+      setImportSeedDownloads([]);
       const data = await api("/imports/scan", {
         method: "POST",
         body: JSON.stringify({ path: null }),
@@ -757,6 +759,9 @@ function App() {
       });
       setTasks((current) => upsertTask(current, task));
       setToast({ title: "Import review queued", body: "A review item was added to the task queue." });
+      setImportFiles([]);
+      setImportDownloadRequests([]);
+      setImportSeedDownloads([]);
       setPage("Task Queue");
       window.setTimeout(() => {
         refreshApprovals();
@@ -2115,6 +2120,12 @@ function ImportWizard({
       ...Object.fromEntries(albums.map((album) => [albumRecordKey(album.artist, album.name), album.tracks])),
     }));
   }, [seedKey, seedDownloadRequests]);
+
+  useEffect(() => {
+    if (files.length === 0 && manualAlbums.length === 0) {
+      updateDownloadRequests([]);
+    }
+  }, [files.length, manualAlbums.length, updateDownloadRequests]);
 
   function removeManualAlbum(artist, album) {
     setManualAlbums((current) => current.filter((entry) => entry.artist !== artist || entry.name !== album));
