@@ -158,8 +158,12 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                         "track": title,
                         "track_number": request.get("track_number"),
                         "disc_number": request.get("disc_number"),
+                        "duration_ms": request.get("duration_ms") or request.get("length"),
                         "musicbrainz_album_id": request.get("musicbrainz_album_id"),
                         "musicbrainz_recording_id": request.get("musicbrainz_recording_id"),
+                        "replace_track_id": request.get("replace_track_id"),
+                        "replace_path": request.get("replace_path"),
+                        "require_lossless": request.get("require_lossless"),
                     }
                 ),
             )
@@ -1645,11 +1649,13 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
     known_paths = existing_library_and_proposal_paths(session)
     imported = 0
     for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
-        normalized_metadata = normalize_download_metadata(metadata, entry.get("request") or {})
+        request = entry.get("request") or {}
+        normalized_metadata = normalize_download_metadata(metadata, request)
         normalized_metadata["acoustic_verified"] = not bool(entry.get("acoustid_deferred"))
         write_audio_metadata(file_path, normalized_metadata)
-        target_path = unique_destination(suggest_library_path(normalized_metadata, file_path))
-        if str(target_path) in known_paths:
+        replacement_track = session.get(Track, request.get("replace_track_id")) if request.get("replace_track_id") else None
+        target_path = replacement_target_path(replacement_track, normalized_metadata, file_path)
+        if not replacement_track and str(target_path) in known_paths:
             update_download_manifest_entry(entry, "completed", path=str(file_path), metadata=normalized_metadata)
             continue
         payload = {
@@ -1662,7 +1668,10 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
             "fingerprint": None,
             "suggested_library_path": str(target_path),
         }
-        import_file_to_library(session, file_path, target_path, payload)
+        if replacement_track:
+            replace_library_track_file(session, replacement_track, file_path, target_path, payload)
+        else:
+            import_file_to_library(session, file_path, target_path, payload)
         mark_matching_wishlist_completed(session, normalized_metadata)
         update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
         imported += 1
@@ -1673,6 +1682,44 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
     batch.status = ProposalStatus.completed
     session.flush()
     return imported
+
+
+def replacement_target_path(track: Track | None, metadata: dict, file_path: Path) -> Path:
+    if track and track.path:
+        old_path = Path(track.path)
+        return old_path.with_suffix(file_path.suffix.lower())
+    return unique_destination(suggest_library_path(metadata, file_path))
+
+
+def replace_library_track_file(session: Session, track: Track, source_path: Path, target_path: Path, payload: dict) -> None:
+    settings = get_settings()
+    old_path = Path(track.path) if track.path else None
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if old_path and old_path.exists():
+        settings.trash_path.mkdir(parents=True, exist_ok=True)
+        trash_path = unique_destination(settings.trash_path / old_path.name)
+        shutil.move(str(old_path), str(trash_path))
+    elif target_path.exists():
+        target_path.unlink()
+    moved_old_to_trash = old_path and old_path.exists() is False and "trash_path" in locals() and trash_path.exists()
+    try:
+        shutil.move(str(source_path), str(target_path))
+    except Exception:
+        if moved_old_to_trash:
+            old_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(trash_path), str(old_path))
+        raise
+    metadata = payload.get("metadata", {})
+    track.title = metadata.get("title") or track.title
+    track.track_number = metadata.get("track_number")
+    track.disc_number = metadata.get("disc_number")
+    track.duration_ms = metadata.get("duration_ms")
+    track.format = metadata.get("format")
+    track.bitrate = metadata.get("bitrate")
+    track.path = str(target_path)
+    track.musicbrainz_recording_id = metadata.get("musicbrainz_recording_id")
+    track.is_lossless = metadata.get("is_lossless", False)
+    track.acoustic_verified = bool(metadata.get("acoustic_verified"))
 
 
 def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: dict | None) -> dict:
@@ -1690,6 +1737,10 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
         return {"status": "unknown", "request": request, "message": f"AcoustID did not return a match for {file_path.name}."}
     best = candidates[0]
     candidate_metadata = best.get("metadata") or {}
+    file_metadata = read_audio_metadata(file_path)
+    file_issue = downloaded_file_mismatch_reason(file_metadata, request)
+    if file_issue:
+        return {"status": "mismatch", "request": request, "metadata": candidate_metadata, "message": f"{file_path.name}: {file_issue}"}
     if metadata_matches_request(candidate_metadata, request):
         return {"status": "verified", "request": request, "metadata": verified_download_metadata(candidate_metadata, request)}
     expected = download_query(request)
@@ -1704,6 +1755,38 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
         "metadata": candidate_metadata,
         "message": f"{file_path.name} matched {found or 'a different recording'} instead of {expected or 'the requested track'}.",
     }
+
+
+def downloaded_file_mismatch_reason(metadata: dict, request: dict) -> str | None:
+    expected_duration = request_duration_ms(request)
+    actual_duration = metadata.get("duration_ms")
+    if expected_duration and actual_duration:
+        delta = abs(int(actual_duration) - int(expected_duration))
+        tolerance = max(5000, int(expected_duration * 0.08))
+        if delta > tolerance:
+            return f"duration {round(int(actual_duration) / 1000)}s does not match expected {round(int(expected_duration) / 1000)}s"
+    if request.get("require_lossless") and lossy_or_suspicious_audio(metadata):
+        return "file is not a reliable lossless replacement"
+    return None
+
+
+def request_duration_ms(request: dict) -> int | None:
+    raw = request.get("duration_ms") or request.get("length")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def lossy_or_suspicious_audio(metadata: dict) -> bool:
+    fmt = str(metadata.get("format") or "").casefold()
+    bitrate = int(metadata.get("bitrate") or 0)
+    if fmt in {"mp3", "m4a", "aac", "ogg", "opus", "wma"}:
+        return True
+    if fmt in {"flac", "alac", "wav", "aiff", "aif"} and bitrate and bitrate < 650_000:
+        return True
+    return not metadata.get("is_lossless")
 
 
 def metadata_matches_request(metadata: dict, request: dict) -> bool:
@@ -2504,6 +2587,9 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     source_path = Path(item.old_value or "")
     track = session.get(Track, payload.get("track_id"))
+    if payload.get("action") == "normalize_volume":
+        normalize_audio_file_volume(source_path)
+        return
     if payload.get("action") == "remove_record":
         if not track:
             raise ValueError("Track record no longer exists")
@@ -2532,6 +2618,28 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
         session.delete(track)
         session.flush()
         cleanup_empty_album_artist(session, album)
+
+
+def normalize_audio_file_volume(source_path: Path) -> None:
+    if not source_path.exists():
+        raise FileNotFoundError(f"{source_path} no longer exists")
+    temp_path = source_path.with_name(f".nudibranch-normalized-{source_path.name}")
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source_path),
+        "-af",
+        "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-map_metadata",
+        "0",
+        str(temp_path),
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=3600)
+    backup_path = unique_destination(get_settings().trash_path / source_path.name)
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source_path), str(backup_path))
+    shutil.move(str(temp_path), str(source_path))
 
 
 def unique_destination(path: Path) -> Path:
@@ -3002,7 +3110,20 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
             track_number = track.get("track_number")
             if not track_number or track_number in existing_numbers:
                 continue
-            add_download_request_item(session, batch, artist_items, album_items, album.artist.name, album.title, track.get("title"))
+            add_download_request_item(
+                session,
+                batch,
+                artist_items,
+                album_items,
+                album.artist.name,
+                album.title,
+                track.get("title"),
+                track_number=track.get("track_number"),
+                disc_number=track.get("disc_number"),
+                duration_ms=track.get("length"),
+                musicbrainz_album_id=record.get("musicbrainz_album_id"),
+                musicbrainz_recording_id=track.get("musicbrainz_recording_id"),
+            )
             created += 1
     if created == 0:
         session.delete(batch)
@@ -3024,6 +3145,102 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     return {"albums_checked": checked, "download_items_created": created, "batch_id": batch.id}
 
 
+def run_check_non_lossless(session: Session, _payload: dict) -> dict:
+    tracks = list(session.scalars(select(Track).options(selectinload(Track.album).selectinload(Album.artist)).order_by(Track.title.asc())))
+    batch = ProposalBatch(title="Lossless replacement downloads", kind=ProposalKind.download, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    checked = 0
+    for track in tracks:
+        checked += 1
+        try:
+            metadata = read_audio_metadata(Path(track.path)) if track.path and Path(track.path).exists() else {
+                "format": track.format,
+                "bitrate": track.bitrate,
+                "is_lossless": track.is_lossless,
+            }
+        except Exception:
+            metadata = {"format": track.format, "bitrate": track.bitrate, "is_lossless": False}
+        if not lossy_or_suspicious_audio(metadata):
+            continue
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        add_download_request_item(
+            session,
+            batch,
+            artist_items,
+            album_items,
+            artist_name,
+            album_title,
+            track.title,
+            track_number=track.track_number,
+            disc_number=track.disc_number,
+            duration_ms=track.duration_ms or metadata.get("duration_ms"),
+            musicbrainz_album_id=album.musicbrainz_release_id if album else None,
+            musicbrainz_recording_id=track.musicbrainz_recording_id,
+            replace_track_id=track.id,
+            replace_path=track.path,
+            require_lossless=True,
+        )
+        created += 1
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Lossless check complete",
+            body=f"{checked} tracks checked. No lossy or suspicious files were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Lossless replacement review ready",
+        body=f"{created} replacement downloads were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
+
+
+def run_normalize_volume(session: Session, _payload: dict) -> dict:
+    tracks = list(session.scalars(select(Track).where(Track.path.is_not(None)).order_by(Track.title.asc())))
+    batch = ProposalBatch(title="Normalize library volume", kind=ProposalKind.file_move, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    created = 0
+    for track in tracks:
+        if not track.path or not Path(track.path).exists():
+            continue
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=track.title,
+                kind=ProposalKind.file_move,
+                old_value=track.path,
+                new_value=track.path,
+                payload_json=json.dumps({"action": "normalize_volume", "track_id": track.id, "path": track.path}),
+            )
+        )
+        created += 1
+    if created == 0:
+        session.delete(batch)
+        create_notification(session, title="Volume check complete", body="No library files were found to normalize.", event_type="tool_completed", target_url="/tools")
+        return {"tracks_checked": len(tracks), "items_created": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Volume normalization review ready",
+        body=f"{created} files were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"tracks_checked": len(tracks), "items_created": created, "batch_id": batch.id}
+
+
 def add_download_request_item(
     session: Session,
     batch: ProposalBatch,
@@ -3032,6 +3249,14 @@ def add_download_request_item(
     artist: str,
     album: str,
     track: str | None,
+    track_number: int | None = None,
+    disc_number: int | None = None,
+    duration_ms: int | None = None,
+    musicbrainz_album_id: str | None = None,
+    musicbrainz_recording_id: str | None = None,
+    replace_track_id: str | None = None,
+    replace_path: str | None = None,
+    require_lossless: bool | None = None,
 ) -> None:
     if artist not in artist_items:
         artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
@@ -3063,6 +3288,14 @@ def add_download_request_item(
                     "artist": artist,
                     "album": album,
                     "track": track,
+                    "track_number": track_number,
+                    "disc_number": disc_number,
+                    "duration_ms": duration_ms,
+                    "musicbrainz_album_id": musicbrainz_album_id,
+                    "musicbrainz_recording_id": musicbrainz_recording_id,
+                    "replace_track_id": replace_track_id,
+                    "replace_path": replace_path,
+                    "require_lossless": require_lossless,
                 }
             ),
         )
@@ -3316,6 +3549,8 @@ TASK_HANDLERS = {
     "check_lyrics": run_check_lyrics,
     "check_album_covers": run_check_album_covers,
     "check_missing_tracks": run_check_missing_tracks,
+    "check_non_lossless": run_check_non_lossless,
+    "normalize_volume": run_normalize_volume,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
     "restore_backup": run_restore_backup,
@@ -3411,6 +3646,8 @@ def task_notification_title(task_type: str) -> str:
         "check_lyrics": "Lyrics check",
         "check_album_covers": "Album cover check",
         "check_missing_tracks": "Missing tracks check",
+        "check_non_lossless": "Lossless check",
+        "normalize_volume": "Volume normalization",
         "backup_now": "Backup",
         "restore_default": "Restore",
         "restore_backup": "Restore",
@@ -3425,7 +3662,7 @@ def task_target_url(task_type: str) -> str:
         return "/import"
     if task_type in {"sync_favorites_jellyfin"}:
         return "/playlists"
-    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads"}:
+    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads"}:
         return "/tools"
     return "/activity"
 

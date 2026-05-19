@@ -191,7 +191,10 @@ function App() {
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
       if (hasPermission(user, "notifications:read")) refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
-      if (hasPermission(user, "wishlist:manage_own")) refreshWishlistApprovals();
+      if (hasPermission(user, "wishlist:manage_own")) {
+        refreshWishlist();
+        refreshWishlistApprovals();
+      }
       if (hasPermission(user, "activity:read")) refreshUserPlayback();
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
@@ -668,6 +671,14 @@ function App() {
       setWishlistApprovals(await api("/wishlist/approvals"));
     } catch {
       // Wishlist approval polling is best-effort.
+    }
+  }
+
+  async function refreshWishlist() {
+    try {
+      setWishlist(await api("/wishlist"));
+    } catch {
+      // Wishlist status polling is best-effort.
     }
   }
 
@@ -3549,7 +3560,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
       album.slots.forEach((slot) => {
         if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
         if (isGenericTrackTitle(slot.title)) return;
-        requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number });
+        requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number, duration_ms: slot.length || slot.duration_ms });
       });
     });
   });
@@ -3559,7 +3570,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
     slots.forEach((slot) => {
       if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
       if (isGenericTrackTitle(slot.title)) return;
-      requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number });
+      requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number, duration_ms: slot.length || slot.duration_ms });
     });
   });
   return requests;
@@ -3741,6 +3752,8 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
+    ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
+    ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
@@ -5559,7 +5572,7 @@ function acousticResultMeta(result) {
   if (result.status === "skipped_verified") return "Already verified";
   if (result.status === "changed") {
     const candidateTitle = result.candidate?.title || "different recording";
-    return `Changed: ${candidateTitle}${result.score ? ` ${result.score}%` : ""}`;
+    return `Replacement suggested: ${candidateTitle}${result.score ? ` ${result.score}%` : ""}`;
   }
   if (result.status === "missing_file") return "Missing file";
   if (result.status === "error") return result.error || "Lookup failed";

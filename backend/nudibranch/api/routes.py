@@ -397,14 +397,16 @@ def acoustic_match_library_album(
     for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999, track.title.lower())):
         results.append(acoustic_match_track_result(session, track, force=False))
 
-    batch = queue_acoustic_metadata_fixes(session, results)
+    metadata_batch = queue_acoustic_metadata_fixes(session, results)
+    replacement_batch = queue_acoustic_replacement_downloads(session, results)
     session.commit()
     return {
         "album_id": album.id,
         "album": album.title,
         "tracks": results,
         "queued_changes": sum(1 for result in results if result.get("changes")),
-        "batch_id": batch.id if batch else None,
+        "queued_replacements": sum(1 for result in results if result.get("replacement_request")),
+        "batch_id": metadata_batch.id if metadata_batch else replacement_batch.id if replacement_batch else None,
     }
 
 
@@ -418,10 +420,12 @@ def acoustic_match_library_track(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     result = acoustic_match_track_result(session, track, force=True)
-    batch = queue_acoustic_metadata_fixes(session, [result])
+    metadata_batch = queue_acoustic_metadata_fixes(session, [result])
+    replacement_batch = queue_acoustic_replacement_downloads(session, [result])
     session.commit()
     result["queued_changes"] = 1 if result.get("changes") else 0
-    result["batch_id"] = batch.id if batch else None
+    result["queued_replacements"] = 1 if result.get("replacement_request") else 0
+    result["batch_id"] = metadata_batch.id if metadata_batch else replacement_batch.id if replacement_batch else None
     return result
 
 
@@ -434,6 +438,7 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
         "score": None,
         "candidate": None,
         "changes": {},
+        "replacement_request": None,
         "error": None,
         "acoustic_verified": track.acoustic_verified,
     }
@@ -458,13 +463,15 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
     same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
     same_recording = bool(track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id"))
     matched = same_recording or same_title
-    changes = acoustic_metadata_changes(track, metadata)
+    changes = acoustic_metadata_changes(track, metadata) if matched else {}
+    replacement_request = acoustic_replacement_request(track) if not matched else None
     result.update(
         {
             "status": "matched" if matched else "changed",
             "score": round((candidate.get("score") or 0) * 100),
             "candidate": metadata,
             "changes": changes,
+            "replacement_request": replacement_request,
             "acoustic_verified": track.acoustic_verified,
         }
     )
@@ -482,6 +489,24 @@ def acoustic_metadata_changes(track: Track, metadata: dict) -> dict:
     if not track.acoustic_verified:
         changes["acoustic_verified"] = True
     return changes
+
+
+def acoustic_replacement_request(track: Track) -> dict:
+    return {
+        "action": "wishlist_request",
+        "kind": "track",
+        "artist": track.album.artist.name if track.album and track.album.artist else "Unknown Artist",
+        "album": track.album.title if track.album else "Unknown Album",
+        "track": track.title,
+        "track_number": track.track_number,
+        "disc_number": track.disc_number,
+        "duration_ms": track.duration_ms,
+        "musicbrainz_album_id": track.album.musicbrainz_release_id if track.album else None,
+        "musicbrainz_recording_id": track.musicbrainz_recording_id,
+        "replace_track_id": track.id,
+        "replace_path": track.path,
+        "require_lossless": True,
+    }
 
 
 def queue_acoustic_metadata_fixes(session: Session, results: list[dict]) -> ProposalBatch | None:
@@ -517,6 +542,50 @@ def queue_acoustic_metadata_fixes(session: Session, results: list[dict]) -> Prop
                         "changes": changes,
                     }
                 ),
+            )
+        )
+    session.flush()
+    return batch
+
+
+def queue_acoustic_replacement_downloads(session: Session, results: list[dict]) -> ProposalBatch | None:
+    replacement_results = [result for result in results if result.get("replacement_request")]
+    if not replacement_results:
+        return None
+    batch = ProposalBatch(title="AcoustID replacement downloads", kind=ProposalKind.download, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    for result in replacement_results:
+        request = result["replacement_request"]
+        artist = request.get("artist") or "Unknown Artist"
+        album = request.get("album") or "Unknown Album"
+        if artist not in artist_items:
+            artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+        album_key = (artist, album)
+        if album_key not in album_items:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_items[artist].id,
+                title=album,
+                kind=ProposalKind.download,
+                payload_json=json.dumps({"artist": artist, "album": album}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_items[album_key].id,
+                title=request.get("track") or result.get("title") or "Replacement download",
+                kind=ProposalKind.download,
+                old_value=request.get("replace_path"),
+                payload_json=json.dumps(request),
             )
         )
     session.flush()
@@ -723,6 +792,7 @@ def propose_wishlist_items(
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
     album_items: dict[tuple[str, str], ProposalItem] = {}
+    album_lookup_cache: dict[tuple[str, str], dict | None] = {}
     for wishlist_item in items:
         artist_name = wishlist_item.artist
         album_name = wishlist_item.album or "Singles"
@@ -755,14 +825,10 @@ def propose_wishlist_items(
                 title=wishlist_item.track or wishlist_item.album or wishlist_item.artist,
                 kind=ProposalKind.download,
                 payload_json=json.dumps(
-                    {
+                    wishlist_download_payload(wishlist_item, album_lookup_cache)
+                    | {
                         "user_id": wishlist_item.user_id,
-                        "action": "wishlist_request",
                         "wishlist_item_id": wishlist_item.id,
-                        "kind": wishlist_item.kind,
-                        "artist": wishlist_item.artist,
-                        "album": wishlist_item.album,
-                        "track": wishlist_item.track,
                     }
                 ),
             )
@@ -1212,6 +1278,22 @@ def tool_check_missing_tracks(
     return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
 
 
+@router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"])
+def tool_check_non_lossless(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_non_lossless", {}))
+
+
+@router.post("/tools/normalize-volume", response_model=TaskOut, tags=["tools"])
+def tool_normalize_volume(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "normalize_volume", {}))
+
+
 @router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"])
 def tool_clear_downloads(
     session: Session = Depends(get_session),
@@ -1489,6 +1571,42 @@ def metadata_target_title(target_type: str, target) -> str:
 
 def normalized_music_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def wishlist_download_payload(item: WishlistItem, album_lookup_cache: dict[tuple[str, str], dict | None]) -> dict:
+    payload = {
+        "action": "wishlist_request",
+        "kind": item.kind,
+        "artist": item.artist,
+        "album": item.album,
+        "track": item.track,
+    }
+    if not item.track or not item.album:
+        return payload
+    cache_key = (item.artist, item.album)
+    if cache_key not in album_lookup_cache:
+        try:
+            album_lookup_cache[cache_key] = lookup_album_tracks(item.artist, item.album)
+        except Exception:
+            album_lookup_cache[cache_key] = None
+    record = album_lookup_cache.get(cache_key)
+    if not record:
+        return payload
+    expected_title = normalized_music_name(item.track)
+    for track in record.get("tracks", []):
+        if normalized_music_name(track.get("title")) != expected_title:
+            continue
+        payload.update(
+            {
+                "track_number": track.get("track_number"),
+                "disc_number": track.get("disc_number"),
+                "duration_ms": track.get("length"),
+                "musicbrainz_album_id": track.get("musicbrainz_album_id") or record.get("musicbrainz_album_id"),
+                "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
+            }
+        )
+        break
+    return payload
 
 
 def library_target_tracks(target) -> list[Track]:
