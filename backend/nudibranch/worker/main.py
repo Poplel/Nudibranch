@@ -1458,7 +1458,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         session.commit()
 
     if search_jobs:
-        workers = min(4, len(search_jobs))
+        workers = min(3, len(search_jobs))
         append_task_log(session, task, f"{artist} / {album}: searching {len(search_jobs)} track(s) with {workers} concurrent worker(s)")
         if task is not None:
             update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
@@ -1489,10 +1489,9 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
                 else:
                     retry_tracks += 1
-                    status = "slskd rate limited; retry search" if search_result.get("diagnostics", {}).get("rate_limited") else "needs another slskd search"
+                    status = "slskd rate limited; no candidate yet" if search_result.get("diagnostics", {}).get("rate_limited") else "no slskd candidate found"
                     set_item_payload_status(track_item, status)
                     append_task_log(session, task, f"{track_title}: {status}; YouTube fallback left unselected", "warning")
-                    add_slskd_retry_item(session, batch, track_item, request, query)
                     add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
                 completed_tracks += 1
                 session.commit()
@@ -1529,26 +1528,6 @@ def add_download_candidate_items(session: Session, batch: ProposalBatch, track_i
                 ),
             )
         )
-
-
-def add_slskd_retry_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str) -> None:
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            parent_id=track_item.id,
-            title=f"Retry slskd search: {query}",
-            kind=ProposalKind.download,
-            old_value=query,
-            new_value="slskd retry",
-            payload_json=json.dumps(
-                {
-                    "action": "wishlist_request",
-                    "request": request,
-                    **request,
-                }
-            ),
-        )
-    )
 
 
 def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, selected: bool = True) -> None:
@@ -1813,7 +1792,7 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
         attempted.append(query)
         query_logs.append(f"slskd track search started: {query}")
         result = None
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 result = search_slskd_detailed(
                     slskd_url,
@@ -1826,7 +1805,7 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 )
                 break
             except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
-                if is_rate_limit_error(error) and attempt < 2:
+                if is_rate_limit_error(error) and attempt < 4:
                     rate_limited = True
                     delay = 1.5 * (attempt + 1)
                     query_logs.append(f"slskd track search rate limited: {query}; retrying in {delay:g}s")
@@ -2855,6 +2834,14 @@ async def worker_loop() -> None:
                 handler = TASK_HANDLERS.get(task.type)
                 if not handler:
                     raise ValueError(f"No handler registered for task type {task.type}")
+                create_notification(
+                    session,
+                    title=f"{task_notification_title(task.type)} started",
+                    body="Task is running.",
+                    event_type="task_started",
+                    target_url=task_target_url(task.type),
+                    deliver_apns=False,
+                )
                 if task.type == "execute_proposal_batch":
                     result = handler(session, task_to_payload(task), task)
                 else:
@@ -2879,6 +2866,35 @@ async def worker_loop() -> None:
                     target_url="/activity",
                 )
                 fail_task(session, task, str(error))
+
+
+def task_notification_title(task_type: str) -> str:
+    return {
+        "propose_import": "Import review",
+        "execute_proposal_batch": "Task queue item",
+        "process_wishlist": "Wishlist scan",
+        "sync_favorites_jellyfin": "Playlist sync",
+        "jellyfin_scan": "Jellyfin scan",
+        "check_files": "File check",
+        "check_lyrics": "Lyrics check",
+        "check_album_covers": "Album cover check",
+        "check_missing_tracks": "Missing tracks check",
+        "backup_now": "Backup",
+        "restore_default": "Restore",
+        "restore_backup": "Restore",
+    }.get(task_type, task_type.replace("_", " ").title())
+
+
+def task_target_url(task_type: str) -> str:
+    if task_type in {"execute_proposal_batch"}:
+        return "/task-queue"
+    if task_type in {"propose_import"}:
+        return "/import"
+    if task_type in {"sync_favorites_jellyfin"}:
+        return "/playlists"
+    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "jellyfin_scan", "backup_now", "restore_default", "restore_backup"}:
+        return "/tools"
+    return "/activity"
 
 
 if __name__ == "__main__":

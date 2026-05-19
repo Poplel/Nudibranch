@@ -332,6 +332,9 @@ function App() {
       const taskData = await api("/tasks");
       handleCompletedTaskEffects(taskData);
       setTasks(taskData);
+      if (taskData.some((task) => ["queued", "running"].includes(task.status)) && hasPermission(user, "approvals:manage")) {
+        refreshApprovals();
+      }
     } catch {
       // Task polling should not disrupt the page the user is working in.
     }
@@ -1321,7 +1324,6 @@ function App() {
               <ToolsView
                 tasks={tasks}
                 appLogs={appLogs}
-                notifications={notifications}
                 user={user}
                 backups={backups}
                 onRun={runTool}
@@ -3624,7 +3626,7 @@ function InlineProgress({ value = 0, label = "", indeterminate = false }) {
   );
 }
 
-function ToolsView({ tasks, appLogs, notifications, user, backups, onRun, onFix }) {
+function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
@@ -3636,7 +3638,7 @@ function ToolsView({ tasks, appLogs, notifications, user, backups, onRun, onFix 
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
-  const logs = buildLiveLog(tasks, appLogs, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
+  const logs = buildLiveLog(tasks, appLogs).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
   return (
     <div className="tools-view">
       {tools.length > 0 && (
@@ -4973,7 +4975,7 @@ function latestTaskResult(tasks, type) {
   return tasks.find((task) => task.type === type && task.status === "completed" && task.result) || null;
 }
 
-function buildLiveLog(tasks, appLogs, notifications) {
+function buildLiveLog(tasks, appLogs) {
   const taskEntries = tasks.map((task) => ({
     id: `task:${task.id}`,
     level: task.status === "failed" || task.error || task.result?.errors?.length ? "error" : "info",
@@ -4986,13 +4988,7 @@ function buildLiveLog(tasks, appLogs, notifications) {
     createdAt: entry.created_at,
     text: `[${new Date(entry.created_at).toLocaleString()}] ${entry.message || ""}`,
   }));
-  const notificationEntries = notifications.map((notification) => ({
-    id: `notification:${notification.id}`,
-    level: notification.event_type?.includes("failed") || notification.title?.toLowerCase().includes("failed") ? "error" : "info",
-    createdAt: notification.created_at,
-    text: `[${new Date(notification.created_at).toLocaleString()}] ${notification.title}: ${notification.body}`,
-  }));
-  return [...taskEntries, ...appLogEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return [...taskEntries, ...appLogEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 function notificationSeverity(notification) {
