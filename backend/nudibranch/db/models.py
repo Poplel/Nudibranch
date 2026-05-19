@@ -141,6 +141,7 @@ class Track(Base):
     musicbrainz_recording_id: Mapped[str | None] = mapped_column(String(64), index=True)
     explicit: Mapped[bool | None] = mapped_column(Boolean)
     is_lossless: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    acoustic_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     metadata_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     artwork_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     filename_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

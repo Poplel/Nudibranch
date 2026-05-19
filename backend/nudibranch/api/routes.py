@@ -234,6 +234,7 @@ def library_tree(
                             format=track.format,
                             bitrate=track.bitrate,
                             is_lossless=track.is_lossless,
+                            acoustic_verified=track.acoustic_verified,
                             path=track.path,
                             musicbrainz_recording_id=track.musicbrainz_recording_id,
                             explicit=track.explicit,
@@ -352,48 +353,71 @@ def acoustic_match_library_album(
     if not album:
         raise HTTPException(status_code=404, detail="Album not found")
 
-    api_key = integration_value(session, "acoustid_api_key")
     results = []
     for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999, track.title.lower())):
-        result = {
-            "track_id": track.id,
-            "title": track.title,
-            "track_number": track.track_number,
-            "status": "unmatched",
-            "score": None,
-            "candidate": None,
-            "error": None,
-        }
-        if not track.path or not Path(track.path).exists():
-            result["status"] = "missing_file"
-            result["error"] = "Track file is missing"
-            results.append(result)
-            continue
-        try:
-            candidates = lookup_recording_by_fingerprint({"path": track.path}, api_key)
-        except (ValueError, httpx.HTTPError) as error:
-            result["status"] = "error"
-            result["error"] = str(error)
-            results.append(result)
-            continue
-        candidate = candidates[0] if candidates else None
-        if not candidate:
-            results.append(result)
-            continue
-        metadata = candidate.get("metadata") or {}
-        candidate_title = metadata.get("title") or ""
-        same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
-        same_recording = track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id")
-        result.update(
-            {
-                "status": "matched" if same_recording or same_title else "changed",
-                "score": round((candidate.get("score") or 0) * 100),
-                "candidate": metadata,
-            }
-        )
-        results.append(result)
+        results.append(acoustic_match_track_result(session, track, force=False))
 
+    session.commit()
     return {"album_id": album.id, "album": album.title, "tracks": results}
+
+
+@router.post("/library/tracks/{track_id}/acoustic-match", tags=["library"])
+def acoustic_match_library_track(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    track = session.get(Track, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    result = acoustic_match_track_result(session, track, force=True)
+    session.commit()
+    return result
+
+
+def acoustic_match_track_result(session: Session, track: Track, force: bool = False) -> dict:
+    result = {
+        "track_id": track.id,
+        "title": track.title,
+        "track_number": track.track_number,
+        "status": "unmatched",
+        "score": None,
+        "candidate": None,
+        "error": None,
+        "acoustic_verified": track.acoustic_verified,
+    }
+    if track.acoustic_verified and not force:
+        result["status"] = "skipped_verified"
+        return result
+    if not track.path or not Path(track.path).exists():
+        result["status"] = "missing_file"
+        result["error"] = "Track file is missing"
+        return result
+    try:
+        candidates = lookup_recording_by_fingerprint({"path": track.path}, integration_value(session, "acoustid_api_key"))
+    except (ValueError, RuntimeError, httpx.HTTPError) as error:
+        result["status"] = "error"
+        result["error"] = str(error)
+        return result
+    candidate = candidates[0] if candidates else None
+    if not candidate:
+        track.acoustic_verified = False
+        return result
+    metadata = candidate.get("metadata") or {}
+    candidate_title = metadata.get("title") or ""
+    same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
+    same_recording = bool(track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id"))
+    matched = same_recording or same_title
+    track.acoustic_verified = matched
+    result.update(
+        {
+            "status": "matched" if matched else "changed",
+            "score": round((candidate.get("score") or 0) * 100),
+            "candidate": metadata,
+            "acoustic_verified": track.acoustic_verified,
+        }
+    )
+    return result
 
 
 @router.get("/library/tracks/{track_id}/stream", tags=["library"])

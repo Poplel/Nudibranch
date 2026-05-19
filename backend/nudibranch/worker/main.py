@@ -544,6 +544,7 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
             acoustic_fingerprint=json.dumps(payload.get("fingerprint")) if payload.get("fingerprint") else None,
             musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
             is_lossless=metadata.get("is_lossless", False),
+            acoustic_verified=bool(metadata.get("acoustic_verified")),
         )
     )
 
@@ -1554,6 +1555,7 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
     imported = 0
     for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
         normalized_metadata = normalize_download_metadata(metadata, entry.get("request") or {})
+        normalized_metadata["acoustic_verified"] = not bool(entry.get("acoustid_deferred"))
         write_audio_metadata(file_path, normalized_metadata)
         target_path = unique_destination(suggest_library_path(normalized_metadata, file_path))
         if str(target_path) in known_paths:
@@ -2400,6 +2402,7 @@ def editable_track_fields() -> set[str]:
         "musicbrainz_recording_id",
         "explicit",
         "is_lossless",
+        "acoustic_verified",
         "metadata_locked",
         "artwork_locked",
         "filename_locked",

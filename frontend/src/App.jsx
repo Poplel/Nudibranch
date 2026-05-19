@@ -855,10 +855,30 @@ function App() {
       const counts = countAcousticStatuses(data.tracks || []);
       setToast({
         title: "Album AcoustID check complete",
-        body: `${counts.matched} matched. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed.`,
+        body: `${counts.matched} matched. ${counts.skipped} skipped. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed.`,
       });
     } catch (lookupError) {
       notify("Album AcoustID check failed", lookupError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function checkLibraryTrackAcoustID(track) {
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api(`/library/tracks/${track.id}/acoustic-match`, { method: "POST" });
+      const label = acousticResultMeta(result);
+      setToast({
+        title: "Track AcoustID check complete",
+        body: `${track.title}: ${label}`,
+      });
+      refreshLibrary();
+      return result;
+    } catch (lookupError) {
+      notify("Track AcoustID check failed", lookupError.message, "ui_error");
+      return null;
     } finally {
       setLoading(false);
     }
@@ -1263,6 +1283,7 @@ function App() {
                 artists={library}
                 onCheckAlbum={lookupImportAlbum}
                 onCheckAlbumAcoustID={checkLibraryAlbumAcoustID}
+                onCheckTrackAcoustID={checkLibraryTrackAcoustID}
                 albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
@@ -1505,7 +1526,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrackAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1697,6 +1718,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, albumChecks,
                             playlists={canUsePlaylists ? playlists : []}
                             targetTrackIds={[track.id]}
                             onAddToPlaylist={onAddToPlaylist}
+                            onAcousticCheck={canEditMetadata ? () => onCheckTrackAcoustID(track) : null}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
@@ -3271,6 +3293,7 @@ function trackFields(track) {
     { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id },
     { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
     { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean" },
+    { key: "acoustic_verified", label: "AcoustID verified", value: track.acoustic_verified, type: "boolean" },
     { key: "metadata_locked", label: "Metadata locked", value: track.metadata_locked, type: "boolean" },
     { key: "artwork_locked", label: "Artwork locked", value: track.artwork_locked, type: "boolean" },
     { key: "filename_locked", label: "Filename locked", value: track.filename_locked, type: "boolean" },
@@ -4584,33 +4607,65 @@ function downloadProgressSummary(approvals) {
   const batches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
   const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && isDownloadActionItem(item));
   if (leaves.length === 0) return null;
-  let ready = 0;
+  let downloading = 0;
+  let retried = 0;
+  let finished = 0;
   let failed = 0;
+  let selected = 0;
+  let verifying = 0;
+  let verified = 0;
   let partial = 0;
   for (const item of leaves) {
     const status = itemStatusMeta(item);
     const lower = String(status || "").toLowerCase();
-    if (item.status === "completed" || /downloaded|verifying|verified|importing/.test(lower)) {
-      ready += 1;
-      partial += 100;
-      continue;
-    }
+    const payload = parseJsonObject(item.payload_json);
+    const hasRetried = /retry|retried|replacement|stalled/.test(lower) || (payload.failed_candidates || []).length > 0;
+    if (hasRetried) retried += 1;
     if (item.status === "failed" || /need attention|failed|mismatch|could not be verified/.test(lower)) {
       failed += 1;
       continue;
     }
+    if (item.status === "completed" || /verified|importing|acoustid deferred/.test(lower)) {
+      finished += 1;
+      verified += 1;
+      partial += 100;
+      continue;
+    }
+    if (/downloaded|verifying/.test(lower)) {
+      finished += 1;
+      if (/verifying/.test(lower)) verifying += 1;
+      partial += 100;
+      continue;
+    }
+    if (/candidate ready|candidate|pending/.test(lower) || item.status === "pending" || item.status === "approved") {
+      selected += 1;
+      continue;
+    }
     const progress = downloadStatusProgress(status);
-    partial += progress && !progress.indeterminate ? progress.value : 0;
+    if (progress) {
+      downloading += 1;
+      partial += progress.indeterminate ? 0 : progress.value;
+      continue;
+    }
+    selected += 1;
   }
   const total = leaves.length;
-  const waiting = Math.max(0, total - ready - failed);
-  if (ready === total && failed === 0) return null;
+  if (verified === total && failed === 0) return null;
   const percent = total ? partial / total : 0;
+  const notStarted = selected === total && downloading === 0 && finished === 0 && failed === 0;
+  const verificationPending = finished === total && verified < total && failed === 0;
+  const label = notStarted
+    ? `${selected} selected candidates`
+    : verificationPending
+      ? `Verification pending for ${total} downloads`
+      : verifying > 0
+        ? `Verifying ${verified}/${total}`
+        : `${finished}/${total} finished`;
   return {
     percent,
-    indeterminate: waiting > 0 && partial === 0,
-    label: failed ? `${ready}/${total} ready, ${failed} need attention` : `${ready}/${total} ready`,
-    detail: `${waiting} waiting · ${ready} ready · ${failed} need attention`,
+    indeterminate: !notStarted && downloading > 0 && partial === 0,
+    label,
+    detail: `${downloading} downloading · ${retried} retried · ${finished} finished · ${failed} failed`,
   };
 }
 
@@ -4621,7 +4676,7 @@ function downloadStatusProgress(status) {
   if (match) {
     return { value: Number(match[1]), label: text, indeterminate: false };
   }
-  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete/i.test(text)) {
+  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete|verifying with acoustid/i.test(text)) {
     return { value: 0, label: text, indeterminate: true };
   }
   return null;
@@ -5180,17 +5235,19 @@ function countAcousticStatuses(results) {
   return results.reduce(
     (counts, result) => {
       if (result.status === "matched") counts.matched += 1;
+      else if (result.status === "skipped_verified") counts.skipped += 1;
       else if (result.status === "changed") counts.changed += 1;
       else if (result.status === "unmatched") counts.unmatched += 1;
       else counts.failed += 1;
       return counts;
     },
-    { matched: 0, changed: 0, unmatched: 0, failed: 0 },
+    { matched: 0, changed: 0, unmatched: 0, failed: 0, skipped: 0 },
   );
 }
 
 function acousticResultMeta(result) {
   if (result.status === "matched") return `Matched${result.score ? ` ${result.score}%` : ""}`;
+  if (result.status === "skipped_verified") return "Already verified";
   if (result.status === "changed") {
     const candidateTitle = result.candidate?.title || "different recording";
     return `Changed: ${candidateTitle}${result.score ? ` ${result.score}%` : ""}`;

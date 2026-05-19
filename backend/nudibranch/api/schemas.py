@@ -56,6 +56,7 @@ class LibraryTreeTrack(BaseModel):
     format: str | None = None
     bitrate: int | None = None
     is_lossless: bool = False
+    acoustic_verified: bool = False
     path: str | None = None
     musicbrainz_recording_id: str | None = None
     explicit: bool | None = None
