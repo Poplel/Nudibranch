@@ -29,8 +29,15 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
         "fingerprint": fingerprint.get("fingerprint"),
         "meta": "recordings releasegroups releases tracks",
     }
-    response = httpx.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20, headers={"User-Agent": USER_AGENT})
-    response.raise_for_status()
+    try:
+        response = httpx.post("https://api.acoustid.org/v2/lookup", data=params, timeout=20, headers={"User-Agent": USER_AGENT})
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        status = error.response.status_code
+        detail = error.response.text.strip()[:240]
+        raise RuntimeError(f"AcoustID lookup request failed ({status}){': ' + detail if detail else ''}") from error
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"AcoustID lookup request failed: {error}") from error
     payload = response.json()
     if payload.get("status") == "error":
         error = payload.get("error") or {}

@@ -963,6 +963,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         return {"imported": 0, "errors": [], "waiting": waiting_count, "ready": len(ready_entries), "failed": failed_count}
 
     verified_entries = []
+    deferred_acoustid_messages: list[str] = []
     for entry, file_path in ready_entries:
         if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
             verified_entries.append((entry, Path(entry["path"]), entry["metadata"]))
@@ -974,6 +975,15 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             handle_download_mismatch(session, batch, entry, file_path, verification)
             return {"imported": 0, "errors": [verification["message"]], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         if verification["status"] != "verified":
+            if verification["status"] == "deferred":
+                message = verification.get("message") or f"AcoustID check was deferred for {file_path.name}."
+                metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
+                update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata, acoustid_deferred=message)
+                set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "AcoustID deferred; waiting for batch import")
+                append_task_log(session, None, message, "warning")
+                deferred_acoustid_messages.append(message)
+                verified_entries.append((entry, file_path, metadata))
+                continue
             message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
             handle_download_verification_issue(session, batch, entry, file_path, message, verification)
             return {"imported": 0, "errors": [message], "waiting": 0, "ready": len(ready_entries), "failed": 1}
@@ -986,6 +996,14 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         for entry, _file_path, _metadata in verified_entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch")
         imported = import_verified_download_batch(session, batch, verified_entries)
+        if deferred_acoustid_messages:
+            create_notification(
+                session,
+                title="AcoustID check deferred",
+                body=f"{len(deferred_acoustid_messages)} downloaded tracks were imported and should be checked later.",
+                event_type="tool_warning",
+                target_url="/tools",
+            )
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
         batch.status = ProposalStatus.failed
         create_notification(
@@ -1573,8 +1591,8 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
         return {"status": "unknown", "request": request, "message": "AcoustID API key is required before downloaded batches can be verified."}
     try:
         candidates = lookup_recording_by_fingerprint({"path": str(file_path)}, api_key)
-    except Exception as error:  # noqa: BLE001 - verification should not block an otherwise usable download when AcoustID is unavailable.
-        return {"status": "unknown", "request": request, "error": str(error), "message": f"AcoustID lookup failed for {file_path.name}: {error}"}
+    except Exception as error:  # noqa: BLE001 - service/request failures should not block an otherwise usable download.
+        return {"status": "deferred", "request": request, "error": str(error), "message": f"AcoustID lookup deferred for {file_path.name}: {error}"}
     if not candidates:
         return {"status": "unknown", "request": request, "message": f"AcoustID did not return a match for {file_path.name}."}
     best = candidates[0]

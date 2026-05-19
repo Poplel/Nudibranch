@@ -1380,6 +1380,7 @@ function App() {
             queueItemCount={queueItemCount}
             queueSelectionCount={queueSelectionCount}
             tasks={tasks}
+            downloadProgress={downloadProgressSummary(approvals)}
             importActions={{
               onScan: scanImportFolder,
               onToggleAlbumSearch: () => setImportAlbumSearchOpen((value) => !value),
@@ -4058,7 +4059,7 @@ function SettingsPanel({
   );
 }
 
-function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, importActions, wishlistActions, playlistActions }) {
+function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, downloadProgress, importActions, wishlistActions, playlistActions }) {
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
@@ -4109,6 +4110,13 @@ function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tas
             <RefreshCw size={16} />
             Sync playlists
           </button>
+        </div>
+      )}
+      {downloadProgress && (
+        <div className="inspector-progress-card">
+          <strong>Downloads</strong>
+          <InlineProgress value={downloadProgress.percent} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} />
+          <small>{downloadProgress.detail}</small>
         </div>
       )}
       <ActiveWorkBar tasks={tasks} />
@@ -4559,6 +4567,40 @@ function itemStatusMeta(item) {
   if (item.status === "failed") return "needs attention";
   if (item.status === "rejected") return "rejected";
   return item.kind;
+}
+
+function downloadProgressSummary(approvals) {
+  const batches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
+  const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && isDownloadActionItem(item));
+  if (leaves.length === 0) return null;
+  let ready = 0;
+  let failed = 0;
+  let partial = 0;
+  for (const item of leaves) {
+    const status = itemStatusMeta(item);
+    const lower = String(status || "").toLowerCase();
+    if (item.status === "completed" || /downloaded|verifying|verified|importing/.test(lower)) {
+      ready += 1;
+      partial += 100;
+      continue;
+    }
+    if (item.status === "failed" || /need attention|failed|mismatch|could not be verified/.test(lower)) {
+      failed += 1;
+      continue;
+    }
+    const progress = downloadStatusProgress(status);
+    partial += progress && !progress.indeterminate ? progress.value : 0;
+  }
+  const total = leaves.length;
+  const waiting = Math.max(0, total - ready - failed);
+  if (ready === total && failed === 0) return null;
+  const percent = total ? partial / total : 0;
+  return {
+    percent,
+    indeterminate: waiting > 0 && partial === 0,
+    label: failed ? `${ready}/${total} ready, ${failed} need attention` : `${ready}/${total} ready`,
+    detail: `${waiting} waiting · ${ready} ready · ${failed} need attention`,
+  };
 }
 
 function downloadStatusProgress(status) {

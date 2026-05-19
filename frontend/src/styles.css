@@ -529,6 +529,25 @@ nav button:hover,
   grid-template-columns: minmax(0, 1fr);
 }
 
+.inspector-progress-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.inspector-progress-card strong {
+  font-size: 12px;
+}
+
+.inspector-progress-card small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
 .file-row {
   grid-template-columns: 18px minmax(0, 1fr) auto;
 }
