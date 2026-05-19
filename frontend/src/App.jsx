@@ -3677,6 +3677,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
+    ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 

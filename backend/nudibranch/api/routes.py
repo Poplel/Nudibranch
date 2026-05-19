@@ -1102,6 +1102,14 @@ def tool_check_missing_tracks(
     return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
 
 
+@router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"])
+def tool_clear_downloads(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.downloads_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "clear_downloads", {}))
+
+
 @router.post("/tools/backup", response_model=TaskOut, tags=["tools"])
 def tool_backup(
     session: Session = Depends(get_session),

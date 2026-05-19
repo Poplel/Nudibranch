@@ -29,6 +29,7 @@ MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 150
 STALLED_PROGRESS_RETRY_SECONDS = 300
 MISSING_TRANSFER_RETRY_SECONDS = 240
+TRANSFER_COMPLETE_PERCENT = 99.5
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -1153,15 +1154,35 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
     if transfer_is_failed(transfer):
         detail = f": {error}" if error else f": {status}" if status else ""
         return f"slskd transfer failed{detail}"
-    percent = transfer.get("percent")
-    if isinstance(percent, (int, float)):
-        bounded = max(0, min(100, percent))
-        return f"downloading {bounded:.0f}%"
+    if transfer_is_complete_or_finishing(transfer):
+        return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
+    percent = transfer_percent(transfer)
+    if percent is not None:
+        return f"downloading {percent:.0f}%"
     if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
         return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
     if status:
         return manifest_wait_status(entry, f"slskd {status}; waiting for downloaded file")
     return manifest_wait_status(entry, fallback)
+
+
+def transfer_percent(transfer: dict | None) -> float | None:
+    if not transfer:
+        return None
+    percent = transfer.get("percent")
+    if not isinstance(percent, (int, float)):
+        return None
+    return max(0, min(100, float(percent)))
+
+
+def transfer_is_complete_or_finishing(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    status = str(transfer.get("status") or "").casefold()
+    if status in {"complete", "completed", "succeeded"} or "complete" in status:
+        return True
+    percent = transfer_percent(transfer)
+    return percent is not None and percent >= TRANSFER_COMPLETE_PERCENT
 
 
 def transfer_is_failed(transfer: dict | None) -> bool:
@@ -1179,13 +1200,14 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
         error = transfer.get("error") if transfer else None
         status = transfer.get("status") if transfer else None
         return f"transfer failed: {error or status or 'unknown error'}"
+    if transfer_is_complete_or_finishing(transfer):
+        return None
     age = manifest_entry_age_seconds(entry)
     if not transfer and age >= MISSING_TRANSFER_RETRY_SECONDS:
         return "slskd transfer disappeared before the file arrived"
-    percent = transfer.get("percent") if transfer else None
-    if not isinstance(percent, (int, float)):
+    percent = transfer_percent(transfer)
+    if percent is None:
         return None
-    percent = max(0, min(100, float(percent)))
     last_percent = manifest_float(entry.get("last_transfer_percent"))
     last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
     if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
@@ -3022,6 +3044,38 @@ def run_restore_backup(session: Session, payload: dict) -> dict:
     return {"restored_from": str(backup_path), "pre_restore_backup": pre_restore.get("backup_path")}
 
 
+def run_clear_downloads(session: Session, _payload: dict) -> dict:
+    root = get_settings().downloads_path
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = download_manifest_path().resolve()
+    removed_files = 0
+    removed_dirs = 0
+    errors: list[str] = []
+    for path in sorted(root.rglob("*"), key=lambda candidate: len(candidate.parts), reverse=True):
+        try:
+            if path.resolve() == manifest_path:
+                continue
+            if path.is_file():
+                path.unlink()
+                removed_files += 1
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                    removed_dirs += 1
+                except OSError:
+                    continue
+        except OSError as error:
+            errors.append(f"{path}: {error}")
+    create_notification(
+        session,
+        title="Downloads folder cleared",
+        body=f"{removed_files} files removed.",
+        event_type="tool_completed" if not errors else "tool_warning",
+        target_url="/tools",
+    )
+    return {"removed_files": removed_files, "removed_dirs": removed_dirs, "errors": errors}
+
+
 def first_admin_id(session: Session) -> str:
     admin_id = session.scalar(select(User.id).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
     if not admin_id:
@@ -3187,6 +3241,7 @@ TASK_HANDLERS = {
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
     "restore_backup": run_restore_backup,
+    "clear_downloads": run_clear_downloads,
 }
 
 
@@ -3281,6 +3336,7 @@ def task_notification_title(task_type: str) -> str:
         "backup_now": "Backup",
         "restore_default": "Restore",
         "restore_backup": "Restore",
+        "clear_downloads": "Clear downloads",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
@@ -3291,7 +3347,7 @@ def task_target_url(task_type: str) -> str:
         return "/import"
     if task_type in {"sync_favorites_jellyfin"}:
         return "/playlists"
-    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "jellyfin_scan", "backup_now", "restore_default", "restore_backup"}:
+    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads"}:
         return "/tools"
     return "/activity"
 
