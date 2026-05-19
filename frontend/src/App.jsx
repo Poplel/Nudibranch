@@ -192,7 +192,7 @@ function App() {
       if (hasPermission(user, "notifications:read")) refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
       if (hasPermission(user, "wishlist:manage_own")) refreshWishlistApprovals();
-      if (canManageUsers(user)) refreshUserPlayback();
+      if (hasPermission(user, "activity:read")) refreshUserPlayback();
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
   }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || []), activeWork]);
@@ -314,10 +314,8 @@ function App() {
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
-      if (canManageUsers(me)) {
-        refreshUsers();
-        refreshUserPlayback();
-      }
+      if (canManageUsers(me)) refreshUsers();
+      if (hasPermission(me, "activity:read")) refreshUserPlayback();
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
         setError("");
@@ -442,7 +440,7 @@ function App() {
     try {
       setUserPlayback(await api("/users/playback"));
     } catch {
-      // Playback visibility is only available to users who can manage users.
+      // Playback visibility is only available to users with activity access.
     }
   }
 
@@ -1361,7 +1359,7 @@ function App() {
                 onDownloadRequestsChange={setImportDownloadRequests}
               />
             )}
-            {page === "Activity" && <TasksView tasks={tasks} onCancel={cancelTask} />}
+            {page === "Activity" && <TasksView tasks={tasks} playback={userPlayback} onCancel={cancelTask} />}
             {page === "Settings" && (
               <SettingsPanel
                 accentColor={accentColor}
@@ -1422,7 +1420,6 @@ function App() {
                 users={users}
                 permissions={permissionCatalog}
                 currentUser={user}
-                playback={userPlayback}
                 canManage={canManageUsers(user)}
                 onCreate={createUserAccount}
                 onUpdate={updateUserAccount}
@@ -3627,33 +3624,45 @@ function artistGhostSlots(artist, dismissedGhosts) {
   return artist.albums.flatMap((album) => album.slots.filter((slot) => !slot.file && !dismissedGhosts.has(slot.id)));
 }
 
-function TasksView({ tasks, onCancel }) {
+function TasksView({ tasks, playback, onCancel }) {
   const [openTasks, setOpenTasks] = useState(() => new Set());
-  if (tasks.length === 0) {
-    return <EmptyState title="No activity" body="Scans, queued changes, downloads, and notifications will appear here." />;
-  }
+  const nowPlaying = activePlaybackRows(playback);
 
   return (
-    <div className="task-list">
-      {tasks.map((task) => (
-        <section className="task-entry" key={task.id}>
-          <button className="task-row" onClick={() => toggleSet(setOpenTasks, task.id)}>
-            <strong>{task.type}</strong>
-            <span>{task.status}</span>
-            <small>{taskSummary(task)}</small>
-            <TaskProgress task={task} />
-          </button>
-          {["queued", "running"].includes(task.status) && (
-            <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
-              <X size={14} />
-              Cancel
-            </button>
-          )}
-          {openTasks.has(task.id) && (
-            <pre className="task-detail">{JSON.stringify({ payload: task.payload, result: task.result, error: task.error }, null, 2)}</pre>
-          )}
+    <div className="activity-view">
+      {nowPlaying.length > 0 && (
+        <section className="now-playing-strip">
+          <h2>Now playing</h2>
+          <div className="now-playing-list">
+            {nowPlaying.map((row, index) => <PlaybackRow row={row} key={`${row.source}:${row.user_name}:${row.title}:${index}`} />)}
+          </div>
         </section>
-      ))}
+      )}
+      {tasks.length === 0 ? (
+        <EmptyState title="No activity" body="Scans, queued changes, downloads, and notifications will appear here." />
+      ) : (
+        <div className="task-list">
+          {tasks.map((task) => (
+            <section className="task-entry" key={task.id}>
+              <button className="task-row" onClick={() => toggleSet(setOpenTasks, task.id)}>
+                <strong>{task.type}</strong>
+                <span>{task.status}</span>
+                <small>{taskSummary(task)}</small>
+                <TaskProgress task={task} />
+              </button>
+              {["queued", "running"].includes(task.status) && (
+                <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
+                  <X size={14} />
+                  Cancel
+                </button>
+              )}
+              {openTasks.has(task.id) && (
+                <pre className="task-detail">{JSON.stringify({ payload: task.payload, result: task.result, error: task.error }, null, 2)}</pre>
+              )}
+            </section>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -3820,7 +3829,7 @@ function CheckFilesResult({ result, onFix }) {
   );
 }
 
-function UsersView({ users, permissions, currentUser, playback, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
+function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
   const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
@@ -3841,9 +3850,6 @@ function UsersView({ users, permissions, currentUser, playback, canManage, onCre
 
   return (
     <div className="users-view">
-      {canManage && (
-        <PlaybackPanel playback={playback} />
-      )}
       {canManage && (
         <form className="user-create-panel" onSubmit={submitNewUser}>
           <h2>Create user</h2>
@@ -3889,40 +3895,18 @@ function UsersView({ users, permissions, currentUser, playback, canManage, onCre
   );
 }
 
-function PlaybackPanel({ playback }) {
-  const appRows = playback?.app || [];
-  const jellyfinRows = playback?.jellyfin || [];
-  return (
-    <section className="user-create-panel playback-panel">
-      <h2>Now playing</h2>
-      <div className="playback-columns">
-        <div>
-          <h3>In app</h3>
-          {appRows.length === 0 ? (
-            <p className="user-note">No app playback reported.</p>
-          ) : (
-            appRows.map((row) => <PlaybackRow row={row} key={`app:${row.user_id}`} />)
-          )}
-        </div>
-        <div>
-          <h3>Jellyfin</h3>
-          {jellyfinRows.length === 0 ? (
-            <p className="user-note">No Jellyfin playback reported.</p>
-          ) : (
-            jellyfinRows.map((row, index) => <PlaybackRow row={row} key={`jellyfin:${row.user_name}:${index}`} />)
-          )}
-        </div>
-      </div>
-    </section>
-  );
-}
-
 function PlaybackRow({ row }) {
+  const location = [row.source, row.client || row.device_name].filter(Boolean).join(" / ");
+  const meta = [
+    row.title,
+    row.artist,
+    row.album,
+  ].filter(Boolean).join(" · ");
   return (
     <div className="playback-row">
       <strong>{row.user_name}</strong>
-      <span>{row.status || "stopped"}</span>
-      <small>{row.title ? `${row.title}${row.artist ? ` · ${row.artist}` : ""}${row.album ? ` / ${row.album}` : ""}` : "Nothing playing"}</small>
+      <span>{[location, row.status || "stopped"].filter(Boolean).join(" · ")}</span>
+      <small>{meta || "Nothing playing"}</small>
     </div>
   );
 }
@@ -4137,10 +4121,10 @@ function SettingsPanel({
                 </select>
               ) : key === "favorite_playlist_id" ? (
                 <select
-                  value={integrationDraft[key] || favoritePlaylistFrom(playlists)?.id || ""}
+                  value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
                 >
-                  <option value="">Auto detect</option>
+                  <option value="">Default Favorites</option>
                   {(playlists || []).map((playlist) => (
                     <option key={playlist.id} value={playlist.id}>
                       {playlist.name}
@@ -5095,9 +5079,14 @@ function upsertUser(users, user) {
 function favoritePlaylistFrom(playlists) {
   return (
     playlists.find((playlist) => playlist.protected) ||
-    playlists.find((playlist) => playlist.name === "Favorite songs") ||
     playlists.find((playlist) => playlist.name === "Favorites") ||
     null
+  );
+}
+
+function activePlaybackRows(playback) {
+  return [...(playback?.app || []), ...(playback?.jellyfin || [])].filter((row) =>
+    row?.title && ["playing", "paused"].includes(String(row.status || "").toLowerCase()),
   );
 }
 

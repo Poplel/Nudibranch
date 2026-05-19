@@ -235,7 +235,7 @@ def update_player_status(
 @router.get("/users/playback", tags=["users"])
 def users_playback(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.users_manage)),
+    _: User = Depends(require_permission(Permission.activity_read)),
 ) -> dict:
     users = list(session.scalars(select(User).options(selectinload(User.player_state)).order_by(User.created_at.asc())))
     return {
@@ -1322,6 +1322,7 @@ def update_integrations(
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> IntegrationSettings:
     update_integration_settings(session, payload.model_dump())
+    set_app_setting(session, "favorite_playlist_explicit", "1" if payload.favorite_playlist_id else "0")
     get_or_create_favorites(session)
     session.commit()
     return IntegrationSettings(**integration_settings(session))
@@ -1440,11 +1441,9 @@ def remove_action_title(action: str) -> str:
 def get_or_create_favorites(session: Session) -> Playlist:
     configured_setting = session.get(AppSetting, "favorite_playlist_id")
     configured_id = configured_setting.value if configured_setting else ""
-    playlist = session.get(Playlist, configured_id) if configured_id else None
-    if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorite songs"))
-    if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)).order_by(Playlist.name.asc()))
+    explicit_setting = session.get(AppSetting, "favorite_playlist_explicit")
+    explicit_favorite = explicit_setting and explicit_setting.value == "1"
+    playlist = session.get(Playlist, configured_id) if explicit_favorite and configured_id else None
     if not playlist:
         playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
@@ -1459,12 +1458,16 @@ def mark_favorite_playlist(session: Session, playlist: Playlist) -> None:
     for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
         protected_playlist.protected = False
     playlist.protected = True
-    setting = session.get(AppSetting, "favorite_playlist_id")
+    session.flush()
+
+
+def set_app_setting(session: Session, key: str, value: str) -> None:
+    setting = session.get(AppSetting, key)
     if not setting:
-        setting = AppSetting(key="favorite_playlist_id", value=playlist.id)
+        setting = AppSetting(key=key, value=value)
         session.add(setting)
     else:
-        setting.value = playlist.id
+        setting.value = value
     session.flush()
 
 
@@ -1530,7 +1533,7 @@ def serialize_user(user: User) -> UserOut:
 def serialize_player_state(user: User) -> dict:
     state = user.player_state
     if not state:
-        return {"user_id": user.id, "user_name": user.display_name, "status": "stopped"}
+        return {"user_id": user.id, "user_name": user.display_name, "status": "stopped", "source": "Nudibranch"}
     updated_at = state.updated_at
     if updated_at and updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)
@@ -1543,6 +1546,7 @@ def serialize_player_state(user: User) -> dict:
         "artist": state.artist,
         "album": state.album,
         "status": "stopped" if stale else state.status,
+        "source": "Nudibranch",
         "queue_length": state.queue_length,
         "current_index": state.current_index,
         "position_seconds": state.position_seconds,
@@ -1576,6 +1580,7 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
                 "artist": ", ".join(now_playing.get("Artists") or []),
                 "album": now_playing.get("Album"),
                 "status": "playing" if not (item.get("PlayState") or {}).get("IsPaused") else "paused",
+                "source": "Jellyfin",
             }
         )
     return sessions

@@ -1082,6 +1082,31 @@ nav button:hover,
   font-size: 13px;
 }
 
+.activity-view {
+  display: grid;
+  gap: 10px;
+}
+
+.now-playing-strip {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 10px;
+  background: var(--panel-strong);
+}
+
+.now-playing-strip h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.now-playing-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
 .playback-columns {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));

@@ -32,6 +32,9 @@ def integration_settings(session: Session) -> dict[str, str]:
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value
+    explicit_favorite = session.get(AppSetting, "favorite_playlist_explicit")
+    if not explicit_favorite or explicit_favorite.value != "1":
+        values["favorite_playlist_id"] = ""
     return values
 
 

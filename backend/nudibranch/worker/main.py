@@ -3096,11 +3096,9 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
 def ensure_favorites_playlist(session: Session) -> Playlist:
     configured_setting = session.get(AppSetting, "favorite_playlist_id")
     configured_id = configured_setting.value if configured_setting else ""
-    playlist = session.get(Playlist, configured_id) if configured_id else None
-    if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorite songs"))
-    if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)).order_by(Playlist.name.asc()))
+    explicit_setting = session.get(AppSetting, "favorite_playlist_explicit")
+    explicit_favorite = explicit_setting and explicit_setting.value == "1"
+    playlist = session.get(Playlist, configured_id) if explicit_favorite and configured_id else None
     if not playlist:
         playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
@@ -3110,12 +3108,6 @@ def ensure_favorites_playlist(session: Session) -> Playlist:
     for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
         protected_playlist.protected = False
     playlist.protected = True
-    setting = session.get(AppSetting, "favorite_playlist_id")
-    if not setting:
-        setting = AppSetting(key="favorite_playlist_id", value=playlist.id)
-        session.add(setting)
-    else:
-        setting.value = playlist.id
     session.flush()
     return playlist
 
