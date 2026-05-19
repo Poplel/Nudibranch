@@ -4947,6 +4947,9 @@ function proposalTaskSummary(result) {
   if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);
+  if (parts.length === 0 && Array.isArray(result.logs) && result.logs.length > 0) {
+    return result.logs[result.logs.length - 1]?.message || "Working";
+  }
   return parts.length ? parts.join(", ") : "No changes applied";
 }
 
@@ -4961,13 +4964,21 @@ function buildLiveLog(tasks, notifications) {
     createdAt: task.updated_at || task.created_at,
     text: `[${new Date(task.updated_at || task.created_at).toLocaleString()}] ${task.type} ${task.status}: ${taskSummary(task)}`,
   }));
+  const taskLogEntries = tasks.flatMap((task) =>
+    (Array.isArray(task.result?.logs) ? task.result.logs : []).map((entry, index) => ({
+      id: `task-log:${task.id}:${index}`,
+      level: entry.level || "info",
+      createdAt: entry.created_at || task.updated_at || task.created_at,
+      text: `[${new Date(entry.created_at || task.updated_at || task.created_at).toLocaleString()}] ${task.type}: ${entry.message || ""}`,
+    })),
+  );
   const notificationEntries = notifications.map((notification) => ({
     id: `notification:${notification.id}`,
     level: notification.event_type?.includes("failed") || notification.title?.toLowerCase().includes("failed") ? "error" : "info",
     createdAt: notification.created_at,
     text: `[${new Date(notification.created_at).toLocaleString()}] ${notification.title}: ${notification.body}`,
   }));
-  return [...taskEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return [...taskEntries, ...taskLogEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 function notificationSeverity(notification) {

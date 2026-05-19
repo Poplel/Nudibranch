@@ -1,6 +1,7 @@
 import json
 import socket
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
@@ -83,6 +84,7 @@ def claim_next_task(session: Session, lease_seconds: int = 300) -> Task | None:
 
 def complete_task(session: Session, task: Task, result: dict) -> None:
     task.status = TaskStatus.completed
+    result = merge_task_logs(task, result)
     task.result_json = json.dumps(result)
     task.error = None
     task.lease_until = None
@@ -90,17 +92,17 @@ def complete_task(session: Session, task: Task, result: dict) -> None:
 
 
 def update_task_progress(session: Session, task: Task, current: int, total: int, message: str, **extra: object) -> None:
-    task.result_json = json.dumps(
-        {
-            "progress": {
-                "current": current,
-                "total": total,
-                "percent": round((current / total) * 100, 1) if total else 0,
-                "message": message,
-                **extra,
-            }
-        }
-    )
+    payload = task_result(task) or {}
+    progress = {
+        "current": current,
+        "total": total,
+        "percent": round((current / total) * 100, 1) if total else 0,
+        "message": message,
+        **extra,
+    }
+    payload["progress"] = progress
+    payload["logs"] = append_log_entry(payload.get("logs"), message, "info", {"progress": progress})
+    task.result_json = json.dumps(payload)
     session.commit()
 
 
@@ -109,6 +111,36 @@ def fail_task(session: Session, task: Task, error: str) -> None:
     task.error = error
     task.lease_until = None
     session.commit()
+
+
+def append_task_log(session: Session, task: Task | None, message: str, level: str = "info", **context: Any) -> None:
+    if task is None:
+        return
+    payload = task_result(task) or {}
+    payload["logs"] = append_log_entry(payload.get("logs"), message, level, context)
+    task.result_json = json.dumps(payload)
+    session.commit()
+
+
+def append_log_entry(existing: Any, message: str, level: str = "info", context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    logs = existing if isinstance(existing, list) else []
+    if logs and isinstance(logs[-1], dict) and logs[-1].get("message") == message and logs[-1].get("level") == level:
+        return logs
+    entry = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "level": level,
+        "message": message,
+    }
+    if context:
+        entry["context"] = context
+    return [*logs, entry][-300:]
+
+
+def merge_task_logs(task: Task, result: dict) -> dict:
+    existing = task_result(task) or {}
+    if existing.get("logs") and "logs" not in result:
+        result = {**result, "logs": existing["logs"]}
+    return result
 
 
 def cancel_task(session: Session, task_id: str) -> Task:
