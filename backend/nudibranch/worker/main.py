@@ -1351,7 +1351,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     session.commit()
 
     slskd_tracks = 0
-    fallback_tracks = 0
+    retry_tracks = 0
     diagnostic_lines = []
     append_task_log(session, task, f"{artist} / {album}: searching slskd for an album folder")
     folder_pool = search_album_folder_pool(session, artist, album, requests, task)
@@ -1392,7 +1392,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         session.commit()
 
     if search_jobs:
-        workers = min(8, len(search_jobs))
+        workers = min(4, len(search_jobs))
         append_task_log(session, task, f"{artist} / {album}: searching {len(search_jobs)} track(s) with {workers} concurrent worker(s)")
         if task is not None:
             update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
@@ -1422,20 +1422,22 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     set_item_payload_status(track_item, "candidate ready")
                     append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
                 else:
-                    fallback_tracks += 1
-                    set_item_payload_status(track_item, "fallback ready")
-                    append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback prepared", "warning")
-                    add_ytdlp_fallback_item(session, batch, track_item, request, query)
+                    retry_tracks += 1
+                    status = "slskd rate limited; retry search" if search_result.get("diagnostics", {}).get("rate_limited") else "needs another slskd search"
+                    set_item_payload_status(track_item, status)
+                    append_task_log(session, task, f"{track_title}: {status}; YouTube fallback left unselected", "warning")
+                    add_slskd_retry_item(session, batch, track_item, request, query)
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
                 completed_tracks += 1
                 session.commit()
                 if task is not None:
                     update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
     session.flush()
-    append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {fallback_tracks} fallback track(s)")
+    append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing retry")
     create_notification(
         session,
         title="Download candidates ready",
-        body=f"{album}: {slskd_tracks} tracks with slskd candidates. {fallback_tracks} tracks using YouTube fallback. {' '.join(diagnostic_lines[:3])}",
+        body=f"{album}: {slskd_tracks} tracks with slskd candidates. {retry_tracks} tracks need another slskd search. {' '.join(diagnostic_lines[:3])}",
         event_type="approval_needed",
         target_url="/downloads",
     )
@@ -1463,13 +1465,34 @@ def add_download_candidate_items(session: Session, batch: ProposalBatch, track_i
         )
 
 
-def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str) -> None:
+def add_slskd_retry_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str) -> None:
     session.add(
         ProposalItem(
             batch_id=batch.id,
             parent_id=track_item.id,
-            title=f"YouTube fallback: {query}",
+            title=f"Retry slskd search: {query}",
             kind=ProposalKind.download,
+            old_value=query,
+            new_value="slskd retry",
+            payload_json=json.dumps(
+                {
+                    "action": "wishlist_request",
+                    "request": request,
+                    **request,
+                }
+            ),
+        )
+    )
+
+
+def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, selected: bool = True) -> None:
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            parent_id=track_item.id,
+            title=f"Last resort YouTube fallback: {query}",
+            kind=ProposalKind.download,
+            selected=selected,
             old_value=query,
             new_value="yt-dlp",
             payload_json=json.dumps(
@@ -1716,29 +1739,53 @@ def search_slskd_for_request(session: Session, request: dict, limit: int = 1, ta
 def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
     attempted = []
     query_logs = []
-    last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs}}
+    rate_limited = False
+    last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs, "rate_limited": False}}
     for index, query in enumerate(download_query_variants(request)):
         if not query or query in attempted:
             continue
         attempted.append(query)
         query_logs.append(f"slskd track search started: {query}")
-        try:
-            result = search_slskd_detailed(
-                slskd_url,
-                api_key,
-                query,
-                limit=limit,
-                poll_interval=0.75,
-                timeout_seconds=4 if index < 2 else 3,
-                timeout_buffer_seconds=1,
-            )
-        except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
-            query_logs.append(f"slskd track search failed: {query}: {error}")
-            last_result = {"candidates": [], "diagnostics": {"queries": attempted.copy(), "query_logs": query_logs, "query": query}}
+        result = None
+        for attempt in range(3):
+            try:
+                result = search_slskd_detailed(
+                    slskd_url,
+                    api_key,
+                    query,
+                    limit=limit,
+                    poll_interval=0.75,
+                    timeout_seconds=5 if index < 3 else 4,
+                    timeout_buffer_seconds=1,
+                )
+                break
+            except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
+                if is_rate_limit_error(error) and attempt < 2:
+                    rate_limited = True
+                    delay = 1.5 * (attempt + 1)
+                    query_logs.append(f"slskd track search rate limited: {query}; retrying in {delay:g}s")
+                    time.sleep(delay)
+                    continue
+                rate_limited = rate_limited or is_rate_limit_error(error)
+                query_logs.append(f"slskd track search failed: {query}: {error}")
+                last_result = {
+                    "candidates": [],
+                    "diagnostics": {
+                        "queries": attempted.copy(),
+                        "query_logs": query_logs,
+                        "query": query,
+                        "rate_limited": rate_limited,
+                    },
+                }
+                break
+        if result is None:
+            if rate_limited:
+                break
             continue
         result["diagnostics"]["query"] = query
         result["diagnostics"]["queries"] = attempted.copy()
         result["diagnostics"]["query_logs"] = query_logs
+        result["diagnostics"]["rate_limited"] = rate_limited
         last_result = result
         diagnostics = result["diagnostics"]
         query_logs.append(
@@ -1752,8 +1799,13 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
             return result
     last_result["diagnostics"]["queries"] = attempted
     last_result["diagnostics"]["query_logs"] = query_logs
+    last_result["diagnostics"]["rate_limited"] = rate_limited
     query_logs.append(f"slskd found no candidates after {len(attempted)} query variant(s): {download_query(request)}")
     return last_result
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429
 
 
 def add_download_tree_parents(session: Session, batch: ProposalBatch, request: dict, query: str) -> ProposalItem:
@@ -1869,8 +1921,10 @@ def download_query_variants(request: dict) -> list[str]:
     track = str(request.get("track") or request.get("title") or "").strip()
     return [
         " ".join(part for part in [album, track] if part),
+        " ".join(part for part in [album, track, "flac"] if part),
         track,
         " ".join(part for part in [artist, album, track] if part),
+        " ".join(part for part in [artist, album, track, "flac"] if part),
         " ".join(part for part in [artist, track] if part),
         f"{artist} - {track}".strip(" -"),
     ]
