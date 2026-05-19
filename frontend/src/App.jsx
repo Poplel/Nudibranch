@@ -862,10 +862,11 @@ function App() {
     try {
       const data = await api(`/library/albums/${album.id}/acoustic-match`, { method: "POST" });
       setLibraryAlbumChecks((current) => ({ ...current, [album.id]: data }));
+      if (data.queued_changes) await refreshApprovals();
       const counts = countAcousticStatuses(data.tracks || []);
       setToast({
         title: "Album AcoustID check complete",
-        body: `${counts.matched} matched. ${counts.skipped} skipped. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed.`,
+        body: `${counts.matched} matched. ${counts.skipped} skipped. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed. ${data.queued_changes || 0} fixes queued.`,
       });
     } catch (lookupError) {
       notify("Album AcoustID check failed", lookupError.message, "ui_error");
@@ -874,17 +875,18 @@ function App() {
     }
   }
 
-  async function checkLibraryTrackAcoustID(track) {
+  async function checkLibraryTrackAcoustID(track, album = null) {
     setLoading(true);
     setError("");
     try {
       const result = await api(`/library/tracks/${track.id}/acoustic-match`, { method: "POST" });
       const label = acousticResultMeta(result);
+      setLibraryAlbumChecks((current) => mergeTrackAcousticResult(current, album?.id, album?.title, result));
+      if (result.queued_changes) await refreshApprovals();
       setToast({
         title: "Track AcoustID check complete",
         body: `${track.title}: ${label}`,
       });
-      refreshLibrary();
       return result;
     } catch (lookupError) {
       notify("Track AcoustID check failed", lookupError.message, "ui_error");
@@ -1670,20 +1672,6 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                       </button>
                     )}
                   </div>
-                  {albumChecks[album.id] && (
-                    <div className="album-acoustic-results">
-                      {albumChecks[album.id].tracks.map((result) => (
-                        <TreeRow
-                          key={result.track_id}
-                          depth={2}
-                          icon={Search}
-                          title={result.title}
-                          meta={acousticResultMeta(result)}
-                          warning={["changed", "unmatched", "missing_file", "error"].includes(result.status)}
-                        />
-                      ))}
-                    </div>
-                  )}
                   {removeTarget === removeKey("album", album.id) && (
                     <RemoveChoice
                       title={album.title}
@@ -1714,7 +1702,9 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                     />
                   )}
                   {openAlbums.has(album.id) &&
-                    album.tracks.map((track) => (
+                    album.tracks.map((track) => {
+                      const acousticResult = (albumChecks[album.id]?.tracks || []).find((result) => result.track_id === track.id);
+                      return (
                       <div key={track.id}>
                         <div className="tree-action-row library-row-actions">
                           <TreeRow
@@ -1757,13 +1747,34 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                             playlists={canUsePlaylists ? playlists : []}
                             targetTrackIds={[track.id]}
                             onAddToPlaylist={onAddToPlaylist}
-                            onAcousticCheck={canEditMetadata ? () => onCheckTrackAcoustID(track) : null}
+                            onAcousticCheck={canEditMetadata ? () => onCheckTrackAcoustID(track, album) : null}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
                         )}
+                        {acousticResult && (
+                          <div className="track-acoustic-result">
+                            <TreeRow
+                              depth={3}
+                              icon={Search}
+                              title="AcoustID"
+                              meta={acousticResultMeta(acousticResult)}
+                              warning={["changed", "unmatched", "missing_file", "error"].includes(acousticResult.status)}
+                            />
+                            {acousticResult.changes && Object.keys(acousticResult.changes).length > 0 && (
+                              <div className="acoustic-change-list">
+                                {Object.entries(acousticResult.changes).map(([key, value]) => (
+                                  <span key={key}>
+                                    {metadataFieldLabel(key)}: {String(value)}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
-                    ))}
+                    );
+                    })}
                 </div>
               ))}
           </div>
@@ -5553,6 +5564,22 @@ function acousticResultMeta(result) {
   if (result.status === "missing_file") return "Missing file";
   if (result.status === "error") return result.error || "Lookup failed";
   return "No match";
+}
+
+function mergeTrackAcousticResult(current, albumId, albumTitle, result) {
+  if (!albumId || !result) return current;
+  const existing = current[albumId] || { album_id: albumId, album: albumTitle || "", tracks: [] };
+  const tracks = [...(existing.tracks || [])];
+  const index = tracks.findIndex((entry) => entry.track_id === result.track_id);
+  if (index >= 0) tracks[index] = result;
+  else tracks.push(result);
+  return { ...current, [albumId]: { ...existing, tracks } };
+}
+
+function metadataFieldLabel(key) {
+  return String(key || "")
+    .replace(/_/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function toggleSet(setter, value) {

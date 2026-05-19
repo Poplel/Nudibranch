@@ -397,8 +397,15 @@ def acoustic_match_library_album(
     for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999, track.title.lower())):
         results.append(acoustic_match_track_result(session, track, force=False))
 
+    batch = queue_acoustic_metadata_fixes(session, results)
     session.commit()
-    return {"album_id": album.id, "album": album.title, "tracks": results}
+    return {
+        "album_id": album.id,
+        "album": album.title,
+        "tracks": results,
+        "queued_changes": sum(1 for result in results if result.get("changes")),
+        "batch_id": batch.id if batch else None,
+    }
 
 
 @router.post("/library/tracks/{track_id}/acoustic-match", tags=["library"])
@@ -411,7 +418,10 @@ def acoustic_match_library_track(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     result = acoustic_match_track_result(session, track, force=True)
+    batch = queue_acoustic_metadata_fixes(session, [result])
     session.commit()
+    result["queued_changes"] = 1 if result.get("changes") else 0
+    result["batch_id"] = batch.id if batch else None
     return result
 
 
@@ -423,6 +433,7 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
         "status": "unmatched",
         "score": None,
         "candidate": None,
+        "changes": {},
         "error": None,
         "acoustic_verified": track.acoustic_verified,
     }
@@ -441,23 +452,75 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
         return result
     candidate = candidates[0] if candidates else None
     if not candidate:
-        track.acoustic_verified = False
         return result
     metadata = candidate.get("metadata") or {}
     candidate_title = metadata.get("title") or ""
     same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
     same_recording = bool(track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id"))
     matched = same_recording or same_title
-    track.acoustic_verified = matched
+    changes = acoustic_metadata_changes(track, metadata)
     result.update(
         {
             "status": "matched" if matched else "changed",
             "score": round((candidate.get("score") or 0) * 100),
             "candidate": metadata,
+            "changes": changes,
             "acoustic_verified": track.acoustic_verified,
         }
     )
     return result
+
+
+def acoustic_metadata_changes(track: Track, metadata: dict) -> dict:
+    changes = {}
+    candidate_title = metadata.get("title")
+    candidate_recording_id = metadata.get("musicbrainz_recording_id")
+    if candidate_title and candidate_title != track.title:
+        changes["title"] = candidate_title
+    if candidate_recording_id and candidate_recording_id != track.musicbrainz_recording_id:
+        changes["musicbrainz_recording_id"] = candidate_recording_id
+    if not track.acoustic_verified:
+        changes["acoustic_verified"] = True
+    return changes
+
+
+def queue_acoustic_metadata_fixes(session: Session, results: list[dict]) -> ProposalBatch | None:
+    fix_results = [result for result in results if result.get("changes")]
+    if not fix_results:
+        return None
+    batch = ProposalBatch(
+        title="AcoustID metadata fixes",
+        kind=ProposalKind.metadata,
+        tree_path="/library",
+    )
+    session.add(batch)
+    session.flush()
+    for result in fix_results:
+        track = session.get(Track, result["track_id"])
+        if not track:
+            continue
+        changes = {key: value for key, value in result["changes"].items() if key in editable_fields("track")}
+        if not changes:
+            continue
+        old_values = {key: getattr(track, key, None) for key in changes}
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=track.title,
+                kind=ProposalKind.metadata,
+                old_value=json.dumps(old_values),
+                new_value=json.dumps(changes),
+                payload_json=json.dumps(
+                    {
+                        "target_type": "track",
+                        "target_id": track.id,
+                        "changes": changes,
+                    }
+                ),
+            )
+        )
+    session.flush()
+    return batch
 
 
 @router.get("/library/tracks/{track_id}/stream", tags=["library"])
@@ -1398,6 +1461,7 @@ def editable_fields(target_type: str) -> set[str]:
             "musicbrainz_recording_id",
             "explicit",
             "is_lossless",
+            "acoustic_verified",
             "metadata_locked",
             "artwork_locked",
             "filename_locked",
