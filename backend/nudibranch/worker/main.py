@@ -25,6 +25,12 @@ from nudibranch.services.slskd import download_transfers, queue_slskd_download, 
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
+MAX_DOWNLOAD_AUTO_RETRIES = 6
+ZERO_PROGRESS_RETRY_SECONDS = 150
+STALLED_PROGRESS_RETRY_SECONDS = 300
+MISSING_TRANSFER_RETRY_SECONDS = 240
+
+
 def run_propose_import(session: Session, payload: dict) -> dict:
     files = payload.get("files")
     if files is None:
@@ -741,7 +747,7 @@ def record_download_manifest_entry(request: dict, candidate: dict, item: Proposa
         if not (
             entry.get("batch_id") == item.batch_id
             and entry.get("item_id") == item.id
-            and entry.get("status") in {"queued", "verified"}
+            and entry.get("status") not in {"completed", "rejected", "rejected_removed"}
         )
     ]
     entries.append(
@@ -928,9 +934,19 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
         if not file_path:
             item = session.get(ProposalItem, entry.get("item_id"))
+            retry_reason = download_retry_reason(entry, transfer)
+            if item and retry_reason and not transfer_error_message:
+                if retry_download_entry(session, batch, entry, item, retry_reason):
+                    waiting_count += 1
+                    waiting = True
+                    continue
+                failed_count += 1
+                waiting = True
+                continue
             if transfer_error_message and not transfer:
                 wait_status = f"{transfer_error_message}; {wait_status}"
             status = transfer_wait_status(entry, transfer, wait_status)
+            update_manifest_transfer_tracking(entry, transfer)
             set_download_item_status(item, status)
             if transfer_is_failed(transfer) and item:
                 item.status = ProposalStatus.failed
@@ -1026,7 +1042,7 @@ def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
         action = json.loads(item.payload_json or "{}").get("action")
         if action == "queue_ytdlp_download" and item.status not in {ProposalStatus.completed, ProposalStatus.rejected}:
             blockers.append(item)
-        elif action == "queue_download" and item.status == ProposalStatus.failed:
+        elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
             blockers.append(item)
     return blockers
 
@@ -1135,6 +1151,213 @@ def transfer_is_failed(transfer: dict | None) -> bool:
     status = str(transfer.get("status") or "").casefold()
     error = transfer.get("error")
     return bool(error) or any(token in status for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
+
+
+def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
+    if int(entry.get("retry_count") or 0) >= MAX_DOWNLOAD_AUTO_RETRIES:
+        return None
+    if transfer_is_failed(transfer):
+        error = transfer.get("error") if transfer else None
+        status = transfer.get("status") if transfer else None
+        return f"transfer failed: {error or status or 'unknown error'}"
+    age = manifest_entry_age_seconds(entry)
+    if not transfer and age >= MISSING_TRANSFER_RETRY_SECONDS:
+        return "slskd transfer disappeared before the file arrived"
+    percent = transfer.get("percent") if transfer else None
+    if not isinstance(percent, (int, float)):
+        return None
+    percent = max(0, min(100, float(percent)))
+    last_percent = manifest_float(entry.get("last_transfer_percent"))
+    last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
+    if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
+        return "transfer stayed at 0%"
+    if last_percent is not None and abs(last_percent - percent) >= 0.5:
+        return None
+    if last_progress_age is not None and last_progress_age >= STALLED_PROGRESS_RETRY_SECONDS:
+        return f"transfer stalled at {percent:.0f}%"
+    if last_percent is None and age >= STALLED_PROGRESS_RETRY_SECONDS * 2:
+        return f"transfer stalled at {percent:.0f}%"
+    return None
+
+
+def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str) -> bool:
+    retry_count = int(entry.get("retry_count") or 0)
+    current_candidate = entry.get("candidate") or {}
+    failed_candidates = manifest_failed_candidates(entry)
+    if current_candidate:
+        failed_candidates.append(
+            {
+                "username": current_candidate.get("username"),
+                "filename": current_candidate.get("filename"),
+                "reason": reason,
+            }
+        )
+    retry_count += 1
+    request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
+    set_download_item_status(item, f"{reason}; searching for another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+    update_download_manifest_entry(
+        entry,
+        "retrying",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    append_task_log(
+        session,
+        None,
+        f"{item.title}: {reason}; searching for replacement candidate {retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES}",
+        "warning",
+    )
+    if retry_count > MAX_DOWNLOAD_AUTO_RETRIES:
+        return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
+    try:
+        search_result = search_slskd_for_request(session, request, limit=8)
+        candidates = filter_ignored_candidates(search_result.get("candidates") or [], failed_candidates)
+    except Exception as error:  # noqa: BLE001 - keep the failed row visible with a useful reason.
+        return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
+    if not candidates:
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, "no replacement candidates were found", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "queued",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason="no replacement candidates were found",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        set_download_item_status(item, f"no replacement candidate yet; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        return True
+    candidate = candidates[0]
+    payload = json.loads(item.payload_json or "{}")
+    payload.update(
+        {
+            "action": "queue_download",
+            "request": entry.get("request") or payload.get("request") or {},
+            "candidate": candidate,
+            "failed_candidates": failed_candidates[-25:],
+            "status": f"replacement candidate found; queueing ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
+            "auto_retry_exhausted": False,
+        }
+    )
+    item.payload_json = json.dumps(payload)
+    item.title = f"slskd: {candidate.get('filename') or download_query(payload['request'])}"
+    item.new_value = candidate.get("username")
+    item.status = ProposalStatus.executing
+    try:
+        settings = integration_settings(session)
+        queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
+        record_download_manifest_entry(entry.get("request") or {}, candidate, item)
+        update_download_manifest_entry(
+            {
+                "batch_id": item.batch_id,
+                "item_id": item.id,
+                "basename": remote_basename(candidate.get("filename") or ""),
+            },
+            "queued",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        set_download_item_status(item, f"replacement queued in slskd ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate queued after {reason}")
+        return True
+    except Exception as error:  # noqa: BLE001 - immediately try again on the next scan without duplicating rows.
+        failed_candidates.append(
+            {
+                "username": candidate.get("username"),
+                "filename": candidate.get("filename"),
+                "reason": str(error),
+            }
+        )
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, f"replacement queue failed: {error}", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "queued",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason=f"replacement queue failed: {error}",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        set_download_item_status(item, f"replacement queue failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate failed to queue: {error}", "warning")
+        return True
+
+
+def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    payload["status"] = f"needs attention after {retry_count} automatic retries: {reason}"
+    payload["auto_retry_exhausted"] = True
+    payload["failed_candidates"] = failed_candidates[-25:]
+    item.payload_json = json.dumps(payload)
+    item.status = ProposalStatus.failed
+    update_download_manifest_entry(
+        entry,
+        "failed",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    append_task_log(session, None, f"{item.title}: automatic replacement search exhausted: {reason}", "error")
+    return False
+
+
+def manifest_failed_candidates(entry: dict) -> list[dict]:
+    failed = entry.get("failed_candidates")
+    return list(failed) if isinstance(failed, list) else []
+
+
+def filter_ignored_candidates(candidates: list[dict], ignored_candidates: list[dict]) -> list[dict]:
+    ignored = {candidate_identity(candidate) for candidate in ignored_candidates}
+    return [candidate for candidate in candidates if candidate_identity(candidate) not in ignored]
+
+
+def candidate_identity(candidate: dict) -> tuple[str, str]:
+    return (
+        str(candidate.get("username") or "").casefold(),
+        str(candidate.get("filename") or "").replace("\\", "/").casefold(),
+    )
+
+
+def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> None:
+    if not transfer:
+        return
+    percent = transfer.get("percent")
+    now = datetime.now(timezone.utc).isoformat()
+    fields: dict[str, object] = {
+        "last_transfer_seen_at": now,
+        "last_transfer_status": transfer.get("status"),
+    }
+    if isinstance(percent, (int, float)):
+        bounded = max(0, min(100, float(percent)))
+        last_percent = manifest_float(entry.get("last_transfer_percent"))
+        fields["last_transfer_percent"] = bounded
+        if last_percent is None or abs(last_percent - bounded) >= 0.5:
+            fields["last_transfer_progress_at"] = now
+    update_download_manifest_entry(entry, entry.get("status") or "queued", **fields)
+    entry.update(fields)
+
+
+def manifest_entry_age_seconds(entry: dict) -> int:
+    return manifest_seconds_since(entry.get("queued_at")) or 0
+
+
+def manifest_seconds_since(value: object) -> int | None:
+    if not value:
+        return None
+    try:
+        since = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - since).total_seconds()))
+
+
+def manifest_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Path | None, str]:
@@ -1915,6 +2138,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
     attempted = []
     query_logs = []
     rate_limited = False
+    raw_ignored_candidates = request.get("ignored_candidates") or []
+    ignored_candidates = raw_ignored_candidates if isinstance(raw_ignored_candidates, list) else []
+    ignored = {candidate_identity(candidate) for candidate in ignored_candidates if isinstance(candidate, dict)}
     last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs, "rate_limited": False}}
     for index, query in enumerate(download_query_variants(request)):
         if not query or query in attempted:
@@ -1928,7 +2154,7 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                     slskd_url,
                     api_key,
                     query,
-                    limit=limit,
+                    limit=max(limit, len(ignored) + limit),
                     poll_interval=0.75,
                     timeout_seconds=5 if index < 3 else 4,
                     timeout_buffer_seconds=1,
@@ -1961,13 +2187,15 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
         result["diagnostics"]["queries"] = attempted.copy()
         result["diagnostics"]["query_logs"] = query_logs
         result["diagnostics"]["rate_limited"] = rate_limited
+        result["candidates"] = filter_ignored_candidates(result.get("candidates") or [], ignored_candidates)[:limit]
+        result["diagnostics"]["ignored_candidates"] = len(ignored_candidates)
         last_result = result
         diagnostics = result["diagnostics"]
         query_logs.append(
             (
                 f"slskd track search finished: {query}: "
                 f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
-                f"{len(result.get('candidates') or [])} candidates after {diagnostics.get('polls', 0)} polls"
+                f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls"
             ),
         )
         if result["candidates"]:
@@ -2946,6 +3174,8 @@ async def worker_loop() -> None:
         init_db(session)
 
     last_download_scan = 0.0
+    last_download_scan_summary = ""
+    last_download_scan_log = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -2954,11 +3184,21 @@ async def worker_loop() -> None:
                     try:
                         scan_result = import_completed_downloads(session)
                         if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
+                            summary = f"{scan_result.get('waiting', 0)}:{scan_result.get('ready', 0)}:{scan_result.get('failed', 0)}"
+                            now = time.time()
+                            if summary == last_download_scan_summary and now - last_download_scan_log < 120:
+                                session.commit()
+                                last_download_scan = now
+                                await deliver_apns_notifications(session)
+                                time.sleep(2)
+                                continue
                             append_task_log(
                                 session,
                                 None,
                                 f"Download scan checked {scan_result.get('waiting', 0)} waiting, {scan_result.get('ready', 0)} ready, {scan_result.get('failed', 0)} needing attention",
                             )
+                            last_download_scan_summary = summary
+                            last_download_scan_log = now
                         session.commit()
                     except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
                         session.rollback()
