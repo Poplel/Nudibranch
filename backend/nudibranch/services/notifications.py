@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
-from nudibranch.db.models import MobileDevice, Notification
+from nudibranch.db.models import MobileDevice, Notification, Permission, User
 
 
 def create_notification(
@@ -20,6 +20,26 @@ def create_notification(
     user_id: str | None = None,
     deliver_apns: bool = True,
 ) -> Notification:
+    if user_id is None:
+        users = list(session.scalars(select(User)))
+        target_user_ids = [
+            user.id
+            for user in users
+            if user.is_admin or any(permission.permission == Permission.notifications_read for permission in user.permissions)
+        ]
+        if target_user_ids:
+            created: Notification | None = None
+            for target_user_id in target_user_ids:
+                created = create_notification(
+                    session,
+                    title=title,
+                    body=body,
+                    event_type=event_type,
+                    target_url=target_url,
+                    user_id=target_user_id,
+                    deliver_apns=deliver_apns,
+                )
+            return created
     for attempt in range(3):
         notification = Notification(
             user_id=user_id,

@@ -54,6 +54,7 @@ from nudibranch.api.schemas import (
 from nudibranch.db.init import hash_secret
 from nudibranch.db.models import (
     Album,
+    AppSetting,
     Artist,
     MobileDevice,
     Notification,
@@ -719,6 +720,8 @@ def favorites_playlist(
     _: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
     playlist = get_or_create_favorites(session)
+    session.commit()
+    session.refresh(playlist)
     return serialize_favorites(session, playlist)
 
 
@@ -727,9 +730,9 @@ def list_playlists(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> list[FavoritesOut]:
+    get_or_create_favorites(session)
+    session.commit()
     playlists = list(session.scalars(select(Playlist).order_by(Playlist.name.asc())))
-    if not any(playlist.name == "Favorites" for playlist in playlists):
-        playlists.insert(0, get_or_create_favorites(session))
     return [serialize_favorites(session, playlist) for playlist in playlists]
 
 
@@ -929,9 +932,9 @@ def propose_favorite_position(
         raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
 
     batch = ProposalBatch(
-        title="Update Favorites order",
+        title=f"Update {playlist.name} order",
         kind=ProposalKind.playlist,
-        tree_path="/playlists/Favorites",
+        tree_path=f"/playlists/{playlist.name}",
     )
     session.add(batch)
     session.flush()
@@ -1318,7 +1321,10 @@ def update_integrations(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> IntegrationSettings:
-    return IntegrationSettings(**update_integration_settings(session, payload.model_dump()))
+    update_integration_settings(session, payload.model_dump())
+    get_or_create_favorites(session)
+    session.commit()
+    return IntegrationSettings(**integration_settings(session))
 
 
 @router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"])
@@ -1327,7 +1333,7 @@ def list_notifications(
     user: User = Depends(require_permission(Permission.notifications_read)),
 ) -> list[NotificationOut]:
     query = select(Notification).where(
-        ((Notification.user_id == user.id) | (Notification.user_id.is_(None)))
+        (Notification.user_id == user.id)
         & (Notification.status != NotificationStatus.dismissed)
     )
     notifications = list(session.scalars(query.order_by(Notification.created_at.desc()).limit(100)))
@@ -1351,7 +1357,7 @@ def mark_notifications_read(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),
 ) -> dict:
-    notifications = list(session.scalars(select(Notification).where((Notification.user_id == user.id) | (Notification.user_id.is_(None)))))
+    notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
     for notification in notifications:
         if notification.status == NotificationStatus.unread:
             notification.status = NotificationStatus.read
@@ -1364,7 +1370,7 @@ def clear_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),
 ) -> dict:
-    notifications = list(session.scalars(select(Notification).where((Notification.user_id == user.id) | (Notification.user_id.is_(None)))))
+    notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
     for notification in notifications:
         notification.status = NotificationStatus.dismissed
     session.commit()
@@ -1432,17 +1438,34 @@ def remove_action_title(action: str) -> str:
 
 
 def get_or_create_favorites(session: Session) -> Playlist:
-    playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+    configured_setting = session.get(AppSetting, "favorite_playlist_id")
+    configured_id = configured_setting.value if configured_setting else ""
+    playlist = session.get(Playlist, configured_id) if configured_id else None
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorite songs"))
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)).order_by(Playlist.name.asc()))
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
         playlist = Playlist(name="Favorites", protected=True)
         session.add(playlist)
-        session.commit()
-        session.refresh(playlist)
-    elif not playlist.protected:
-        playlist.protected = True
-        session.commit()
-        session.refresh(playlist)
+        session.flush()
+    mark_favorite_playlist(session, playlist)
     return playlist
+
+
+def mark_favorite_playlist(session: Session, playlist: Playlist) -> None:
+    for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
+        protected_playlist.protected = False
+    playlist.protected = True
+    setting = session.get(AppSetting, "favorite_playlist_id")
+    if not setting:
+        setting = AppSetting(key="favorite_playlist_id", value=playlist.id)
+        session.add(setting)
+    else:
+        setting.value = playlist.id
+    session.flush()
 
 
 def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:

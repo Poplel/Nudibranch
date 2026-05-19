@@ -540,6 +540,7 @@ function App() {
         body: JSON.stringify(settings),
       });
       setIntegrationSettings(saved);
+      refreshPlaylists();
       setToast({ title: "Settings saved", body: "Integration settings were updated." });
     } catch (settingsError) {
       setError(settingsError.message);
@@ -568,7 +569,7 @@ function App() {
         body: JSON.stringify({ name }),
       });
       setPlaylists((current) => upsertPlaylist(current, playlist));
-      if (playlist.name === "Favorites") {
+      if (playlist.protected) {
         setFavoriteTrackIds(new Set(playlist.track_ids || []));
       }
       setToast({ title: "Playlist created", body: playlist.name });
@@ -591,7 +592,7 @@ function App() {
         body: JSON.stringify({ track_ids: trackIds }),
       });
       setPlaylists((current) => upsertPlaylist(current, playlist));
-      if (playlist.name === "Favorites") {
+      if (playlist.protected) {
         setFavoriteTrackIds(new Set(playlist.track_ids || []));
       }
       setToast({ title: "Playlist updated", body: `${trackIds.length} item${trackIds.length === 1 ? "" : "s"} added to ${playlist.name}.` });
@@ -1371,6 +1372,7 @@ function App() {
                 setDark={setDark}
                 user={user}
                 apiKey={token}
+                playlists={playlists}
                 integrationSettings={integrationSettings}
                 onSaveIntegrations={saveIntegrationSettings}
                 onUploadYoutubeCookies={uploadYoutubeCookies}
@@ -2491,7 +2493,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
 }
 
 function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onQueueRename, onQueueDelete, onPlay, onQueue, onSync, onInspectorActionsChange }) {
-  const [openPlaylists, setOpenPlaylists] = useState(() => new Set(["Favorites"]));
+  const [openPlaylists, setOpenPlaylists] = useState(() => new Set());
   const [addOpen, setAddOpen] = useState(null);
   const [editOpen, setEditOpen] = useState(null);
   const [playlistName, setPlaylistName] = useState("");
@@ -2549,7 +2551,7 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
           <div key={playlist.id}>
             <div className="tree-action-row library-row-actions">
               <TreeRow
-                icon={playlist.name === "Favorites" ? Heart : FileAudio}
+                icon={playlist.protected ? Heart : FileAudio}
                 open={openPlaylists.has(playlist.name)}
                 title={playlist.name}
                 meta={`${playlist.track_count || 0} tracks`}
@@ -2636,7 +2638,7 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
 }
 
 function PlaylistEditPanel({ playlist, draftName, setDraftName, onRename, onDelete }) {
-  const protectedPlaylist = playlist.protected || playlist.name === "Favorites";
+  const protectedPlaylist = playlist.protected;
   return (
     <div className="album-search-panel playlist-edit-panel">
       <label>
@@ -4031,6 +4033,7 @@ function SettingsPanel({
   setDark,
   user,
   apiKey,
+  playlists,
   integrationSettings,
   onSaveIntegrations,
   onUploadYoutubeCookies,
@@ -4104,6 +4107,7 @@ function SettingsPanel({
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
             ["playlist_conflict_winner", "Conflicting playlist entries"],
+            ["favorite_playlist_id", "Favorites playlist"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
@@ -4130,6 +4134,18 @@ function SettingsPanel({
                 >
                   <option value="nudibranch">Nudibranch</option>
                   <option value="jellyfin">Jellyfin</option>
+                </select>
+              ) : key === "favorite_playlist_id" ? (
+                <select
+                  value={integrationDraft[key] || favoritePlaylistFrom(playlists)?.id || ""}
+                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+                >
+                  <option value="">Auto detect</option>
+                  {(playlists || []).map((playlist) => (
+                    <option key={playlist.id} value={playlist.id}>
+                      {playlist.name}
+                    </option>
+                  ))}
                 </select>
               ) : (
                 <input
@@ -5077,7 +5093,12 @@ function upsertUser(users, user) {
 }
 
 function favoritePlaylistFrom(playlists) {
-  return playlists.find((playlist) => playlist.name === "Favorites") || null;
+  return (
+    playlists.find((playlist) => playlist.protected) ||
+    playlists.find((playlist) => playlist.name === "Favorite songs") ||
+    playlists.find((playlist) => playlist.name === "Favorites") ||
+    null
+  );
 }
 
 function toggleArrayValue(values, value) {

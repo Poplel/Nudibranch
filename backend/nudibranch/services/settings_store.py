@@ -11,6 +11,7 @@ INTEGRATION_KEYS = {
     "slskd_url",
     "slskd_api_key",
     "playlist_conflict_winner",
+    "favorite_playlist_id",
     "youtube_cookies_browser",
     "youtube_cookies_path",
 }
@@ -25,6 +26,7 @@ def integration_settings(session: Session) -> dict[str, str]:
         "slskd_url": settings.slskd_url,
         "slskd_api_key": settings.slskd_api_key,
         "playlist_conflict_winner": "nudibranch",
+        "favorite_playlist_id": "",
         "youtube_cookies_browser": "",
         "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
     }

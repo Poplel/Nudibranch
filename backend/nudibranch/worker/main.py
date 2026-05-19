@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
+from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
@@ -2545,15 +2545,6 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     if conflict_winner not in {"nudibranch", "jellyfin"}:
         conflict_winner = "nudibranch"
 
-    ensure_favorites_playlist(session)
-    playlists = list(
-        session.scalars(
-            select(Playlist)
-            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
-            .order_by(Playlist.name.asc())
-        )
-    )
-
     headers = {"X-Emby-Token": jellyfin_api_key}
     synced_playlists = 0
     pushed_tracks = 0
@@ -2566,18 +2557,28 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             raise ValueError("No Jellyfin user was found for playlist sync")
 
         jellyfin_playlists = list_jellyfin_playlists(client, user_id)
+        playlists = list(session.scalars(select(Playlist).order_by(Playlist.name.asc())))
         local_by_name = {playlist.name: playlist for playlist in playlists}
         imported_playlist_names = set()
         for jellyfin_playlist in jellyfin_playlists.values():
             name = jellyfin_playlist.get("Name")
             if not name or name in local_by_name:
                 continue
-            playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"), protected=name == "Favorites")
+            playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
             session.add(playlist)
             session.flush()
             local_by_name[name] = playlist
             playlists.append(playlist)
             imported_playlist_names.add(name)
+
+        ensure_favorites_playlist(session)
+        playlists = list(
+            session.scalars(
+                select(Playlist)
+                .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+                .order_by(Playlist.name.asc())
+            )
+        )
 
         for playlist in playlists:
             jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
@@ -3093,13 +3094,29 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
 
 
 def ensure_favorites_playlist(session: Session) -> Playlist:
-    playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+    configured_setting = session.get(AppSetting, "favorite_playlist_id")
+    configured_id = configured_setting.value if configured_setting else ""
+    playlist = session.get(Playlist, configured_id) if configured_id else None
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorite songs"))
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)).order_by(Playlist.name.asc()))
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
         playlist = Playlist(name="Favorites", protected=True)
         session.add(playlist)
         session.flush()
-    elif not playlist.protected:
-        playlist.protected = True
+    for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
+        protected_playlist.protected = False
+    playlist.protected = True
+    setting = session.get(AppSetting, "favorite_playlist_id")
+    if not setting:
+        setting = AppSetting(key="favorite_playlist_id", value=playlist.id)
+        session.add(setting)
+    else:
+        setting.value = playlist.id
+    session.flush()
     return playlist
 
 

@@ -205,6 +205,7 @@ class IntegrationSettings(BaseModel):
     slskd_url: str = ""
     slskd_api_key: str = ""
     playlist_conflict_winner: str = "nudibranch"
+    favorite_playlist_id: str = ""
     youtube_cookies_browser: str = ""
     youtube_cookies_path: str = ""
 
