@@ -559,6 +559,7 @@ def list_wishlist(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> list[WishlistOut]:
+    reconcile_stale_approved_wishlist_items(session, user)
     query = select(WishlistItem).options(selectinload(WishlistItem.user))
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
@@ -574,6 +575,7 @@ def create_wishlist_item(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> WishlistOut:
+    reconcile_stale_approved_wishlist_items(session, user)
     existing = session.scalar(
         select(WishlistItem)
         .where(WishlistItem.user_id == user.id)
@@ -637,6 +639,7 @@ def propose_wishlist_items(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> ProposalBatchOut:
+    reconcile_stale_approved_wishlist_items(session, user)
     query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
@@ -1616,6 +1619,51 @@ def expire_old_terminal_wishlist_items(session: Session, items: list[WishlistIte
         session.delete(item)
     if expired:
         session.commit()
+
+
+def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> None:
+    query = select(WishlistItem).where(WishlistItem.status == "approved")
+    if not user_has_permission(user, Permission.wishlist_manage_all):
+        query = query.where(WishlistItem.user_id == user.id)
+    approved_items = list(session.scalars(query))
+    if not approved_items:
+        return
+    active_ids = active_wishlist_download_ids(session)
+    changed = False
+    now = datetime.now(timezone.utc)
+    for item in approved_items:
+        if item.id in active_ids:
+            continue
+        item.status = "wanted"
+        item.status_changed_at = now
+        changed = True
+    if changed:
+        session.commit()
+
+
+def active_wishlist_download_ids(session: Session) -> set[str]:
+    active_ids: set[str] = set()
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.kind == ProposalKind.download)
+            .where(ProposalBatch.tree_path == "/downloads")
+            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+        )
+    )
+    for batch in batches:
+        for item in batch.items:
+            if item.kind != ProposalKind.download or item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed}:
+                continue
+            payload = json.loads(item.payload_json or "{}")
+            if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
+                continue
+            request = payload.get("request") or {}
+            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
+            if wishlist_item_id:
+                active_ids.add(wishlist_item_id)
+    return active_ids
 
 
 def notify_wishlist_decisions(

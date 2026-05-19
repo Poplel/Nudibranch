@@ -23,24 +23,31 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
     if not fingerprint:
         raise ValueError("Unable to fingerprint this file")
 
-    duration = fingerprint.get("duration") or file_info.get("duration") or file_info.get("duration_seconds")
-    if not duration and file_info.get("duration_ms"):
-        duration = round(float(file_info["duration_ms"]) / 1000)
+    duration = normalized_acoustid_duration(
+        fingerprint.get("duration")
+        or file_info.get("duration")
+        or file_info.get("duration_seconds")
+        or (round(float(file_info["duration_ms"]) / 1000) if file_info.get("duration_ms") else None)
+    )
     if not duration and file_info.get("path"):
         metadata = read_audio_metadata(Path(file_info["path"]))
         if metadata.get("duration_ms"):
-            duration = round(float(metadata["duration_ms"]) / 1000)
+            duration = normalized_acoustid_duration(float(metadata["duration_ms"]) / 1000)
     if not duration:
         raise ValueError("Unable to determine this file's duration for AcoustID lookup")
+    fingerprint_value = fingerprint.get("fingerprint")
+    if not fingerprint_value:
+        raise ValueError("Unable to fingerprint this file")
 
     params = {
+        "format": "json",
         "client": api_key,
-        "duration": duration,
-        "fingerprint": fingerprint.get("fingerprint"),
+        "duration": str(duration),
+        "fingerprint": fingerprint_value,
         "meta": "recordings releasegroups releases tracks",
     }
     try:
-        response = httpx.post("https://api.acoustid.org/v2/lookup", data=params, timeout=20, headers={"User-Agent": USER_AGENT})
+        response = httpx.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
         status = error.response.status_code
@@ -74,6 +81,14 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
                 }
             )
     return sorted(candidates, key=lambda candidate: candidate.get("score") or 0, reverse=True)
+
+
+def normalized_acoustid_duration(value: object) -> int | None:
+    try:
+        duration = round(float(value))
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
 
 
 def search_album_releases(artist: str, album: str) -> list[dict]:
