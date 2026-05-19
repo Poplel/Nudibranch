@@ -85,6 +85,7 @@ class User(Base):
 
     permissions: Mapped[list["UserPermission"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     wishlists: Mapped[list["WishlistItem"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    player_state: Mapped["PlayerState | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
 
 
 class UserPermission(Base):
@@ -96,6 +97,25 @@ class UserPermission(Base):
     permission: Mapped[Permission] = mapped_column(Enum(Permission), nullable=False)
 
     user: Mapped[User] = relationship(back_populates="permissions")
+
+
+class PlayerState(Base):
+    __tablename__ = "player_states"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    track_id: Mapped[str | None] = mapped_column(ForeignKey("tracks.id", ondelete="SET NULL"))
+    title: Mapped[str | None] = mapped_column(String(255))
+    artist: Mapped[str | None] = mapped_column(String(255))
+    album: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="stopped", nullable=False)
+    queue_length: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    position_seconds: Mapped[int | None] = mapped_column(Integer)
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="player_state")
+    track: Mapped["Track | None"] = relationship()
 
 
 class Artist(Base):

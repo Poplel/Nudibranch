@@ -47,6 +47,18 @@ class UserPinUpdate(BaseModel):
     pin: str = Field(min_length=4, max_length=32)
 
 
+class PlayerStateUpdate(BaseModel):
+    track_id: str | None = None
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    status: str = "stopped"
+    queue_length: int = 0
+    current_index: int = 0
+    position_seconds: int | None = None
+    duration_seconds: int | None = None
+
+
 class LibraryTreeTrack(BaseModel):
     id: str
     title: str

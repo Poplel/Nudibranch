@@ -4,7 +4,7 @@ from pathlib import Path
 import httpx
 
 from nudibranch.core.config import get_settings
-from nudibranch.services.imports import fingerprint_audio
+from nudibranch.services.imports import fingerprint_audio, read_audio_metadata
 
 
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
@@ -23,9 +23,19 @@ def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | Non
     if not fingerprint:
         raise ValueError("Unable to fingerprint this file")
 
+    duration = fingerprint.get("duration") or file_info.get("duration") or file_info.get("duration_seconds")
+    if not duration and file_info.get("duration_ms"):
+        duration = round(float(file_info["duration_ms"]) / 1000)
+    if not duration and file_info.get("path"):
+        metadata = read_audio_metadata(Path(file_info["path"]))
+        if metadata.get("duration_ms"):
+            duration = round(float(metadata["duration_ms"]) / 1000)
+    if not duration:
+        raise ValueError("Unable to determine this file's duration for AcoustID lookup")
+
     params = {
         "client": api_key,
-        "duration": fingerprint.get("duration"),
+        "duration": duration,
         "fingerprint": fingerprint.get("fingerprint"),
         "meta": "recordings releasegroups releases tracks",
     }

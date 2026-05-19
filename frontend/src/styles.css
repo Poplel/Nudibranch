@@ -1082,6 +1082,40 @@ nav button:hover,
   font-size: 13px;
 }
 
+.playback-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.playback-columns h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.playback-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto;
+  gap: 4px 8px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  background: var(--panel);
+}
+
+.playback-row span {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.playback-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
 .wishlist-row.removed {
   opacity: 0.58;
 }

@@ -32,6 +32,7 @@ from nudibranch.api.schemas import (
     PlaylistAddTracks,
     PlaylistCreate,
     PlaylistPositionProposalRequest,
+    PlayerStateUpdate,
     PlaylistTrackOut,
     PlaylistUpdate,
     PermissionOut,
@@ -60,6 +61,7 @@ from nudibranch.db.models import (
     Permission,
     Playlist,
     PlaylistTrack,
+    PlayerState,
     ProposalBatch,
     ProposalItem,
     ProposalKind,
@@ -202,6 +204,43 @@ def update_own_pin(
     user.pin_hash = hash_secret(payload.pin)
     session.commit()
     return serialize_user(load_user(session, user.id))
+
+
+@router.post("/player/status", tags=["users"])
+def update_player_status(
+    payload: PlayerStateUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    state = session.get(PlayerState, user.id)
+    if not state:
+        state = PlayerState(user_id=user.id)
+        session.add(state)
+    track = session.get(Track, payload.track_id) if payload.track_id else None
+    state.track_id = track.id if track else payload.track_id
+    state.title = payload.title or (track.title if track else None)
+    state.artist = payload.artist or (track.album.artist.name if track and track.album and track.album.artist else None)
+    state.album = payload.album or (track.album.title if track and track.album else None)
+    state.status = payload.status if payload.status in {"playing", "paused", "stopped"} else "stopped"
+    state.queue_length = max(0, payload.queue_length)
+    state.current_index = max(0, payload.current_index)
+    state.position_seconds = payload.position_seconds
+    state.duration_seconds = payload.duration_seconds
+    state.updated_at = datetime.now(timezone.utc)
+    session.commit()
+    return {"ok": True}
+
+
+@router.get("/users/playback", tags=["users"])
+def users_playback(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> dict:
+    users = list(session.scalars(select(User).options(selectinload(User.player_state)).order_by(User.created_at.asc())))
+    return {
+        "app": [serialize_player_state(user) for user in users],
+        "jellyfin": jellyfin_now_playing(session),
+    }
 
 
 @router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"])
@@ -489,8 +528,9 @@ def acoustic_match(
 @router.post("/imports/album-lookup", tags=["imports"])
 def album_lookup(
     payload: AlbumLookupRequest,
-    _: User = Depends(require_permission(Permission.import_run)),
+    user: User = Depends(get_current_user),
 ) -> dict:
+    require_album_lookup_access(user)
     try:
         return lookup_album_tracks(payload.artist, payload.album, payload.release_id)
     except httpx.HTTPStatusError as error:
@@ -502,8 +542,9 @@ def album_lookup(
 @router.post("/imports/album-search", tags=["imports"])
 def album_search(
     payload: AlbumLookupRequest,
-    _: User = Depends(require_permission(Permission.import_run)),
+    user: User = Depends(get_current_user),
 ) -> dict:
+    require_album_lookup_access(user)
     try:
         return {"results": search_album_releases(payload.artist, payload.album)}
     except httpx.HTTPStatusError as error:
@@ -1463,6 +1504,60 @@ def serialize_user(user: User) -> UserOut:
     )
 
 
+def serialize_player_state(user: User) -> dict:
+    state = user.player_state
+    if not state:
+        return {"user_id": user.id, "user_name": user.display_name, "status": "stopped"}
+    updated_at = state.updated_at
+    if updated_at and updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    stale = bool(updated_at and updated_at < datetime.now(timezone.utc) - timedelta(minutes=10))
+    return {
+        "user_id": user.id,
+        "user_name": user.display_name,
+        "track_id": state.track_id,
+        "title": state.title,
+        "artist": state.artist,
+        "album": state.album,
+        "status": "stopped" if stale else state.status,
+        "queue_length": state.queue_length,
+        "current_index": state.current_index,
+        "position_seconds": state.position_seconds,
+        "duration_seconds": state.duration_seconds,
+        "updated_at": updated_at.isoformat() if updated_at else None,
+    }
+
+
+def jellyfin_now_playing(session: Session) -> list[dict]:
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not api_key:
+        return []
+    try:
+        response = httpx.get(f"{jellyfin_url}/Sessions", headers={"X-Emby-Token": api_key}, timeout=8)
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return []
+    sessions = []
+    for item in response.json():
+        now_playing = item.get("NowPlayingItem") or {}
+        if not now_playing:
+            continue
+        sessions.append(
+            {
+                "user_name": item.get("UserName") or item.get("UserId") or "Jellyfin user",
+                "client": item.get("Client"),
+                "device_name": item.get("DeviceName"),
+                "title": now_playing.get("Name"),
+                "artist": ", ".join(now_playing.get("Artists") or []),
+                "album": now_playing.get("Album"),
+                "status": "playing" if not (item.get("PlayState") or {}).get("IsPaused") else "paused",
+            }
+        )
+    return sessions
+
+
 def serialize_wishlist_item(item: WishlistItem) -> WishlistOut:
     return WishlistOut(
         id=item.id,
@@ -1535,6 +1630,19 @@ def effective_permission_values(user: User) -> list[str]:
 
 def user_has_permission(user: User, permission: Permission) -> bool:
     return user.is_admin or any(user_permission.permission == permission for user_permission in user.permissions)
+
+
+def require_album_lookup_access(user: User) -> None:
+    allowed = {
+        Permission.import_run,
+        Permission.wishlist_manage_own,
+        Permission.wishlist_manage_all,
+        Permission.library_read,
+        Permission.downloads_manage,
+    }
+    if user.is_admin or any(user_permission.permission in allowed for user_permission in user.permissions):
+        return
+    raise HTTPException(status_code=403, detail="Not enough permissions")
 
 
 def permission_label(permission: Permission) -> str:

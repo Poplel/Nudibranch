@@ -64,8 +64,8 @@ const navItems = [
 const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the managed library.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
-  Wishlist: "Prepare wishlist requests and submit them for approval.",
-  "Wishlist Approvals": "Prepare wishlist requests and submit them for approval.",
+  Wishlist: "Request music and track each item through approval and download.",
+  "Wishlist Approvals": "Review user wishlist requests and choose what moves to the task queue.",
   "Task Queue": "Review requested changes before they run.",
   Downloads: "Review download searches, candidates, and completed transfers.",
   Playlists: "Create, import, and manage playlists.",
@@ -108,6 +108,7 @@ function App() {
   const [wishlistApprovals, setWishlistApprovals] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [users, setUsers] = useState([]);
+  const [userPlayback, setUserPlayback] = useState({ app: [], jellyfin: [] });
   const [permissionCatalog, setPermissionCatalog] = useState([]);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
@@ -191,6 +192,7 @@ function App() {
       if (hasPermission(user, "notifications:read")) refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
       if (hasPermission(user, "wishlist:manage_own")) refreshWishlistApprovals();
+      if (canManageUsers(user)) refreshUserPlayback();
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
   }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || []), activeWork]);
@@ -314,6 +316,7 @@ function App() {
       }
       if (canManageUsers(me)) {
         refreshUsers();
+        refreshUserPlayback();
       }
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
@@ -432,6 +435,14 @@ function App() {
       setUsers(await api("/users"));
     } catch {
       // Users without management permissions do not need this list.
+    }
+  }
+
+  async function refreshUserPlayback() {
+    try {
+      setUserPlayback(await api("/users/playback"));
+    } catch {
+      // Playback visibility is only available to users who can manage users.
     }
   }
 
@@ -1122,10 +1133,29 @@ function App() {
     try {
       setAudioUrl(`${API_BASE}/library/tracks/${track.id}/stream?api_key=${encodeURIComponent(token)}`);
       setCurrentTrack(track);
+      reportPlayerStatus(track, "playing", { queue_length: playerQueue.length || 1, current_index: Math.max(0, playerQueue.findIndex((queuedTrack) => queuedTrack.id === track.id)) });
     } catch (playError) {
       setError(`Playback failed: ${playError.message}`);
       notify("Playback failed", playError.message, "ui_error");
     }
+  }
+
+  function reportPlayerStatus(track = currentTrack, status = "stopped", details = {}) {
+    if (!user?.id) return;
+    api("/player/status", {
+      method: "POST",
+      body: JSON.stringify({
+        track_id: track?.id || null,
+        title: track?.title || null,
+        artist: track?._artist || null,
+        album: track?._album || null,
+        status,
+        queue_length: details.queue_length ?? playerQueue.length,
+        current_index: details.current_index ?? Math.max(0, currentTrackIndex),
+        position_seconds: details.position_seconds ?? null,
+        duration_seconds: details.duration_seconds ?? null,
+      }),
+    }).catch(() => {});
   }
 
   async function playNextTrack() {
@@ -1276,7 +1306,7 @@ function App() {
 
         <div className="content-grid">
           <section className="panel main-panel">
-            <PanelHeader page={page === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
+            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && (
               <LibraryTree
@@ -1390,6 +1420,7 @@ function App() {
                 users={users}
                 permissions={permissionCatalog}
                 currentUser={user}
+                playback={userPlayback}
                 canManage={canManageUsers(user)}
                 onCreate={createUserAccount}
                 onUpdate={updateUserAccount}
@@ -1435,12 +1466,16 @@ function App() {
             onSkipForward={playNextTrack}
             onFavorite={toggleFavoriteTrack}
             favoriteTrackIds={favoriteTrackIds}
+            onPlaybackState={(status, details) => reportPlayerStatus(currentTrack, status, details)}
             onDockChange={({ popped, compactHeight, fullHeight }) => {
               setPlayerPopped(popped);
               setPlayerDockHeight(compactHeight || 0);
               setPlayerToastHeight(fullHeight || compactHeight || 0);
             }}
-            onClose={() => setPlayerOpen(false)}
+            onClose={() => {
+              reportPlayerStatus(currentTrack, "stopped");
+              setPlayerOpen(false);
+            }}
           />
         )}
       </section>
@@ -2332,7 +2367,7 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
     <div className="wishlist-view">
       {albumSearchOpen && <AlbumSearchPanel onAdd={addAlbumToWishlist} onLookup={onLookupAlbum} onSearch={onSearchAlbums} />}
       {wishlist.length === 0 ? (
-        <EmptyState title="No wishlist items" body="Add music here before sending wishlist work to the task queue." />
+        <EmptyState title="No wishlist items" body={canApproveAll ? "User requests will appear here for approval." : "Add music here to request it."} />
       ) : (
         <div className="tree">
           <TreeToolbar
@@ -3498,6 +3533,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
     artist.albums.forEach((album) => {
       album.slots.forEach((slot) => {
         if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+        if (isGenericTrackTitle(slot.title)) return;
         requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number });
       });
     });
@@ -3507,6 +3543,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
     const albumName = albumParts.join("/");
     slots.forEach((slot) => {
       if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+      if (isGenericTrackTitle(slot.title)) return;
       requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number });
     });
   });
@@ -3781,7 +3818,7 @@ function CheckFilesResult({ result, onFix }) {
   );
 }
 
-function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
+function UsersView({ users, permissions, currentUser, playback, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
   const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
@@ -3802,6 +3839,9 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
 
   return (
     <div className="users-view">
+      {canManage && (
+        <PlaybackPanel playback={playback} />
+      )}
       {canManage && (
         <form className="user-create-panel" onSubmit={submitNewUser}>
           <h2>Create user</h2>
@@ -3843,6 +3883,44 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+function PlaybackPanel({ playback }) {
+  const appRows = playback?.app || [];
+  const jellyfinRows = playback?.jellyfin || [];
+  return (
+    <section className="user-create-panel playback-panel">
+      <h2>Now playing</h2>
+      <div className="playback-columns">
+        <div>
+          <h3>In app</h3>
+          {appRows.length === 0 ? (
+            <p className="user-note">No app playback reported.</p>
+          ) : (
+            appRows.map((row) => <PlaybackRow row={row} key={`app:${row.user_id}`} />)
+          )}
+        </div>
+        <div>
+          <h3>Jellyfin</h3>
+          {jellyfinRows.length === 0 ? (
+            <p className="user-note">No Jellyfin playback reported.</p>
+          ) : (
+            jellyfinRows.map((row, index) => <PlaybackRow row={row} key={`jellyfin:${row.user_name}:${index}`} />)
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function PlaybackRow({ row }) {
+  return (
+    <div className="playback-row">
+      <strong>{row.user_name}</strong>
+      <span>{row.status || "stopped"}</span>
+      <small>{row.title ? `${row.title}${row.artist ? ` · ${row.artist}` : ""}${row.album ? ` / ${row.album}` : ""}` : "Nothing playing"}</small>
     </div>
   );
 }
@@ -4191,6 +4269,7 @@ function AudioPlayer({
   onSkipForward,
   onFavorite,
   favoriteTrackIds,
+  onPlaybackState,
   onDockChange,
   onClose,
 }) {
@@ -4199,6 +4278,7 @@ function AudioPlayer({
   const coreRef = useRef(null);
   const pipWindowRef = useRef(null);
   const reopenPipAfterFullscreen = useRef(false);
+  const lastPlaybackReportSecond = useRef(-1);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -4269,6 +4349,13 @@ function AudioPlayer({
     } else {
       audio.pause();
     }
+  }
+
+  function notifyPlaybackState(status, event) {
+    onPlaybackState?.(status, {
+      position_seconds: Math.round(event?.currentTarget?.currentTime || currentTime || 0),
+      duration_seconds: Math.round(event?.currentTarget?.duration || duration || 0) || null,
+    });
   }
 
   function seek(event) {
@@ -4443,9 +4530,22 @@ function AudioPlayer({
         ref={audioRef}
         autoPlay
         src={audioUrl}
-        onPlay={() => setPlaying(true)}
-        onPause={() => setPlaying(false)}
-        onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+        onPlay={(event) => {
+          setPlaying(true);
+          notifyPlaybackState("playing", event);
+        }}
+        onPause={(event) => {
+          setPlaying(false);
+          notifyPlaybackState("paused", event);
+        }}
+        onTimeUpdate={(event) => {
+          const second = Math.round(event.currentTarget.currentTime);
+          setCurrentTime(event.currentTarget.currentTime);
+          if (second !== lastPlaybackReportSecond.current && second % 15 === 0) {
+            lastPlaybackReportSecond.current = second;
+            notifyPlaybackState(playing ? "playing" : "paused", event);
+          }
+        }}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
         onEnded={onEnded}
       />
@@ -4850,11 +4950,13 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
   const trackMap = new Map();
   files.forEach((file) => {
     const trackNumber = file.metadata?.track_number;
-    if (trackNumber) trackMap.set(trackNumber, file);
+    if (trackNumber && !trackMap.has(trackNumber)) trackMap.set(trackNumber, file);
   });
+  const usedPaths = new Set();
   const slots = expectedTracks.map((track, index) => {
     const trackNumber = track.track_number || index + 1;
     const file = trackMap.get(trackNumber);
+    if (file) usedPaths.add(file.path);
     return file
       ? { id: file.path, track_number: trackNumber, title: file.metadata?.title || track.title, file }
       : {
@@ -4863,6 +4965,17 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
           title: track.title || `Track ${trackNumber}`,
           reason: recordTracks ? "Missing from album record" : libraryAlbum ? "Missing from import" : "Album slot",
         };
+  });
+  files.forEach((file, index) => {
+    if (usedPaths.has(file.path)) return;
+    const trackNumber = file.metadata?.track_number || expectedTracks.length + index + 1;
+    slots.push({
+      id: file.path,
+      track_number: trackNumber,
+      title: file.metadata?.title || `Track ${trackNumber}`,
+      file,
+      unmatched: true,
+    });
   });
   const matchedCount = slots.filter((slot) => slot.file).length;
   const matchStatus = libraryAlbum ? (matchedCount >= expectedTracks.length ? "full" : "partial") : "new";
