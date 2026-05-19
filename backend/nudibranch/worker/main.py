@@ -344,10 +344,11 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             skipped += 1
 
     downloaded_import = import_completed_downloads(session)
+    open_downloads = batch_has_open_downloads(batch)
 
     if errors:
         batch.status = ProposalStatus.failed
-    elif batch_has_open_downloads(batch):
+    elif open_downloads:
         batch.status = ProposalStatus.executing
     elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed} or not item.selected for item in batch.items):
         batch.status = ProposalStatus.completed
@@ -357,7 +358,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     create_notification(
         session,
-        title="Task queue item failed" if errors else "Task queue item completed",
+        title="Task queue item failed" if errors else "Downloads queued" if open_downloads else "Task queue item completed",
         body=task_queue_notification_body(
             imported,
             metadata_updated,
@@ -369,9 +370,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             errors,
             download_errors,
             downloaded_import,
+            open_downloads,
         ),
         event_type="task_completed",
-        target_url="/activity",
+        target_url="/downloads" if open_downloads else "/activity",
     )
     return {
         "batch_id": batch_id,
@@ -385,6 +387,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         "errors": errors,
         "download_errors": download_errors,
         "downloaded_import": downloaded_import,
+        "open_downloads": open_downloads,
     }
 
 
@@ -399,6 +402,7 @@ def task_queue_notification_body(
     errors: list[str],
     download_errors: list[str] | None = None,
     downloaded_import: dict | None = None,
+    open_downloads: bool = False,
 ) -> str:
     parts = [
         f"{imported} tracks imported",
@@ -412,6 +416,8 @@ def task_queue_notification_body(
         parts.append(f"{skipped} items skipped")
     if downloaded_import and downloaded_import.get("imported"):
         parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
+    if open_downloads:
+        parts.append("downloads are queued and will move to the library after the files finish and verify")
     body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
@@ -590,8 +596,10 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
         try:
             result = queue_slskd_download(slskd_url, api_key, candidate)
             record_download_manifest_entry(request, candidate, item)
+            set_download_item_status(item, "queued in slskd; waiting for downloaded file")
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
+                set_download_item_status(candidate_item, "queued in slskd; waiting for downloaded file")
                 item.title = candidate_item.title
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
@@ -850,6 +858,8 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
     blocking_items = selected_download_blockers(batch)
     if blocking_items:
+        for item in blocking_items:
+            set_download_item_status(item, "needs attention before this batch can finish")
         return {"imported": 0, "errors": []}
     expected_item_ids = selected_slskd_download_item_ids(batch)
     if not expected_item_ids:
@@ -858,13 +868,19 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     manifest_item_ids = {entry.get("item_id") for entry in entries}
     if not expected_item_ids.issubset(manifest_item_ids):
+        for item_id in expected_item_ids - manifest_item_ids:
+            set_download_item_status(session.get(ProposalItem, item_id), "waiting for slskd queue record")
+        session.flush()
         return {"imported": 0, "errors": []}
     ready_entries = []
     errors: list[str] = []
     for entry in entries:
-        file_path = manifest_entry_file_path(entry, minimum_age_seconds)
+        file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
         if not file_path:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), wait_status)
+            session.flush()
             return {"imported": 0, "errors": []}
+        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for batch verification")
         ready_entries.append((entry, file_path))
 
     verified_entries = []
@@ -872,6 +888,8 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
             verified_entries.append((entry, Path(entry["path"]), entry["metadata"]))
             continue
+        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verifying with AcoustID")
+        session.flush()
         verification = verify_downloaded_file(session, file_path, entry)
         if verification["status"] == "mismatch":
             handle_download_mismatch(session, batch, entry, file_path, verification)
@@ -882,9 +900,12 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             return {"imported": 0, "errors": [message]}
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
+        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; waiting for the rest of the batch")
         verified_entries.append((entry, file_path, metadata))
 
     try:
+        for entry, _file_path, _metadata in verified_entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch")
         imported = import_verified_download_batch(session, batch, verified_entries)
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
         batch.status = ProposalStatus.failed
@@ -957,7 +978,7 @@ def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
     return ids
 
 
-def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> Path | None:
+def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Path | None, str]:
     root = get_settings().downloads_path
     known_path = entry.get("path")
     candidates = []
@@ -975,9 +996,9 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> Path | No
         except OSError:
             continue
         if now - stat.st_mtime < minimum_age_seconds:
-            return None
+            return None, "downloaded; waiting for file to settle"
         return file_path
-    return None
+    return None, "waiting for downloaded file"
 
 
 def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
@@ -998,6 +1019,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
     if item:
         item.status = ProposalStatus.failed
         item.selected = False
+        set_download_item_status(item, verification["message"])
     batch.status = ProposalStatus.failed
     request = entry.get("request") or verification.get("request") or {}
     if request:
@@ -1017,6 +1039,7 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
     item = session.get(ProposalItem, entry.get("item_id"))
     if item:
         item.status = ProposalStatus.failed
+        set_download_item_status(item, message)
     batch.status = ProposalStatus.failed
     create_notification(
         session,
@@ -1457,6 +1480,15 @@ def set_item_payload_status(item: ProposalItem, status: str) -> None:
     payload = json.loads(item.payload_json or "{}")
     payload["status"] = status
     item.payload_json = json.dumps(payload)
+
+
+def set_download_item_status(item: ProposalItem | None, status: str) -> None:
+    if not item:
+        return
+    set_item_payload_status(item, status)
+    if item.parent and item.parent.kind == ProposalKind.download:
+        set_item_payload_status(item.parent, status)
+        item.parent.status = ProposalStatus.executing
 
 
 def download_folder_pool(candidate: dict) -> dict | None:
@@ -2009,14 +2041,20 @@ def run_check_files(session: Session, _payload: dict) -> dict:
     ]
     missing_records = [file_info_for_existing_library_file(Path(path)) for path in missing_record_paths]
     queued_missing_files = queue_missing_file_downloads(session, missing_files)
+    queued_missing_records = queue_missing_record_imports(session, missing_records)
     create_notification(
         session,
         title="File check complete",
-        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records. {queued_missing_files} downloads added to the task queue.",
+        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue.",
         event_type="tool_completed",
-        target_url="/tools",
+        target_url="/task-queue",
     )
-    return {"missing_files": missing_files, "missing_records": missing_records, "queued_missing_files": queued_missing_files}
+    return {
+        "missing_files": missing_files,
+        "missing_records": [],
+        "queued_missing_files": queued_missing_files,
+        "queued_missing_records": queued_missing_records,
+    }
 
 
 def queue_missing_file_downloads(session: Session, missing_files: list[dict]) -> int:
@@ -2052,6 +2090,32 @@ def queue_missing_file_downloads(session: Session, missing_files: list[dict]) ->
                         "track_number": record.get("track_number"),
                     }
                 ),
+            )
+        )
+    session.flush()
+    return len(rows)
+
+
+def queue_missing_record_imports(session: Session, missing_records: list[dict]) -> int:
+    if not missing_records:
+        return 0
+    known_paths = existing_library_and_proposal_paths(session)
+    rows = [record for record in missing_records if record.get("path") and record["path"] not in known_paths]
+    if not rows:
+        return 0
+    batch = ProposalBatch(title="Create records for library files", kind=ProposalKind.import_files, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    for record in rows:
+        path = record["path"]
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=(record.get("metadata") or {}).get("title") or record.get("name") or Path(path).stem,
+                kind=ProposalKind.import_files,
+                old_value=path,
+                new_value=path,
+                payload_json=json.dumps(record),
             )
         )
     session.flush()

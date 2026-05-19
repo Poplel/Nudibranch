@@ -357,13 +357,14 @@ function App() {
   function sendFileCheckToImport(result) {
     const files = result.missing_records || [];
     const queuedDownloads = result.queued_missing_files || 0;
-    if (files.length === 0 && queuedDownloads === 0) return;
+    const queuedRecords = result.queued_missing_records || 0;
+    if (files.length === 0 && queuedDownloads === 0 && queuedRecords === 0) return;
     setImportFiles(files);
     setImportSeedDownloads([]);
-    setPage(files.length ? "Import/Add" : "Task Queue");
+    setPage("Task Queue");
     setToast({
       title: "File check ready",
-      body: `${files.length} files were sent to Import/Add. ${queuedDownloads} missing records were added to the task queue.`,
+      body: `${queuedDownloads + queuedRecords} fixes were added to the task queue.`,
     });
     refreshApprovals();
   }
@@ -3622,8 +3623,6 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
-  const latestCheckFilesResult = tasks.find((task) => task.type === "check_files" && task.status === "completed" && task.result)?.result;
-
   return (
     <div className="tools-view">
       {tools.length > 0 && (
@@ -3662,7 +3661,6 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
           </div>
         </section>
       )}
-      {hasPermission(user, "library:manage") && latestCheckFilesResult && <CheckFilesResult result={latestCheckFilesResult} onFix={onFix} />}
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
           <div className="log-header">
@@ -4911,7 +4909,8 @@ function taskSummary(task) {
   if (task.error) return task.error;
   if (task.result?.errors?.length) return task.result.errors.join("; ");
   if (task.type === "check_files" && task.result) {
-    return `${task.result.missing_files?.length || 0} records missing files, ${task.result.missing_records?.length || 0} files missing records`;
+    const queued = (task.result.queued_missing_files || 0) + (task.result.queued_missing_records || 0);
+    return `${queued} fixes added to task queue`;
   }
   if (task.type === "check_lyrics" && task.result) {
     return `${task.result.missing || 0} missing lyrics, ${task.result.existing || 0} already present`;
@@ -4943,6 +4942,7 @@ function proposalTaskSummary(result) {
   if (result.file_actions) parts.push(`${result.file_actions} files`);
   if (result.playlist_changes) parts.push(`${result.playlist_changes} playlists`);
   if (result.download_changes) parts.push(`${result.download_changes} downloads`);
+  if (result.open_downloads) parts.push("waiting for downloads to finish");
   if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);
