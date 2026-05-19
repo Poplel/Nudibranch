@@ -102,6 +102,7 @@ function App() {
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
+  const [appLogs, setAppLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
   const [wishlistApprovals, setWishlistApprovals] = useState([]);
@@ -185,6 +186,7 @@ function App() {
     const interval = window.setInterval(() => {
       if (hasPermission(user, "library:read")) refreshLibrary();
       if (hasPermission(user, "activity:read")) refreshTasks();
+      if (hasPermission(user, "activity:read")) refreshLogs();
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
       if (hasPermission(user, "notifications:read")) refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
@@ -283,10 +285,11 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
+      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
         api("/permissions"),
         hasPermission(me, "library:read") ? api("/library/tree") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
+        hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
         hasPermission(me, "notifications:read") ? api("/notifications") : Promise.resolve([]),
         hasPermission(me, "wishlist:manage_own") ? api("/wishlist") : Promise.resolve([]),
         hasPermission(me, "wishlist:manage_own") ? api("/wishlist/approvals") : Promise.resolve([]),
@@ -297,6 +300,7 @@ function App() {
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
       setTasks(taskData);
+      setAppLogs(logData);
       handleCompletedTaskEffects(taskData, { emit: false });
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
@@ -330,6 +334,15 @@ function App() {
       setTasks(taskData);
     } catch {
       // Task polling should not disrupt the page the user is working in.
+    }
+  }
+
+  async function refreshLogs() {
+    try {
+      const logData = await api("/logs");
+      setAppLogs(logData);
+    } catch {
+      // Log polling should not interrupt active work.
     }
   }
 
@@ -1307,6 +1320,7 @@ function App() {
             {page === "Tools" && (
               <ToolsView
                 tasks={tasks}
+                appLogs={appLogs}
                 notifications={notifications}
                 user={user}
                 backups={backups}
@@ -3610,7 +3624,7 @@ function InlineProgress({ value = 0, label = "", indeterminate = false }) {
   );
 }
 
-function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
+function ToolsView({ tasks, appLogs, notifications, user, backups, onRun, onFix }) {
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
@@ -3622,7 +3636,7 @@ function ToolsView({ tasks, notifications, user, backups, onRun, onFix }) {
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
-  const logs = buildLiveLog(tasks, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
+  const logs = buildLiveLog(tasks, appLogs, notifications).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
   return (
     <div className="tools-view">
       {tools.length > 0 && (
@@ -4947,9 +4961,6 @@ function proposalTaskSummary(result) {
   if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);
-  if (parts.length === 0 && Array.isArray(result.logs) && result.logs.length > 0) {
-    return result.logs[result.logs.length - 1]?.message || "Working";
-  }
   return parts.length ? parts.join(", ") : "No changes applied";
 }
 
@@ -4957,28 +4968,26 @@ function latestTaskResult(tasks, type) {
   return tasks.find((task) => task.type === type && task.status === "completed" && task.result) || null;
 }
 
-function buildLiveLog(tasks, notifications) {
+function buildLiveLog(tasks, appLogs, notifications) {
   const taskEntries = tasks.map((task) => ({
     id: `task:${task.id}`,
     level: task.status === "failed" || task.error || task.result?.errors?.length ? "error" : "info",
     createdAt: task.updated_at || task.created_at,
     text: `[${new Date(task.updated_at || task.created_at).toLocaleString()}] ${task.type} ${task.status}: ${taskSummary(task)}`,
   }));
-  const taskLogEntries = tasks.flatMap((task) =>
-    (Array.isArray(task.result?.logs) ? task.result.logs : []).map((entry, index) => ({
-      id: `task-log:${task.id}:${index}`,
-      level: entry.level || "info",
-      createdAt: entry.created_at || task.updated_at || task.created_at,
-      text: `[${new Date(entry.created_at || task.updated_at || task.created_at).toLocaleString()}] ${task.type}: ${entry.message || ""}`,
-    })),
-  );
+  const appLogEntries = (appLogs || []).map((entry, index) => ({
+    id: `app-log:${index}:${entry.created_at}`,
+    level: entry.level || "info",
+    createdAt: entry.created_at,
+    text: `[${new Date(entry.created_at).toLocaleString()}] ${entry.message || ""}`,
+  }));
   const notificationEntries = notifications.map((notification) => ({
     id: `notification:${notification.id}`,
     level: notification.event_type?.includes("failed") || notification.title?.toLowerCase().includes("failed") ? "error" : "info",
     createdAt: notification.created_at,
     text: `[${new Date(notification.created_at).toLocaleString()}] ${notification.title}: ${notification.body}`,
   }));
-  return [...taskEntries, ...taskLogEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return [...taskEntries, ...appLogEntries, ...notificationEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
 function notificationSeverity(notification) {

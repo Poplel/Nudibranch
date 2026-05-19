@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     trash_path: Path = Path("/app/trash")
     backups_path: Path = Path("/app/backups")
     config_path: Path = Path("/app/config")
+    log_path: Path = Field(Path("/app/config/nudibranch.log"), alias="NUDIBRANCH_LOG_PATH")
 
 
 @lru_cache

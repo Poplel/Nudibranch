@@ -1,12 +1,12 @@
 import json
 import socket
 from datetime import datetime, timezone
-from typing import Any
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from nudibranch.db.models import ProposalBatch, ProposalStatus, Task, TaskStatus
+from nudibranch.services.app_log import write_app_log
 
 
 def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
@@ -84,7 +84,6 @@ def claim_next_task(session: Session, lease_seconds: int = 300) -> Task | None:
 
 def complete_task(session: Session, task: Task, result: dict) -> None:
     task.status = TaskStatus.completed
-    result = merge_task_logs(task, result)
     task.result_json = json.dumps(result)
     task.error = None
     task.lease_until = None
@@ -101,7 +100,6 @@ def update_task_progress(session: Session, task: Task, current: int, total: int,
         **extra,
     }
     payload["progress"] = progress
-    payload["logs"] = append_log_entry(payload.get("logs"), message, "info", {"progress": progress})
     task.result_json = json.dumps(payload)
     session.commit()
 
@@ -113,34 +111,14 @@ def fail_task(session: Session, task: Task, error: str) -> None:
     session.commit()
 
 
-def append_task_log(session: Session, task: Task | None, message: str, level: str = "info", **context: Any) -> None:
-    if task is None:
-        return
-    payload = task_result(task) or {}
-    payload["logs"] = append_log_entry(payload.get("logs"), message, level, context)
-    task.result_json = json.dumps(payload)
-    session.commit()
-
-
-def append_log_entry(existing: Any, message: str, level: str = "info", context: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    logs = existing if isinstance(existing, list) else []
-    if logs and isinstance(logs[-1], dict) and logs[-1].get("message") == message and logs[-1].get("level") == level:
-        return logs
-    entry = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "level": level,
-        "message": message,
-    }
-    if context:
-        entry["context"] = context
-    return [*logs, entry][-300:]
-
-
-def merge_task_logs(task: Task, result: dict) -> dict:
-    existing = task_result(task) or {}
-    if existing.get("logs") and "logs" not in result:
-        result = {**result, "logs": existing["logs"]}
-    return result
+def append_task_log(session: Session, task: Task | None, message: str, level: str = "info", **context: object) -> None:
+    write_app_log(
+        message,
+        level=level,
+        task_id=task.id if task else None,
+        task_type=task.type if task else None,
+        **context,
+    )
 
 
 def cancel_task(session: Session, task_id: str) -> Task:

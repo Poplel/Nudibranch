@@ -25,6 +25,7 @@ from nudibranch.api.schemas import (
     LibraryTreeAlbum,
     LibraryTreeArtist,
     LibraryTreeTrack,
+    LogEntryOut,
     LoginRequest,
     LoginResponse,
     NotificationOut,
@@ -72,6 +73,7 @@ from nudibranch.db.models import (
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
+from nudibranch.services.app_log import tail_app_log
 from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
@@ -1188,6 +1190,14 @@ def list_tasks(
     return [serialize_task(task) for task in tasks]
 
 
+@router.get("/logs", response_model=list[LogEntryOut], tags=["tasks"])
+def list_logs(
+    limit: int = Query(500, ge=1, le=2000),
+    _: User = Depends(require_permission(Permission.activity_read)),
+) -> list[LogEntryOut]:
+    return [serialize_log_entry(entry) for entry in tail_app_log(limit)]
+
+
 @router.post("/tasks/{task_id}/cancel", response_model=TaskOut, tags=["tasks"])
 def cancel_existing_task(
     task_id: str,
@@ -1548,4 +1558,21 @@ def serialize_task(task: Task) -> TaskOut:
         attempts=task.attempts,
         created_at=task.created_at,
         updated_at=task.updated_at,
+    )
+
+
+def serialize_log_entry(entry: dict) -> LogEntryOut:
+    created_at = entry.get("created_at")
+    if isinstance(created_at, str):
+        try:
+            parsed_created_at = datetime.fromisoformat(created_at)
+        except ValueError:
+            parsed_created_at = datetime.now(timezone.utc)
+    else:
+        parsed_created_at = datetime.now(timezone.utc)
+    return LogEntryOut(
+        created_at=parsed_created_at,
+        level=str(entry.get("level") or "info"),
+        message=str(entry.get("message") or ""),
+        context=entry.get("context") if isinstance(entry.get("context"), dict) else {},
     )

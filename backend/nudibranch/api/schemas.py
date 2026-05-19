@@ -159,6 +159,13 @@ class TaskOut(BaseModel):
     updated_at: datetime
 
 
+class LogEntryOut(BaseModel):
+    created_at: datetime
+    level: str = "info"
+    message: str
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
 class NotificationOut(BaseModel):
     id: str
     user_id: str | None

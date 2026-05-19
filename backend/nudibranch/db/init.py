@@ -1,12 +1,14 @@
 import hashlib
+import json
 
 from sqlalchemy import text
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
-from nudibranch.db.models import Base, Permission, User, UserPermission
+from nudibranch.db.models import Base, Permission, Task, User, UserPermission
 from nudibranch.db.session import engine
+from nudibranch.services.app_log import write_app_log
 
 
 def hash_secret(value: str) -> str:
@@ -41,4 +43,31 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "status_changed_at" not in columns:
         session.execute(text("ALTER TABLE wishlist_items ADD COLUMN status_changed_at DATETIME"))
         session.execute(text("UPDATE wishlist_items SET status_changed_at = created_at WHERE status_changed_at IS NULL"))
+        session.commit()
+    move_task_result_logs_to_app_log(session)
+
+
+def move_task_result_logs_to_app_log(session: Session) -> None:
+    changed = False
+    for task in session.scalars(select(Task).where(Task.result_json.like('%"logs"%'))):
+        try:
+            result = json.loads(task.result_json or "{}")
+        except json.JSONDecodeError:
+            continue
+        logs = result.pop("logs", None)
+        if not isinstance(logs, list):
+            continue
+        for entry in logs:
+            if not isinstance(entry, dict):
+                continue
+            write_app_log(
+                str(entry.get("message") or ""),
+                level=str(entry.get("level") or "info"),
+                task_id=task.id,
+                task_type=task.type,
+                migrated_from="task_result",
+            )
+        task.result_json = json.dumps(result)
+        changed = True
+    if changed:
         session.commit()

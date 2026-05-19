@@ -21,7 +21,7 @@ from nudibranch.services.metadata_lookup import search_album_releases, lookup_al
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
-from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, merge_task_logs, task_to_payload, update_task_progress
+from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -2691,7 +2691,6 @@ async def worker_loop() -> None:
                 if task.status == TaskStatus.canceled:
                     continue
                 if result.get("errors"):
-                    result = merge_task_logs(task, result)
                     task.status = TaskStatus.failed
                     task.result_json = json.dumps(result)
                     task.error = result["errors"][0]
