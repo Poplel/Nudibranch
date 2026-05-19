@@ -140,6 +140,147 @@ def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]
     raise RuntimeError("; ".join(errors))
 
 
+def download_transfers(slskd_url: str, api_key: str) -> list[dict[str, Any]]:
+    if not slskd_url or not api_key:
+        return []
+    with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
+        response = client.get("/api/v0/transfers/downloads")
+        if response.status_code in {404, 405}:
+            return []
+        response.raise_for_status()
+        return flatten_download_transfers(response.json())
+
+
+def flatten_download_transfers(payload: Any) -> list[dict[str, Any]]:
+    transfers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add_transfer(value: dict[str, Any], username: str | None) -> None:
+        normalized = normalize_file(value)
+        if not normalized:
+            return
+        transfer = {
+            **value,
+            "username": username or response_username(value),
+            "filename": normalized["filename"],
+            "size": normalized.get("size"),
+            "status": transfer_status(value),
+            "percent": transfer_percent(value),
+            "local_path": transfer_local_path(value),
+            "error": transfer_error(value),
+        }
+        key = (str(transfer.get("username") or ""), str(transfer.get("filename") or ""), str(transfer.get("local_path") or ""))
+        if key in seen:
+            return
+        seen.add(key)
+        transfers.append(transfer)
+
+    def walk(value: Any, username: str | None = None) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item, username)
+            return
+        if not isinstance(value, dict):
+            return
+
+        current_username = response_username(value) or username
+        if looks_like_transfer_file(value):
+            add_transfer(value, current_username)
+
+        for key in ("files", "Files", "downloads", "Downloads", "items", "Items"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                walk(list(child.values()), current_username)
+            elif isinstance(child, list):
+                walk(child, current_username)
+
+        for key in ("directories", "Directories", "folders", "Folders"):
+            child = value.get(key)
+            if isinstance(child, list):
+                walk(child, current_username)
+            elif isinstance(child, dict):
+                walk(list(child.values()), current_username)
+
+        for key in ("users", "Users", "data", "Data", "transfers", "Transfers"):
+            child = value.get(key)
+            if isinstance(child, dict):
+                for mapped_username, mapped_value in child.items():
+                    walk(mapped_value, current_username or str(mapped_username))
+            elif isinstance(child, list):
+                walk(child, current_username)
+
+        if not current_username:
+            for mapped_username, mapped_value in value.items():
+                if isinstance(mapped_value, (dict, list)):
+                    walk(mapped_value, str(mapped_username))
+
+    walk(payload)
+    return transfers
+
+
+def looks_like_transfer_file(value: dict[str, Any]) -> bool:
+    if not normalize_file(value):
+        return False
+    transfer_keys = {
+        "state",
+        "State",
+        "status",
+        "Status",
+        "percentComplete",
+        "PercentComplete",
+        "percentage",
+        "Percentage",
+        "bytesTransferred",
+        "BytesTransferred",
+        "localFilename",
+        "LocalFilename",
+        "localPath",
+        "LocalPath",
+    }
+    return any(key in value for key in transfer_keys)
+
+
+def transfer_status(value: dict[str, Any]) -> str | None:
+    status = value.get("state") or value.get("State") or value.get("status") or value.get("Status")
+    return str(status) if status is not None else None
+
+
+def transfer_percent(value: dict[str, Any]) -> float | None:
+    for key in ("percentComplete", "PercentComplete", "percentage", "Percentage", "percent", "Percent", "progress", "Progress"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            percent = float(raw)
+        except (TypeError, ValueError):
+            continue
+        return percent * 100 if 0 < percent <= 1 else percent
+    transferred = value.get("bytesTransferred") or value.get("BytesTransferred") or value.get("bytesDownloaded") or value.get("BytesDownloaded")
+    size = value.get("size") or value.get("Size") or value.get("bytes") or value.get("Bytes")
+    try:
+        if transferred is not None and size:
+            return (float(transferred) / float(size)) * 100
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return None
+
+
+def transfer_local_path(value: dict[str, Any]) -> str | None:
+    for key in ("localFilename", "LocalFilename", "localPath", "LocalPath", "path", "Path"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
+def transfer_error(value: dict[str, Any]) -> str | None:
+    for key in ("error", "Error", "message", "Message", "exception", "Exception"):
+        raw = value.get(key)
+        if isinstance(raw, str) and raw:
+            return raw
+    return None
+
+
 def search_identifier(payload: Any) -> str | None:
     if isinstance(payload, str):
         return payload

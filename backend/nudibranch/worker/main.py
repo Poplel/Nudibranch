@@ -21,7 +21,7 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
-from nudibranch.services.slskd import queue_slskd_download, search_slskd_detailed
+from nudibranch.services.slskd import download_transfers, queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
@@ -816,6 +816,9 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
     manifest_result = import_manifest_download_batches(session, minimum_age_seconds)
     imported += manifest_result["imported"]
     errors.extend(manifest_result["errors"])
+    manifest_waiting = manifest_result.get("waiting", 0)
+    manifest_ready = manifest_result.get("ready", 0)
+    manifest_failed = manifest_result.get("failed", 0)
     now = time.time()
     known_paths = existing_library_and_proposal_paths(session)
     for file_path in sorted(root.rglob("*")):
@@ -865,7 +868,7 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
             target_url="/library",
         )
         enqueue_task(session, "jellyfin_scan", {})
-    return {"imported": imported, "errors": errors}
+    return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
 
 
 def import_manifest_download_batches(session: Session, minimum_age_seconds: int) -> dict:
@@ -876,6 +879,9 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
             entries_by_batch.setdefault(batch_id, []).append(entry)
     imported = 0
     errors: list[str] = []
+    waiting = 0
+    ready = 0
+    failed = 0
     for batch_id, entries in entries_by_batch.items():
         batch = session.get(ProposalBatch, batch_id)
         if not batch or batch.status not in {ProposalStatus.executing, ProposalStatus.failed, ProposalStatus.pending, ProposalStatus.approved}:
@@ -883,7 +889,10 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
         result = process_download_manifest_batch(session, batch, entries, minimum_age_seconds)
         imported += result["imported"]
         errors.extend(result["errors"])
-    return {"imported": imported, "errors": errors}
+        waiting += result.get("waiting", 0)
+        ready += result.get("ready", 0)
+        failed += result.get("failed", 0)
+    return {"imported": imported, "errors": errors, "waiting": waiting, "ready": ready, "failed": failed}
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
@@ -891,7 +900,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     if blocking_items:
         for item in blocking_items:
             set_download_item_status(item, "needs attention before this batch can finish")
-        return {"imported": 0, "errors": []}
+        return {"imported": 0, "errors": [], "waiting": 0, "ready": 0, "failed": len(blocking_items)}
     expected_item_ids = selected_slskd_download_item_ids(batch)
     if not expected_item_ids:
         return {"imported": 0, "errors": []}
@@ -903,14 +912,31 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             set_download_item_status(session.get(ProposalItem, item_id), "waiting for slskd queue record")
         update_download_container_statuses(batch)
         session.flush()
-        return {"imported": 0, "errors": []}
+        return {"imported": 0, "errors": [], "waiting": len(expected_item_ids - manifest_item_ids), "ready": 0, "failed": 0}
+    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
+    if transfer_error_message:
+        for entry in entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; waiting for downloaded file")
     ready_entries = []
     errors: list[str] = []
     waiting = False
+    waiting_count = 0
+    failed_count = 0
     for entry in entries:
+        transfer = transfer_lookup.get(manifest_entry_key(entry))
+        apply_transfer_path_to_manifest(entry, transfer)
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
         if not file_path:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), manifest_wait_status(entry, wait_status))
+            item = session.get(ProposalItem, entry.get("item_id"))
+            if transfer_error_message and not transfer:
+                wait_status = f"{transfer_error_message}; {wait_status}"
+            status = transfer_wait_status(entry, transfer, wait_status)
+            set_download_item_status(item, status)
+            if transfer_is_failed(transfer) and item:
+                item.status = ProposalStatus.failed
+                failed_count += 1
+            else:
+                waiting_count += 1
             waiting = True
             continue
         set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for batch verification")
@@ -918,7 +944,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     update_download_container_statuses(batch)
     session.flush()
     if waiting:
-        return {"imported": 0, "errors": []}
+        return {"imported": 0, "errors": [], "waiting": waiting_count, "ready": len(ready_entries), "failed": failed_count}
 
     verified_entries = []
     for entry, file_path in ready_entries:
@@ -930,11 +956,11 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         verification = verify_downloaded_file(session, file_path, entry)
         if verification["status"] == "mismatch":
             handle_download_mismatch(session, batch, entry, file_path, verification)
-            return {"imported": 0, "errors": [verification["message"]]}
+            return {"imported": 0, "errors": [verification["message"]], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         if verification["status"] != "verified":
             message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
             handle_download_verification_issue(session, batch, entry, file_path, message, verification)
-            return {"imported": 0, "errors": [message]}
+            return {"imported": 0, "errors": [message], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
         set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; waiting for the rest of the batch")
@@ -954,8 +980,8 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             target_url="/downloads",
         )
         session.commit()
-        return {"imported": 0, "errors": [str(error)]}
-    return {"imported": imported, "errors": errors}
+        return {"imported": 0, "errors": [str(error)], "waiting": 0, "ready": len(ready_entries), "failed": 1}
+    return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
 
 
 def reconcile_manifest_entries_to_selected_items(session: Session, batch: ProposalBatch, entries: list[dict], expected_item_ids: set[str]) -> list[dict]:
@@ -1015,18 +1041,122 @@ def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
     return ids
 
 
+def slskd_transfer_lookup(session: Session, entries: list[dict]) -> tuple[dict[tuple[str, str, str], dict], str | None]:
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    if not slskd_url or not api_key:
+        return {}, "slskd settings are missing"
+    try:
+        transfers = download_transfers(slskd_url, api_key)
+    except Exception as error:  # noqa: BLE001 - folder scans can still catch completed files.
+        return {}, f"slskd transfer status unavailable: {error}"
+    lookup: dict[tuple[str, str, str], dict] = {}
+    for entry in entries:
+        transfer = matching_download_transfer(entry, transfers)
+        if transfer:
+            lookup[manifest_entry_key(entry)] = transfer
+    return lookup, None
+
+
+def manifest_entry_key(entry: dict) -> tuple[str, str, str]:
+    candidate = entry.get("candidate") or {}
+    return (
+        str(entry.get("batch_id") or ""),
+        str(entry.get("item_id") or entry.get("_original_item_id") or ""),
+        f"{candidate.get('username') or ''}:{candidate.get('filename') or entry.get('basename') or ''}",
+    )
+
+
+def matching_download_transfer(entry: dict, transfers: list[dict]) -> dict | None:
+    candidate = entry.get("candidate") or {}
+    expected_user = str(candidate.get("username") or "").casefold()
+    expected_filename = normalize_remote_path(candidate.get("filename"))
+    expected_basename = str(entry.get("basename") or remote_basename(expected_filename)).casefold()
+    for transfer in transfers:
+        transfer_user = str(transfer.get("username") or "").casefold()
+        if expected_user and transfer_user and transfer_user != expected_user:
+            continue
+        paths = [
+            normalize_remote_path(transfer.get("filename")),
+            normalize_remote_path(transfer.get("local_path")),
+        ]
+        for path in paths:
+            if not path:
+                continue
+            transfer_basename = path.rsplit("/", 1)[-1].casefold()
+            if expected_basename and transfer_basename == expected_basename:
+                return transfer
+            if expected_filename and (path.endswith(expected_filename) or expected_filename.endswith(path)):
+                return transfer
+    return None
+
+
+def normalize_remote_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").casefold()
+
+
+def apply_transfer_path_to_manifest(entry: dict, transfer: dict | None) -> None:
+    if not transfer or entry.get("path"):
+        return
+    local_path = transfer.get("local_path")
+    if not isinstance(local_path, str) or not local_path:
+        return
+    path = Path(local_path)
+    if not path.is_absolute():
+        path = get_settings().downloads_path / path
+    update_download_manifest_entry(entry, entry.get("status") or "queued", path=str(path))
+    entry["path"] = str(path)
+
+
+def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> str:
+    if not transfer:
+        return manifest_wait_status(entry, fallback)
+    status = str(transfer.get("status") or "").strip()
+    status_text = status.casefold()
+    error = transfer.get("error")
+    if transfer_is_failed(transfer):
+        detail = f": {error}" if error else f": {status}" if status else ""
+        return f"slskd transfer failed{detail}"
+    percent = transfer.get("percent")
+    if isinstance(percent, (int, float)):
+        bounded = max(0, min(100, percent))
+        return f"downloading {bounded:.0f}%"
+    if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
+        return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
+    if status:
+        return manifest_wait_status(entry, f"slskd {status}; waiting for downloaded file")
+    return manifest_wait_status(entry, fallback)
+
+
+def transfer_is_failed(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    status = str(transfer.get("status") or "").casefold()
+    error = transfer.get("error")
+    return bool(error) or any(token in status for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
+
+
 def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Path | None, str]:
     root = get_settings().downloads_path
     known_path = entry.get("path")
     candidates = []
+    known_candidates: set[Path] = set()
     if known_path:
-        candidates.append(Path(known_path))
+        known = Path(known_path)
+        known_candidate = known if known.is_absolute() else root / known
+        known_candidates.add(known_candidate)
+        candidates.append(known_candidate)
     candidates.extend(root.rglob("*"))
     now = time.time()
     for file_path in candidates:
         if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             continue
-        if not manifest_entry_matches_path(entry, file_path):
+        if file_path in known_candidates:
+            matches_entry = True
+        else:
+            matches_entry = manifest_entry_matches_path(entry, file_path)
+        if not matches_entry:
             continue
         try:
             stat = file_path.stat()
@@ -2822,8 +2952,16 @@ async def worker_loop() -> None:
             if not task:
                 if time.time() - last_download_scan > 15:
                     try:
-                        import_completed_downloads(session)
+                        scan_result = import_completed_downloads(session)
+                        if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
+                            append_task_log(
+                                session,
+                                None,
+                                f"Download scan checked {scan_result.get('waiting', 0)} waiting, {scan_result.get('ready', 0)} ready, {scan_result.get('failed', 0)} needing attention",
+                            )
+                        session.commit()
                     except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
+                        session.rollback()
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
                 await deliver_apns_notifications(session)

@@ -1997,6 +1997,8 @@ function ApprovalNode({
   const firstSelectedSibling = siblingCandidates.find((sibling) => sibling.selected);
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
+  const statusMeta = itemStatusMeta(item);
+  const downloadProgress = item.kind === "download" ? downloadStatusProgress(statusMeta) : null;
   if (hiddenAlternateCandidate) return null;
 
   function updateChecked(checked) {
@@ -2020,7 +2022,7 @@ function ApprovalNode({
           {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
         </button>
         <span className="proposal-title">{item.title}</span>
-        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : itemStatusMeta(item)}</small>
+        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}</small>
         {leafDownloadCandidate && (
           <button
             className="row-icon-button"
@@ -2036,6 +2038,11 @@ function ApprovalNode({
           </button>
         )}
       </div>
+      {downloadProgress && (
+        <div className="download-row-progress" style={{ "--depth": depth }}>
+          <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} />
+        </div>
+      )}
       {open &&
         metadataChanges.map((change) => (
           <div className="proposal-row metadata-change-row" style={{ "--depth": depth + 1 }} key={`${item.id}:${change.field}`}>
@@ -4552,6 +4559,19 @@ function itemStatusMeta(item) {
   if (item.status === "failed") return "needs attention";
   if (item.status === "rejected") return "rejected";
   return item.kind;
+}
+
+function downloadStatusProgress(status) {
+  if (!status) return null;
+  const text = String(status);
+  const match = text.match(/downloading\s+(\d+(?:\.\d+)?)%/i);
+  if (match) {
+    return { value: Number(match[1]), label: text, indeterminate: false };
+  }
+  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete/i.test(text)) {
+    return { value: 0, label: text, indeterminate: true };
+  }
+  return null;
 }
 
 function downloadBatchNodeId(batchId) {
