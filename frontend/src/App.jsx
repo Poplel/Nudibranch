@@ -1432,7 +1432,12 @@ function App() {
 
           <Inspector
             page={page}
+            library={library}
             importFiles={importFiles}
+            importDownloadRequests={importDownloadRequests}
+            approvals={approvals}
+            wishlist={wishlist}
+            playlists={playlists}
             queueItemCount={queueItemCount}
             queueSelectionCount={queueSelectionCount}
             tasks={tasks}
@@ -4172,7 +4177,34 @@ function SettingsPanel({
   );
 }
 
-function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tasks, downloadProgress, importActions, wishlistActions, playlistActions }) {
+function Inspector({
+  page,
+  library,
+  importFiles,
+  importDownloadRequests,
+  approvals,
+  wishlist,
+  playlists,
+  queueItemCount,
+  queueSelectionCount,
+  tasks,
+  downloadProgress,
+  importActions,
+  wishlistActions,
+  playlistActions,
+}) {
+  const stats = inspectorStats({
+    page,
+    library,
+    importFiles,
+    importDownloadRequests,
+    approvals,
+    wishlist,
+    playlists,
+    queueItemCount,
+    queueSelectionCount,
+    tasks,
+  });
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
@@ -4233,18 +4265,160 @@ function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tas
         </div>
       )}
       <ActiveWorkBar tasks={tasks} />
-      <div className="metadata-grid">
-        <label>Page</label>
-        <strong>{page}</strong>
-        <label>Imports</label>
-        <strong>{importFiles.length}</strong>
-        <label>Queue</label>
-        <strong>{queueSelectionCount} / {queueItemCount} selected</strong>
-        <label>Tasks</label>
-        <strong>{tasks.length}</strong>
-      </div>
+      {stats.rows.length > 0 && (
+        <div className="metadata-grid inspector-stats">
+          {stats.summary && (
+            <>
+              <label>Selection</label>
+              <strong>{stats.summary}</strong>
+            </>
+          )}
+          {stats.rows.map(([label, value]) => (
+            <React.Fragment key={label}>
+              <label>{label}</label>
+              <strong>{value}</strong>
+            </React.Fragment>
+          ))}
+        </div>
+      )}
     </aside>
   );
+}
+
+function inspectorStats({
+  page,
+  library = [],
+  importFiles = [],
+  importDownloadRequests = [],
+  approvals = [],
+  wishlist = [],
+  playlists = [],
+  queueItemCount = 0,
+  queueSelectionCount = 0,
+  tasks = [],
+}) {
+  if (page === "Library") {
+    return { summary: "", rows: musicStatRows(countLibraryMusic(library)) };
+  }
+  if (page === "Import/Add") {
+    const stats = countImportMusic(importFiles, importDownloadRequests);
+    const selected = stats.tracks;
+    const ready = importDownloadRequests.length;
+    return { summary: `${selected} selected · ${ready} ready`, rows: musicStatRows(stats) };
+  }
+  if (page === "Task Queue") {
+    const stats = countApprovalMusic(approvals.filter((batch) => batch.tree_path !== "/downloads" && batch.status !== "executing"));
+    return {
+      summary: `${queueSelectionCount} selected · ${queueItemCount} ready`,
+      rows: musicStatRows(stats),
+    };
+  }
+  if (page === "Downloads") {
+    const stats = countApprovalMusic(approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads"), true);
+    return {
+      summary: `${stats.selected} selected · ${stats.ready} ready`,
+      rows: musicStatRows(stats),
+    };
+  }
+  if (page === "Wishlist") {
+    return { summary: "", rows: musicStatRows(countWishlistMusic(wishlist)) };
+  }
+  if (page === "Playlists") {
+    const stats = countPlaylistMusic(playlists);
+    return { summary: "", rows: [["Playlists", playlists.length], ...musicStatRows(stats)] };
+  }
+  if (page === "Activity") {
+    const queued = tasks.filter((task) => task.status === "queued").length;
+    const running = tasks.filter((task) => task.status === "running").length;
+    const failed = tasks.filter((task) => task.status === "failed").length;
+    return { summary: "", rows: [["Running", running], ["Queued", queued], ["Failed", failed]] };
+  }
+  return { summary: "", rows: [] };
+}
+
+function musicStatRows(stats) {
+  return [
+    ["Artists", stats.artists || 0],
+    ["Albums", stats.albums || 0],
+    ["Tracks", stats.tracks || 0],
+  ];
+}
+
+function countLibraryMusic(artists = []) {
+  const albumCount = artists.reduce((total, artist) => total + (artist.albums || []).length, 0);
+  const trackCount = artists.reduce(
+    (total, artist) => total + (artist.albums || []).reduce((albumTotal, album) => albumTotal + (album.tracks || []).length, 0),
+    0,
+  );
+  return { artists: artists.length, albums: albumCount, tracks: trackCount };
+}
+
+function countImportMusic(files = [], requests = []) {
+  const refs = [
+    ...files.map((file) => ({
+      artist: file.metadata?.artist || "Unknown Artist",
+      album: file.metadata?.album || "Unknown Album",
+      track: file.metadata?.title || file.name || file.path,
+    })),
+    ...requests.map((request) => ({
+      artist: request.artist || "Unknown Artist",
+      album: request.album || "Unknown Album",
+      track: request.track || request.title,
+    })),
+  ];
+  return countMusicRefs(refs);
+}
+
+function countApprovalMusic(batches = [], downloadsOnly = false) {
+  const items = downloadsOnly ? visibleDownloadItems(batches) : batches.flatMap((batch) => batch.items || []);
+  const leaves = lowestLevelItems(items);
+  const actionLeaves = leaves.filter((item) => !["artist", "album"].includes(item.kind));
+  const selected = actionLeaves.filter((item) => item.selected).length;
+  const ready = actionLeaves.filter((item) => item.selected && isReadyApprovalItem(item)).length;
+  return { ...countMusicRefs(actionLeaves.map(itemMusicRef)), selected, ready };
+}
+
+function countWishlistMusic(items = []) {
+  return countMusicRefs(
+    items
+      .filter((item) => item.status !== "removed")
+      .map((item) => ({ artist: item.artist, album: item.album, track: item.track || item.title })),
+  );
+}
+
+function countPlaylistMusic(playlists = []) {
+  return countMusicRefs(
+    playlists.flatMap((playlist) =>
+      (playlist.tracks || []).map((track) => ({ artist: track.artist, album: track.album, track: track.title || track.name })),
+    ),
+  );
+}
+
+function countMusicRefs(refs = []) {
+  const artists = new Set();
+  const albums = new Set();
+  let tracks = 0;
+  refs.forEach((ref) => {
+    if (ref.artist) artists.add(normalizeName(ref.artist));
+    if (ref.artist || ref.album) albums.add(`${normalizeName(ref.artist)}::${normalizeName(ref.album)}`);
+    if (ref.track) tracks += 1;
+  });
+  return { artists: artists.size, albums: albums.size, tracks };
+}
+
+function itemMusicRef(item) {
+  const payload = parseJsonObject(item.payload_json);
+  const request = payload.request || payload;
+  return {
+    artist: request.artist || payload.artist,
+    album: request.album || payload.album,
+    track: request.track || request.title || payload.track || payload.title || item.title,
+  };
+}
+
+function isReadyApprovalItem(item) {
+  const status = String(itemStatusMeta(item) || item.status || "").toLowerCase();
+  return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
 }
 
 function Toast({ title, body, onClose }) {
