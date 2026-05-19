@@ -21,7 +21,7 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
-from nudibranch.services.slskd import download_transfers, queue_slskd_download, search_slskd_detailed
+from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
@@ -29,6 +29,7 @@ MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 150
 STALLED_PROGRESS_RETRY_SECONDS = 300
 MISSING_TRANSFER_RETRY_SECONDS = 240
+QUEUED_TRANSFER_RETRY_SECONDS = 600
 TRANSFER_COMPLETE_PERCENT = 99.5
 
 
@@ -938,7 +939,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             item = session.get(ProposalItem, entry.get("item_id"))
             retry_reason = download_retry_reason(entry, transfer)
             if item and retry_reason and not transfer_error_message:
-                if retry_download_entry(session, batch, entry, item, retry_reason):
+                if retry_download_entry(session, batch, entry, item, retry_reason, transfer):
                     waiting_count += 1
                     waiting = True
                     continue
@@ -1158,7 +1159,10 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
         return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
     percent = transfer_percent(transfer)
     if percent is not None:
-        return f"downloading {percent:.0f}%"
+        if percent <= 0 and not transfer_has_started(transfer):
+            return manifest_wait_status(entry, f"slskd {friendly_transfer_status(status)}; waiting to start")
+        speed = transfer_speed_label(transfer)
+        return f"downloading {percent:.0f}%{speed}"
     if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
         return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
     if status:
@@ -1173,6 +1177,51 @@ def transfer_percent(transfer: dict | None) -> float | None:
     if not isinstance(percent, (int, float)):
         return None
     return max(0, min(100, float(percent)))
+
+
+def transfer_has_started(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    bytes_transferred = transfer.get("bytes_transferred")
+    speed = transfer.get("average_speed")
+    try:
+        if bytes_transferred is not None and int(bytes_transferred) > 0:
+            return True
+        if speed is not None and float(speed) > 0:
+            return True
+    except (TypeError, ValueError):
+        return False
+    status = str(transfer.get("status") or "").casefold()
+    return any(token in status for token in ("download", "progress", "transferring", "succeeded", "complete"))
+
+
+def transfer_is_queued_or_waiting(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    status = str(transfer.get("status") or "").casefold()
+    return any(token in status for token in ("queue", "queued", "waiting", "requested", "initializing"))
+
+
+def friendly_transfer_status(status: str) -> str:
+    cleaned = str(status or "").strip()
+    return cleaned or "queued"
+
+
+def transfer_speed_label(transfer: dict | None) -> str:
+    if not transfer:
+        return ""
+    speed = transfer.get("average_speed")
+    try:
+        speed_value = float(speed)
+    except (TypeError, ValueError):
+        return ""
+    if speed_value <= 0:
+        return ""
+    if speed_value >= 1024 * 1024:
+        return f" · {speed_value / (1024 * 1024):.1f} MB/s"
+    if speed_value >= 1024:
+        return f" · {speed_value / 1024:.0f} KB/s"
+    return f" · {speed_value:.0f} B/s"
 
 
 def transfer_is_complete_or_finishing(transfer: dict | None) -> bool:
@@ -1211,6 +1260,10 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     last_percent = manifest_float(entry.get("last_transfer_percent"))
     last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
     if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
+        if transfer_is_queued_or_waiting(transfer) and age < QUEUED_TRANSFER_RETRY_SECONDS:
+            return None
+        if transfer_is_queued_or_waiting(transfer):
+            return "transfer stayed queued"
         return "transfer stayed at 0%"
     if last_percent is not None and abs(last_percent - percent) >= 0.5:
         return None
@@ -1221,7 +1274,7 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     return None
 
 
-def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str) -> bool:
+def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str, transfer: dict | None = None) -> bool:
     retry_count = int(entry.get("retry_count") or 0)
     current_candidate = entry.get("candidate") or {}
     failed_candidates = manifest_failed_candidates(entry)
@@ -1249,6 +1302,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         f"{item.title}: {reason}; searching for replacement candidate {retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES}",
         "warning",
     )
+    cancel_existing_slskd_transfer(session, transfer, item, reason)
     if retry_count > MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     try:
@@ -1324,6 +1378,21 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         set_download_item_status(item, f"replacement queue failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
         append_task_log(session, None, f"{item.title}: replacement candidate failed to queue: {error}", "warning")
         return True
+
+
+def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item: ProposalItem, reason: str) -> None:
+    if not transfer:
+        return
+    transfer_id = str(transfer.get("id") or "")
+    username = str(transfer.get("username") or "")
+    if not transfer_id or not username:
+        return
+    settings = integration_settings(session)
+    try:
+        if cancel_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), username, transfer_id, remove=True):
+            append_task_log(session, None, f"{item.title}: cancelled previous slskd transfer before retrying: {reason}", "warning")
+    except Exception as error:  # noqa: BLE001 - retry can still proceed if slskd already removed the record.
+        append_task_log(session, None, f"{item.title}: could not cancel previous slskd transfer before retrying: {error}", "warning")
 
 
 def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:

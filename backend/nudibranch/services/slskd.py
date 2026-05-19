@@ -1,5 +1,6 @@
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -140,6 +141,17 @@ def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]
     raise RuntimeError("; ".join(errors))
 
 
+def cancel_slskd_download(slskd_url: str, api_key: str, username: str, transfer_id: str, remove: bool = True) -> bool:
+    if not slskd_url or not api_key or not username or not transfer_id:
+        return False
+    with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
+        response = client.delete(f"/api/v0/transfers/downloads/{quote(username, safe='')}/{quote(transfer_id, safe='')}", params={"remove": remove})
+        if response.status_code in {404, 410}:
+            return False
+        response.raise_for_status()
+        return True
+
+
 def download_transfers(slskd_url: str, api_key: str) -> list[dict[str, Any]]:
     if not slskd_url or not api_key:
         return []
@@ -161,11 +173,15 @@ def flatten_download_transfers(payload: Any) -> list[dict[str, Any]]:
             return
         transfer = {
             **value,
+            "id": transfer_id(value),
             "username": username or response_username(value),
             "filename": normalized["filename"],
             "size": normalized.get("size"),
             "status": transfer_status(value),
             "percent": transfer_percent(value),
+            "bytes_transferred": transfer_bytes_transferred(value),
+            "bytes_remaining": transfer_bytes_remaining(value),
+            "average_speed": transfer_average_speed(value),
             "local_path": transfer_local_path(value),
             "error": transfer_error(value),
         }
@@ -245,6 +261,11 @@ def transfer_status(value: dict[str, Any]) -> str | None:
     return str(status) if status is not None else None
 
 
+def transfer_id(value: dict[str, Any]) -> str | None:
+    raw = value.get("id") or value.get("Id") or value.get("ID")
+    return str(raw) if raw is not None else None
+
+
 def transfer_percent(value: dict[str, Any]) -> float | None:
     for key in ("percentComplete", "PercentComplete", "percentage", "Percentage", "percent", "Percent", "progress", "Progress"):
         raw = value.get(key)
@@ -262,6 +283,42 @@ def transfer_percent(value: dict[str, Any]) -> float | None:
             return (float(transferred) / float(size)) * 100
     except (TypeError, ValueError, ZeroDivisionError):
         return None
+    return None
+
+
+def transfer_bytes_transferred(value: dict[str, Any]) -> int | None:
+    for key in ("bytesTransferred", "BytesTransferred", "bytesDownloaded", "BytesDownloaded"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def transfer_bytes_remaining(value: dict[str, Any]) -> int | None:
+    for key in ("bytesRemaining", "BytesRemaining"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def transfer_average_speed(value: dict[str, Any]) -> float | None:
+    for key in ("averageSpeed", "AverageSpeed", "speed", "Speed"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
     return None
 
 
