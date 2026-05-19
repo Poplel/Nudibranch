@@ -666,7 +666,7 @@ function App() {
         method: "POST",
         body: JSON.stringify(item),
       });
-      setWishlist((current) => [created, ...current]);
+      setWishlist((current) => [created, ...current.filter((wishlistItem) => wishlistItem.id !== created.id)]);
       setToast({ title: "Wishlist updated", body: "The item was added to the wishlist." });
       return created;
     } catch (wishlistError) {
@@ -2280,7 +2280,7 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
       selectedCount: selectedItems.size,
       canApproveAll,
       onToggleAlbumSearch: () => setAlbumSearchOpen((value) => !value),
-      onSubmitSelected: () => onSubmit([...selectedItems], { denyUnselected: canApproveAll }),
+      onSubmitSelected: canApproveAll ? () => onSubmit([...selectedItems], { denyUnselected: true }) : null,
     });
     return () => onInspectorActionsChange?.(null);
   }, [selectedItems.size, canApproveAll]);
@@ -4074,10 +4074,12 @@ function Inspector({ page, importFiles, queueItemCount, queueSelectionCount, tas
             <Plus size={16} />
             Add album
           </button>
-          <button className="primary" onClick={wishlistActions.onSubmitSelected} disabled={wishlistActions.selectedCount === 0}>
-            <ListChecks size={16} />
-            {wishlistActions.canApproveAll ? "Approve selected" : "Add selected to approvals"}
-          </button>
+          {wishlistActions.canApproveAll && (
+            <button className="primary" onClick={wishlistActions.onSubmitSelected} disabled={wishlistActions.selectedCount === 0}>
+              <ListChecks size={16} />
+              Add selected to task queue
+            </button>
+          )}
         </div>
       )}
       {page === "Playlists" && playlistActions && (

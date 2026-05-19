@@ -114,6 +114,7 @@ class ProposalItemOut(BaseModel):
     selected: bool
     old_value: str | None = None
     new_value: str | None = None
+    payload_json: str = "{}"
     suppress_until: datetime | None = None
 
 

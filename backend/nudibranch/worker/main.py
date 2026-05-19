@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1366,71 +1367,69 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     else:
         append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
     total_tracks = max(1, len(track_items))
-    for track_index, (request, track_item) in enumerate(track_items, start=1):
+    search_jobs = []
+    completed_tracks = 0
+    integration = integration_settings(session)
+    slskd_url = integration.get("slskd_url", "")
+    api_key = integration.get("slskd_api_key", "")
+    for request, track_item in track_items:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
         set_item_payload_status(track_item, f"searching {track_title}")
-        if task is not None:
-            update_task_progress(session, task, track_index - 1, total_tracks, f"Searching download candidates for {track_title}")
-        session.commit()
         folder_candidate = candidate_from_folder_pool(folder_pool, request) if folder_pool else None
         if folder_candidate:
-            candidates = [folder_candidate]
             diagnostic_lines.append(f"{query}: reused {folder_candidate.get('folder') or 'the same folder'} from {folder_candidate.get('username')}.")
             append_task_log(session, task, f"{track_title}: reused album-folder candidate {folder_candidate.get('filename')}")
-        else:
-            candidate_limit = 4 if request.get("multiple_candidates") else 1
-            search_result = search_slskd_for_request(session, request, limit=candidate_limit, task=task)
-            candidates = search_result["candidates"]
-            diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
-            if candidates and not request.get("multiple_candidates") and not folder_pool:
-                folder_pool = download_folder_pool(candidates[0])
-        if candidates:
+            add_download_candidate_items(session, batch, track_item, request, query, [folder_candidate])
             slskd_tracks += 1
             set_item_payload_status(track_item, "candidate ready")
-            append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
-            for index, candidate in enumerate(candidates):
-                session.add(
-                    ProposalItem(
-                        batch_id=batch.id,
-                        parent_id=track_item.id,
-                        title=f"slskd: {candidate.get('filename') or query}",
-                        kind=ProposalKind.download,
-                        selected=index == 0,
-                        old_value=query,
-                        new_value=candidate.get("username"),
-                        payload_json=json.dumps(
-                            {
-                                "action": "queue_download",
-                                "request": request,
-                                "candidate": candidate,
-                            }
-                        ),
-                    )
-                )
+            completed_tracks += 1
+            if task is not None:
+                update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
         else:
-            fallback_tracks += 1
-            set_item_payload_status(track_item, "fallback ready")
-            append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback prepared", "warning")
-            session.add(
-                ProposalItem(
-                    batch_id=batch.id,
-                    parent_id=track_item.id,
-                    title=f"YouTube fallback: {query}",
-                    kind=ProposalKind.download,
-                    old_value=query,
-                    new_value="yt-dlp",
-                    payload_json=json.dumps(
-                        {
-                            "action": "queue_ytdlp_download",
-                            "request": request,
-                        }
-                    ),
-                )
-            )
+            candidate_limit = 4 if request.get("multiple_candidates") else 1
+            search_jobs.append((request, track_item, track_title, query, candidate_limit))
         session.commit()
+
+    if search_jobs:
+        workers = min(8, len(search_jobs))
+        append_task_log(session, task, f"{artist} / {album}: searching {len(search_jobs)} track(s) with {workers} concurrent worker(s)")
         if task is not None:
-            update_task_progress(session, task, track_index, total_tracks, f"Prepared download candidate for {track_title}")
+            update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item, track_title, query)
+                for request, track_item, track_title, query, candidate_limit in search_jobs
+            }
+            for future in as_completed(futures):
+                request, track_item, track_title, query = futures[future]
+                try:
+                    search_result = future.result()
+                except Exception as error:  # noqa: BLE001 - keep creating candidates for the rest of the album.
+                    search_result = {
+                        "candidates": [],
+                        "diagnostics": {"queries": download_query_variants(request), "query_logs": [f"slskd search failed for {query}: {error}"]},
+                    }
+                for line in search_result.get("diagnostics", {}).get("query_logs") or []:
+                    append_task_log(session, task, line)
+                candidates = search_result["candidates"]
+                diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
+                if candidates and not request.get("multiple_candidates") and not folder_pool:
+                    folder_pool = download_folder_pool(candidates[0])
+                if candidates:
+                    add_download_candidate_items(session, batch, track_item, request, query, candidates)
+                    slskd_tracks += 1
+                    set_item_payload_status(track_item, "candidate ready")
+                    append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
+                else:
+                    fallback_tracks += 1
+                    set_item_payload_status(track_item, "fallback ready")
+                    append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback prepared", "warning")
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query)
+                completed_tracks += 1
+                session.commit()
+                if task is not None:
+                    update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
     session.flush()
     append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {fallback_tracks} fallback track(s)")
     create_notification(
@@ -1439,6 +1438,47 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         body=f"{album}: {slskd_tracks} tracks with slskd candidates. {fallback_tracks} tracks using YouTube fallback. {' '.join(diagnostic_lines[:3])}",
         event_type="approval_needed",
         target_url="/downloads",
+    )
+
+
+def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
+    for index, candidate in enumerate(candidates):
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=track_item.id,
+                title=f"slskd: {candidate.get('filename') or query}",
+                kind=ProposalKind.download,
+                selected=index == 0,
+                old_value=query,
+                new_value=candidate.get("username"),
+                payload_json=json.dumps(
+                    {
+                        "action": "queue_download",
+                        "request": request,
+                        "candidate": candidate,
+                    }
+                ),
+            )
+        )
+
+
+def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str) -> None:
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            parent_id=track_item.id,
+            title=f"YouTube fallback: {query}",
+            kind=ProposalKind.download,
+            old_value=query,
+            new_value="yt-dlp",
+            payload_json=json.dumps(
+                {
+                    "action": "queue_ytdlp_download",
+                    "request": request,
+                }
+            ),
+        )
     )
 
 
@@ -1667,30 +1707,41 @@ def folder_file_score(file_info: dict, normalized_track: str) -> tuple[int, int,
 
 def search_slskd_for_request(session: Session, request: dict, limit: int = 1, task: Task | None = None) -> dict:
     settings = integration_settings(session)
-    slskd_url = settings.get("slskd_url", "")
-    api_key = settings.get("slskd_api_key", "")
+    result = search_slskd_for_request_with_settings(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), request, limit)
+    for line in result.get("diagnostics", {}).get("query_logs") or []:
+        append_task_log(session, task, line)
+    return result
+
+
+def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
     attempted = []
-    last_result = {"candidates": [], "diagnostics": {"queries": []}}
+    query_logs = []
+    last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs}}
     for index, query in enumerate(download_query_variants(request)):
         if not query or query in attempted:
             continue
         attempted.append(query)
-        append_task_log(session, task, f"slskd track search started: {query}")
-        result = search_slskd_detailed(
-            slskd_url,
-            api_key,
-            query,
-            limit=limit,
-            timeout_seconds=12 if index == 0 else 6,
-            timeout_buffer_seconds=3,
-        )
+        query_logs.append(f"slskd track search started: {query}")
+        try:
+            result = search_slskd_detailed(
+                slskd_url,
+                api_key,
+                query,
+                limit=limit,
+                poll_interval=0.75,
+                timeout_seconds=4 if index < 2 else 3,
+                timeout_buffer_seconds=1,
+            )
+        except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
+            query_logs.append(f"slskd track search failed: {query}: {error}")
+            last_result = {"candidates": [], "diagnostics": {"queries": attempted.copy(), "query_logs": query_logs, "query": query}}
+            continue
         result["diagnostics"]["query"] = query
         result["diagnostics"]["queries"] = attempted.copy()
+        result["diagnostics"]["query_logs"] = query_logs
         last_result = result
         diagnostics = result["diagnostics"]
-        append_task_log(
-            session,
-            task,
+        query_logs.append(
             (
                 f"slskd track search finished: {query}: "
                 f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
@@ -1700,7 +1751,8 @@ def search_slskd_for_request(session: Session, request: dict, limit: int = 1, ta
         if result["candidates"]:
             return result
     last_result["diagnostics"]["queries"] = attempted
-    append_task_log(session, task, f"slskd found no candidates after {len(attempted)} query variant(s): {download_query(request)}", "warning")
+    last_result["diagnostics"]["query_logs"] = query_logs
+    query_logs.append(f"slskd found no candidates after {len(attempted)} query variant(s): {download_query(request)}")
     return last_result
 
 
@@ -1816,11 +1868,11 @@ def download_query_variants(request: dict) -> list[str]:
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
     return [
+        " ".join(part for part in [album, track] if part),
+        track,
         " ".join(part for part in [artist, album, track] if part),
         " ".join(part for part in [artist, track] if part),
         f"{artist} - {track}".strip(" -"),
-        " ".join(part for part in [album, track] if part),
-        track,
     ]
 
 

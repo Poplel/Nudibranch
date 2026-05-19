@@ -508,6 +508,17 @@ def create_wishlist_item(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> WishlistOut:
+    existing = session.scalar(
+        select(WishlistItem)
+        .where(WishlistItem.user_id == user.id)
+        .where(WishlistItem.kind == payload.kind)
+        .where(WishlistItem.artist == payload.artist)
+        .where(WishlistItem.album == payload.album)
+        .where(WishlistItem.track == payload.track)
+        .where(WishlistItem.status.in_(["wanted", "review", "approved"]))
+    )
+    if existing:
+        return serialize_wishlist_item(existing)
     item = WishlistItem(user_id=user.id, **payload.model_dump())
     item.status_changed_at = datetime.now(timezone.utc)
     session.add(item)
@@ -1540,6 +1551,7 @@ def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:
                 selected=item.selected,
                 old_value=item.old_value,
                 new_value=item.new_value,
+                payload_json=item.payload_json,
                 suppress_until=item.suppress_until,
             )
             for item in batch.items
