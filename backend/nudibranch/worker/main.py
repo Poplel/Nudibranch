@@ -350,13 +350,31 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             download_changes += 1
             finish_progress_step(f"Queued download for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
-            item.status = ProposalStatus.failed
-            download_errors.append(f"{item.title}: {error}")
             failed_request = download_request_from_item(item)
+            retry_started = False
             if failed_request:
-                replacements = add_replacement_candidates_to_download_batch(session, batch, {"parent_id": item.parent_id}, {**failed_request, "multiple_candidates": True})
-                if replacements:
-                    item.selected = False
+                payload = json.loads(item.payload_json or "{}")
+                failed_candidate = payload.get("candidate") or {}
+                retry_started = retry_download_entry(
+                    session,
+                    batch,
+                    {
+                        "batch_id": item.batch_id,
+                        "item_id": item.id,
+                        "parent_id": item.parent_id,
+                        "request": failed_request,
+                        "candidate": failed_candidate,
+                        "basename": remote_basename(failed_candidate.get("filename") or ""),
+                        "queued_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    item,
+                    f"candidate queue failed: {error}",
+                )
+            if retry_started:
+                download_changes += 1
+            else:
+                item.status = ProposalStatus.failed
+                download_errors.append(f"{item.title}: {error}")
             finish_progress_step(f"Download needs attention for {item.title}")
 
     lyric_changes = 0
@@ -922,7 +940,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     manifest_item_ids = {entry.get("item_id") for entry in entries}
     if not expected_item_ids.issubset(manifest_item_ids):
         for item_id in expected_item_ids - manifest_item_ids:
-            set_download_item_status(session.get(ProposalItem, item_id), "waiting for slskd queue record")
+            item = session.get(ProposalItem, item_id)
+            if item and queue_missing_manifest_download(session, batch, item):
+                continue
+            set_download_item_status(item, "waiting for slskd queue record")
         update_download_container_statuses(batch)
         session.flush()
         return {"imported": 0, "errors": [], "waiting": len(expected_item_ids - manifest_item_ids), "ready": 0, "failed": 0}
@@ -979,7 +1000,8 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         session.flush()
         verification = verify_downloaded_file(session, file_path, entry)
         if verification["status"] == "mismatch":
-            handle_download_mismatch(session, batch, entry, file_path, verification)
+            if handle_download_mismatch(session, batch, entry, file_path, verification):
+                return {"imported": 0, "errors": [], "waiting": 1, "ready": max(0, len(ready_entries) - 1), "failed": 0}
             return {"imported": 0, "errors": [verification["message"]], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         if verification["status"] != "verified":
             if verification["status"] == "deferred":
@@ -992,6 +1014,9 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 verified_entries.append((entry, file_path, metadata))
                 continue
             message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
+            if verification["status"] == "unknown" and "api key" not in message.casefold():
+                if handle_download_mismatch(session, batch, entry, file_path, {**verification, "message": message}):
+                    return {"imported": 0, "errors": [], "waiting": 1, "ready": max(0, len(ready_entries) - 1), "failed": 0}
             handle_download_verification_issue(session, batch, entry, file_path, message, verification)
             return {"imported": 0, "errors": [message], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
@@ -1080,6 +1105,40 @@ def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
         if json.loads(item.payload_json or "{}").get("action") == "queue_download":
             ids.add(item.id)
     return ids
+
+
+def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
+        return False
+    try:
+        set_download_item_status(item, "queue record missing; queueing download automatically")
+        apply_download_item(session, item)
+        item.status = ProposalStatus.executing
+        batch.status = ProposalStatus.executing
+        append_task_log(session, None, f"{item.title}: missing queue record was recreated automatically")
+        return True
+    except Exception as error:  # noqa: BLE001 - try a different candidate without creating another row.
+        request = download_request_from_item(item)
+        if not request:
+            set_download_item_status(item, f"queue record missing and could not be recreated: {error}")
+            return False
+        candidate = payload.get("candidate") or {}
+        return retry_download_entry(
+            session,
+            batch,
+            {
+                "batch_id": item.batch_id,
+                "item_id": item.id,
+                "parent_id": item.parent_id,
+                "request": request,
+                "candidate": candidate,
+                "basename": remote_basename(candidate.get("filename") or ""),
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+            item,
+            f"queue record missing and candidate failed: {error}",
+        )
 
 
 def slskd_transfer_lookup(session: Session, entries: list[dict]) -> tuple[dict[tuple[str, str, str], dict], str | None]:
@@ -1313,7 +1372,19 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         search_result = search_slskd_for_request(session, request, limit=8)
         candidates = filter_ignored_candidates(search_result.get("candidates") or [], failed_candidates)
     except Exception as error:  # noqa: BLE001 - keep the failed row visible with a useful reason.
-        return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "queued",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason=f"replacement search failed: {error}",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        set_download_item_status(item, f"replacement search failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement search failed and will retry: {error}", "warning")
+        return True
     if not candidates:
         if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
             return exhaust_download_retries(session, item, entry, "no replacement candidates were found", failed_candidates, retry_count)
@@ -1573,29 +1644,34 @@ def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
     return bool(filename and str(file_path).replace("\\", "/").casefold().endswith(filename))
 
 
-def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, verification: dict) -> None:
+def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, verification: dict) -> bool:
     try:
         file_path.unlink()
     except OSError as error:
         verification["message"] = f"{verification['message']} Could not remove {file_path.name}: {error}"
-    update_download_manifest_entry(entry, "mismatch", path=str(file_path), metadata=verification.get("metadata"))
     item = session.get(ProposalItem, entry.get("item_id"))
     if item:
+        set_download_item_status(item, f"{verification['message']}; retrying another candidate")
+        retry_started = retry_download_entry(session, batch, entry, item, verification["message"])
+        if retry_started:
+            batch.status = ProposalStatus.executing
+            create_notification(
+                session,
+                title="Download candidate rejected",
+                body=f"{file_path.name} did not match and another candidate is being tried.",
+                event_type="task_warning",
+                target_url="/downloads",
+            )
+            session.commit()
+            return True
+    update_download_manifest_entry(entry, "failed", path=str(file_path), metadata=verification.get("metadata"), retry_reason=verification["message"])
+    if item:
         item.status = ProposalStatus.failed
-        item.selected = False
-        set_download_item_status(item, verification["message"])
+        set_download_item_status(item, f"needs attention: {verification['message']}")
     batch.status = ProposalStatus.failed
-    request = entry.get("request") or verification.get("request") or {}
-    if request:
-        add_replacement_candidates_to_download_batch(session, batch, entry, request)
-    create_notification(
-        session,
-        title="Downloaded track did not match",
-        body=verification["message"],
-        event_type="task_failed",
-        target_url="/downloads",
-    )
+    create_notification(session, title="Downloaded track did not match", body=verification["message"], event_type="task_failed", target_url="/downloads")
     session.commit()
+    return False
 
 
 def handle_download_verification_issue(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, message: str, verification: dict) -> None:
@@ -1613,36 +1689,6 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
         target_url="/downloads",
     )
     session.commit()
-
-
-def add_replacement_candidates_to_download_batch(session: Session, batch: ProposalBatch, entry: dict, request: dict) -> int:
-    query = download_query(request)
-    search_result = search_slskd_for_request(session, {**request, "multiple_candidates": True}, limit=4)
-    parent_id = entry.get("parent_id")
-    if not parent_id:
-        parent = add_download_tree_parents(session, batch, request, query)
-        parent_id = parent.id
-    candidates = search_result["candidates"]
-    for index, candidate in enumerate(candidates):
-        session.add(
-            ProposalItem(
-                batch_id=batch.id,
-                parent_id=parent_id,
-                title=f"Replacement: {candidate.get('filename') or query}",
-                kind=ProposalKind.download,
-                selected=index == 0,
-                old_value=query,
-                new_value=candidate.get("username"),
-                payload_json=json.dumps(
-                    {
-                        "action": "queue_download",
-                        "request": {**request, "multiple_candidates": True},
-                        "candidate": candidate,
-                    }
-                ),
-            )
-        )
-    return len(candidates)
 
 
 def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
@@ -2759,13 +2805,30 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
 
         for playlist in playlists:
             jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
+            jellyfin_items: list[dict] = []
+            if jellyfin_playlist_id:
+                try:
+                    jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
+                except JellyfinPlaylistMissing:
+                    append_task_log(session, None, f"Jellyfin playlist id for {playlist.name} was stale; resolving it again", "warning")
+                    if playlist.jellyfin_playlist_id == jellyfin_playlist_id:
+                        playlist.jellyfin_playlist_id = None
+                    refreshed_playlists = list_jellyfin_playlists(client, user_id)
+                    refreshed_id = (refreshed_playlists.get(playlist.name) or {}).get("Id")
+                    jellyfin_playlists.update(refreshed_playlists)
+                    if refreshed_id and refreshed_id != jellyfin_playlist_id:
+                        jellyfin_playlist_id = refreshed_id
+                        playlist.jellyfin_playlist_id = refreshed_id
+                        jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
+                    else:
+                        jellyfin_playlist_id = None
             if not jellyfin_playlist_id:
-                created = client.post("/Playlists", params={"Name": playlist.name, "UserId": user_id})
+                created = client.post("/Playlists", params={"name": playlist.name, "userId": user_id, "mediaType": "Audio"})
                 created.raise_for_status()
                 jellyfin_playlist_id = created.json().get("Id")
                 playlist.jellyfin_playlist_id = jellyfin_playlist_id
                 session.flush()
-            jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
+                jellyfin_items = []
             local_item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at))) if item_id]
             jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
             if conflict_winner == "jellyfin" or playlist.name in imported_playlist_names:
@@ -2774,7 +2837,16 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                 removed = remove_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, set(local_item_ids))
                 missing_ids = [item_id for item_id in local_item_ids if item_id not in set(jellyfin_item_ids)]
                 if missing_ids:
-                    add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
+                    try:
+                        add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
+                    except JellyfinPlaylistMissing:
+                        append_task_log(session, None, f"Jellyfin playlist {playlist.name} disappeared during sync; recreating it", "warning")
+                        created = client.post("/Playlists", params={"name": playlist.name, "userId": user_id, "mediaType": "Audio"})
+                        created.raise_for_status()
+                        jellyfin_playlist_id = created.json().get("Id")
+                        playlist.jellyfin_playlist_id = jellyfin_playlist_id
+                        session.flush()
+                        add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
                 pushed_tracks += len(missing_ids) + removed
             synced_playlists += 1
     session.commit()
@@ -3414,6 +3486,10 @@ def ensure_favorites_playlist(session: Session) -> Playlist:
     return playlist
 
 
+class JellyfinPlaylistMissing(RuntimeError):
+    pass
+
+
 def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
     response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist"})
     response.raise_for_status()
@@ -3431,24 +3507,30 @@ def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: 
 
 def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str) -> list[dict]:
     try:
-        response = client.get(f"/Playlists/{playlist_id}/Items", params={"UserId": user_id})
+        response = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": user_id})
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
-        if error.response.status_code in {404, 405}:
+        if error.response.status_code == 404:
+            raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found") from error
+        if error.response.status_code == 405:
             return []
         raise
     return response.json().get("Items", [])
 
 
 def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
-    response = client.post(f"/Playlists/{playlist_id}/Items", params={"Ids": ",".join(item_ids), "UserId": user_id})
+    response = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(item_ids), "userId": user_id})
     if response.is_success:
         return
+    if response.status_code == 404:
+        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
     if response.status_code < 500:
         response.raise_for_status()
     failures = []
     for item_id in item_ids:
-        single = client.post(f"/Playlists/{playlist_id}/Items", params={"Ids": item_id, "UserId": user_id})
+        single = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": item_id, "userId": user_id})
+        if single.status_code == 404:
+            raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
         if not single.is_success:
             failures.append(f"{item_id}: {single.status_code} {single.text[-300:]}")
     if failures:
@@ -3463,7 +3545,7 @@ def remove_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_
     ]
     if not entry_ids:
         return 0
-    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"EntryIds": ",".join(entry_ids), "UserId": user_id})
+    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"entryIds": ",".join(entry_ids), "userId": user_id})
     if response.status_code in {404, 405, 501}:
         return 0
     response.raise_for_status()
