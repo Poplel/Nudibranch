@@ -29,10 +29,10 @@ from nudibranch.services.tasks import append_task_log, claim_next_task, complete
 MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 150
 STALLED_PROGRESS_RETRY_SECONDS = 300
-MISSING_TRANSFER_RETRY_SECONDS = 240
-COMPLETED_MISSING_FILE_RETRY_SECONDS = 180
-QUEUED_TRANSFER_RETRY_SECONDS = 120
-REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 90
+MISSING_TRANSFER_RETRY_SECONDS = 60
+COMPLETED_MISSING_FILE_RETRY_SECONDS = 45
+QUEUED_TRANSFER_RETRY_SECONDS = 75
+REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 45
 TRANSFER_COMPLETE_PERCENT = 99.5
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
@@ -543,7 +543,7 @@ def task_queue_notification_body(
     if downloaded_import and downloaded_import.get("imported"):
         parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
     if open_downloads:
-        parts.append("downloads are queued and will move to the library after the files finish and verify")
+        parts.append("downloads are transferring and will move to the library after verification")
     body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
@@ -729,10 +729,10 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
             append_task_log(session, task, f"{item.title}: queueing candidate {label}")
             result = queue_slskd_download(slskd_url, api_key, candidate)
             record_download_manifest_entry(request, candidate, item)
-            set_download_item_status(item, "queued in slskd; waiting for downloaded file")
+            set_download_item_status(item, "transferring: slskd accepted the download")
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
-                set_download_item_status(candidate_item, "queued in slskd; waiting for downloaded file")
+                set_download_item_status(candidate_item, "transferring: slskd accepted the download")
                 item.title = candidate_item.title
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
@@ -1021,14 +1021,14 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             item = session.get(ProposalItem, item_id)
             if item and queue_missing_manifest_download(session, batch, item):
                 continue
-            set_download_item_status(item, "waiting for slskd queue record")
+            set_download_item_status(item, "searching for slskd queue record")
         update_download_container_statuses(batch)
         session.flush()
         return {"imported": 0, "errors": [], "waiting": len(expected_item_ids - manifest_item_ids), "ready": 0, "failed": 0}
     transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
     if transfer_error_message:
         for entry in entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; waiting for downloaded file")
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
     ready_entries = []
     errors: list[str] = []
     waiting = False
@@ -1061,7 +1061,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 waiting_count += 1
             waiting = True
             continue
-        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for batch verification")
+        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; queued for batch verification")
         ready_entries.append((entry, file_path))
     update_download_container_statuses(batch)
     session.flush()
@@ -1086,7 +1086,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 message = verification.get("message") or f"AcoustID check was deferred for {file_path.name}."
                 metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
                 update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata, acoustid_deferred=message)
-                set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "AcoustID deferred; waiting for batch import")
+                set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "AcoustID deferred; queued for batch import")
                 append_task_log(session, None, message, "warning")
                 deferred_acoustid_messages.append(message)
                 verified_entries.append((entry, file_path, metadata))
@@ -1099,7 +1099,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             return {"imported": 0, "errors": [message], "waiting": 0, "ready": len(ready_entries), "failed": 1}
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
-        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; waiting for the rest of the batch")
+        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; queued for batch import")
         verified_entries.append((entry, file_path, metadata))
 
     try:
@@ -1327,17 +1327,17 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
         detail = f": {error}" if error else f": {status}" if status else ""
         return f"slskd transfer failed{detail}"
     if transfer_is_complete_or_finishing(transfer):
-        return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
+        return manifest_wait_status(entry, "transferring completed file from slskd")
     percent = transfer_percent(transfer)
     if percent is not None:
         if percent <= 0 and not transfer_has_started(transfer):
-            return manifest_wait_status(entry, f"slskd {friendly_transfer_status(status)}; waiting to start")
+            return manifest_wait_status(entry, f"transferring: slskd {friendly_transfer_status(status)}")
         speed = transfer_speed_label(transfer)
         return f"downloading {percent:.0f}%{speed}"
     if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
-        return manifest_wait_status(entry, "slskd reports complete; waiting for downloaded file")
+        return manifest_wait_status(entry, "transferring completed file from slskd")
     if status:
-        return manifest_wait_status(entry, f"slskd {status}; waiting for downloaded file")
+        return manifest_wait_status(entry, f"transferring: slskd {status}")
     return manifest_wait_status(entry, fallback)
 
 
@@ -1697,9 +1697,9 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Pat
         except OSError:
             continue
         if now - stat.st_mtime < minimum_age_seconds:
-            return None, "downloaded; waiting for file to settle"
+            return None, "downloaded; settling before verification"
         return file_path, "downloaded; ready for verification"
-    return None, "waiting for downloaded file"
+    return None, "searching for downloaded file"
 
 
 def manifest_wait_status(entry: dict, wait_status: str) -> str:
@@ -1758,7 +1758,7 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
         elif downloaded:
             status = f"{downloaded} of {total} downloaded"
         else:
-            status = f"waiting for downloads ({total} queued)"
+            status = f"transferring {total} queued download(s)"
         set_item_payload_status(item, status)
 
 
@@ -4129,7 +4129,7 @@ async def worker_loop() -> None:
                             append_task_log(
                                 session,
                                 None,
-                                f"Download scan checked {scan_result.get('waiting', 0)} waiting, {scan_result.get('ready', 0)} ready, {scan_result.get('failed', 0)} needing attention",
+                                f"Download scan checked {scan_result.get('waiting', 0)} transferring, {scan_result.get('ready', 0)} ready, {scan_result.get('failed', 0)} needing attention",
                             )
                             last_download_scan_summary = summary
                             last_download_scan_log = now

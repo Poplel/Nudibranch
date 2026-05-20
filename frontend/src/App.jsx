@@ -4963,7 +4963,7 @@ function downloadProgressSummary(approvals) {
   const label = notStarted
     ? `${selected} selected candidates`
     : waitingForDownload
-      ? `${waiting}/${total} waiting to download`
+      ? `${waiting}/${total} transferring`
     : verificationPending
       ? `Verification pending for ${total} downloads`
       : verifying > 0
@@ -4987,7 +4987,7 @@ function downloadStatusProgress(status) {
   if (/verifying with acoustid/i.test(text)) {
     return { value: 0, label: text, indeterminate: true };
   }
-  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete/i.test(text)) {
+  if (/transferring|searching for downloaded file|searching for slskd|slskd .*queued|slskd .*remote|reports complete/i.test(text)) {
     return { value: 0, label: text, indeterminate: false };
   }
   return null;
@@ -5426,7 +5426,7 @@ function proposalTaskSummary(result) {
   if (result.file_actions) parts.push(`${result.file_actions} files`);
   if (result.playlist_changes) parts.push(`${result.playlist_changes} playlists`);
   if (result.download_changes) parts.push(`${result.download_changes} downloads`);
-  if (result.open_downloads) parts.push("waiting for downloads to finish");
+  if (result.open_downloads) parts.push("downloads are still transferring");
   if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);
