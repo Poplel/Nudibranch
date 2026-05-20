@@ -77,7 +77,7 @@ const pageDescriptions = {
 
 const approvalTypeLabels = {
   import_files: "Imports",
-  download: "Downloads",
+  download: "Download candidates",
   metadata: "Metadata",
   artwork: "Artwork",
   lyrics: "Lyrics",
@@ -1850,7 +1850,7 @@ function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }
 function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove, onReject, onCancelTask }) {
   const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
   if (downloadBatches.length === 0) {
-    return <EmptyState title="No download candidates" body="Approved wishlist requests will add download candidates here." />;
+    return <EmptyState title="No active downloads" body="Chosen candidates will move here after they are started from the task queue." />;
   }
   return (
     <div className="approval-tree">
@@ -2034,7 +2034,7 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
               }
             }}
           />
-          Select all visible
+          Select all
         </label>
         <span>{selectedItems.length} selected</span>
         <TreeToolbar

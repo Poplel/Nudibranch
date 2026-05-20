@@ -1830,7 +1830,7 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
             select(ProposalBatch)
             .options(selectinload(ProposalBatch.items))
             .where(ProposalBatch.kind == ProposalKind.download)
-            .where(ProposalBatch.tree_path == "/downloads")
+            .where(ProposalBatch.tree_path.in_(["/task-queue", "/downloads"]))
             .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
         )
     )

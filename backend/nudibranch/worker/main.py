@@ -109,7 +109,7 @@ TEXT_SEARCH_ALTERNATIVES: list[tuple[str, tuple[str, ...]]] = [
 ]
 
 
-def run_propose_import(session: Session, payload: dict) -> dict:
+def run_propose_import(session: Session, payload: dict, task: Task | None = None) -> dict:
     files = payload.get("files")
     if files is None:
         files = discover_import_files(payload.get("path"), include_fingerprint=True)
@@ -123,7 +123,9 @@ def run_propose_import(session: Session, payload: dict) -> dict:
         batch_title = "Import/Add review"
     elif files and all(str(file_info.get("path") or "").startswith(str(get_settings().downloads_path)) for file_info in files):
         batch_title = "Downloaded files review"
-    batch = ProposalBatch(title=batch_title, kind=ProposalKind.import_files, tree_path="/app/import")
+    batch_kind = ProposalKind.download if download_requests and not files else ProposalKind.import_files
+    tree_path = "/task-queue" if batch_kind == ProposalKind.download else "/app/import"
+    batch = ProposalBatch(title=batch_title, kind=batch_kind, tree_path=tree_path)
     session.add(batch)
     session.flush()
 
@@ -190,6 +192,36 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                 ),
             )
         )
+    download_candidates = 0
+    if download_requests:
+        download_candidates = add_download_candidate_review_items(
+            session,
+            batch,
+            download_requests,
+            artist_items,
+            album_items,
+            task,
+        )
+    create_notification(
+        session,
+        title="Import review ready",
+        body=f"{len(files)} files and {len(download_requests)} downloads with {download_candidates} candidates were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"batch_id": batch.id, "files": len(files), "downloads": len(download_requests), "download_candidates": download_candidates}
+
+
+def add_download_candidate_review_items(
+    session: Session,
+    batch: ProposalBatch,
+    download_requests: list[dict],
+    artist_items: dict[str, ProposalItem],
+    album_items: dict[tuple[str, str], ProposalItem],
+    task: Task | None = None,
+) -> int:
+    parent_kind = ProposalKind.download if batch.kind == ProposalKind.download else ProposalKind.import_files
+    grouped: dict[tuple[str, str], list[tuple[dict, ProposalItem]]] = {}
     for request in download_requests:
         artist = request.get("artist") or "Unknown Artist"
         album = request.get("album") or "Unknown Album"
@@ -199,8 +231,8 @@ def run_propose_import(session: Session, payload: dict) -> dict:
             artist_item = ProposalItem(
                 batch_id=batch.id,
                 title=artist,
-                kind=ProposalKind.import_files,
-                payload_json=json.dumps({"artist": artist}),
+                kind=parent_kind,
+                payload_json=json.dumps({"artist": artist, "status": "searching candidates"}),
             )
             session.add(artist_item)
             session.flush()
@@ -212,46 +244,126 @@ def run_propose_import(session: Session, payload: dict) -> dict:
                 batch_id=batch.id,
                 parent_id=artist_item.id,
                 title=album,
-                kind=ProposalKind.import_files,
-                payload_json=json.dumps({"artist": artist, "album": album}),
+                kind=parent_kind,
+                payload_json=json.dumps({"artist": artist, "album": album, "status": "searching candidates"}),
             )
             session.add(album_item)
             session.flush()
             album_items[album_key] = album_item
-        session.add(
-            ProposalItem(
-                batch_id=batch.id,
-                parent_id=album_item.id,
-                title=title,
-                kind=ProposalKind.download,
-                old_value="missing import slot",
-                payload_json=json.dumps(
-                    {
-                        "action": "wishlist_request",
-                        "kind": "track",
-                        "artist": artist,
-                        "album": album,
-                        "track": title,
-                        "track_number": request.get("track_number"),
-                        "disc_number": request.get("disc_number"),
-                        "duration_ms": request.get("duration_ms") or request.get("length"),
-                        "musicbrainz_album_id": request.get("musicbrainz_album_id"),
-                        "musicbrainz_recording_id": request.get("musicbrainz_recording_id"),
-                        "replace_track_id": request.get("replace_track_id"),
-                        "replace_path": request.get("replace_path"),
-                        "require_lossless": request.get("require_lossless"),
-                    }
-                ),
-            )
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=title,
+            kind=ProposalKind.download,
+            old_value="download request",
+            payload_json=json.dumps(
+                {
+                    "kind": "track",
+                    "artist": artist,
+                    "album": album,
+                    "track": title,
+                    "status": "searching candidates",
+                }
+            ),
         )
-    create_notification(
-        session,
-        title="Import review ready",
-        body=f"{len(files)} files and {len(download_requests)} downloads were added to the task queue.",
-        event_type="approval_needed",
-        target_url="/task-queue",
-    )
-    return {"batch_id": batch.id, "files": len(files), "downloads": len(download_requests)}
+        session.add(track_item)
+        session.flush()
+        grouped.setdefault(album_key, []).append((normalize_download_request(request, artist, album, title), track_item))
+    session.commit()
+
+    total_tracks = max(1, len(download_requests))
+    completed = 0
+    candidates_added = 0
+    for (artist, album), track_items in grouped.items():
+        requests = [request for request, _track_item in track_items]
+        append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
+        pools = search_album_folder_pools(session, artist, album, requests, task, limit=8)
+        if pools:
+            append_task_log(session, task, f"{artist} / {album}: using {len(pools)} ranked album folder(s) for candidates")
+        else:
+            append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; falling back to track searches", "warning")
+        missing_track_jobs: list[tuple[dict, ProposalItem, str, int]] = []
+        for request, track_item in track_items:
+            query = download_query(request)
+            candidates = candidates_from_folder_pools(pools, request, limit=5)
+            if candidates:
+                add_download_candidate_items(session, batch, track_item, request, query, candidates)
+                candidates_added += len(candidates)
+                set_item_payload_status(track_item, f"{len(candidates)} candidates ready")
+                append_task_log(session, task, f"{track_item.title}: {len(candidates)} album-level candidate(s) ready")
+            else:
+                set_item_payload_status(track_item, "searching track candidates")
+                missing_track_jobs.append((request, track_item, query, 5))
+            completed += 1
+            if task is not None:
+                update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_item.title}")
+        if missing_track_jobs:
+            candidates_added += add_track_search_candidate_items(session, batch, missing_track_jobs, task)
+        if (artist, album) in album_items:
+            set_item_payload_status(album_items[(artist, album)], "candidate review ready")
+        if artist in artist_items:
+            set_item_payload_status(artist_items[artist], "candidate review ready")
+        session.commit()
+    session.flush()
+    return candidates_added
+
+
+def normalize_download_request(request: dict, artist: str, album: str, title: str) -> dict:
+    return {
+        **request,
+        "artist": artist,
+        "album": album,
+        "track": title,
+        "track_number": request.get("track_number"),
+        "disc_number": request.get("disc_number"),
+        "duration_ms": request.get("duration_ms") or request.get("length"),
+        "musicbrainz_album_id": request.get("musicbrainz_album_id"),
+        "musicbrainz_recording_id": request.get("musicbrainz_recording_id"),
+        "replace_track_id": request.get("replace_track_id"),
+        "replace_path": request.get("replace_path"),
+        "require_lossless": request.get("require_lossless"),
+    }
+
+
+def add_track_search_candidate_items(
+    session: Session,
+    batch: ProposalBatch,
+    jobs: list[tuple[dict, ProposalItem, str, int]],
+    task: Task | None = None,
+) -> int:
+    if not jobs:
+        return 0
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    added = 0
+    workers = min(3, len(jobs))
+    append_task_log(session, task, f"Searching {len(jobs)} track candidate set(s) with {workers} worker(s)")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, {**request, "multiple_candidates": True}, limit): (request, track_item, query)
+            for request, track_item, query, limit in jobs
+        }
+        for future in as_completed(futures):
+            request, track_item, query = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:  # noqa: BLE001 - one failed search should leave the rest of the review usable.
+                result = {"candidates": [], "diagnostics": {"query_logs": [f"slskd track search failed for {query}: {error}"]}}
+            for line in result.get("diagnostics", {}).get("query_logs") or []:
+                append_task_log(session, task, line)
+            candidates = result.get("candidates") or []
+            if candidates:
+                add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
+                added += len(candidates[:5])
+                set_item_payload_status(track_item, f"{len(candidates[:5])} candidates ready")
+                append_task_log(session, task, f"{track_item.title}: {len(candidates[:5])} track candidate(s) ready")
+            else:
+                set_item_payload_status(track_item, "no slskd candidates found")
+                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
+                append_task_log(session, task, f"{track_item.title}: no slskd candidates found; YouTube fallback left unselected", "warning")
+            session.commit()
+    return added
 
 
 def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
@@ -307,6 +419,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     direct_download_items = [
         item for item in download_items if json.loads(item.payload_json or "{}").get("action") != "wishlist_request"
     ]
+    if direct_download_items:
+        batch.kind = ProposalKind.download
+        batch.tree_path = "/downloads"
+        append_task_log(session, task, f"{batch.title}: selected candidates moved to Downloads for transfer and verification")
     lyrics_items = [
         item
         for item in selected_items
@@ -2279,8 +2395,8 @@ def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
     lrc_path.write_text(lyric_text, encoding="utf-8")
 
 
-def create_album_download_candidate_batch(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None) -> None:
-    batch = ProposalBatch(title=f"Download candidates: {artist} / {album}", kind=ProposalKind.download, tree_path="/downloads")
+def create_album_download_candidate_batch(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, tree_path: str = "/task-queue") -> None:
+    batch = ProposalBatch(title=f"Download candidates: {artist} / {album}", kind=ProposalKind.download, tree_path=tree_path)
     session.add(batch)
     session.flush()
     append_task_log(session, task, f"Created download candidate batch for {artist} / {album} with {len(requests)} requested track(s)")
@@ -2321,7 +2437,8 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     retry_tracks = 0
     diagnostic_lines = []
     append_task_log(session, task, f"{artist} / {album}: searching slskd for an album folder")
-    folder_pool = search_album_folder_pool(session, artist, album, requests, task)
+    folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=8)
+    folder_pool = folder_pools[0] if folder_pools else None
     if folder_pool:
         diagnostic_lines.append(
             f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
@@ -2329,7 +2446,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         append_task_log(
             session,
             task,
-            f"{artist} / {album}: matched album folder from {folder_pool.get('username')} with {folder_pool.get('matched_tracks', 0)} track(s)",
+            f"{artist} / {album}: matched {len(folder_pools)} album folder(s); best is from {folder_pool.get('username')} with {folder_pool.get('matched_tracks', 0)} track(s)",
         )
     else:
         append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
@@ -2346,19 +2463,19 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
         set_item_payload_status(track_item, f"searching {track_title}")
-        folder_candidate = candidate_from_folder_pool(folder_pool, request) if folder_pool else None
-        if folder_candidate:
-            confidence = folder_candidate.get("confidence")
-            diagnostic_lines.append(f"{query}: reused {folder_candidate.get('folder') or 'the same folder'} from {folder_candidate.get('username')} at {confidence}% confidence.")
-            append_task_log(session, task, f"{track_title}: reused album-folder candidate {folder_candidate.get('filename')} at {confidence}% confidence")
-            add_download_candidate_items(session, batch, track_item, request, query, [folder_candidate])
+        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
+        if folder_candidates:
+            confidence = folder_candidates[0].get("confidence")
+            diagnostic_lines.append(f"{query}: reused {folder_candidates[0].get('folder') or 'the same folder'} from {folder_candidates[0].get('username')} at {confidence}% confidence.")
+            append_task_log(session, task, f"{track_title}: {len(folder_candidates)} album-folder candidate(s) ready; best {folder_candidates[0].get('filename')} at {confidence}% confidence")
+            add_download_candidate_items(session, batch, track_item, request, query, folder_candidates)
             slskd_tracks += 1
-            set_item_payload_status(track_item, "candidate ready")
+            set_item_payload_status(track_item, f"{len(folder_candidates)} candidates ready")
             completed_tracks += 1
             if task is not None:
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
         else:
-            candidate_limit = 4 if request.get("multiple_candidates") else 1
+            candidate_limit = 5
             search_jobs.append((request, track_item, track_title, query, candidate_limit))
         session.commit()
 
@@ -2411,7 +2528,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         title="Download candidates ready",
         body=f"{album}: {slskd_tracks} tracks with slskd candidates. {retry_tracks} tracks need another slskd search. {' '.join(diagnostic_lines[:3])}",
         event_type="approval_needed",
-        target_url="/downloads",
+        target_url="/task-queue" if tree_path != "/downloads" else "/downloads",
     )
 
 
@@ -2431,10 +2548,25 @@ def add_download_candidate_items(session: Session, batch: ProposalBatch, track_i
                         "action": "queue_download",
                         "request": request,
                         "candidate": candidate,
+                        "candidate_index": index,
+                        "status": candidate_status_label(candidate),
                     }
                 ),
             )
         )
+
+
+def candidate_status_label(candidate: dict) -> str:
+    confidence = candidate.get("confidence")
+    parts = []
+    if confidence is not None:
+        parts.append(f"{confidence}% match")
+    if candidate.get("same_album_folder"):
+        parts.append("same album folder")
+    quality = candidate.get("quality")
+    if quality:
+        parts.append(str(quality))
+    return " · ".join(parts) if parts else "candidate"
 
 
 def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, selected: bool = True) -> None:
@@ -2571,12 +2703,17 @@ def download_folder_pool(candidate: dict) -> dict | None:
 
 
 def search_album_folder_pool(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None) -> dict | None:
+    pools = search_album_folder_pools(session, artist, album, requests, task, limit=1)
+    return pools[0] if pools else None
+
+
+def search_album_folder_pools(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, limit: int = 5) -> list[dict]:
     if not requests:
-        return None
+        return []
     settings = integration_settings(session)
     queries = unique_nonempty([" ".join(part for part in [artist, album_value] if part) for album_value in text_search_values(album)])
     if not queries:
-        return None
+        return []
     match_threshold = slskd_album_match_threshold(settings)
     pools: dict[tuple[str, str], dict] = {}
     for query in queries:
@@ -2616,13 +2753,13 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
                 if filename and filename not in known_filenames:
                     current["files"].append(file_info)
                     known_filenames.add(filename)
+        ranked_after_query = ranked_album_folder_pools(pools, requests, match_threshold)
+        if ranked_after_query and album_folder_pool_is_complete(ranked_after_query[0][0], requests):
+            append_task_log(session, task, f"{artist} / {album}: album search found a complete high-confidence folder from {ranked_after_query[0][1].get('username')}")
+            break
     if not pools:
-        return None
-    ranked = sorted(
-        ((score_album_folder_pool(pool, requests, match_threshold), pool) for pool in pools.values()),
-        key=lambda item: item[0],
-        reverse=True,
-    )
+        return []
+    ranked = ranked_album_folder_pools(pools, requests, match_threshold)
     if not ranked or ranked[0][0][0] == 0:
         if ranked:
             best_score, best_pool = ranked[0]
@@ -2635,11 +2772,25 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
                 ),
                 "warning",
             )
-        return None
+        return []
+    result_pools = []
+    for score, pool in ranked[:limit]:
+        if score[0] == 0:
+            continue
+        prepared = {**pool}
+        prepared["matched_tracks"] = score[0]
+        prepared["match_threshold"] = match_threshold
+        prepared["album_query"] = ", ".join(prepared.get("queries") or queries)
+        prepared["album_folder_score"] = {
+            "matched": score[0],
+            "confidence_total": score[1],
+            "artist": score[2],
+            "album": score[3],
+            "lossless": score[4],
+            "files": score[5],
+        }
+        result_pools.append(prepared)
     best_score, best_pool = ranked[0]
-    best_pool["matched_tracks"] = best_score[0]
-    best_pool["match_threshold"] = match_threshold
-    best_pool["album_query"] = ", ".join(best_pool.get("queries") or queries)
     append_task_log(
         session,
         task,
@@ -2648,7 +2799,23 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
             f"with artist {best_score[2]:.2f}, album {best_score[3]:.2f}, {best_score[4]} lossless tracks"
         ),
     )
-    return best_pool
+    return result_pools
+
+
+def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list[dict], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
+    return sorted(
+        ((score_album_folder_pool(pool, requests, threshold), pool) for pool in pools.values()),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+
+
+def album_folder_pool_is_complete(score: tuple[int, float, float, float, int, int], requests: list[dict]) -> bool:
+    matched, confidence_total, artist_score, album_score, _lossless, _files = score
+    if matched < len(requests):
+        return False
+    average_confidence = confidence_total / max(matched, 1)
+    return average_confidence >= 92 and artist_score >= 0.85 and album_score >= 0.70
 
 
 def slskd_album_match_threshold(settings: dict[str, str]) -> float:
@@ -2729,6 +2896,24 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
         "files": [file_info],
         "folder_files": files,
     }
+
+
+def candidates_from_folder_pools(pools: list[dict], request: dict, limit: int = 5) -> list[dict]:
+    candidates: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for pool in pools:
+        candidate = candidate_from_folder_pool(pool, request)
+        if not candidate:
+            continue
+        identity = candidate_identity(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidate["same_album_folder"] = True
+        candidates.append(candidate)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def folder_file_confidence(file_info: dict, request: dict) -> float:
@@ -4378,7 +4563,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"execute_proposal_batch", "clear_downloads"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))

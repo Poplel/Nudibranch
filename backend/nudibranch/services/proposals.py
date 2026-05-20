@@ -58,9 +58,17 @@ def normalize_download_candidate_selection(items: list[ProposalItem], preferred_
         selected = [item for item in candidates if item.selected]
         if len(selected) <= 1:
             continue
-        selected.sort(key=lambda item: (item.id not in preferred_ids, item.status == ProposalStatus.executing, item.id))
+        selected.sort(key=lambda item: (item.id not in preferred_ids, download_candidate_rank(item), item.status == ProposalStatus.executing, item.id))
         for item in selected[1:]:
             item.selected = False
+
+
+def download_candidate_rank(item: ProposalItem) -> int:
+    payload = json.loads(item.payload_json or "{}")
+    try:
+        return int(payload.get("candidate_index", 9999))
+    except (TypeError, ValueError):
+        return 9999
 
 
 def reject_items(session: Session, batch_id: str, item_ids: list[str] | None, suppress_for: str) -> int:
