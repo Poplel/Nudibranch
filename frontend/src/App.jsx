@@ -4915,6 +4915,7 @@ function downloadProgressSummary(approvals) {
   let finished = 0;
   let failed = 0;
   let selected = 0;
+  let waiting = 0;
   let verifying = 0;
   let verified = 0;
   let partial = 0;
@@ -4946,7 +4947,8 @@ function downloadProgressSummary(approvals) {
     }
     const progress = downloadStatusProgress(status);
     if (progress) {
-      downloading += 1;
+      if (/downloading\s+\d+(?:\.\d+)?%/.test(lower)) downloading += 1;
+      else waiting += 1;
       partial += progress.indeterminate ? 0 : progress.value;
       continue;
     }
@@ -4957,12 +4959,15 @@ function downloadProgressSummary(approvals) {
   const percent = total ? partial / total : 0;
   const notStarted = selected === total && downloading === 0 && finished === 0 && failed === 0;
   const verificationPending = finished === total && verified < total && failed === 0;
+  const waitingForDownload = waiting > 0 && downloading === 0 && finished === 0 && failed === 0;
   const label = notStarted
     ? `${selected} selected candidates`
+    : waitingForDownload
+      ? `${waiting}/${total} waiting to download`
     : verificationPending
       ? `Verification pending for ${total} downloads`
       : verifying > 0
-        ? `Verifying ${verified}/${total}`
+        ? `Verifying ${finished}/${total}`
         : `${finished}/${total} finished`;
   return {
     percent,
@@ -4979,8 +4984,11 @@ function downloadStatusProgress(status) {
   if (match) {
     return { value: Number(match[1]), label: text, indeterminate: false };
   }
-  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete|verifying with acoustid/i.test(text)) {
+  if (/verifying with acoustid/i.test(text)) {
     return { value: 0, label: text, indeterminate: true };
+  }
+  if (/queued in slskd|waiting for downloaded file|slskd .*waiting|waiting for slskd|reports complete/i.test(text)) {
+    return { value: 0, label: text, indeterminate: false };
   }
   return null;
 }

@@ -30,6 +30,7 @@ MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 150
 STALLED_PROGRESS_RETRY_SECONDS = 300
 MISSING_TRANSFER_RETRY_SECONDS = 240
+COMPLETED_MISSING_FILE_RETRY_SECONDS = 180
 QUEUED_TRANSFER_RETRY_SECONDS = 120
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 90
 TRANSFER_COMPLETE_PERCENT = 99.5
@@ -908,7 +909,7 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
     entries_by_batch: dict[str, list[dict]] = {}
     for entry in load_download_manifest():
         batch_id = entry.get("batch_id")
-        if batch_id and entry.get("status") in {"queued", "verified"}:
+        if batch_id and entry.get("status") in {"queued", "verified", "failed"}:
             entries_by_batch.setdefault(batch_id, []).append(entry)
     imported = 0
     errors: list[str] = []
@@ -929,6 +930,11 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
+    revived_items = revive_exhausted_slskd_downloads(session, batch)
+    if revived_items:
+        append_task_log(session, None, f"Download batch {batch.title}: revived {revived_items} exhausted slskd item(s) for another automatic search")
+        batch.status = ProposalStatus.executing
+        session.flush()
     blocking_items = selected_download_blockers(batch)
     if blocking_items:
         for item in blocking_items:
@@ -1097,6 +1103,36 @@ def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
         elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
             blockers.append(item)
     return blockers
+
+
+def revive_exhausted_slskd_downloads(session: Session, batch: ProposalBatch) -> int:
+    revived = 0
+    for item in batch.items:
+        if not item.selected or item.kind != ProposalKind.download or item.status != ProposalStatus.failed:
+            continue
+        payload = json.loads(item.payload_json or "{}")
+        request = payload.get("request") or {}
+        if payload.get("action") != "queue_download" or not payload.get("auto_retry_exhausted"):
+            continue
+        retry_started = retry_download_entry(
+            session,
+            batch,
+            {
+                "batch_id": item.batch_id,
+                "item_id": item.id,
+                "parent_id": item.parent_id,
+                "request": request,
+                "candidate": payload.get("candidate") or {},
+                "failed_candidates": [],
+                "basename": remote_basename((payload.get("candidate") or {}).get("filename") or ""),
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+            item,
+            "starting a fresh automatic slskd search cycle",
+        )
+        if retry_started:
+            revived += 1
+    return revived
 
 
 def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
@@ -1308,15 +1344,15 @@ def transfer_is_failed(transfer: dict | None) -> bool:
 
 
 def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
-    if int(entry.get("retry_count") or 0) >= MAX_DOWNLOAD_AUTO_RETRIES:
-        return None
     if transfer_is_failed(transfer):
         error = transfer.get("error") if transfer else None
         status = transfer.get("status") if transfer else None
         return f"transfer failed: {error or status or 'unknown error'}"
-    if transfer_is_complete_or_finishing(transfer):
-        return None
     age = manifest_entry_age_seconds(entry)
+    if transfer_is_complete_or_finishing(transfer):
+        if age >= COMPLETED_MISSING_FILE_RETRY_SECONDS:
+            return "slskd reported complete but the file was not found"
+        return None
     if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
         return "transfer stayed queued"
     if not transfer and age >= MISSING_TRANSFER_RETRY_SECONDS:
@@ -1365,6 +1401,10 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
     set_download_item_status(item, f"{reason}; searching for another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+    payload = json.loads(item.payload_json or "{}")
+    payload["auto_retry_exhausted"] = False
+    item.payload_json = json.dumps(payload)
+    item.status = ProposalStatus.executing
     update_download_manifest_entry(
         entry,
         "retrying",
@@ -1395,6 +1435,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             retry_reason=f"replacement search failed: {error}",
             queued_at=datetime.now(timezone.utc).isoformat(),
         )
+        item.status = ProposalStatus.executing
         set_download_item_status(item, f"replacement search failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
         append_task_log(session, None, f"{item.title}: replacement search failed and will retry: {error}", "warning")
         return True
@@ -1409,6 +1450,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             retry_reason="no replacement candidates were found",
             queued_at=datetime.now(timezone.utc).isoformat(),
         )
+        item.status = ProposalStatus.executing
         set_download_item_status(item, f"no replacement candidate yet; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
         return True
     candidate = candidates[0]
@@ -1463,6 +1505,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             retry_reason=f"replacement queue failed: {error}",
             queued_at=datetime.now(timezone.utc).isoformat(),
         )
+        item.status = ProposalStatus.executing
         set_download_item_status(item, f"replacement queue failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
         append_task_log(session, None, f"{item.title}: replacement candidate failed to queue: {error}", "warning")
         return True
