@@ -1,94 +1,95 @@
 import re
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import httpx
 
-from nudibranch.core.config import get_settings
-from nudibranch.services.imports import fingerprint_audio, read_audio_metadata
+from nudibranch.services.imports import read_audio_metadata
 
 
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
 
 
-def lookup_recording_by_fingerprint(file_info: dict, acoustid_api_key: str | None = None) -> list[dict]:
-    settings = get_settings()
-    api_key = acoustid_api_key or settings.acoustid_api_key
-    if not api_key:
-        raise ValueError("ACOUSTID_API_KEY is required for acoustic metadata lookup")
-
-    fingerprint = file_info.get("fingerprint")
-    if not fingerprint:
-        path = Path(file_info["path"])
-        fingerprint = fingerprint_audio(path)
-    if not fingerprint:
-        raise ValueError("Unable to fingerprint this file")
-
-    duration = normalized_acoustid_duration(
-        fingerprint.get("duration")
-        or file_info.get("duration")
-        or file_info.get("duration_seconds")
-        or (round(float(file_info["duration_ms"]) / 1000) if file_info.get("duration_ms") else None)
-    )
-    if not duration and file_info.get("path"):
-        metadata = read_audio_metadata(Path(file_info["path"]))
-        if metadata.get("duration_ms"):
-            duration = normalized_acoustid_duration(float(metadata["duration_ms"]) / 1000)
-    if not duration:
-        raise ValueError("Unable to determine this file's duration for AcoustID lookup")
-    fingerprint_value = fingerprint.get("fingerprint")
-    if not fingerprint_value:
-        raise ValueError("Unable to fingerprint this file")
-
-    params = {
-        "format": "json",
-        "client": api_key,
-        "duration": str(duration),
-        "fingerprint": fingerprint_value,
-        "meta": "recordings releasegroups releases tracks",
-    }
-    try:
-        response = httpx.get("https://api.acoustid.org/v2/lookup", params=params, timeout=20, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-    except httpx.HTTPStatusError as error:
-        status = error.response.status_code
-        detail = error.response.text.strip()[:240]
-        raise RuntimeError(f"AcoustID lookup request failed ({status}){': ' + detail if detail else ''}") from error
-    except httpx.HTTPError as error:
-        raise RuntimeError(f"AcoustID lookup request failed: {error}") from error
-    payload = response.json()
-    if payload.get("status") == "error":
-        error = payload.get("error") or {}
-        message = error.get("message") or "AcoustID rejected the lookup request"
-        raise ValueError(f"AcoustID lookup failed: {message}")
+def lookup_recording_by_musicbrainz_metadata(file_info: dict) -> list[dict]:
+    metadata = file_info_metadata(file_info)
+    artist = metadata.get("albumartist") or metadata.get("artist") or file_info.get("artist")
+    album = metadata.get("album") or file_info.get("album")
+    if not artist or not album:
+        raise ValueError("Artist and album metadata are required for MusicBrainz matching")
+    record = lookup_album_tracks(str(artist), str(album), metadata.get("musicbrainz_album_id") or file_info.get("musicbrainz_album_id"))
     candidates = []
-    for result in payload.get("results", []):
-        for recording in result.get("recordings", []):
-            release = first_release(recording)
-            artist = artist_credit(recording.get("artists", []))
-            candidates.append(
-                {
-                    "score": result.get("score", 0),
-                    "metadata": {
-                        "artist": artist,
-                        "albumartist": artist,
-                        "album": release.get("title"),
-                        "title": recording.get("title"),
-                        "track_number": release.get("track_number"),
-                        "musicbrainz_recording_id": recording.get("id"),
-                        "musicbrainz_album_id": release.get("id"),
-                    },
-                    "source": "acoustid",
-                }
-            )
+    for track in record.get("tracks") or []:
+        score = musicbrainz_track_score(metadata, track)
+        candidates.append(
+            {
+                "score": score,
+                "metadata": {
+                    "artist": record.get("artist") or artist,
+                    "albumartist": record.get("artist") or artist,
+                    "album": record.get("album") or album,
+                    "title": track.get("title"),
+                    "track_number": track.get("track_number"),
+                    "disc_number": track.get("disc_number"),
+                    "duration_ms": track.get("length"),
+                    "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
+                    "musicbrainz_album_id": record.get("musicbrainz_album_id"),
+                },
+                "source": "musicbrainz",
+            }
+        )
     return sorted(candidates, key=lambda candidate: candidate.get("score") or 0, reverse=True)
 
 
-def normalized_acoustid_duration(value: object) -> int | None:
+def file_info_metadata(file_info: dict) -> dict:
+    metadata = {key: value for key, value in dict(file_info.get("metadata") or {}).items() if value is not None}
+    if file_info.get("path"):
+        metadata = {**read_audio_metadata(Path(file_info["path"])), **metadata}
+    for key in ("artist", "album", "title", "track_number", "duration_ms", "musicbrainz_album_id", "musicbrainz_recording_id"):
+        if file_info.get(key) is not None and metadata.get(key) is None:
+            metadata[key] = file_info[key]
+    return metadata
+
+
+def musicbrainz_track_score(metadata: dict, track: dict) -> float:
+    title_score = text_similarity(metadata.get("title"), track.get("title"))
+    number_score = number_match_score(metadata.get("track_number"), track.get("track_number"))
+    duration_score = duration_score_for_musicbrainz(metadata.get("duration_ms"), track.get("length"))
+    recording_score = 1.0 if metadata.get("musicbrainz_recording_id") and metadata.get("musicbrainz_recording_id") == track.get("musicbrainz_recording_id") else 0.0
+    return max(recording_score, (title_score * 0.58) + (number_score * 0.24) + (duration_score * 0.18))
+
+
+def text_similarity(left: object, right: object) -> float:
+    left_text = normalize(left)
+    right_text = normalize(right)
+    if not left_text or not right_text:
+        return 0.0
+    if left_text == right_text:
+        return 1.0
+    if left_text in right_text or right_text in left_text:
+        return 0.94
+    return SequenceMatcher(None, left_text, right_text).ratio()
+
+
+def number_match_score(left: object, right: object) -> float:
+    left_number = parse_track_number(left)
+    right_number = parse_track_number(right)
+    if left_number is None or right_number is None:
+        return 0.5
+    return 1.0 if left_number == right_number else 0.0
+
+
+def duration_score_for_musicbrainz(left: object, right: object) -> float:
     try:
-        duration = round(float(value))
+        left_ms = int(left)
+        right_ms = int(right)
     except (TypeError, ValueError):
-        return None
-    return duration if duration > 0 else None
+        return 0.5
+    if left_ms <= 0 or right_ms <= 0:
+        return 0.5
+    delta = abs(left_ms - right_ms)
+    if delta <= 5000:
+        return 1.0
+    return max(0.0, 1.0 - (delta / max(left_ms, right_ms)) * 5)
 
 
 def search_album_releases(artist: str, album: str) -> list[dict]:

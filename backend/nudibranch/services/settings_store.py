@@ -5,7 +5,6 @@ from nudibranch.db.models import AppSetting
 
 
 INTEGRATION_KEYS = {
-    "acoustid_api_key",
     "jellyfin_url",
     "jellyfin_api_key",
     "slskd_url",
@@ -21,7 +20,6 @@ INTEGRATION_KEYS = {
 def integration_settings(session: Session) -> dict[str, str]:
     settings = get_settings()
     values = {
-        "acoustid_api_key": settings.acoustid_api_key,
         "jellyfin_url": settings.jellyfin_url,
         "jellyfin_api_key": settings.jellyfin_api_key,
         "slskd_url": settings.slskd_url,

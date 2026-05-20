@@ -45,8 +45,8 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("UPDATE wishlist_items SET status_changed_at = created_at WHERE status_changed_at IS NULL"))
         session.commit()
     track_columns = {row[1] for row in session.execute(text("PRAGMA table_info(tracks)"))}
-    if "acoustic_verified" not in track_columns:
-        session.execute(text("ALTER TABLE tracks ADD COLUMN acoustic_verified BOOLEAN NOT NULL DEFAULT 0"))
+    if "musicbrainz_verified" not in track_columns:
+        session.execute(text("ALTER TABLE tracks ADD COLUMN musicbrainz_verified BOOLEAN NOT NULL DEFAULT 0"))
         session.commit()
     move_task_result_logs_to_app_log(session)
 

@@ -68,7 +68,7 @@ class LibraryTreeTrack(BaseModel):
     format: str | None = None
     bitrate: int | None = None
     is_lossless: bool = False
-    acoustic_verified: bool = False
+    musicbrainz_verified: bool = False
     path: str | None = None
     musicbrainz_recording_id: str | None = None
     explicit: bool | None = None
@@ -199,7 +199,6 @@ class DeviceRegistration(BaseModel):
 
 
 class IntegrationSettings(BaseModel):
-    acoustid_api_key: str = ""
     jellyfin_url: str = ""
     jellyfin_api_key: str = ""
     slskd_url: str = ""
@@ -252,7 +251,7 @@ class ImportScanRequest(BaseModel):
     download_requests: list[dict[str, Any]] | None = None
 
 
-class ImportAcousticLookupRequest(BaseModel):
+class ImportMusicBrainzLookupRequest(BaseModel):
     file: dict[str, Any]
 
 

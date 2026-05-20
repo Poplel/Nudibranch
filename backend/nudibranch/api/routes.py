@@ -2,6 +2,7 @@ import secrets
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -17,7 +18,7 @@ from nudibranch.api.schemas import (
     CheckFileFixRequest,
     DeviceRegistration,
     FavoritesOut,
-    ImportAcousticLookupRequest,
+    ImportMusicBrainzLookupRequest,
     IntegrationSettings,
     ImportScanRequest,
     LibraryMetadataProposalRequest,
@@ -77,10 +78,10 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.app_log import tail_app_log
-from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_fingerprint, search_album_releases
+from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
-from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
+from nudibranch.services.settings_store import integration_settings, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 
 router = APIRouter(prefix="/api/v1")
@@ -274,7 +275,7 @@ def library_tree(
                             format=track.format,
                             bitrate=track.bitrate,
                             is_lossless=track.is_lossless,
-                            acoustic_verified=track.acoustic_verified,
+                            musicbrainz_verified=track.musicbrainz_verified,
                             path=track.path,
                             musicbrainz_recording_id=track.musicbrainz_recording_id,
                             explicit=track.explicit,
@@ -383,8 +384,8 @@ def propose_library_remove(
     return serialize_batch(batch)
 
 
-@router.post("/library/albums/{album_id}/acoustic-match", tags=["library"])
-def acoustic_match_library_album(
+@router.post("/library/albums/{album_id}/musicbrainz-match", tags=["library"])
+def musicbrainz_match_library_album(
     album_id: str,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.metadata_edit)),
@@ -393,12 +394,18 @@ def acoustic_match_library_album(
     if not album:
         raise HTTPException(status_code=404, detail="Album not found")
 
+    album_record = None
+    if album.artist:
+        try:
+            album_record = lookup_album_tracks(album.artist.name, album.title, album.musicbrainz_release_id)
+        except (RuntimeError, httpx.HTTPError):
+            album_record = None
     results = []
     for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999, track.title.lower())):
-        results.append(acoustic_match_track_result(session, track, force=False))
+        results.append(musicbrainz_match_track_result(session, track, force=False, album_record=album_record))
 
-    metadata_batch = queue_acoustic_metadata_fixes(session, results)
-    replacement_batch = queue_acoustic_replacement_downloads(session, results)
+    metadata_batch = queue_musicbrainz_metadata_fixes(session, results)
+    replacement_batch = queue_musicbrainz_replacement_downloads(session, results)
     session.commit()
     return {
         "album_id": album.id,
@@ -410,8 +417,8 @@ def acoustic_match_library_album(
     }
 
 
-@router.post("/library/tracks/{track_id}/acoustic-match", tags=["library"])
-def acoustic_match_library_track(
+@router.post("/library/tracks/{track_id}/musicbrainz-match", tags=["library"])
+def musicbrainz_match_library_track(
     track_id: str,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.metadata_edit)),
@@ -419,9 +426,9 @@ def acoustic_match_library_track(
     track = session.get(Track, track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    result = acoustic_match_track_result(session, track, force=True)
-    metadata_batch = queue_acoustic_metadata_fixes(session, [result])
-    replacement_batch = queue_acoustic_replacement_downloads(session, [result])
+    result = musicbrainz_match_track_result(session, track, force=True)
+    metadata_batch = queue_musicbrainz_metadata_fixes(session, [result])
+    replacement_batch = queue_musicbrainz_replacement_downloads(session, [result])
     session.commit()
     result["queued_changes"] = 1 if result.get("changes") else 0
     result["queued_replacements"] = 1 if result.get("replacement_request") else 0
@@ -429,7 +436,7 @@ def acoustic_match_library_track(
     return result
 
 
-def acoustic_match_track_result(session: Session, track: Track, force: bool = False) -> dict:
+def musicbrainz_match_track_result(session: Session, track: Track, force: bool = False, album_record: dict | None = None) -> dict:
     result = {
         "track_id": track.id,
         "title": track.title,
@@ -440,9 +447,9 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
         "changes": {},
         "replacement_request": None,
         "error": None,
-        "acoustic_verified": track.acoustic_verified,
+        "musicbrainz_verified": track.musicbrainz_verified,
     }
-    if track.acoustic_verified and not force:
+    if track.musicbrainz_verified and not force:
         result["status"] = "skipped_verified"
         return result
     if not track.path or not Path(track.path).exists():
@@ -450,35 +457,117 @@ def acoustic_match_track_result(session: Session, track: Track, force: bool = Fa
         result["error"] = "Track file is missing"
         return result
     try:
-        candidates = lookup_recording_by_fingerprint({"path": track.path}, integration_value(session, "acoustid_api_key"))
+        expected = expected_musicbrainz_metadata_for_track(track, album_record=album_record)
     except (ValueError, RuntimeError, httpx.HTTPError) as error:
         result["status"] = "error"
         result["error"] = str(error)
         return result
-    candidate = candidates[0] if candidates else None
-    if not candidate:
-        return result
-    metadata = candidate.get("metadata") or {}
-    candidate_title = metadata.get("title") or ""
-    same_title = normalized_music_name(track.title) == normalized_music_name(candidate_title)
-    same_recording = bool(track.musicbrainz_recording_id and track.musicbrainz_recording_id == metadata.get("musicbrainz_recording_id"))
-    matched = same_recording or same_title
-    changes = acoustic_metadata_changes(track, metadata) if matched else {}
-    replacement_request = acoustic_replacement_request(track) if not matched else None
+    file_metadata = read_audio_metadata(Path(track.path))
+    match = musicbrainz_file_match(file_metadata, expected)
+    matched = match["matched"]
+    changes = musicbrainz_metadata_changes(track, expected) if matched else {}
+    replacement_request = musicbrainz_replacement_request(track) if not matched else None
     result.update(
         {
             "status": "matched" if matched else "changed",
-            "score": round((candidate.get("score") or 0) * 100),
-            "candidate": metadata,
+            "score": round(match["score"] * 100),
+            "candidate": expected,
             "changes": changes,
             "replacement_request": replacement_request,
-            "acoustic_verified": track.acoustic_verified,
+            "musicbrainz_verified": track.musicbrainz_verified,
+            "message": match.get("message"),
         }
     )
     return result
 
 
-def acoustic_metadata_changes(track: Track, metadata: dict) -> dict:
+def expected_musicbrainz_metadata_for_track(track: Track, album_record: dict | None = None) -> dict:
+    fallback = {
+        "artist": track.album.artist.name if track.album and track.album.artist else None,
+        "albumartist": track.album.artist.name if track.album and track.album.artist else None,
+        "album": track.album.title if track.album else None,
+        "title": track.title,
+        "track_number": track.track_number,
+        "disc_number": track.disc_number,
+        "duration_ms": track.duration_ms,
+        "musicbrainz_recording_id": track.musicbrainz_recording_id,
+        "musicbrainz_album_id": track.album.musicbrainz_release_id if track.album else None,
+    }
+    if not track.album or not track.album.artist:
+        return fallback
+    record = album_record or lookup_album_tracks(track.album.artist.name, track.album.title, track.album.musicbrainz_release_id)
+    matches = record.get("tracks") or []
+    selected = None
+    if track.musicbrainz_recording_id:
+        selected = next((candidate for candidate in matches if candidate.get("musicbrainz_recording_id") == track.musicbrainz_recording_id), None)
+    if not selected and track.track_number is not None:
+        selected = next((candidate for candidate in matches if candidate.get("track_number") == track.track_number), None)
+    if not selected:
+        selected = next((candidate for candidate in matches if normalized_music_name(candidate.get("title")) == normalized_music_name(track.title)), None)
+    if not selected:
+        return fallback
+    return {
+        **fallback,
+        "artist": record.get("artist") or fallback["artist"],
+        "albumartist": record.get("artist") or fallback["albumartist"],
+        "album": record.get("album") or fallback["album"],
+        "title": selected.get("title") or fallback["title"],
+        "track_number": selected.get("track_number") or fallback["track_number"],
+        "disc_number": selected.get("disc_number") or fallback["disc_number"],
+        "duration_ms": selected.get("length") or fallback["duration_ms"],
+        "musicbrainz_recording_id": selected.get("musicbrainz_recording_id") or fallback["musicbrainz_recording_id"],
+        "musicbrainz_album_id": record.get("musicbrainz_album_id") or fallback["musicbrainz_album_id"],
+    }
+
+
+def musicbrainz_file_match(file_metadata: dict, expected: dict) -> dict:
+    file_recording_id = normalized_music_name(file_metadata.get("musicbrainz_recording_id"))
+    expected_recording_id = normalized_music_name(expected.get("musicbrainz_recording_id"))
+    if file_recording_id and expected_recording_id:
+        if file_recording_id == expected_recording_id:
+            return {"matched": True, "score": 1.0}
+        return {"matched": False, "score": 0.0, "message": "MusicBrainz recording ID does not match"}
+    title_score = musicbrainz_text_score(file_metadata.get("title"), expected.get("title"))
+    artist_score = musicbrainz_text_score(file_metadata.get("albumartist") or file_metadata.get("artist"), expected.get("albumartist") or expected.get("artist"))
+    album_score = musicbrainz_text_score(file_metadata.get("album"), expected.get("album"))
+    duration_score = musicbrainz_duration_score(file_metadata.get("duration_ms"), expected.get("duration_ms"))
+    score = (title_score * 0.52) + (artist_score * 0.22) + (album_score * 0.10) + (duration_score * 0.16)
+    if title_score < 0.78:
+        return {"matched": False, "score": score, "message": "Title does not match MusicBrainz"}
+    if duration_score < 0.45:
+        return {"matched": False, "score": score, "message": "Duration does not match MusicBrainz"}
+    if artist_score < 0.50 and album_score < 0.50:
+        return {"matched": False, "score": score, "message": "Artist and album do not match MusicBrainz"}
+    return {"matched": score >= 0.72, "score": score, "message": None if score >= 0.72 else "MusicBrainz confidence was too low"}
+
+
+def musicbrainz_text_score(left: object, right: object) -> float:
+    left_text = normalized_music_name(left)
+    right_text = normalized_music_name(right)
+    if not left_text or not right_text:
+        return 0.5
+    if left_text == right_text:
+        return 1.0
+    if left_text in right_text or right_text in left_text:
+        return 0.94
+    return SequenceMatcher(None, left_text, right_text).ratio()
+
+
+def musicbrainz_duration_score(left: object, right: object) -> float:
+    try:
+        left_ms = int(left)
+        right_ms = int(right)
+    except (TypeError, ValueError):
+        return 0.5
+    if left_ms <= 0 or right_ms <= 0:
+        return 0.5
+    delta = abs(left_ms - right_ms)
+    if delta <= 5000:
+        return 1.0
+    return max(0.0, 1.0 - (delta / max(left_ms, right_ms)) * 5)
+
+
+def musicbrainz_metadata_changes(track: Track, metadata: dict) -> dict:
     changes = {}
     candidate_title = metadata.get("title")
     candidate_recording_id = metadata.get("musicbrainz_recording_id")
@@ -486,12 +575,12 @@ def acoustic_metadata_changes(track: Track, metadata: dict) -> dict:
         changes["title"] = candidate_title
     if candidate_recording_id and candidate_recording_id != track.musicbrainz_recording_id:
         changes["musicbrainz_recording_id"] = candidate_recording_id
-    if not track.acoustic_verified:
-        changes["acoustic_verified"] = True
+    if not track.musicbrainz_verified:
+        changes["musicbrainz_verified"] = True
     return changes
 
 
-def acoustic_replacement_request(track: Track) -> dict:
+def musicbrainz_replacement_request(track: Track) -> dict:
     return {
         "action": "wishlist_request",
         "kind": "track",
@@ -509,12 +598,12 @@ def acoustic_replacement_request(track: Track) -> dict:
     }
 
 
-def queue_acoustic_metadata_fixes(session: Session, results: list[dict]) -> ProposalBatch | None:
+def queue_musicbrainz_metadata_fixes(session: Session, results: list[dict]) -> ProposalBatch | None:
     fix_results = [result for result in results if result.get("changes")]
     if not fix_results:
         return None
     batch = ProposalBatch(
-        title="AcoustID metadata fixes",
+        title="MusicBrainz metadata fixes",
         kind=ProposalKind.metadata,
         tree_path="/library",
     )
@@ -548,11 +637,11 @@ def queue_acoustic_metadata_fixes(session: Session, results: list[dict]) -> Prop
     return batch
 
 
-def queue_acoustic_replacement_downloads(session: Session, results: list[dict]) -> ProposalBatch | None:
+def queue_musicbrainz_replacement_downloads(session: Session, results: list[dict]) -> ProposalBatch | None:
     replacement_results = [result for result in results if result.get("replacement_request")]
     if not replacement_results:
         return None
-    batch = ProposalBatch(title="AcoustID replacement downloads", kind=ProposalKind.download, tree_path="/library")
+    batch = ProposalBatch(title="MusicBrainz replacement downloads", kind=ProposalKind.download, tree_path="/library")
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -617,7 +706,7 @@ def scan_imports(
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     try:
-        files = discover_import_files(payload.path, include_fingerprint=True)
+        files = discover_import_files(payload.path)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {"files": files, "count": len(files)}
@@ -641,20 +730,20 @@ def propose_import(
     return serialize_task(task)
 
 
-@router.post("/imports/acoustic-match", tags=["imports"])
-def acoustic_match(
-    payload: ImportAcousticLookupRequest,
+@router.post("/imports/musicbrainz-match", tags=["imports"])
+def musicbrainz_match_import(
+    payload: ImportMusicBrainzLookupRequest,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     try:
-        candidates = lookup_recording_by_fingerprint(payload.file, integration_value(session, "acoustid_api_key"))
+        candidates = lookup_recording_by_musicbrainz_metadata(payload.file)
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     except httpx.HTTPStatusError as error:
-        raise HTTPException(status_code=502, detail=lookup_error_detail("AcoustID", error)) from error
+        raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
     except httpx.RequestError as error:
-        raise HTTPException(status_code=503, detail="AcoustID could not be reached from the server") from error
+        raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
     return {"candidates": candidates}
 
 
@@ -1543,7 +1632,7 @@ def editable_fields(target_type: str) -> set[str]:
             "musicbrainz_recording_id",
             "explicit",
             "is_lossless",
-            "acoustic_verified",
+            "musicbrainz_verified",
             "metadata_locked",
             "artwork_locked",
             "filename_locked",

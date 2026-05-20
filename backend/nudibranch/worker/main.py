@@ -19,7 +19,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks, lookup_recording_by_fingerprint
+from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed
@@ -27,12 +27,13 @@ from nudibranch.services.tasks import append_task_log, claim_next_task, complete
 
 
 MAX_DOWNLOAD_AUTO_RETRIES = 6
-ZERO_PROGRESS_RETRY_SECONDS = 150
-STALLED_PROGRESS_RETRY_SECONDS = 300
-MISSING_TRANSFER_RETRY_SECONDS = 60
-COMPLETED_MISSING_FILE_RETRY_SECONDS = 45
-QUEUED_TRANSFER_RETRY_SECONDS = 75
-REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 45
+ZERO_PROGRESS_RETRY_SECONDS = 90
+STALLED_PROGRESS_RETRY_SECONDS = 150
+MISSING_TRANSFER_RETRY_SECONDS = 45
+COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
+QUEUED_TRANSFER_RETRY_SECONDS = 45
+REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
+DOWNLOAD_SCAN_INTERVAL_SECONDS = 5
 TRANSFER_COMPLETE_PERCENT = 99.5
 DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
 DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_removed"}
@@ -112,7 +113,7 @@ TEXT_SEARCH_ALTERNATIVES: list[tuple[str, tuple[str, ...]]] = [
 def run_propose_import(session: Session, payload: dict, task: Task | None = None) -> dict:
     files = payload.get("files")
     if files is None:
-        files = discover_import_files(payload.get("path"), include_fingerprint=True)
+        files = discover_import_files(payload.get("path"))
     download_requests = payload.get("download_requests") or []
     if not files and not download_requests:
         raise ValueError("No import files or downloads were selected")
@@ -757,10 +758,9 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
             format=metadata.get("format"),
             bitrate=metadata.get("bitrate"),
             path=str(target_path),
-            acoustic_fingerprint=json.dumps(payload.get("fingerprint")) if payload.get("fingerprint") else None,
             musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
             is_lossless=metadata.get("is_lossless", False),
-            acoustic_verified=bool(metadata.get("acoustic_verified")),
+            musicbrainz_verified=bool(metadata.get("musicbrainz_verified")),
         )
     )
 
@@ -1058,8 +1058,8 @@ def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, f
     )
     entry.update({"status": "staged", "path": str(destination), "download_path": str(file_path)})
     item = session.get(ProposalItem, entry.get("item_id"))
-    set_download_item_status(item, "staged; queued for AcoustID verification")
-    append_task_log(session, None, f"{entry_download_label(entry)}: staged for AcoustID verification")
+    set_download_item_status(item, "staged; queued for MusicBrainz verification")
+    append_task_log(session, None, f"{entry_download_label(entry)}: staged for MusicBrainz verification")
     return destination
 
 
@@ -1069,7 +1069,7 @@ def entry_download_label(entry: dict) -> str:
     return str(request.get("track") or request.get("title") or candidate.get("filename") or entry.get("basename") or "download")
 
 
-def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) -> dict:
+def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -> dict:
     settings = get_settings()
     root = settings.downloads_path
     if not root.exists():
@@ -1109,7 +1109,6 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
             "size_bytes": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,
             "metadata": metadata,
-            "fingerprint": None,
             "suggested_library_path": str(suggest_library_path(metadata, file_path)),
         }
         target_path = Path(payload["suggested_library_path"])
@@ -1190,7 +1189,6 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         for entry in entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
     verified_entries = []
-    deferred_acoustid_messages: list[str] = []
     errors: list[str] = []
     waiting_count = 0
     ready_count = 0
@@ -1243,10 +1241,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 waiting_count += 1
             continue
 
-        set_download_item_status(item, "verifying with AcoustID")
+        set_download_item_status(item, "verifying with MusicBrainz")
         update_download_manifest_entry(entry, "verifying", path=str(file_path), verifying_at=datetime.now(timezone.utc).isoformat())
         entry.update({"status": "verifying", "path": str(file_path)})
-        append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with AcoustID")
+        append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with MusicBrainz")
         session.flush()
         verification = verify_downloaded_file(session, file_path, entry)
         if verification["status"] == "mismatch":
@@ -1257,41 +1255,17 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 errors.append(verification["message"])
             continue
         if verification["status"] != "verified":
-            if verification["status"] == "deferred":
-                message = verification.get("message") or f"AcoustID check was deferred for {file_path.name}."
-                metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
-                update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata, acoustid_deferred=message)
-                set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "AcoustID deferred; queued for batch import")
-                append_task_log(session, None, message, "warning")
-                deferred_acoustid_messages.append(message)
-                verified_entries.append((entry, file_path, metadata))
-                ready_count += 1
-                continue
-            message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
-            if verification["status"] == "unknown" and "api key" not in message.casefold():
-                if handle_download_mismatch(session, batch, entry, file_path, {**verification, "message": message}):
-                    waiting_count += 1
-                else:
-                    failed_count += 1
-                    errors.append(message)
-                continue
-            if verification["status"] == "unknown" and "api key" in message.casefold():
-                metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
-                update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata, acoustid_deferred=message)
-                set_download_item_status(item, "AcoustID deferred; queued for batch import")
-                append_task_log(session, None, message, "warning")
-                deferred_acoustid_messages.append(message)
-                verified_entries.append((entry, file_path, metadata))
-                ready_count += 1
-                continue
-            handle_download_verification_issue(session, batch, entry, file_path, message, verification)
-            failed_count += 1
-            errors.append(message)
+            message = verification.get("message") or f"{file_path.name} could not be verified with MusicBrainz metadata."
+            if handle_download_mismatch(session, batch, entry, file_path, {**verification, "message": message}):
+                waiting_count += 1
+            else:
+                failed_count += 1
+                errors.append(message)
             continue
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
         set_download_item_status(item, "verified; queued for batch import")
-        append_task_log(session, None, f"{entry_download_label(entry)}: AcoustID verified")
+        append_task_log(session, None, f"{entry_download_label(entry)}: MusicBrainz metadata verified")
         verified_entries.append((entry, file_path, metadata))
         ready_count += 1
 
@@ -1305,14 +1279,6 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch")
         append_task_log(session, None, f"{batch.title}: all {len(verified_entries)} staged track(s) verified; importing batch")
         imported = import_verified_download_batch(session, batch, verified_entries)
-        if deferred_acoustid_messages:
-            create_notification(
-                session,
-                title="AcoustID check deferred",
-                body=f"{len(deferred_acoustid_messages)} downloaded tracks were imported and should be checked later.",
-                event_type="tool_warning",
-                target_url="/tools",
-            )
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
         batch.status = ProposalStatus.failed
         create_notification(
@@ -1978,12 +1944,12 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
 
 def download_status_is_downloaded(status: str) -> bool:
     lowered = str(status or "").casefold()
-    return any(token in lowered for token in ("downloaded", "staged", "verifying", "verified", "importing", "acoustid deferred"))
+    return any(token in lowered for token in ("downloaded", "staged", "verifying", "verified", "importing"))
 
 
 def download_status_is_verified(status: str) -> bool:
     lowered = str(status or "").casefold()
-    return any(token in lowered for token in ("verified", "importing", "acoustid deferred"))
+    return any(token in lowered for token in ("verified", "importing"))
 
 
 def download_status_progress_value(status: str) -> float:
@@ -2058,7 +2024,7 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
     for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
         request = entry.get("request") or {}
         normalized_metadata = normalize_download_metadata(metadata, request)
-        normalized_metadata["acoustic_verified"] = not bool(entry.get("acoustid_deferred"))
+        normalized_metadata["musicbrainz_verified"] = True
         append_task_log(session, None, f"{entry_download_label(entry)}: writing normalized metadata before library import")
         write_audio_metadata(file_path, normalized_metadata)
         replacement_track = session.get(Track, request.get("replace_track_id")) if request.get("replace_track_id") else None
@@ -2076,7 +2042,6 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
             "size_bytes": file_path.stat().st_size,
             "mtime_ns": file_path.stat().st_mtime_ns,
             "metadata": normalized_metadata,
-            "fingerprint": None,
             "suggested_library_path": str(target_path),
         }
         if replacement_track:
@@ -2189,42 +2154,131 @@ def replace_library_track_file(session: Session, track: Track, source_path: Path
     track.path = str(target_path)
     track.musicbrainz_recording_id = metadata.get("musicbrainz_recording_id")
     track.is_lossless = metadata.get("is_lossless", False)
-    track.acoustic_verified = bool(metadata.get("acoustic_verified"))
+    track.musicbrainz_verified = bool(metadata.get("musicbrainz_verified"))
 
 
 def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: dict | None) -> dict:
     if not manifest_entry:
-        return {"status": "unknown"}
+        return {"status": "unknown", "message": "Download manifest entry is missing."}
     request = manifest_entry.get("request") or {}
-    api_key = integration_settings(session).get("acoustid_api_key", "")
-    if not api_key:
-        return {"status": "deferred", "request": request, "message": "AcoustID API key is required before downloaded batches can be verified."}
-    try:
-        candidates = lookup_recording_by_fingerprint({"path": str(file_path)}, api_key)
-    except Exception as error:  # noqa: BLE001 - service/request failures should not block an otherwise usable download.
-        return {"status": "deferred", "request": request, "error": str(error), "message": f"AcoustID lookup deferred for {file_path.name}: {error}"}
-    if not candidates:
-        return {"status": "unknown", "request": request, "message": f"AcoustID did not return a match for {file_path.name}."}
-    best = candidates[0]
-    candidate_metadata = best.get("metadata") or {}
     file_metadata = read_audio_metadata(file_path)
-    file_issue = downloaded_file_mismatch_reason(file_metadata, request)
+    expected_metadata = expected_download_musicbrainz_metadata(session, request)
+    file_issue = downloaded_file_mismatch_reason(file_metadata, expected_metadata)
     if file_issue:
-        return {"status": "mismatch", "request": request, "metadata": candidate_metadata, "message": f"{file_path.name}: {file_issue}"}
-    if metadata_matches_request(candidate_metadata, request):
-        return {"status": "verified", "request": request, "metadata": verified_download_metadata(candidate_metadata, request)}
-    expected = download_query(request)
+        return {"status": "mismatch", "request": request, "metadata": expected_metadata, "message": f"{file_path.name}: {file_issue}"}
+    match = musicbrainz_download_file_match(file_metadata, expected_metadata, file_path)
+    if match["matched"]:
+        return {
+            "status": "verified",
+            "request": request,
+            "metadata": verified_download_metadata({**file_metadata, **expected_metadata}, expected_metadata),
+            "score": match.get("score"),
+            "message": match.get("message"),
+        }
+    expected = download_query(expected_metadata)
     found = " ".join(
         str(part)
-        for part in [candidate_metadata.get("artist"), candidate_metadata.get("album"), candidate_metadata.get("title")]
+        for part in [file_metadata.get("albumartist") or file_metadata.get("artist"), file_metadata.get("album"), file_metadata.get("title") or file_path.stem]
         if part
     ).strip()
     return {
         "status": "mismatch",
         "request": request,
-        "metadata": candidate_metadata,
+        "metadata": expected_metadata,
         "message": f"{file_path.name} matched {found or 'a different recording'} instead of {expected or 'the requested track'}.",
     }
+
+
+def expected_download_musicbrainz_metadata(session: Session, request: dict) -> dict:
+    expected = dict(request)
+    expected["title"] = request.get("track") or request.get("title")
+    artist = request.get("artist")
+    album = request.get("album")
+    if not artist or not album:
+        return expected
+    if expected.get("duration_ms") and (expected.get("musicbrainz_recording_id") or expected.get("title") or expected.get("track")):
+        return expected
+    try:
+        album_record = lookup_album_tracks(str(artist), str(album), request.get("musicbrainz_album_id"))
+    except Exception as error:  # noqa: BLE001 - keep downloads moving with request metadata if MusicBrainz is unavailable.
+        append_task_log(session, None, f"MusicBrainz metadata lookup failed for {artist} / {album}: {error}", "warning")
+        return expected
+    best_track = best_musicbrainz_track_for_request(album_record, request)
+    if best_track:
+        expected.update(
+            {
+                "artist": album_record.get("artist") or artist,
+                "albumartist": album_record.get("artist") or artist,
+                "album": album_record.get("album") or album,
+                "title": best_track.get("title") or expected.get("title"),
+                "track": best_track.get("title") or expected.get("track"),
+                "track_number": best_track.get("track_number") or expected.get("track_number"),
+                "disc_number": best_track.get("disc_number") or expected.get("disc_number"),
+                "duration_ms": best_track.get("length") or expected.get("duration_ms"),
+                "musicbrainz_recording_id": best_track.get("musicbrainz_recording_id") or expected.get("musicbrainz_recording_id"),
+                "musicbrainz_album_id": album_record.get("musicbrainz_album_id") or expected.get("musicbrainz_album_id"),
+            }
+        )
+    return expected
+
+
+def best_musicbrainz_track_for_request(album_record: dict, request: dict) -> dict | None:
+    tracks = album_record.get("tracks") or []
+    if not tracks:
+        return None
+    request_recording_id = normalize_match_text(request.get("musicbrainz_recording_id"))
+    if request_recording_id:
+        for track in tracks:
+            if normalize_match_text(track.get("musicbrainz_recording_id")) == request_recording_id:
+                return track
+    scored = sorted(
+        ((musicbrainz_request_track_score(track, request), track) for track in tracks),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    return scored[0][1] if scored and scored[0][0] >= 0.55 else None
+
+
+def musicbrainz_request_track_score(track: dict, request: dict) -> float:
+    title = request.get("track") or request.get("title")
+    title_score = fuzzy_similarity(fuzzy_text(title), fuzzy_text(track.get("title"))) if title and track.get("title") else 0.0
+    try:
+        expected_number = int(request.get("track_number") or 0)
+        track_number = int(track.get("track_number") or 0)
+    except (TypeError, ValueError):
+        expected_number = 0
+        track_number = 0
+    number_score = 1.0 if expected_number and track_number and expected_number == track_number else 0.0
+    duration_score = duration_match_score(request_duration_ms(request), track.get("length"))
+    return (title_score * 0.62) + (number_score * 0.28) + (duration_score * 0.10)
+
+
+def musicbrainz_download_file_match(file_metadata: dict, expected: dict, file_path: Path) -> dict:
+    expected_recording_id = normalize_match_text(expected.get("musicbrainz_recording_id"))
+    file_recording_id = normalize_match_text(file_metadata.get("musicbrainz_recording_id"))
+    if expected_recording_id and file_recording_id:
+        matched = expected_recording_id == file_recording_id
+        return {
+            "matched": matched,
+            "score": 1.0 if matched else 0.0,
+            "message": "MusicBrainz recording id matched." if matched else "MusicBrainz recording id did not match.",
+        }
+    expected_title = fuzzy_text(expected.get("track") or expected.get("title"))
+    file_title = fuzzy_text(file_metadata.get("title") or file_path.stem)
+    title_score = fuzzy_similarity(expected_title, file_title) if expected_title and file_title else 0.0
+    expected_artist = fuzzy_text(expected.get("albumartist") or expected.get("artist"))
+    file_artist = fuzzy_text(file_metadata.get("albumartist") or file_metadata.get("artist"))
+    artist_score = fuzzy_similarity(expected_artist, file_artist) if expected_artist and file_artist else 0.75
+    expected_album = fuzzy_text(expected.get("album"))
+    file_album = fuzzy_text(file_metadata.get("album"))
+    album_score = fuzzy_similarity(expected_album, file_album) if expected_album and file_album else 0.75
+    duration_score = duration_match_score(request_duration_ms(expected), file_metadata.get("duration_ms"))
+    score = (title_score * 0.52) + (artist_score * 0.18) + (album_score * 0.12) + (duration_score * 0.18)
+    if title_score < 0.76:
+        return {"matched": False, "score": score, "message": f"title confidence {title_score:.0%} was too low"}
+    if duration_score < 0.45:
+        return {"matched": False, "score": score, "message": f"duration confidence {duration_score:.0%} was too low"}
+    return {"matched": score >= 0.72, "score": score, "message": f"MusicBrainz metadata confidence {score:.0%}"}
 
 
 def downloaded_file_mismatch_reason(metadata: dict, request: dict) -> str | None:
@@ -3452,7 +3506,7 @@ def editable_track_fields() -> set[str]:
         "musicbrainz_recording_id",
         "explicit",
         "is_lossless",
-        "acoustic_verified",
+        "musicbrainz_verified",
         "metadata_locked",
         "artwork_locked",
         "filename_locked",
@@ -3863,7 +3917,6 @@ def file_info_for_existing_library_file(file_path: Path) -> dict:
         "size_bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "metadata": metadata,
-        "fingerprint": None,
         "suggested_library_path": str(file_path),
         "action": "create_library_record",
         "name": file_path.name,
@@ -4522,7 +4575,7 @@ async def worker_loop() -> None:
         with SessionLocal() as session:
             task = claim_next_task(session)
             if not task:
-                if time.time() - last_download_scan > 15:
+                if time.time() - last_download_scan > DOWNLOAD_SCAN_INTERVAL_SECONDS:
                     try:
                         scan_result = import_completed_downloads(session)
                         if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):

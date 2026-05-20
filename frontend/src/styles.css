@@ -1149,13 +1149,13 @@ nav button:hover,
   color: var(--muted);
 }
 
-.track-acoustic-result {
+.track-musicbrainz-result {
   display: grid;
   gap: 2px;
   padding: 4px 0 8px;
 }
 
-.acoustic-change-list {
+.musicbrainz-change-list {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -1164,7 +1164,7 @@ nav button:hover,
   font-size: 12px;
 }
 
-.acoustic-change-list span {
+.musicbrainz-change-list span {
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 2px 6px;

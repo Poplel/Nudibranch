@@ -65,9 +65,7 @@ JELLYFIN_URL=
 JELLYFIN_API_KEY=
 SLSKD_URL=
 SLSKD_API_KEY=
-ACOUSTID_API_KEY=
 ```
 
 These services may run in the same Compose project or elsewhere on the network.
-The AcoustID key is optional, but fingerprint-based import metadata checks need
-it to return online matches.
+Import and download verification uses MusicBrainz metadata only.

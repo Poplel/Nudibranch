@@ -800,18 +800,18 @@ function App() {
     setLoading(true);
     setError("");
     try {
-      const data = await api("/imports/acoustic-match", {
+      const data = await api("/imports/musicbrainz-match", {
         method: "POST",
         body: JSON.stringify({ file }),
       });
       const candidate = data.candidates?.[0];
       if (!candidate) {
-        setToast({ title: "No metadata match", body: "No acoustic match was found for this track." });
+        setToast({ title: "No metadata match", body: "No MusicBrainz match was found for this track." });
         return;
       }
       const metadataPatch = compactMetadata(candidate.metadata || {});
       setImportFiles((current) => patchImportFile(current, file.path, metadataPatch));
-      setToast({ title: "Metadata updated", body: "The most likely acoustic match was applied." });
+      setToast({ title: "Metadata updated", body: "The most likely MusicBrainz match was applied." });
     } catch (lookupError) {
       notify("Metadata lookup failed", lookupError.message, "ui_error");
     } finally {
@@ -832,14 +832,14 @@ function App() {
     try {
       for (const file of albumFiles) {
         try {
-          const data = await api("/imports/acoustic-match", {
+          const data = await api("/imports/musicbrainz-match", {
             method: "POST",
             body: JSON.stringify({ file }),
           });
           const candidate = data.candidates?.[0];
           if (!candidate) {
             missing += 1;
-            nextFiles = patchImportFile(nextFiles, file.path, { acoustid_match: "no match" });
+            nextFiles = patchImportFile(nextFiles, file.path, { musicbrainz_match: "no match" });
             continue;
           }
           const metadataPatch = compactMetadata(candidate.metadata || {});
@@ -850,8 +850,8 @@ function App() {
           else changed += 1;
           nextFiles = patchImportFile(nextFiles, file.path, {
             ...metadataPatch,
-            acoustid_match: matchStatus,
-            acoustid_score: Math.round((candidate.score || 0) * 100),
+            musicbrainz_match: matchStatus,
+            musicbrainz_score: Math.round((candidate.score || 0) * 100),
           });
         } catch {
           failed += 1;
@@ -859,7 +859,7 @@ function App() {
       }
       setImportFiles(nextFiles);
       setToast({
-        title: "Album AcoustID check complete",
+        title: "Album MusicBrainz check complete",
         body: `${matched} matched. ${changed} updated. ${missing} unmatched. ${failed} failed.`,
       });
     } finally {
@@ -867,40 +867,40 @@ function App() {
     }
   }
 
-  async function checkLibraryAlbumAcoustID(album) {
+  async function checkLibraryAlbumMusicBrainz(album) {
     setLoading(true);
     setError("");
     try {
-      const data = await api(`/library/albums/${album.id}/acoustic-match`, { method: "POST" });
+      const data = await api(`/library/albums/${album.id}/musicbrainz-match`, { method: "POST" });
       setLibraryAlbumChecks((current) => ({ ...current, [album.id]: data }));
       if (data.queued_changes) await refreshApprovals();
-      const counts = countAcousticStatuses(data.tracks || []);
+      const counts = countMusicBrainzStatuses(data.tracks || []);
       setToast({
-        title: "Album AcoustID check complete",
+        title: "Album MusicBrainz check complete",
         body: `${counts.matched} matched. ${counts.skipped} skipped. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed. ${data.queued_changes || 0} fixes queued.`,
       });
     } catch (lookupError) {
-      notify("Album AcoustID check failed", lookupError.message, "ui_error");
+      notify("Album MusicBrainz check failed", lookupError.message, "ui_error");
     } finally {
       setLoading(false);
     }
   }
 
-  async function checkLibraryTrackAcoustID(track, album = null) {
+  async function checkLibraryTrackMusicBrainz(track, album = null) {
     setLoading(true);
     setError("");
     try {
-      const result = await api(`/library/tracks/${track.id}/acoustic-match`, { method: "POST" });
-      const label = acousticResultMeta(result);
-      setLibraryAlbumChecks((current) => mergeTrackAcousticResult(current, album?.id, album?.title, result));
+      const result = await api(`/library/tracks/${track.id}/musicbrainz-match`, { method: "POST" });
+      const label = musicBrainzResultMeta(result);
+      setLibraryAlbumChecks((current) => mergeTrackMusicBrainzResult(current, album?.id, album?.title, result));
       if (result.queued_changes) await refreshApprovals();
       setToast({
-        title: "Track AcoustID check complete",
+        title: "Track MusicBrainz check complete",
         body: `${track.title}: ${label}`,
       });
       return result;
     } catch (lookupError) {
-      notify("Track AcoustID check failed", lookupError.message, "ui_error");
+      notify("Track MusicBrainz check failed", lookupError.message, "ui_error");
       return null;
     } finally {
       setLoading(false);
@@ -1324,8 +1324,8 @@ function App() {
               <LibraryTree
                 artists={library}
                 onCheckAlbum={lookupImportAlbum}
-                onCheckAlbumAcoustID={checkLibraryAlbumAcoustID}
-                onCheckTrackAcoustID={checkLibraryTrackAcoustID}
+                onCheckAlbumMusicBrainz={checkLibraryAlbumMusicBrainz}
+                onCheckTrackMusicBrainz={checkLibraryTrackMusicBrainz}
                 albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
@@ -1578,7 +1578,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrackAcoustID, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1706,7 +1706,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                       playlists={canUsePlaylists ? playlists : []}
                       targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
                       onAddToPlaylist={onAddToPlaylist}
-                      onAcousticCheck={canEditMetadata ? () => onCheckAlbumAcoustID(album) : null}
+                      onMusicBrainzCheck={canEditMetadata ? () => onCheckAlbumMusicBrainz(album) : null}
                       onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("album", album.id)) : null}
                       onQueue={onQueueMetadata}
                       onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
@@ -1714,7 +1714,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                   )}
                   {openAlbums.has(album.id) &&
                     album.tracks.map((track) => {
-                      const acousticResult = (albumChecks[album.id]?.tracks || []).find((result) => result.track_id === track.id);
+                      const musicBrainzResult = (albumChecks[album.id]?.tracks || []).find((result) => result.track_id === track.id);
                       return (
                       <div key={track.id}>
                         <div className="tree-action-row library-row-actions">
@@ -1758,23 +1758,23 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumAcoustID, onCheckTrack
                             playlists={canUsePlaylists ? playlists : []}
                             targetTrackIds={[track.id]}
                             onAddToPlaylist={onAddToPlaylist}
-                            onAcousticCheck={canEditMetadata ? () => onCheckTrackAcoustID(track, album) : null}
+                            onMusicBrainzCheck={canEditMetadata ? () => onCheckTrackMusicBrainz(track, album) : null}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
                         )}
-                        {acousticResult && (
-                          <div className="track-acoustic-result">
+                        {musicBrainzResult && (
+                          <div className="track-musicbrainz-result">
                             <TreeRow
                               depth={3}
                               icon={Search}
-                              title="AcoustID"
-                              meta={acousticResultMeta(acousticResult)}
-                              warning={["changed", "unmatched", "missing_file", "error"].includes(acousticResult.status)}
+                              title="MusicBrainz"
+                              meta={musicBrainzResultMeta(musicBrainzResult)}
+                              warning={["changed", "unmatched", "missing_file", "error"].includes(musicBrainzResult.status)}
                             />
-                            {acousticResult.changes && Object.keys(acousticResult.changes).length > 0 && (
-                              <div className="acoustic-change-list">
-                                {Object.entries(acousticResult.changes).map(([key, value]) => (
+                            {musicBrainzResult.changes && Object.keys(musicBrainzResult.changes).length > 0 && (
+                              <div className="musicbrainz-change-list">
+                                {Object.entries(musicBrainzResult.changes).map(([key, value]) => (
                                   <span key={key}>
                                     {metadataFieldLabel(key)}: {String(value)}
                                   </span>
@@ -2081,8 +2081,9 @@ function ApprovalNode({
   const descendantIds = collectItemIds(item, childrenById);
   const leafDownloadCandidate = item.kind === "download" && children.length === 0 && Boolean(item.new_value);
   const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.new_value || sibling.old_value)) : [];
+  const hasAlternateCandidates = siblingCandidates.length > 1;
   const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
-  const pickerOpen = leafDownloadCandidate && openCandidatePickers?.has(item.parent_id);
+  const pickerOpen = leafDownloadCandidate && hasAlternateCandidates && openCandidatePickers?.has(item.parent_id);
   const firstSelectedSibling = siblingCandidates.find((sibling) => sibling.selected);
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
@@ -2117,7 +2118,7 @@ function ApprovalNode({
           )}
         </span>
         <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}</small>
-        {leafDownloadCandidate && (
+        {leafDownloadCandidate && hasAlternateCandidates && (
           <button
             className="row-icon-button"
             onClick={() => toggleSet(setOpenCandidatePickers, item.parent_id)}
@@ -2934,7 +2935,7 @@ function ImportTree({
                       <button className="row-icon-button" onClick={() => onCheckAlbum(artist.name, album.name)} title="Check album records">
                         <Search size={15} />
                       </button>
-                      <button className="row-icon-button" onClick={() => onRecheckAlbum(album)} title="Check album tracks with AcoustID">
+                      <button className="row-icon-button" onClick={() => onRecheckAlbum(album)} title="Check album tracks with MusicBrainz">
                         <Sparkles size={15} />
                       </button>
                       <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, albumId)} title="Album details">
@@ -3056,7 +3057,7 @@ function ImportTrackRow({ file, album, selected, onClick, onChange, onDragStart,
           onCommit={(value) => onChange({ track_number: parseInt(value, 10) || null })}
         />
         <DraftInput value={metadata.title || ""} onCommit={(value) => onChange({ title: value })} />
-        <small>{metadata.acoustid_match ? `AcoustID ${metadata.acoustid_match}${metadata.acoustid_score ? ` ${metadata.acoustid_score}%` : ""}` : album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
+        <small>{metadata.musicbrainz_match ? `MusicBrainz ${metadata.musicbrainz_match}${metadata.musicbrainz_score ? ` ${metadata.musicbrainz_score}%` : ""}` : album?.matchStatus === "full" ? "In library" : formatBytes(file.size_bytes)}</small>
         <button className="row-icon-button" onClick={onRecheck} title="Scan and match metadata">
           <Search size={15} />
         </button>
@@ -3187,7 +3188,7 @@ function LibraryMetadataEditor({
   playlists = [],
   targetTrackIds = [],
   onAddToPlaylist,
-  onAcousticCheck,
+  onMusicBrainzCheck,
   onRemove,
   onQueue,
   onClose,
@@ -3277,12 +3278,12 @@ function LibraryMetadataEditor({
             onSearch={onSearchAlbums}
           />
         )}
-        {(onAcousticCheck || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
+        {(onMusicBrainzCheck || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
           <div className="metadata-menu-actions">
-            {onAcousticCheck && (
-              <button className="secondary compact" onClick={onAcousticCheck}>
+            {onMusicBrainzCheck && (
+              <button className="secondary compact" onClick={onMusicBrainzCheck}>
                 <Sparkles size={15} />
-                Check AcoustID
+                Check MusicBrainz
               </button>
             )}
             {playlists.length > 0 && targetTrackIds.length > 0 && (
@@ -3354,7 +3355,7 @@ function trackFields(track) {
     { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id },
     { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
     { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean" },
-    { key: "acoustic_verified", label: "AcoustID verified", value: track.acoustic_verified, type: "boolean" },
+    { key: "musicbrainz_verified", label: "MusicBrainz verified", value: track.musicbrainz_verified, type: "boolean" },
     { key: "metadata_locked", label: "Metadata locked", value: track.metadata_locked, type: "boolean" },
     { key: "artwork_locked", label: "Artwork locked", value: track.artwork_locked, type: "boolean" },
     { key: "filename_locked", label: "Filename locked", value: track.filename_locked, type: "boolean" },
@@ -4118,7 +4119,6 @@ function SettingsPanel({
         <section className="settings-section">
           <h2>Integrations</h2>
           {[
-            ["acoustid_api_key", "AcoustID API key"],
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
             ["playlist_conflict_winner", "Conflicting playlist entries"],
@@ -4931,7 +4931,7 @@ function downloadProgressSummary(approvals) {
       failed += 1;
       continue;
     }
-    if (item.status === "completed" || /verified|importing|acoustid deferred/.test(lower)) {
+    if (item.status === "completed" || /verified|importing/.test(lower)) {
       finished += 1;
       verified += 1;
       partial += 100;
@@ -4986,10 +4986,10 @@ function downloadStatusProgress(status) {
   if (match) {
     return { value: Number(match[1]), label: text, indeterminate: false };
   }
-  if (/verifying with acoustid/i.test(text)) {
+  if (/verifying with musicbrainz/i.test(text)) {
     return { value: 0, label: text, indeterminate: true };
   }
-  if (/downloaded|staged|verified|importing|acoustid deferred/i.test(text)) {
+  if (/downloaded|staged|verified|importing/i.test(text)) {
     return { value: 100, label: text, indeterminate: false };
   }
   const ratio = text.match(/(?:downloading|verifying)\s+(\d+(?:\.\d+)?)%/i);
@@ -5574,7 +5574,7 @@ function wishlistAlbumMeta(album) {
   return `${count} ${label}${statuses.size ? ` · ${[...statuses].join(", ")}` : ""}`;
 }
 
-function countAcousticStatuses(results) {
+function countMusicBrainzStatuses(results) {
   return results.reduce(
     (counts, result) => {
       if (result.status === "matched") counts.matched += 1;
@@ -5588,7 +5588,7 @@ function countAcousticStatuses(results) {
   );
 }
 
-function acousticResultMeta(result) {
+function musicBrainzResultMeta(result) {
   if (result.status === "matched") return `Matched${result.score ? ` ${result.score}%` : ""}`;
   if (result.status === "skipped_verified") return "Already verified";
   if (result.status === "changed") {
@@ -5600,7 +5600,7 @@ function acousticResultMeta(result) {
   return "No match";
 }
 
-function mergeTrackAcousticResult(current, albumId, albumTitle, result) {
+function mergeTrackMusicBrainzResult(current, albumId, albumTitle, result) {
   if (!albumId || !result) return current;
   const existing = current[albumId] || { album_id: albumId, album: albumTitle || "", tracks: [] };
   const tracks = [...(existing.tracks || [])];

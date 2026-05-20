@@ -33,7 +33,7 @@ pattern. The worker claims one queued task by atomic update before running it.
 
 /app/staging
   candidate files after download/import processing
-  fingerprinting, metadata reads, and candidate naming happen here
+  metadata reads, MusicBrainz checks, and candidate naming happen here
 
 /app/library
   managed Jellyfin music library
@@ -63,8 +63,8 @@ are responsible for updating files, database state, Jellyfin, and notifications.
 ## Import Wizard
 
 1. Scan `/app/import`.
-2. Fingerprint audio with Chromaprint.
-3. Read tags with Mutagen.
+2. Read tags with Mutagen.
+3. Match tags against MusicBrainz release metadata when requested.
 4. Group files into `Artist > Album > Track`.
 5. Match against existing library.
 6. Detect duplicates and deluxe/remaster/version conflicts.
@@ -83,7 +83,7 @@ are responsible for updating files, database state, Jellyfin, and notifications.
 7. Exact album release is preferred.
 8. Whole-album downloads for one track are not allowed.
 9. Candidates become approval batches before download.
-10. Downloads land in `/app/downloads`, then staging, then proposal review again.
+10. Approved downloads land in `/app/downloads`, move through staging, verify against MusicBrainz/request metadata, then import into the library as one batch.
 
 ## Notifications
 
@@ -95,4 +95,3 @@ Notifications are persisted first, then delivered to:
 
 The APNs outbox is part of the initial design so server-triggered notifications
 can arrive when the iOS app is not open.
-

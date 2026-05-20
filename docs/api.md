@@ -31,7 +31,7 @@ GET  /api/v1/library/tree
 
 POST /api/v1/imports/scan
 POST /api/v1/imports/propose
-POST /api/v1/imports/acoustic-match
+POST /api/v1/imports/musicbrainz-match
 POST /api/v1/imports/album-search
 POST /api/v1/imports/album-lookup
 
@@ -73,17 +73,18 @@ Only selected items should execute.
 
 ## Import Metadata Lookups
 
-Fingerprint-based track matching uses AcoustID when `ACOUSTID_API_KEY` is set:
+Track matching uses the file's tags and MusicBrainz release metadata:
 
 ```http
-POST /api/v1/imports/acoustic-match
+POST /api/v1/imports/musicbrainz-match
 
 {
   "file": {
     "path": "/app/import/Artist/Album/01 Track.flac",
-    "fingerprint": {
-      "duration": 180,
-      "fingerprint": "..."
+    "metadata": {
+      "artist": "Artist",
+      "album": "Album",
+      "title": "Track"
     }
   }
 }

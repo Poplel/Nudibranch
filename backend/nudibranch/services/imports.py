@@ -1,7 +1,5 @@
-import json
 from pathlib import Path
 import re
-import subprocess
 
 from mutagen import File
 
@@ -14,7 +12,7 @@ UNKNOWN_ALBUM = "Unknown Album"
 UNKNOWN_TITLE = "Unknown Title"
 
 
-def discover_import_files(path: str | None = None, include_fingerprint: bool = False) -> list[dict]:
+def discover_import_files(path: str | None = None) -> list[dict]:
     settings = get_settings()
     root = Path(path) if path else settings.import_path
     root = root.resolve()
@@ -30,7 +28,6 @@ def discover_import_files(path: str | None = None, include_fingerprint: bool = F
         if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
             stat = file_path.stat()
             metadata = read_audio_metadata(file_path)
-            fingerprint = fingerprint_audio(file_path) if include_fingerprint else None
             suggested_path = suggest_library_path(metadata, file_path)
             files.append(
                 {
@@ -40,7 +37,6 @@ def discover_import_files(path: str | None = None, include_fingerprint: bool = F
                     "size_bytes": stat.st_size,
                     "mtime_ns": stat.st_mtime_ns,
                     "metadata": metadata,
-                    "fingerprint": fingerprint,
                     "suggested_library_path": str(suggested_path),
                 }
             )
@@ -177,19 +173,3 @@ def suggest_library_path(metadata: dict, file_path: Path) -> Path:
     prefix = f"{track_number:02d}" if isinstance(track_number, int) else "#"
     return settings.library_path / artist / album / f"{prefix}-{title}{file_path.suffix.lower()}"
 
-
-def fingerprint_audio(file_path: Path) -> dict | None:
-    try:
-        result = subprocess.run(
-            ["fpcalc", "-json", str(file_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return None
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return {"raw": result.stdout}
