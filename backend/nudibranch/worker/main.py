@@ -3882,36 +3882,77 @@ def run_restore_backup(session: Session, payload: dict) -> dict:
     return {"restored_from": str(backup_path), "pre_restore_backup": pre_restore.get("backup_path")}
 
 
-def run_clear_downloads(session: Session, _payload: dict) -> dict:
+def run_clear_downloads(session: Session, _payload: dict, task: Task | None = None) -> dict:
     root = get_settings().downloads_path
+    append_task_log(session, task, f"Clear downloads started for {root}")
+    if task is not None:
+        update_task_progress(session, task, 0, 1, "Scanning downloads folder")
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = download_manifest_path().resolve()
+    append_task_log(session, task, f"Keeping download manifest at {manifest_path}")
     removed_files = 0
     removed_dirs = 0
+    scanned = 0
+    skipped = 0
     errors: list[str] = []
-    for path in sorted(root.rglob("*"), key=lambda candidate: len(candidate.parts), reverse=True):
+    try:
+        paths = sorted(root.rglob("*"), key=lambda candidate: len(candidate.parts), reverse=True)
+    except OSError as error:
+        append_task_log(session, task, f"Clear downloads scan failed: {error}", "error")
+        return {"removed_files": 0, "removed_dirs": 0, "skipped": 0, "errors": [str(error)]}
+    total = max(1, len(paths))
+    append_task_log(session, task, f"Clear downloads found {len(paths)} path(s) to review")
+    for index, path in enumerate(paths, start=1):
+        scanned += 1
         try:
             if path.resolve() == manifest_path:
+                skipped += 1
+                append_task_log(session, task, f"Skipped download manifest {path}")
                 continue
             if path.is_file():
                 path.unlink()
                 removed_files += 1
+                append_task_log(session, task, f"Removed downloaded file {path}")
             elif path.is_dir():
                 try:
                     path.rmdir()
                     removed_dirs += 1
+                    append_task_log(session, task, f"Removed empty downloads directory {path}")
                 except OSError:
+                    skipped += 1
+                    append_task_log(session, task, f"Skipped non-empty downloads directory {path}")
                     continue
         except OSError as error:
-            errors.append(f"{path}: {error}")
+            message = f"{path}: {error}"
+            errors.append(message)
+            append_task_log(session, task, f"Clear downloads could not remove {message}", "error")
+        if task is not None and (index == total or index % 25 == 0):
+            task.lease_until = Task.lease_expiry()
+            update_task_progress(
+                session,
+                task,
+                index,
+                total,
+                f"Cleared {removed_files} file(s), {removed_dirs} folder(s), skipped {skipped}",
+                removed_files=removed_files,
+                removed_dirs=removed_dirs,
+                skipped=skipped,
+                errors=len(errors),
+            )
+    append_task_log(
+        session,
+        task,
+        f"Clear downloads finished: scanned {scanned}, removed {removed_files} file(s), removed {removed_dirs} folder(s), skipped {skipped}, errors {len(errors)}",
+        "warning" if errors else "info",
+    )
     create_notification(
         session,
         title="Downloads folder cleared",
-        body=f"{removed_files} files removed.",
+        body=f"{removed_files} files and {removed_dirs} folders removed. {skipped} skipped.",
         event_type="tool_completed" if not errors else "tool_warning",
         target_url="/tools",
     )
-    return {"removed_files": removed_files, "removed_dirs": removed_dirs, "errors": errors}
+    return {"removed_files": removed_files, "removed_dirs": removed_dirs, "skipped": skipped, "scanned": scanned, "errors": errors}
 
 
 def first_admin_id(session: Session) -> str:
@@ -4154,22 +4195,27 @@ async def worker_loop() -> None:
                     target_url=task_target_url(task.type),
                     deliver_apns=False,
                 )
-                if task.type == "execute_proposal_batch":
+                append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
+                if task.type in {"execute_proposal_batch", "clear_downloads"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
                 session.refresh(task)
                 if task.status == TaskStatus.canceled:
+                    append_task_log(session, task, f"{task.type} canceled", "warning")
                     continue
                 if result.get("errors"):
+                    append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
                     task.status = TaskStatus.failed
                     task.result_json = json.dumps(result)
                     task.error = result["errors"][0]
                     task.lease_until = None
                     session.commit()
                 else:
+                    append_task_log(session, task, f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}")
                     complete_task(session, task, result)
             except Exception as error:  # noqa: BLE001 - worker must persist task failures.
+                append_task_log(session, task, f"{task.type} failed unexpectedly: {error}", "error")
                 create_notification(
                     session,
                     title=f"{task.type} failed",
