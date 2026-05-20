@@ -29,7 +29,8 @@ MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 150
 STALLED_PROGRESS_RETRY_SECONDS = 300
 MISSING_TRANSFER_RETRY_SECONDS = 240
-QUEUED_TRANSFER_RETRY_SECONDS = 600
+QUEUED_TRANSFER_RETRY_SECONDS = 120
+REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 90
 TRANSFER_COMPLETE_PERCENT = 99.5
 
 
@@ -1315,6 +1316,8 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     if transfer_is_complete_or_finishing(transfer):
         return None
     age = manifest_entry_age_seconds(entry)
+    if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
+        return "transfer stayed queued"
     if not transfer and age >= MISSING_TRANSFER_RETRY_SECONDS:
         return "slskd transfer disappeared before the file arrived"
     percent = transfer_percent(transfer)
@@ -1323,7 +1326,8 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     last_percent = manifest_float(entry.get("last_transfer_percent"))
     last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
     if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
-        if transfer_is_queued_or_waiting(transfer) and age < QUEUED_TRANSFER_RETRY_SECONDS:
+        queued_retry_seconds = queued_transfer_retry_seconds(entry)
+        if transfer_is_queued_or_waiting(transfer) and age < queued_retry_seconds:
             return None
         if transfer_is_queued_or_waiting(transfer):
             return "transfer stayed queued"
@@ -1335,6 +1339,14 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     if last_percent is None and age >= STALLED_PROGRESS_RETRY_SECONDS * 2:
         return f"transfer stalled at {percent:.0f}%"
     return None
+
+
+def queued_transfer_retry_seconds(entry: dict) -> int:
+    retry_count = int(entry.get("retry_count") or 0)
+    request = entry.get("request") or {}
+    if retry_count > 0 or request.get("replace_track_id") or request.get("require_lossless"):
+        return REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS
+    return QUEUED_TRANSFER_RETRY_SECONDS
 
 
 def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str, transfer: dict | None = None) -> bool:
