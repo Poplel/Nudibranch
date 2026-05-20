@@ -2110,7 +2110,12 @@ function ApprovalNode({
         >
           {hasChildren ? (open ? <ChevronDown size={15} /> : <ChevronRight size={15} />) : null}
         </button>
-        <span className="proposal-title">{item.title}</span>
+        <span className="proposal-title-cell">
+          <span className="proposal-title">{item.title}</span>
+          {downloadProgress && (
+            <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} compact />
+          )}
+        </span>
         <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}</small>
         {leafDownloadCandidate && (
           <button
@@ -2127,11 +2132,6 @@ function ApprovalNode({
           </button>
         )}
       </div>
-      {downloadProgress && (
-        <div className="download-row-progress" style={{ "--depth": depth }}>
-          <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} />
-        </div>
-      )}
       {open &&
         metadataChanges.map((change) => (
           <div className="proposal-row metadata-change-row" style={{ "--depth": depth + 1 }} key={`${item.id}:${change.field}`}>
@@ -3728,14 +3728,16 @@ function taskDisplayName(task) {
   return task.type;
 }
 
-function InlineProgress({ value = 0, label = "", indeterminate = false }) {
+function InlineProgress({ value = 0, label = "", indeterminate = false, compact = false }) {
   const clamped = Math.max(0, Math.min(100, Number(value) || 0));
   return (
-    <div className={indeterminate ? "inline-progress indeterminate" : "inline-progress"}>
-      <div className="inline-progress-label">
-        <span>{label || "Working"}</span>
-        {!indeterminate && <span>{Math.round(clamped)}%</span>}
-      </div>
+    <div className={`${indeterminate ? "inline-progress indeterminate" : "inline-progress"}${compact ? " compact" : ""}`}>
+      {!compact && (
+        <div className="inline-progress-label">
+          <span>{label || "Working"}</span>
+          {!indeterminate && <span>{Math.round(clamped)}%</span>}
+        </div>
+      )}
       <div className="inline-progress-track">
         <span style={{ width: indeterminate ? "42%" : `${clamped}%` }} />
       </div>
@@ -4935,7 +4937,7 @@ function downloadProgressSummary(approvals) {
       partial += 100;
       continue;
     }
-    if (/downloaded|verifying/.test(lower)) {
+    if (/downloaded|staged|verifying/.test(lower)) {
       finished += 1;
       if (/verifying/.test(lower)) verifying += 1;
       partial += 100;
@@ -4963,7 +4965,7 @@ function downloadProgressSummary(approvals) {
   const label = notStarted
     ? `${selected} selected candidates`
     : waitingForDownload
-      ? `${waiting}/${total} transferring`
+      ? `${waiting}/${total} downloading`
     : verificationPending
       ? `Verification pending for ${total} downloads`
       : verifying > 0
@@ -4987,7 +4989,14 @@ function downloadStatusProgress(status) {
   if (/verifying with acoustid/i.test(text)) {
     return { value: 0, label: text, indeterminate: true };
   }
-  if (/transferring|searching for downloaded file|searching for slskd|slskd .*queued|slskd .*remote|reports complete/i.test(text)) {
+  if (/downloaded|staged|verified|importing|acoustid deferred/i.test(text)) {
+    return { value: 100, label: text, indeterminate: false };
+  }
+  const ratio = text.match(/(?:downloading|verifying)\s+(\d+(?:\.\d+)?)%/i);
+  if (ratio) {
+    return { value: Number(ratio[1]), label: text, indeterminate: false };
+  }
+  if (/download initialized|download queued|moving completed file|checking slskd|searching for slskd|slskd .*queued|slskd .*remote|reports complete/i.test(text)) {
     return { value: 0, label: text, indeterminate: false };
   }
   return null;
@@ -5426,7 +5435,7 @@ function proposalTaskSummary(result) {
   if (result.file_actions) parts.push(`${result.file_actions} files`);
   if (result.playlist_changes) parts.push(`${result.playlist_changes} playlists`);
   if (result.download_changes) parts.push(`${result.download_changes} downloads`);
-  if (result.open_downloads) parts.push("downloads are still transferring");
+  if (result.open_downloads) parts.push("downloads are still running");
   if (result.downloaded_import?.imported) parts.push(`${result.downloaded_import.imported} downloaded imports`);
   if (result.lyric_changes) parts.push(`${result.lyric_changes} lyrics`);
   if (result.skipped) parts.push(`${result.skipped} skipped`);

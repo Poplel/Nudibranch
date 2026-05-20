@@ -34,6 +34,9 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 45
 QUEUED_TRANSFER_RETRY_SECONDS = 75
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 45
 TRANSFER_COMPLETE_PERCENT = 99.5
+DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
+DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_removed"}
+DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
 DOWNLOAD_VERSION_WORDS = {
@@ -543,7 +546,7 @@ def task_queue_notification_body(
     if downloaded_import and downloaded_import.get("imported"):
         parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
     if open_downloads:
-        parts.append("downloads are transferring and will move to the library after verification")
+        parts.append("downloads are running and will move to the library after verification")
     body = ". ".join(parts) + "."
     if errors:
         return f"{body} First failure: {errors[0]}"
@@ -729,14 +732,14 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
             append_task_log(session, task, f"{item.title}: queueing candidate {label}")
             result = queue_slskd_download(slskd_url, api_key, candidate)
             record_download_manifest_entry(request, candidate, item)
-            set_download_item_status(item, "transferring: slskd accepted the download")
+            set_download_item_status(item, "downloading: initialized in slskd")
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
-                set_download_item_status(candidate_item, "transferring: slskd accepted the download")
+                set_download_item_status(candidate_item, "downloading: initialized in slskd")
                 item.title = candidate_item.title
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
-            append_task_log(session, task, f"{item.title}: slskd accepted candidate {label}")
+            append_task_log(session, task, f"{item.title}: slskd accepted candidate {label}; download initialized")
             return result
         except Exception as error:  # noqa: BLE001 - try the next available candidate for this track.
             attempts.append(f"{label}: {error}")
@@ -845,7 +848,7 @@ def record_download_manifest_entry(request: dict, candidate: dict, item: Proposa
         if not (
             entry.get("batch_id") == item.batch_id
             and entry.get("item_id") == item.id
-            and entry.get("status") not in {"completed", "rejected", "rejected_removed"}
+            and entry.get("status") not in DOWNLOAD_MANIFEST_FINISHED_STATUSES
         )
     ]
     entries.append(
@@ -860,8 +863,9 @@ def record_download_manifest_entry(request: dict, candidate: dict, item: Proposa
                 "folder": candidate.get("folder"),
             },
             "basename": remote_basename(filename),
+            "initialized_at": datetime.now(timezone.utc).isoformat(),
             "queued_at": datetime.now(timezone.utc).isoformat(),
-            "status": "queued",
+            "status": "downloading",
         }
     )
     save_download_manifest(entries[-500:])
@@ -873,7 +877,11 @@ def remote_basename(filename: str) -> str:
 
 def find_download_manifest_entry(file_path: Path) -> dict | None:
     basename = file_path.name.casefold()
-    candidates = [entry for entry in load_download_manifest() if entry.get("status") in {"queued", "verified", "rejected"}]
+    candidates = [
+        entry
+        for entry in load_download_manifest()
+        if entry.get("status") in (DOWNLOAD_MANIFEST_ACTIVE_STATUSES | {"rejected"})
+    ]
     for entry in candidates:
         if entry.get("basename") == basename:
             return entry
@@ -908,6 +916,41 @@ def same_manifest_entry(entry: dict, target: dict) -> bool:
         and entry.get("basename")
         and entry.get("basename") == target.get("basename")
     )
+
+
+def download_staging_root(batch_id: str | None = None) -> Path:
+    root = get_settings().staging_path / "downloads"
+    return root / batch_id if batch_id else root
+
+
+def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, file_path: Path) -> Path:
+    if entry.get("status") in DOWNLOAD_MANIFEST_STAGING_STATUSES and entry.get("path"):
+        staged = Path(str(entry["path"]))
+        if staged.exists():
+            return staged
+    staging_root = download_staging_root(batch.id)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    destination = unique_destination(staging_root / file_path.name)
+    append_task_log(session, None, f"{entry_download_label(entry)}: moving completed download to staging: {destination.name}")
+    shutil.move(str(file_path), str(destination))
+    update_download_manifest_entry(
+        entry,
+        "staged",
+        path=str(destination),
+        download_path=str(file_path),
+        staged_at=datetime.now(timezone.utc).isoformat(),
+    )
+    entry.update({"status": "staged", "path": str(destination), "download_path": str(file_path)})
+    item = session.get(ProposalItem, entry.get("item_id"))
+    set_download_item_status(item, "staged; queued for AcoustID verification")
+    append_task_log(session, None, f"{entry_download_label(entry)}: staged for AcoustID verification")
+    return destination
+
+
+def entry_download_label(entry: dict) -> str:
+    request = entry.get("request") or {}
+    candidate = entry.get("candidate") or {}
+    return str(request.get("track") or request.get("title") or candidate.get("filename") or entry.get("basename") or "download")
 
 
 def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) -> dict:
@@ -971,6 +1014,7 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 10) 
             event_type="tool_completed",
             target_url="/library",
         )
+        append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
         enqueue_task(session, "jellyfin_scan", {})
     return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
 
@@ -979,7 +1023,7 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
     entries_by_batch: dict[str, list[dict]] = {}
     for entry in load_download_manifest():
         batch_id = entry.get("batch_id")
-        if batch_id and entry.get("status") in {"queued", "verified", "failed"}:
+        if batch_id and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES:
             entries_by_batch.setdefault(batch_id, []).append(entry)
     imported = 0
     errors: list[str] = []
@@ -1029,25 +1073,47 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     if transfer_error_message:
         for entry in entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
-    ready_entries = []
+    verified_entries = []
+    deferred_acoustid_messages: list[str] = []
     errors: list[str] = []
-    waiting = False
     waiting_count = 0
+    ready_count = 0
     failed_count = 0
     for entry in entries:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
+            staged_path = Path(str(entry["path"]))
+            if staged_path.exists():
+                verified_entries.append((entry, staged_path, entry["metadata"]))
+                ready_count += 1
+                set_download_item_status(item, "verified; queued for batch import")
+                continue
+
         transfer = transfer_lookup.get(manifest_entry_key(entry))
-        apply_transfer_path_to_manifest(entry, transfer)
+        if entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
+            apply_transfer_path_to_manifest(entry, transfer)
+
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
+        if file_path and entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
+            try:
+                file_path = stage_downloaded_file(session, batch, entry, file_path)
+                wait_status = "staged; ready for verification"
+            except Exception as error:  # noqa: BLE001 - keep the batch visible and retryable.
+                failed_count += 1
+                if item:
+                    item.status = ProposalStatus.failed
+                set_download_item_status(item, f"failed to move download to staging: {error}")
+                update_download_manifest_entry(entry, "failed", retry_reason=f"staging failed: {error}")
+                append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
+                continue
+
         if not file_path:
-            item = session.get(ProposalItem, entry.get("item_id"))
-            retry_reason = download_retry_reason(entry, transfer)
+            retry_reason = None if wait_status.startswith("downloaded; settling") else download_retry_reason(entry, transfer)
             if item and retry_reason and not transfer_error_message:
                 if retry_download_entry(session, batch, entry, item, retry_reason, transfer):
                     waiting_count += 1
-                    waiting = True
                     continue
                 failed_count += 1
-                waiting = True
                 continue
             if transfer_error_message and not transfer:
                 wait_status = f"{transfer_error_message}; {wait_status}"
@@ -1059,28 +1125,21 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 failed_count += 1
             else:
                 waiting_count += 1
-            waiting = True
             continue
-        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; queued for batch verification")
-        ready_entries.append((entry, file_path))
-    update_download_container_statuses(batch)
-    session.flush()
-    if waiting:
-        return {"imported": 0, "errors": [], "waiting": waiting_count, "ready": len(ready_entries), "failed": failed_count}
 
-    verified_entries = []
-    deferred_acoustid_messages: list[str] = []
-    for entry, file_path in ready_entries:
-        if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
-            verified_entries.append((entry, Path(entry["path"]), entry["metadata"]))
-            continue
-        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verifying with AcoustID")
+        set_download_item_status(item, "verifying with AcoustID")
+        update_download_manifest_entry(entry, "verifying", path=str(file_path), verifying_at=datetime.now(timezone.utc).isoformat())
+        entry.update({"status": "verifying", "path": str(file_path)})
+        append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with AcoustID")
         session.flush()
         verification = verify_downloaded_file(session, file_path, entry)
         if verification["status"] == "mismatch":
             if handle_download_mismatch(session, batch, entry, file_path, verification):
-                return {"imported": 0, "errors": [], "waiting": 1, "ready": max(0, len(ready_entries) - 1), "failed": 0}
-            return {"imported": 0, "errors": [verification["message"]], "waiting": 0, "ready": len(ready_entries), "failed": 1}
+                waiting_count += 1
+            else:
+                failed_count += 1
+                errors.append(verification["message"])
+            continue
         if verification["status"] != "verified":
             if verification["status"] == "deferred":
                 message = verification.get("message") or f"AcoustID check was deferred for {file_path.name}."
@@ -1090,21 +1149,45 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 append_task_log(session, None, message, "warning")
                 deferred_acoustid_messages.append(message)
                 verified_entries.append((entry, file_path, metadata))
+                ready_count += 1
                 continue
             message = verification.get("message") or f"{file_path.name} could not be verified with AcoustID."
             if verification["status"] == "unknown" and "api key" not in message.casefold():
                 if handle_download_mismatch(session, batch, entry, file_path, {**verification, "message": message}):
-                    return {"imported": 0, "errors": [], "waiting": 1, "ready": max(0, len(ready_entries) - 1), "failed": 0}
+                    waiting_count += 1
+                else:
+                    failed_count += 1
+                    errors.append(message)
+                continue
+            if verification["status"] == "unknown" and "api key" in message.casefold():
+                metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
+                update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata, acoustid_deferred=message)
+                set_download_item_status(item, "AcoustID deferred; queued for batch import")
+                append_task_log(session, None, message, "warning")
+                deferred_acoustid_messages.append(message)
+                verified_entries.append((entry, file_path, metadata))
+                ready_count += 1
+                continue
             handle_download_verification_issue(session, batch, entry, file_path, message, verification)
-            return {"imported": 0, "errors": [message], "waiting": 0, "ready": len(ready_entries), "failed": 1}
+            failed_count += 1
+            errors.append(message)
+            continue
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
-        set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; queued for batch import")
+        set_download_item_status(item, "verified; queued for batch import")
+        append_task_log(session, None, f"{entry_download_label(entry)}: AcoustID verified")
         verified_entries.append((entry, file_path, metadata))
+        ready_count += 1
+
+    update_download_container_statuses(batch)
+    session.flush()
+    if waiting_count or failed_count or len(verified_entries) < len(expected_item_ids):
+        return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
 
     try:
         for entry, _file_path, _metadata in verified_entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch")
+        append_task_log(session, None, f"{batch.title}: all {len(verified_entries)} staged track(s) verified; importing batch")
         imported = import_verified_download_batch(session, batch, verified_entries)
         if deferred_acoustid_messages:
             create_notification(
@@ -1124,7 +1207,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             target_url="/downloads",
         )
         session.commit()
-        return {"imported": 0, "errors": [str(error)], "waiting": 0, "ready": len(ready_entries), "failed": 1}
+        return {"imported": 0, "errors": [str(error)], "waiting": 0, "ready": ready_count, "failed": 1}
     return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
 
 
@@ -1327,17 +1410,19 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
         detail = f": {error}" if error else f": {status}" if status else ""
         return f"slskd transfer failed{detail}"
     if transfer_is_complete_or_finishing(transfer):
-        return manifest_wait_status(entry, "transferring completed file from slskd")
+        return manifest_wait_status(entry, "moving completed file to staging")
     percent = transfer_percent(transfer)
     if percent is not None:
         if percent <= 0 and not transfer_has_started(transfer):
-            return manifest_wait_status(entry, f"transferring: slskd {friendly_transfer_status(status)}")
+            return manifest_wait_status(entry, f"download queued in slskd: {friendly_transfer_status(status)}")
         speed = transfer_speed_label(transfer)
         return f"downloading {percent:.0f}%{speed}"
     if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
-        return manifest_wait_status(entry, "transferring completed file from slskd")
+        return manifest_wait_status(entry, "moving completed file to staging")
     if status:
-        return manifest_wait_status(entry, f"transferring: slskd {status}")
+        if transfer_is_queued_or_waiting(transfer):
+            return manifest_wait_status(entry, f"download queued in slskd: {status}")
+        return manifest_wait_status(entry, f"download status from slskd: {status}")
     return manifest_wait_status(entry, fallback)
 
 
@@ -1363,7 +1448,7 @@ def transfer_has_started(transfer: dict | None) -> bool:
     except (TypeError, ValueError):
         return False
     status = str(transfer.get("status") or "").casefold()
-    return any(token in status for token in ("download", "progress", "transferring", "succeeded", "complete"))
+    return any(token in status for token in ("download", "progress", "succeeded", "complete"))
 
 
 def transfer_is_queued_or_waiting(transfer: dict | None) -> bool:
@@ -1499,7 +1584,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
         update_download_manifest_entry(
             entry,
-            "queued",
+            "retrying",
             retry_count=retry_count,
             failed_candidates=failed_candidates[-25:],
             retry_reason=f"replacement search failed: {error}",
@@ -1514,7 +1599,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             return exhaust_download_retries(session, item, entry, "no replacement candidates were found", failed_candidates, retry_count)
         update_download_manifest_entry(
             entry,
-            "queued",
+            "retrying",
             retry_count=retry_count,
             failed_candidates=failed_candidates[-25:],
             retry_reason="no replacement candidates were found",
@@ -1549,13 +1634,14 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
                 "item_id": item.id,
                 "basename": remote_basename(candidate.get("filename") or ""),
             },
-            "queued",
+            "downloading",
             retry_count=retry_count,
             failed_candidates=failed_candidates[-25:],
             queued_at=datetime.now(timezone.utc).isoformat(),
+            initialized_at=datetime.now(timezone.utc).isoformat(),
         )
-        set_download_item_status(item, f"replacement queued in slskd ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
-        append_task_log(session, None, f"{item.title}: replacement candidate queued after {reason}")
+        set_download_item_status(item, f"downloading: replacement initialized in slskd ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate initialized after {reason}")
         return True
     except Exception as error:  # noqa: BLE001 - immediately try again on the next scan without duplicating rows.
         failed_candidates.append(
@@ -1569,7 +1655,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
             return exhaust_download_retries(session, item, entry, f"replacement queue failed: {error}", failed_candidates, retry_count)
         update_download_manifest_entry(
             entry,
-            "queued",
+            "retrying",
             retry_count=retry_count,
             failed_candidates=failed_candidates[-25:],
             retry_reason=f"replacement queue failed: {error}",
@@ -1673,6 +1759,11 @@ def manifest_float(value: object) -> float | None:
 
 def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Path | None, str]:
     root = get_settings().downloads_path
+    if entry.get("status") in DOWNLOAD_MANIFEST_STAGING_STATUSES and entry.get("path"):
+        staged = Path(str(entry["path"]))
+        if staged.exists():
+            return staged, "staged; ready for verification"
+        return None, "staged file is missing"
     known_path = entry.get("path")
     candidates = []
     known_candidates: set[Path] = set()
@@ -1699,7 +1790,7 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Pat
         if now - stat.st_mtime < minimum_age_seconds:
             return None, "downloaded; settling before verification"
         return file_path, "downloaded; ready for verification"
-    return None, "searching for downloaded file"
+    return None, "download initialized; checking slskd transfer"
 
 
 def manifest_wait_status(entry: dict, wait_status: str) -> str:
@@ -1747,19 +1838,46 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             or (leaf.status.value if hasattr(leaf.status, "value") else str(leaf.status))
             for leaf in leaves
         ]
-        downloaded = sum(1 for status in statuses if "downloaded" in status or "verifying" in status or "verified" in status or "importing" in status)
-        verified = sum(1 for status in statuses if "verified" in status or "importing" in status)
+        downloaded = sum(1 for status in statuses if download_status_is_downloaded(status))
+        verified = sum(1 for status in statuses if download_status_is_verified(status))
         failed = sum(1 for status in statuses if "failed" in status or "mismatch" in status or "could not be verified" in status)
         total = len(leaves)
+        progress_values = [download_status_progress_value(status) for status in statuses]
+        average_progress = sum(progress_values) / max(1, total)
         if failed:
             status = f"{failed} of {total} need attention"
         elif verified == total:
-            status = "verified; ready to import"
+            status = "verified 100% · ready to import"
+        elif downloaded == total:
+            verify_percent = (verified / max(1, total)) * 100
+            status = f"verifying {verify_percent:.0f}% · {verified} of {total} verified"
         elif downloaded:
-            status = f"{downloaded} of {total} downloaded"
+            status = f"downloading {average_progress:.0f}% · {downloaded} of {total} staged"
+        elif average_progress > 0:
+            status = f"downloading {average_progress:.0f}% · 0 of {total} staged"
         else:
-            status = f"transferring {total} queued download(s)"
+            status = f"download initialized · 0 of {total} staged"
         set_item_payload_status(item, status)
+
+
+def download_status_is_downloaded(status: str) -> bool:
+    lowered = str(status or "").casefold()
+    return any(token in lowered for token in ("downloaded", "staged", "verifying", "verified", "importing", "acoustid deferred"))
+
+
+def download_status_is_verified(status: str) -> bool:
+    lowered = str(status or "").casefold()
+    return any(token in lowered for token in ("verified", "importing", "acoustid deferred"))
+
+
+def download_status_progress_value(status: str) -> float:
+    lowered = str(status or "").casefold()
+    if download_status_is_downloaded(status):
+        return 100.0
+    match = re.search(r"downloading\s+(\d+(?:\.\d+)?)%", lowered)
+    if match:
+        return max(0.0, min(100.0, float(match.group(1))))
+    return 0.0
 
 
 def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
@@ -1820,19 +1938,24 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
 def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
     known_paths = existing_library_and_proposal_paths(session)
     imported = 0
+    imported_albums: set[tuple[str, str]] = set()
     for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
         request = entry.get("request") or {}
         normalized_metadata = normalize_download_metadata(metadata, request)
         normalized_metadata["acoustic_verified"] = not bool(entry.get("acoustid_deferred"))
+        append_task_log(session, None, f"{entry_download_label(entry)}: writing normalized metadata before library import")
         write_audio_metadata(file_path, normalized_metadata)
         replacement_track = session.get(Track, request.get("replace_track_id")) if request.get("replace_track_id") else None
         target_path = replacement_target_path(replacement_track, normalized_metadata, file_path)
         if not replacement_track and str(target_path) in known_paths:
-            update_download_manifest_entry(entry, "completed", path=str(file_path), metadata=normalized_metadata)
+            if file_path.exists() and file_path.resolve() != target_path.resolve():
+                file_path.unlink()
+                append_task_log(session, None, f"{entry_download_label(entry)}: removed duplicate staged file because {target_path.name} already exists")
+            update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
             continue
         payload = {
             "path": str(file_path),
-            "relative_path": str(file_path.relative_to(get_settings().downloads_path)),
+            "relative_path": relative_media_path(file_path),
             "extension": file_path.suffix.lower(),
             "size_bytes": file_path.stat().st_size,
             "mtime_ns": file_path.stat().st_mtime_ns,
@@ -1842,18 +1965,77 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
         }
         if replacement_track:
             replace_library_track_file(session, replacement_track, file_path, target_path, payload)
+            append_task_log(session, None, f"{entry_download_label(entry)}: replaced library file at {target_path}")
         else:
             import_file_to_library(session, file_path, target_path, payload)
+            append_task_log(session, None, f"{entry_download_label(entry)}: moved staged file into library at {target_path}")
         mark_matching_wishlist_completed(session, normalized_metadata)
         update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
         imported += 1
         known_paths.add(str(target_path))
+        imported_albums.add(
+            (
+                str(normalized_metadata.get("albumartist") or normalized_metadata.get("artist") or "Unknown Artist"),
+                str(normalized_metadata.get("album") or "Unknown Album"),
+            )
+        )
+    for artist_name, album_title in sorted(imported_albums):
+        ensure_album_cover_for_import(session, artist_name, album_title)
+    cleanup_download_staging_batch(batch.id)
     for item in batch.items:
         if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
             item.status = ProposalStatus.completed
     batch.status = ProposalStatus.completed
     session.flush()
+    append_task_log(session, None, f"{batch.title}: library import finished for {imported} track(s)")
     return imported
+
+
+def relative_media_path(file_path: Path) -> str:
+    settings = get_settings()
+    roots = [
+        download_staging_root(),
+        settings.staging_path,
+        settings.downloads_path,
+        settings.import_path,
+        settings.library_path,
+    ]
+    for root in roots:
+        try:
+            return str(file_path.relative_to(root))
+        except ValueError:
+            continue
+    return file_path.name
+
+
+def ensure_album_cover_for_import(session: Session, artist_name: str, album_title: str) -> None:
+    album = session.scalar(
+        select(Album)
+        .join(Artist, Album.artist_id == Artist.id)
+        .where(Artist.name == artist_name, Album.title == album_title)
+    )
+    if not album or album.cover_path:
+        return
+    try:
+        results = search_album_releases(artist_name, album_title)
+    except Exception as error:  # noqa: BLE001 - cover art should not block completed imports.
+        append_task_log(session, None, f"{artist_name} / {album_title}: album art lookup failed: {error}", "warning")
+        return
+    cover_url = next((result.get("cover_art_url") for result in results if result.get("cover_art_url")), None)
+    if not cover_url:
+        append_task_log(session, None, f"{artist_name} / {album_title}: no album art found", "warning")
+        return
+    album.cover_path = cover_url
+    append_task_log(session, None, f"{artist_name} / {album_title}: album art set")
+
+
+def cleanup_download_staging_batch(batch_id: str) -> None:
+    staging_root = download_staging_root(batch_id)
+    try:
+        if staging_root.exists() and not any(staging_root.rglob("*")):
+            staging_root.rmdir()
+    except OSError:
+        return
 
 
 def replacement_target_path(track: Track | None, metadata: dict, file_path: Path) -> Path:
@@ -1900,7 +2082,7 @@ def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: di
     request = manifest_entry.get("request") or {}
     api_key = integration_settings(session).get("acoustid_api_key", "")
     if not api_key:
-        return {"status": "unknown", "request": request, "message": "AcoustID API key is required before downloaded batches can be verified."}
+        return {"status": "deferred", "request": request, "message": "AcoustID API key is required before downloaded batches can be verified."}
     try:
         candidates = lookup_recording_by_fingerprint({"path": str(file_path)}, api_key)
     except Exception as error:  # noqa: BLE001 - service/request failures should not block an otherwise usable download.
@@ -4170,7 +4352,7 @@ async def worker_loop() -> None:
                             append_task_log(
                                 session,
                                 None,
-                                f"Download scan checked {scan_result.get('waiting', 0)} transferring, {scan_result.get('ready', 0)} ready, {scan_result.get('failed', 0)} needing attention",
+                                f"Download scan checked {scan_result.get('waiting', 0)} downloading, {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
                             )
                             last_download_scan_summary = summary
                             last_download_scan_log = now

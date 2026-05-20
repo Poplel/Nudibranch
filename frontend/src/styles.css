@@ -1674,6 +1674,23 @@ nav button:hover,
   white-space: nowrap;
 }
 
+.proposal-title-cell {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(140px, 38%);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.proposal-title-cell > .proposal-title {
+  min-width: 0;
+}
+
+.proposal-title-cell > .inline-progress {
+  min-width: 140px;
+  max-width: 420px;
+}
+
 .tree-row small,
 .proposal-row small,
 .bulk-row span {
@@ -1706,14 +1723,6 @@ nav button:hover,
   border-radius: 3px;
 }
 
-.download-row-progress {
-  padding: 2px 10px 8px calc(58px + var(--depth, 0) * 24px);
-}
-
-.download-row-progress .inline-progress {
-  max-width: min(520px, 100%);
-}
-
 .download-batch-row {
   margin-top: 4px;
   border-top: 1px solid var(--line);
@@ -1737,6 +1746,11 @@ nav button:hover,
   display: grid;
   gap: 5px;
   min-width: min(320px, 100%);
+}
+
+.inline-progress.compact {
+  gap: 0;
+  min-width: 120px;
 }
 
 .inline-progress-label {
