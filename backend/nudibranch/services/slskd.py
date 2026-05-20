@@ -90,7 +90,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
     payload = {
         "searchText": query,
         "timeout": timeout_seconds * 1000,
-        "filterResponses": False,
+        "filterResponses": True,
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
     }
@@ -375,6 +375,11 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                     "filename": file_info["filename"],
                     "folder": folder,
                     "size": file_info.get("size"),
+                    "duration": file_info.get("duration"),
+                    "bitrate": file_info.get("bitrate"),
+                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots"),
+                    "upload_speed": response.get("uploadSpeed") or response.get("UploadSpeed"),
+                    "queue_length": response.get("queueLength") or response.get("QueueLength"),
                     "quality": quality_label(file_info),
                     "relevance": relevance,
                     "files": [file_info],
@@ -409,6 +414,11 @@ def extract_folder_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                     "filename": file_info["filename"],
                     "folder": folder,
                     "size": file_info.get("size"),
+                    "duration": file_info.get("duration"),
+                    "bitrate": file_info.get("bitrate"),
+                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots"),
+                    "upload_speed": response.get("uploadSpeed") or response.get("UploadSpeed"),
+                    "queue_length": response.get("queueLength") or response.get("QueueLength"),
                     "quality": quality_label(file_info),
                     "relevance": query_match_score(query, file_info["filename"]),
                     "files": [file_info],
@@ -489,6 +499,8 @@ def normalize_file(file_info: Any) -> dict[str, Any] | None:
         **file_info,
         "filename": filename,
         "size": file_info.get("size") or file_info.get("Size"),
+        "duration": file_info.get("duration") or file_info.get("Duration") or file_info.get("length") or file_info.get("Length"),
+        "bitrate": file_info.get("bitRate") or file_info.get("BitRate") or file_info.get("bitrate") or file_info.get("Bitrate"),
     }
 
 
@@ -515,12 +527,14 @@ def remote_folder(filename: str) -> str:
 
 
 def rank_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    def score(candidate: dict[str, Any]) -> tuple[int, int, int]:
+    def score(candidate: dict[str, Any]) -> tuple[int, int, int, float, int]:
         relevance = int(candidate.get("relevance") or 0)
         quality = candidate.get("quality")
         quality_score = 2 if quality == "lossless" else 1 if quality == "lossy" else 0
+        free_slots = 1 if candidate.get("free_upload_slots") else 0
+        upload_speed = float(candidate.get("upload_speed") or 0)
         size = int(candidate.get("size") or 0)
-        return relevance, quality_score, size
+        return relevance, quality_score, free_slots, upload_speed, size
 
     return sorted(candidates, key=score, reverse=True)
 

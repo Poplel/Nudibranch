@@ -34,6 +34,24 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 180
 QUEUED_TRANSFER_RETRY_SECONDS = 120
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 90
 TRANSFER_COMPLETE_PERCENT = 99.5
+MIN_SLSKD_TRACK_CONFIDENCE = 0.60
+MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
+DOWNLOAD_VERSION_WORDS = {
+    "acapella",
+    "acoustic",
+    "clean",
+    "demo",
+    "edit",
+    "instrumental",
+    "karaoke",
+    "live",
+    "remaster",
+    "remastered",
+    "remix",
+    "sped",
+    "slowed",
+}
+JUNK_ARTIST_SEGMENTS = {"unknown", "unknown artist", "various artists", "various", "va", "soundtrack"}
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -2312,6 +2330,9 @@ def download_folder_pool(candidate: dict) -> dict | None:
         "folder": candidate.get("folder"),
         "files": folder_files,
         "query": candidate.get("query"),
+        "free_upload_slots": candidate.get("free_upload_slots"),
+        "upload_speed": candidate.get("upload_speed"),
+        "queue_length": candidate.get("queue_length"),
     }
 
 
@@ -2319,57 +2340,80 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
     if not requests:
         return None
     settings = integration_settings(session)
-    query = " ".join(part for part in [artist, album] if part).strip()
-    if not query:
+    queries = unique_nonempty([" ".join(part for part in [artist, album_value] if part) for album_value in download_album_query_values(album)])
+    if not queries:
         return None
     match_threshold = slskd_album_match_threshold(settings)
-    try:
-        append_task_log(session, task, f"slskd album search started: {query}")
-        result = search_slskd_detailed(
-            settings.get("slskd_url", ""),
-            settings.get("slskd_api_key", ""),
-            query,
-            limit=40,
-            timeout_seconds=12,
-            timeout_buffer_seconds=2,
-        )
-        diagnostics = result.get("diagnostics") or {}
-        append_task_log(
-            session,
-            task,
-            (
-                f"slskd album search finished: {query}: "
-                f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
-                f"{len(result.get('folder_candidates') or [])} folder candidates"
-            ),
-        )
-    except Exception as error:
-        append_task_log(session, task, f"slskd album search failed: {query}: {error}", "warning")
-        return None
     pools: dict[tuple[str, str], dict] = {}
-    for candidate in result.get("folder_candidates") or result.get("candidates", []):
-        pool = download_folder_pool(candidate)
-        if not pool:
+    for query in queries:
+        try:
+            append_task_log(session, task, f"slskd album search started: {query}")
+            result = search_slskd_detailed(
+                settings.get("slskd_url", ""),
+                settings.get("slskd_api_key", ""),
+                query,
+                limit=60,
+                timeout_seconds=12,
+                timeout_buffer_seconds=2,
+            )
+            diagnostics = result.get("diagnostics") or {}
+            append_task_log(
+                session,
+                task,
+                (
+                    f"slskd album search finished: {query}: "
+                    f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
+                    f"{len(result.get('folder_candidates') or [])} folder candidates"
+                ),
+            )
+        except Exception as error:
+            append_task_log(session, task, f"slskd album search failed: {query}: {error}", "warning")
             continue
-        key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
-        current = pools.setdefault(key, {**pool, "files": []})
-        known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
-        for file_info in pool.get("files") or []:
-            filename = str(file_info.get("filename") or "")
-            if filename and filename not in known_filenames:
-                current["files"].append(file_info)
-                known_filenames.add(filename)
+        for candidate in result.get("folder_candidates") or result.get("candidates", []):
+            pool = download_folder_pool(candidate)
+            if not pool:
+                continue
+            key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+            current = pools.setdefault(key, {**pool, "files": [], "queries": []})
+            current["queries"].append(query)
+            known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
+            for file_info in pool.get("files") or []:
+                filename = str(file_info.get("filename") or "")
+                if filename and filename not in known_filenames:
+                    current["files"].append(file_info)
+                    known_filenames.add(filename)
+    if not pools:
+        return None
     ranked = sorted(
         ((score_album_folder_pool(pool, requests, match_threshold), pool) for pool in pools.values()),
         key=lambda item: item[0],
         reverse=True,
     )
     if not ranked or ranked[0][0][0] == 0:
+        if ranked:
+            best_score, best_pool = ranked[0]
+            append_task_log(
+                session,
+                task,
+                (
+                    f"{artist} / {album}: best folder rejected: {best_pool.get('folder') or 'unknown folder'} "
+                    f"matched {best_score[0]} tracks, artist score {best_score[2]:.2f}, album score {best_score[3]:.2f}"
+                ),
+                "warning",
+            )
         return None
     best_score, best_pool = ranked[0]
     best_pool["matched_tracks"] = best_score[0]
     best_pool["match_threshold"] = match_threshold
-    best_pool["album_query"] = query
+    best_pool["album_query"] = ", ".join(best_pool.get("queries") or queries)
+    append_task_log(
+        session,
+        task,
+        (
+            f"{artist} / {album}: best album folder scored {best_score[1] / max(best_score[0], 1):.0f}% average "
+            f"with artist {best_score[2]:.2f}, album {best_score[3]:.2f}, {best_score[4]} lossless tracks"
+        ),
+    )
     return best_pool
 
 
@@ -2381,19 +2425,34 @@ def slskd_album_match_threshold(settings: dict[str, str]) -> float:
     return max(0.5, min(0.95, value / 100 if value > 1 else value))
 
 
-def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, int, int]:
+def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int]:
     matched = 0
     confidence_total = 0.0
     lossless = 0
+    artist_scores = []
+    album_scores = []
     for request in requests:
         candidate = candidate_from_folder_pool(pool, request, threshold)
         if not candidate:
             continue
         matched += 1
         confidence_total += float(candidate.get("confidence") or 0)
+        artist_scores.append(float(candidate.get("artist_score") or 0))
+        album_scores.append(float(candidate.get("album_score") or 0))
         if candidate.get("quality") == "lossless":
             lossless += 1
-    return (matched, confidence_total, lossless, len(pool.get("files") or []))
+    if not matched:
+        return (0, 0.0, 0.0, 0.0, 0, len(pool.get("files") or []))
+    required = max(2, min(len(requests), int(len(requests) * 0.70)))
+    if len(requests) >= 3 and matched < required:
+        return (0, 0.0, 0.0, 0.0, lossless, len(pool.get("files") or []))
+    average_artist = sum(artist_scores) / max(1, len(artist_scores))
+    average_album = sum(album_scores) / max(1, len(album_scores))
+    if average_artist < MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE:
+        return (0, 0.0, average_artist, average_album, lossless, len(pool.get("files") or []))
+    if fuzzy_text(requests[0].get("album")) and average_album < 0.20 and len(pool.get("files") or []) > len(requests) + 4:
+        return (0, 0.0, average_artist, average_album, lossless, len(pool.get("files") or []))
+    return (matched, confidence_total, average_artist, average_album, lossless, len(pool.get("files") or []))
 
 
 def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: float | None = None) -> dict | None:
@@ -2405,32 +2464,54 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
         return None
     files = pool.get("files") or []
     ranked = sorted(
-        ((folder_file_confidence(file_info, request), file_info) for file_info in files),
-        key=lambda item: folder_file_score(item[1], item[0]),
+        (
+            (download_file_match_score(file_info, request, username=pool.get("username"), folder=pool.get("folder")), file_info)
+            for file_info in files
+        ),
+        key=lambda item: folder_file_score(item[1], item[0].get("confidence", 0.0)),
     )
-    ranked = [(confidence, file_info) for confidence, file_info in ranked if confidence >= threshold]
+    ranked = [(score, file_info) for score, file_info in ranked if score.get("confidence", 0.0) >= threshold and not score.get("rejected")]
     if not ranked:
         return None
-    confidence, file_info = ranked[0]
+    score, file_info = ranked[0]
+    confidence = float(score.get("confidence") or 0.0)
     return {
         "username": pool.get("username"),
         "query": download_query(request),
         "filename": file_info.get("filename"),
         "folder": pool.get("folder"),
         "size": file_info.get("size"),
+        "duration": file_info.get("duration"),
+        "bitrate": file_info.get("bitrate"),
+        "free_upload_slots": pool.get("free_upload_slots"),
+        "upload_speed": pool.get("upload_speed"),
+        "queue_length": pool.get("queue_length"),
         "quality": "lossless" if str(file_info.get("filename") or "").lower().endswith((".flac", ".wav", ".aiff", ".alac")) else "unknown",
         "confidence": round(confidence * 100),
+        "artist_score": round(float(score.get("artist_score") or 0.0), 3),
+        "album_score": round(float(score.get("album_score") or 0.0), 3),
+        "title_score": round(float(score.get("title_score") or 0.0), 3),
+        "duration_score": round(float(score.get("duration_score") or 0.0), 3),
         "files": [file_info],
         "folder_files": files,
     }
 
 
 def folder_file_confidence(file_info: dict, request: dict) -> float:
+    return float(download_file_match_score(file_info, request).get("confidence") or 0.0)
+
+
+def download_file_match_score(file_info: dict, request: dict, username: object | None = None, folder: object | None = None) -> dict:
     title = fuzzy_text(request.get("track") or request.get("title"))
+    artist = fuzzy_text(request.get("artist"))
+    album = fuzzy_text(request.get("album"))
     if not title:
-        return 0.0
+        return {"confidence": 0.0, "rejected": True, "reason": "missing expected title"}
     filename = str(file_info.get("filename") or "")
     stem = Path(filename.replace("\\", "/")).stem
+    path_segments = [segment for segment in re.split(r"[/\\]+", filename) if segment]
+    folder_segments = [segment for segment in re.split(r"[/\\]+", str(folder or "")) if segment]
+    segments = [*folder_segments, *(path_segments[-1:] if folder_segments else path_segments)]
     variants = {
         fuzzy_text(stem),
         fuzzy_text(strip_leading_track_number(stem)),
@@ -2439,19 +2520,114 @@ def folder_file_confidence(file_info: dict, request: dict) -> float:
     }
     variants.discard("")
     if not variants:
-        return 0.0
-    best = max(fuzzy_similarity(title, variant) for variant in variants)
+        return {"confidence": 0.0, "rejected": True, "reason": "missing candidate title"}
+    title_score = max(fuzzy_similarity(title, variant) for variant in variants)
+    artist_score = best_segment_score(artist, segments)
+    album_score = best_segment_score(album, folder_segments or path_segments[:-1])
+    if artist and artist_score < 0.25:
+        return {
+            "confidence": 0.0,
+            "title_score": title_score,
+            "artist_score": artist_score,
+            "album_score": album_score,
+            "duration_score": 0.0,
+            "rejected": True,
+            "reason": "artist not present in candidate path",
+        }
+    candidate_version_words = version_words_for_text(stem)
+    expected_version_words = version_words_for_text(str(request.get("track") or request.get("title") or ""))
+    extra_version_words = candidate_version_words - expected_version_words
+    if extra_version_words:
+        return {
+            "confidence": 0.0,
+            "title_score": title_score,
+            "artist_score": artist_score,
+            "album_score": album_score,
+            "duration_score": 0.0,
+            "rejected": True,
+            "reason": f"wrong version marker: {', '.join(sorted(extra_version_words))}",
+        }
+    if title_score < 0.30:
+        return {
+            "confidence": 0.0,
+            "title_score": title_score,
+            "artist_score": artist_score,
+            "album_score": album_score,
+            "duration_score": 0.0,
+            "rejected": True,
+            "reason": "title match too weak",
+        }
+    if any(fuzzy_text(segment) in JUNK_ARTIST_SEGMENTS for segment in segments):
+        artist_score *= 0.4
+    duration_score = duration_match_score(request_duration_ms(request), candidate_duration_ms(file_info))
     number = leading_track_number(stem)
     request_number = request.get("track_number")
     try:
         request_number_int = int(request_number) if request_number is not None else None
     except (TypeError, ValueError):
         request_number_int = None
+    track_number_bonus = 0.0
     if number is not None and request_number_int is not None:
-        best += 0.08 if number == request_number_int else -0.18
-    if has_extra_version_words(stem, title):
-        best -= 0.12
-    return max(0.0, min(1.0, best))
+        track_number_bonus = 0.08 if number == request_number_int else -0.18
+    album_bonus = 0.08 if album and album_score >= 0.85 else 0.03 if album and album_score >= 0.60 else 0.0
+    confidence = (title_score * 0.45) + (artist_score * 0.38) + (duration_score * 0.12) + album_bonus + track_number_bonus
+    if title_score < 0.55 and artist_score < 0.75:
+        confidence *= 0.7
+    return {
+        "confidence": max(0.0, min(1.0, confidence)),
+        "title_score": title_score,
+        "artist_score": artist_score,
+        "album_score": album_score,
+        "duration_score": duration_score,
+        "rejected": False,
+        "reason": "matched",
+        "username": username,
+    }
+
+
+def candidate_duration_ms(file_info: dict) -> int | None:
+    raw = file_info.get("duration") or file_info.get("Duration") or file_info.get("length") or file_info.get("Length")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return int(value if value > 10000 else value * 1000)
+
+
+def duration_match_score(expected_ms: int | None, candidate_ms: int | None) -> float:
+    if not expected_ms or not candidate_ms:
+        return 0.5
+    delta = abs(expected_ms - candidate_ms)
+    if delta <= 5000:
+        return 1.0
+    return max(0.0, 1.0 - (delta / max(expected_ms, 1)) * 5)
+
+
+def best_segment_score(expected: str, segments: list[str]) -> float:
+    if not expected:
+        return 0.5
+    expected_tokens = set(expected.split())
+    best = 0.0
+    for segment in segments:
+        normalized = fuzzy_text(segment)
+        if not normalized:
+            continue
+        segment_tokens = set(normalized.split())
+        if normalized in JUNK_ARTIST_SEGMENTS:
+            best = max(best, 0.0)
+            continue
+        if expected_tokens and expected_tokens.issubset(segment_tokens):
+            return 1.0
+        if expected and (expected in normalized or normalized in expected):
+            best = max(best, 0.95)
+        best = max(best, SequenceMatcher(None, expected, normalized).ratio())
+    return best
+
+
+def version_words_for_text(value: object) -> set[str]:
+    return set(fuzzy_text(value).split()) & DOWNLOAD_VERSION_WORDS
 
 
 def fuzzy_similarity(left: str, right: str) -> float:
@@ -2467,6 +2643,7 @@ def fuzzy_similarity(left: str, right: str) -> float:
 
 def fuzzy_text(value: object) -> str:
     text = str(value or "").casefold().replace("’", "'")
+    text = text.replace("÷", " divide ").replace("+", " plus ").replace("×", " multiply ")
     text = re.sub(r"\[[^\]]+\]|\([^\)]+\)", " ", text)
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
 
@@ -2514,6 +2691,55 @@ def search_slskd_for_request(session: Session, request: dict, limit: int = 1, ta
     return result
 
 
+def rank_slskd_candidates_for_request(candidates: list[dict], request: dict, ignored_candidates: list[dict], limit: int) -> tuple[list[dict], list[str]]:
+    accepted = []
+    rejected_reasons: list[str] = []
+    for candidate in filter_ignored_candidates(candidates, ignored_candidates):
+        file_info = {
+            "filename": candidate.get("filename"),
+            "size": candidate.get("size"),
+            "duration": candidate.get("duration"),
+            "bitrate": candidate.get("bitrate"),
+        }
+        score = download_file_match_score(file_info, request, username=candidate.get("username"), folder=candidate.get("folder"))
+        reason = str(score.get("reason") or "unknown")
+        confidence = float(score.get("confidence") or 0.0)
+        enriched = {
+            **candidate,
+            "confidence": round(confidence * 100),
+            "title_score": round(float(score.get("title_score") or 0.0), 3),
+            "artist_score": round(float(score.get("artist_score") or 0.0), 3),
+            "album_score": round(float(score.get("album_score") or 0.0), 3),
+            "duration_score": round(float(score.get("duration_score") or 0.0), 3),
+            "match_reason": reason,
+        }
+        if not score.get("rejected") and confidence >= MIN_SLSKD_TRACK_CONFIDENCE:
+            accepted.append(enriched)
+        elif len(rejected_reasons) < 4:
+            rejected_reasons.append(f"{candidate.get('filename') or 'unknown'} ({round(confidence * 100)}%): {reason}")
+    accepted.sort(key=slskd_candidate_sort_key, reverse=True)
+    return accepted[:limit], rejected_reasons
+
+
+def slskd_candidate_sort_key(candidate: dict) -> tuple[int, int, int, float, int, int]:
+    quality = candidate.get("quality")
+    quality_score = 2 if quality == "lossless" else 1 if quality == "lossy" else 0
+    free_slots = 1 if candidate.get("free_upload_slots") else 0
+    try:
+        upload_speed = float(candidate.get("upload_speed") or 0)
+    except (TypeError, ValueError):
+        upload_speed = 0
+    try:
+        queue_length = int(candidate.get("queue_length") or 0)
+    except (TypeError, ValueError):
+        queue_length = 0
+    try:
+        size = int(candidate.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return (int(candidate.get("confidence") or 0), quality_score, free_slots, upload_speed, -queue_length, size)
+
+
 def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
     attempted = []
     query_logs = []
@@ -2534,9 +2760,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                     slskd_url,
                     api_key,
                     query,
-                    limit=max(limit, len(ignored) + limit),
+                    limit=max(12, len(ignored) + limit * 8),
                     poll_interval=0.75,
-                    timeout_seconds=5 if index < 3 else 4,
+                    timeout_seconds=6 if index < 4 else 4,
                     timeout_buffer_seconds=1,
                 )
                 break
@@ -2567,7 +2793,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
         result["diagnostics"]["queries"] = attempted.copy()
         result["diagnostics"]["query_logs"] = query_logs
         result["diagnostics"]["rate_limited"] = rate_limited
-        result["candidates"] = filter_ignored_candidates(result.get("candidates") or [], ignored_candidates)[:limit]
+        result["candidates"], rejected = rank_slskd_candidates_for_request(result.get("candidates") or [], request, ignored_candidates, limit)
+        if rejected:
+            result["diagnostics"]["rejected_candidates"] = rejected
         result["diagnostics"]["ignored_candidates"] = len(ignored_candidates)
         last_result = result
         diagnostics = result["diagnostics"]
@@ -2578,6 +2806,8 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls"
             ),
         )
+        for rejected_line in rejected:
+            query_logs.append(f"slskd candidate rejected: {rejected_line}")
         if result["candidates"]:
             return result
     last_result["diagnostics"]["queries"] = attempted
@@ -2702,15 +2932,51 @@ def download_query_variants(request: dict) -> list[str]:
     artist = str(request.get("artist") or "").strip()
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
-    return [
-        " ".join(part for part in [album, track] if part),
-        " ".join(part for part in [album, track, "flac"] if part),
-        track,
-        " ".join(part for part in [artist, album, track] if part),
-        " ".join(part for part in [artist, album, track, "flac"] if part),
-        " ".join(part for part in [artist, track] if part),
-        f"{artist} - {track}".strip(" -"),
-    ]
+    album_values = download_album_query_values(album)
+    variants = []
+    for album_value in album_values:
+        variants.append(" ".join(part for part in [artist, album_value, track] if part))
+        variants.append(" ".join(part for part in [artist, album_value, track, "flac"] if part))
+    variants.extend(
+        [
+            " ".join(part for part in [artist, track] if part),
+            f"{artist} - {track}".strip(" -"),
+        ]
+    )
+    for album_value in album_values:
+        variants.append(" ".join(part for part in [album_value, track] if part))
+        variants.append(" ".join(part for part in [album_value, track, "flac"] if part))
+    variants.append(track)
+    return unique_nonempty(variants)
+
+
+def download_album_query_values(album: str) -> list[str]:
+    values = [album]
+    normalized = album.strip().casefold()
+    aliases = {
+        "÷": "Divide",
+        "+": "Plus",
+        "×": "Multiply",
+        "x": "Multiply",
+    }
+    if normalized in aliases:
+        values.append(aliases[normalized])
+    if "÷" in album:
+        values.append(album.replace("÷", "Divide"))
+    return unique_nonempty(values)
+
+
+def unique_nonempty(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = " ".join(str(value or "").split())
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
