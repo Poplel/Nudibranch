@@ -52,6 +52,58 @@ DOWNLOAD_VERSION_WORDS = {
     "slowed",
 }
 JUNK_ARTIST_SEGMENTS = {"unknown", "unknown artist", "various artists", "various", "va", "soundtrack"}
+TEXT_SEARCH_ALTERNATIVES: list[tuple[str, tuple[str, ...]]] = [
+    ("&", ("and",)),
+    ("@", ("at",)),
+    ("#", ("number", "no")),
+    ("%", ("percent",)),
+    ("*", ("star",)),
+    ("★", ("star",)),
+    ("☆", ("star",)),
+    ("♥", ("heart",)),
+    ("+", ("plus",)),
+    ("÷", ("divide", "division")),
+    ("×", ("multiply", "times")),
+    ("=", ("equals",)),
+    ("°", ("degree",)),
+    ("½", ("half",)),
+    ("¼", ("quarter",)),
+    ("¾", ("three quarters",)),
+    ("$", ("dollar",)),
+    ("€", ("euro",)),
+    ("£", ("pound",)),
+    ("¥", ("yen",)),
+    ("∞", ("infinity",)),
+    ("0", ("zero",)),
+    ("1", ("one",)),
+    ("2", ("two",)),
+    ("3", ("three",)),
+    ("4", ("four",)),
+    ("5", ("five",)),
+    ("6", ("six",)),
+    ("7", ("seven",)),
+    ("8", ("eight",)),
+    ("9", ("nine",)),
+    ("10", ("ten",)),
+    ("11", ("eleven",)),
+    ("12", ("twelve",)),
+    ("13", ("thirteen",)),
+    ("14", ("fourteen",)),
+    ("15", ("fifteen",)),
+    ("16", ("sixteen",)),
+    ("17", ("seventeen",)),
+    ("18", ("eighteen",)),
+    ("19", ("nineteen",)),
+    ("20", ("twenty",)),
+    ("30", ("thirty",)),
+    ("40", ("forty",)),
+    ("50", ("fifty",)),
+    ("60", ("sixty",)),
+    ("70", ("seventy",)),
+    ("80", ("eighty",)),
+    ("90", ("ninety",)),
+    ("100", ("one hundred", "hundred")),
+]
 
 
 def run_propose_import(session: Session, payload: dict) -> dict:
@@ -2340,7 +2392,7 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
     if not requests:
         return None
     settings = integration_settings(session)
-    queries = unique_nonempty([" ".join(part for part in [artist, album_value] if part) for album_value in download_album_query_values(album)])
+    queries = unique_nonempty([" ".join(part for part in [artist, album_value] if part) for album_value in text_search_values(album)])
     if not queries:
         return None
     match_threshold = slskd_album_match_threshold(settings)
@@ -2643,7 +2695,12 @@ def fuzzy_similarity(left: str, right: str) -> float:
 
 def fuzzy_text(value: object) -> str:
     text = str(value or "").casefold().replace("’", "'")
-    text = text.replace("÷", " divide ").replace("+", " plus ").replace("×", " multiply ")
+    for token, alternatives in TEXT_SEARCH_ALTERNATIVES:
+        replacement = alternatives[0]
+        if token.isdigit():
+            text = re.sub(rf"\b{re.escape(token)}\b", f" {token} {replacement} ", text)
+        else:
+            text = text.replace(token, f" {replacement} ")
     text = re.sub(r"\[[^\]]+\]|\([^\)]+\)", " ", text)
     return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
 
@@ -2932,11 +2989,13 @@ def download_query_variants(request: dict) -> list[str]:
     artist = str(request.get("artist") or "").strip()
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
-    album_values = download_album_query_values(album)
+    album_values = text_search_values(album)
+    track_values = text_search_values(track)[:4]
     variants = []
     for album_value in album_values:
-        variants.append(" ".join(part for part in [artist, album_value, track] if part))
-        variants.append(" ".join(part for part in [artist, album_value, track, "flac"] if part))
+        for track_value in track_values:
+            variants.append(" ".join(part for part in [artist, album_value, track_value] if part))
+            variants.append(" ".join(part for part in [artist, album_value, track_value, "flac"] if part))
     variants.extend(
         [
             " ".join(part for part in [artist, track] if part),
@@ -2950,20 +3009,18 @@ def download_query_variants(request: dict) -> list[str]:
     return unique_nonempty(variants)
 
 
-def download_album_query_values(album: str) -> list[str]:
-    values = [album]
-    normalized = album.strip().casefold()
-    aliases = {
-        "÷": "Divide",
-        "+": "Plus",
-        "×": "Multiply",
-        "x": "Multiply",
-    }
-    if normalized in aliases:
-        values.append(aliases[normalized])
-    if "÷" in album:
-        values.append(album.replace("÷", "Divide"))
-    return unique_nonempty(values)
+def text_search_values(value: str, max_values: int = 8) -> list[str]:
+    values = [value]
+    for token, alternatives in TEXT_SEARCH_ALTERNATIVES:
+        if token not in value:
+            continue
+        for alternative in alternatives:
+            if token.isdigit():
+                values.append(re.sub(rf"\b{re.escape(token)}\b", alternative, value, flags=re.IGNORECASE))
+            else:
+                values.append(value.replace(token, alternative))
+                values.append(value.replace(token, alternative.title()))
+    return unique_nonempty(values)[:max_values]
 
 
 def unique_nonempty(values: list[str]) -> list[str]:
