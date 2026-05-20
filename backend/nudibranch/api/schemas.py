@@ -204,6 +204,7 @@ class IntegrationSettings(BaseModel):
     jellyfin_api_key: str = ""
     slskd_url: str = ""
     slskd_api_key: str = ""
+    slskd_album_match_threshold: str = "72"
     playlist_conflict_winner: str = "nudibranch"
     favorite_playlist_id: str = ""
     youtube_cookies_browser: str = ""

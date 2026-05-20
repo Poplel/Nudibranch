@@ -4123,6 +4123,7 @@ function SettingsPanel({
             ["favorite_playlist_id", "Favorites playlist"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
+            ["slskd_album_match_threshold", "slskd album match confidence"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
             ["youtube_cookies_path", "YouTube cookies file"],
           ].map(([key, label]) => (
@@ -4163,7 +4164,10 @@ function SettingsPanel({
               ) : (
                 <input
                   readOnly={key === "youtube_cookies_path"}
-                  type={key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
+                  type={key === "slskd_album_match_threshold" ? "number" : key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
+                  min={key === "slskd_album_match_threshold" ? "50" : undefined}
+                  max={key === "slskd_album_match_threshold" ? "95" : undefined}
+                  step={key === "slskd_album_match_threshold" ? "1" : undefined}
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
                 />

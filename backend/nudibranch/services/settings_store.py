@@ -10,6 +10,7 @@ INTEGRATION_KEYS = {
     "jellyfin_api_key",
     "slskd_url",
     "slskd_api_key",
+    "slskd_album_match_threshold",
     "playlist_conflict_winner",
     "favorite_playlist_id",
     "youtube_cookies_browser",
@@ -25,6 +26,7 @@ def integration_settings(session: Session) -> dict[str, str]:
         "jellyfin_api_key": settings.jellyfin_api_key,
         "slskd_url": settings.slskd_url,
         "slskd_api_key": settings.slskd_api_key,
+        "slskd_album_match_threshold": "72",
         "playlist_conflict_winner": "nudibranch",
         "favorite_playlist_id": "",
         "youtube_cookies_browser": "",
@@ -44,10 +46,10 @@ def update_integration_settings(session: Session, values: dict[str, str]) -> dic
             continue
         setting = session.get(AppSetting, key)
         if not setting:
-            setting = AppSetting(key=key, value=value or "")
+            setting = AppSetting(key=key, value=str(value) if value is not None else "")
             session.add(setting)
         else:
-            setting.value = value or ""
+            setting.value = str(value) if value is not None else ""
     session.commit()
     return integration_settings(session)
 
