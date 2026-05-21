@@ -1902,6 +1902,7 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   const actionableSelectedItems = selectedActionItems.filter((item) => !["executing", "completed"].includes(item.status));
   const readyLeafItems = selectedLeafItems.filter((item) => !["executing", "completed"].includes(item.status));
   const allSelected = leafItems.length > 0 && leafItems.every((item) => item.selected);
+  const candidatesSearching = allItems.some(isCandidateSearchItem);
 
   useEffect(() => {
     setOpenItems(new Set(batches.map((batch) => downloadBatchNodeId(batch.id))));
@@ -1928,9 +1929,9 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
           <button className="secondary" onClick={() => onReject(selectedItems)} disabled={selectedItems.length === 0}>
             Delete selected
           </button>
-          <button className="primary" onClick={() => onApprove(actionableSelectedItems)} disabled={actionableSelectedItems.length === 0}>
+          <button className="primary" onClick={() => onApprove(actionableSelectedItems)} disabled={candidatesSearching || actionableSelectedItems.length === 0}>
             <Check size={16} />
-            Run selected
+            {candidatesSearching ? "Searching candidates" : "Run selected"}
           </button>
         </div>
       </div>
@@ -2021,6 +2022,8 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
   const selectedItems = batch.items.filter((item) => item.selected);
   const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
   const locked = batch.status === "executing";
+  const candidatesSearching = batch.kind === "download" && batch.items.some(isCandidateSearchItem);
+  const runDisabled = locked || candidatesSearching || selectedItems.length === 0;
 
   useEffect(() => {
     setOpenItems(new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
@@ -2039,9 +2042,9 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
           <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={locked || selectedItems.length === 0}>
+          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={runDisabled}>
             <Check size={16} />
-            {locked ? "Running" : "Run selected"}
+            {locked ? "Running" : candidatesSearching ? "Searching candidates" : "Run selected"}
           </button>
         </div>
       </div>
@@ -4475,6 +4478,14 @@ function itemMusicRef(item) {
 function isReadyApprovalItem(item) {
   const status = String(itemStatusMeta(item) || item.status || "").toLowerCase();
   return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
+}
+
+function isCandidateSearchItem(item) {
+  const payload = parseJsonObject(item.payload_json);
+  const status = String(payload.status || item.status || "").toLowerCase();
+  if (!status) return false;
+  if (/candidate ready|review ready|ready|approved|completed|done|failed|needs attention|rejected/.test(status)) return false;
+  return /searching|preparing/.test(status) && /candidate|download|slskd|track/.test(status);
 }
 
 function Toast({ title, body, onClose }) {
