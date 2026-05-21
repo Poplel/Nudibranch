@@ -3393,22 +3393,19 @@ def download_query_variants(request: dict) -> list[str]:
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
     album_values = text_search_values(album)
-    track_values = text_search_values(track)[:4]
+    track_values = text_search_values(track)[:3]
     variants = []
-    for album_value in album_values:
-        for track_value in track_values:
-            variants.append(" ".join(part for part in [artist, album_value, track_value] if part))
-            variants.append(" ".join(part for part in [artist, album_value, track_value, "flac"] if part))
-    variants.extend(
-        [
-            " ".join(part for part in [artist, track] if part),
-            f"{artist} - {track}".strip(" -"),
-        ]
-    )
     for album_value in album_values:
         variants.append(" ".join(part for part in [album_value, track] if part))
         variants.append(" ".join(part for part in [album_value, track, "flac"] if part))
     variants.append(track)
+    for track_value in track_values:
+        variants.append(" ".join(part for part in [artist, track_value] if part))
+        variants.append(f"{artist} - {track_value}".strip(" -"))
+    for album_value in album_values:
+        for track_value in track_values:
+            variants.append(" ".join(part for part in [artist, album_value, track_value] if part))
+            variants.append(" ".join(part for part in [artist, album_value, track_value, "flac"] if part))
     return unique_nonempty(variants)
 
 
