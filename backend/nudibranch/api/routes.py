@@ -712,6 +712,29 @@ def stream_track(
     return FileResponse(path)
 
 
+@router.get("/library/albums/{album_id}/cover", tags=["library"])
+def album_cover(
+    album_id: str,
+    api_key: str = Query(""),
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    permissions = {permission.permission for permission in user.permissions} if user else set()
+    if not user or (not user.is_admin and Permission.library_read not in permissions):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    album = session.get(Album, album_id)
+    if not album or not album.cover_path:
+        raise HTTPException(status_code=404, detail="Album cover not found")
+    path = Path(album.cover_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Album cover file is missing")
+    library_root = get_settings().library_path.resolve()
+    resolved = path.resolve()
+    if library_root not in [resolved, *resolved.parents]:
+        raise HTTPException(status_code=403, detail="Album cover is outside the library")
+    return FileResponse(resolved)
+
+
 @router.post("/imports/scan", tags=["imports"])
 def scan_imports(
     payload: ImportScanRequest,

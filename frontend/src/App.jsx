@@ -1370,6 +1370,7 @@ function App() {
                 playlists={playlists}
                 onAddToPlaylist={addTracksToPlaylist}
                 user={user}
+                apiKey={token}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
               />
@@ -1615,7 +1616,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1627,10 +1628,12 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTr
       artists
         .map((artist) => ({
           ...artist,
-          albums: artist.albums.filter((album) => album.tracks.length > 0),
+          albums: artist.albums
+            .filter((album) => album.tracks.length > 0)
+            .map((album) => ({ ...album, _coverUrl: albumCoverUrl(album, apiKey) })),
         }))
         .filter((artist) => artist.albums.length > 0),
-    [artists],
+    [artists, apiKey],
   );
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
@@ -1735,7 +1738,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTr
                       targetType="album"
                       targetId={album.id}
                       title={album.title}
-                      coverUrl={album.cover_path}
+                      coverUrl={album._coverUrl}
                       fields={albumFields(album)}
                       details={{ artist: artist.name, tracks: album.tracks.length }}
                       onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
@@ -3470,8 +3473,18 @@ function hydrateTrack(track, artist, album) {
     ...track,
     _artist: artist.name,
     _album: album.title,
-    _coverUrl: album.cover_path,
+    _coverUrl: album._coverUrl || album.cover_path,
   };
+}
+
+function albumCoverUrl(album, apiKey) {
+  const coverPath = album?.cover_path || "";
+  if (!coverPath) return "";
+  if (/^(https?:|data:|blob:)/i.test(coverPath) || coverPath.startsWith(`${API_BASE}/`)) {
+    return coverPath;
+  }
+  if (!apiKey || !album?.id) return "";
+  return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
 }
 
 function playlistPlayableTrack(track) {

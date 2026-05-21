@@ -17,9 +17,9 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
 from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
-from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, suggest_library_path, write_audio_metadata
+from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import itunes_album_artwork, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed
@@ -2233,6 +2233,65 @@ def relative_media_path(file_path: Path) -> str:
     return file_path.name
 
 
+def album_folder_path(album: Album) -> Path:
+    if album.path:
+        return Path(album.path)
+    track_dirs = [Path(track.path).parent for track in album.tracks if track.path]
+    if track_dirs:
+        return track_dirs[0]
+    return get_settings().library_path / safe_path_part(album.artist.name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")
+
+
+def album_cover_candidate_urls(artist: str, album: str, results: list[dict]) -> list[str]:
+    urls = [str(result.get("cover_art_url")) for result in results if result.get("cover_art_url")]
+    itunes_url = itunes_album_artwork(artist, album)
+    if itunes_url:
+        urls.append(itunes_url)
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique_urls.append(url)
+    return unique_urls
+
+
+def cover_extension(content_type: str, url: str) -> str:
+    content_type = content_type.split(";", 1)[0].strip().casefold()
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/webp":
+        return ".webp"
+    if content_type in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    suffix = Path(url.split("?", 1)[0]).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+
+
+def download_album_cover_to_library(session: Session, album: Album, urls: list[str]) -> str | None:
+    album_dir = album_folder_path(album)
+    album_dir.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for url in urls:
+        try:
+            response = httpx.get(url, timeout=20, follow_redirects=True, headers={"User-Agent": "Nudibranch/0.1"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.casefold().startswith("image/"):
+                raise ValueError(f"unexpected content type {content_type or 'unknown'}")
+            cover_path = album_dir / f"cover{cover_extension(content_type, url)}"
+            cover_path.write_bytes(response.content)
+            append_task_log(session, None, f"{album.artist.name} / {album.title}: downloaded album art to {cover_path}")
+            return str(cover_path)
+        except Exception as error:  # noqa: BLE001 - try the next artwork source.
+            last_error = error
+            append_task_log(session, None, f"{album.artist.name} / {album.title}: cover download failed from {url}: {error}", "warning")
+    if last_error:
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: no cover source could be downloaded: {last_error}", "warning")
+    return None
+
+
 def ensure_album_cover_for_import(session: Session, artist_name: str, album_title: str) -> None:
     album = session.scalar(
         select(Album)
@@ -2246,11 +2305,11 @@ def ensure_album_cover_for_import(session: Session, artist_name: str, album_titl
     except Exception as error:  # noqa: BLE001 - cover art should not block completed imports.
         append_task_log(session, None, f"{artist_name} / {album_title}: album art lookup failed: {error}", "warning")
         return
-    cover_url = next((result.get("cover_art_url") for result in results if result.get("cover_art_url")), None)
-    if not cover_url:
+    cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(artist_name, album_title, results))
+    if not cover_path:
         append_task_log(session, None, f"{artist_name} / {album_title}: no album art found", "warning")
         return
-    album.cover_path = cover_url
+    album.cover_path = cover_path
     append_task_log(session, None, f"{artist_name} / {album_title}: album art set")
 
 
@@ -4159,9 +4218,13 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
     session.flush()
     found = 0
     for album in albums:
-        results = search_album_releases(album.artist.name, album.title)
-        cover_url = next((result.get("cover_art_url") for result in results if result.get("cover_art_url")), None)
-        if not cover_url:
+        try:
+            results = search_album_releases(album.artist.name, album.title)
+        except Exception as error:  # noqa: BLE001 - keep checking other albums.
+            append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: album cover lookup failed: {error}", level="warning")
+            continue
+        cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
+        if not cover_path:
             continue
         found += 1
         session.add(
@@ -4170,12 +4233,12 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
                 title=f"{album.artist.name} / {album.title}",
                 kind=ProposalKind.metadata,
                 old_value=json.dumps({"cover_path": album.cover_path}),
-                new_value=json.dumps({"cover_path": cover_url}),
+                new_value=json.dumps({"cover_path": cover_path}),
                 payload_json=json.dumps(
                     {
                         "target_type": "album",
                         "target_id": album.id,
-                        "changes": {"cover_path": cover_url},
+                        "changes": {"cover_path": cover_path},
                     }
                 ),
             )
@@ -4203,9 +4266,7 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
 def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     albums = list(
         session.scalars(
-            select(Album)
-            .where(Album.musicbrainz_release_id.is_not(None))
-            .options(selectinload(Album.artist), selectinload(Album.tracks))
+            select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
         )
     )
     created = 0
@@ -4217,11 +4278,23 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
     album_items: dict[tuple[str, str], ProposalItem] = {}
     for album in albums:
         checked += 1
-        record = lookup_album_tracks(album.artist.name, album.title, album.musicbrainz_release_id)
-        existing_numbers = {track.track_number for track in album.tracks if track.track_number}
+        lookup_title = album.release_title or album.title
+        try:
+            record = lookup_album_tracks(album.artist.name, lookup_title, album.musicbrainz_release_id)
+        except Exception as error:  # noqa: BLE001 - one bad lookup should not stop the full scan.
+            append_task_log(session, None, f"{album.artist.name} / {album.title}: missing-track lookup failed: {error}", "warning")
+            continue
+        if record.get("musicbrainz_album_id") and not album.musicbrainz_release_id:
+            album.musicbrainz_release_id = record.get("musicbrainz_album_id")
+        existing_positions = {
+            (track.disc_number or 1, track.track_number)
+            for track in album.tracks
+            if track.track_number
+        }
         for track in record.get("tracks", []):
             track_number = track.get("track_number")
-            if not track_number or track_number in existing_numbers:
+            disc_number = track.get("disc_number") or 1
+            if not track_number or (disc_number, track_number) in existing_positions:
                 continue
             add_download_request_item(
                 session,
@@ -4232,7 +4305,7 @@ def run_check_missing_tracks(session: Session, _payload: dict) -> dict:
                 album.title,
                 track.get("title"),
                 track_number=track.get("track_number"),
-                disc_number=track.get("disc_number"),
+                disc_number=disc_number,
                 duration_ms=track.get("length"),
                 musicbrainz_album_id=record.get("musicbrainz_album_id"),
                 musicbrainz_recording_id=track.get("musicbrainz_recording_id"),
