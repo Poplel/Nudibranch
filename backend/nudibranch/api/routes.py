@@ -45,6 +45,7 @@ from nudibranch.api.schemas import (
     TaskCreate,
     TaskOut,
     UserCreate,
+    UserAppearanceUpdate,
     UserOut,
     UserPinUpdate,
     UserUpdate,
@@ -204,6 +205,17 @@ def update_own_pin(
     user: User = Depends(get_current_user),
 ) -> UserOut:
     user.pin_hash = hash_secret(payload.pin)
+    session.commit()
+    return serialize_user(load_user(session, user.id))
+
+
+@router.put("/me/appearance", response_model=UserOut, tags=["users"])
+def update_own_appearance(
+    payload: UserAppearanceUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> UserOut:
+    user.theme = payload.theme
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -1801,6 +1813,7 @@ def serialize_user(user: User) -> UserOut:
         display_name=user.display_name,
         is_admin=user.is_admin,
         permissions=effective_permission_values(user),
+        theme=user.theme if user.theme in {"light", "dark"} else "light",
     )
 
 

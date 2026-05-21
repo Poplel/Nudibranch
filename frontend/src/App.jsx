@@ -44,7 +44,6 @@ import "./styles.css";
 
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
-const APPEARANCE_KEY = "nudibranch_appearance";
 const APPEARANCE_LAST_KEY = "nudibranch_appearance_last";
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
 
@@ -232,31 +231,34 @@ function App() {
   useEffect(() => {
     if (!user?.id) return;
     setAppearanceReady(false);
-    const saved = localStorage.getItem(`${APPEARANCE_KEY}_${user.id}`);
+    setDark(user.theme === "dark");
+    const saved = localStorage.getItem(APPEARANCE_LAST_KEY);
     if (!saved) {
       setAppearanceReady(true);
       return;
     }
     try {
       const appearance = JSON.parse(saved);
-      setDark(Boolean(appearance.dark));
       setAccentColor(appearance.accentColor || DEFAULT_APPEARANCE.accentColor);
       setBackgroundTint(appearance.backgroundTint || DEFAULT_APPEARANCE.backgroundTint);
     } catch {
-      localStorage.removeItem(`${APPEARANCE_KEY}_${user.id}`);
+      localStorage.removeItem(APPEARANCE_LAST_KEY);
     }
     setAppearanceReady(true);
-  }, [user?.id]);
+  }, [user?.id, user?.theme]);
 
   useEffect(() => {
     if (!user?.id) return;
     if (!appearanceReady) return;
-    localStorage.setItem(
-      `${APPEARANCE_KEY}_${user.id}`,
-      JSON.stringify({ dark, accentColor, backgroundTint }),
-    );
     localStorage.setItem(APPEARANCE_LAST_KEY, JSON.stringify({ dark, accentColor, backgroundTint }));
   }, [user?.id, appearanceReady, dark, accentColor, backgroundTint]);
+
+  useEffect(() => {
+    if (!user?.id || !appearanceReady) return;
+    const themeName = dark ? "dark" : "light";
+    if ((user.theme || "light") === themeName) return;
+    saveOwnAppearance(themeName);
+  }, [user?.id, user?.theme, appearanceReady, dark]);
 
   async function api(path, options = {}) {
     const isFormData = options.body instanceof FormData;
@@ -551,6 +553,19 @@ function App() {
       throw userError;
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function saveOwnAppearance(themeName) {
+    try {
+      const updated = await api("/me/appearance", {
+        method: "PUT",
+        body: JSON.stringify({ theme: themeName }),
+      });
+      setUser(updated);
+      setUsers((current) => upsertUser(current, updated));
+    } catch (appearanceError) {
+      notify("Theme sync failed", appearanceError.message, "ui_error");
     }
   }
 
@@ -4156,6 +4171,7 @@ function SettingsPanel({
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
+            ["slskd_concurrent_downloads", "Concurrent slskd downloads"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
             ["youtube_cookies_path", "YouTube cookies file"],
           ].map(([key, label]) => (
@@ -4196,10 +4212,10 @@ function SettingsPanel({
               ) : (
                 <input
                   readOnly={key === "youtube_cookies_path"}
-                  type={key === "slskd_album_match_threshold" ? "number" : key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
-                  min={key === "slskd_album_match_threshold" ? "50" : undefined}
-                  max={key === "slskd_album_match_threshold" ? "95" : undefined}
-                  step={key === "slskd_album_match_threshold" ? "1" : undefined}
+                  type={["slskd_album_match_threshold", "slskd_concurrent_downloads"].includes(key) ? "number" : key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
+                  min={key === "slskd_album_match_threshold" ? "50" : key === "slskd_concurrent_downloads" ? "1" : undefined}
+                  max={key === "slskd_album_match_threshold" ? "95" : key === "slskd_concurrent_downloads" ? "12" : undefined}
+                  step={["slskd_album_match_threshold", "slskd_concurrent_downloads"].includes(key) ? "1" : undefined}
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
                 />

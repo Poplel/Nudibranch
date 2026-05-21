@@ -22,6 +22,7 @@ class UserOut(BaseModel):
     display_name: str
     is_admin: bool
     permissions: list[str]
+    theme: str = "light"
 
 
 class PermissionOut(BaseModel):
@@ -45,6 +46,10 @@ class UserUpdate(BaseModel):
 
 class UserPinUpdate(BaseModel):
     pin: str = Field(min_length=4, max_length=32)
+
+
+class UserAppearanceUpdate(BaseModel):
+    theme: str = Field(pattern="^(light|dark)$")
 
 
 class PlayerStateUpdate(BaseModel):
@@ -204,6 +209,7 @@ class IntegrationSettings(BaseModel):
     slskd_url: str = ""
     slskd_api_key: str = ""
     slskd_album_match_threshold: str = "72"
+    slskd_concurrent_downloads: str = "1"
     playlist_conflict_winner: str = "nudibranch"
     favorite_playlist_id: str = ""
     youtube_cookies_browser: str = ""

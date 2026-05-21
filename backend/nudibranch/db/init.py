@@ -48,6 +48,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "musicbrainz_verified" not in track_columns:
         session.execute(text("ALTER TABLE tracks ADD COLUMN musicbrainz_verified BOOLEAN NOT NULL DEFAULT 0"))
         session.commit()
+    user_columns = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
+    if "theme" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'light'"))
+        session.commit()
     move_task_result_logs_to_app_log(session)
 
 
