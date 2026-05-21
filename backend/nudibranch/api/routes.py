@@ -2055,9 +2055,13 @@ def serialize_task(task: Task) -> TaskOut:
         result=task_result(task),
         error=task.error,
         attempts=task.attempts,
-        created_at=task.created_at,
-        updated_at=task.updated_at,
+        created_at=as_utc(task.created_at),
+        updated_at=as_utc(task.updated_at),
     )
+
+
+def as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
 def serialize_log_entry(entry: dict) -> LogEntryOut:

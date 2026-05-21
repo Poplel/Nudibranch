@@ -41,6 +41,8 @@ DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_remove
 DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
+SLSKD_TRACK_SEARCH_WORKERS = 1
+SLSKD_TRACK_QUERY_LIMIT = 6
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
     "acoustic",
@@ -344,8 +346,12 @@ def add_track_search_candidate_items(
     slskd_url = settings.get("slskd_url", "")
     api_key = settings.get("slskd_api_key", "")
     added = 0
-    prepared_jobs = [(request, track_item.id, track_item.title, query, limit) for request, track_item, query, limit in jobs]
-    workers = min(3, len(prepared_jobs))
+    prepared_jobs = []
+    for request, track_item, query, limit in jobs:
+        payload = json.loads(track_item.payload_json or "{}")
+        track_title = payload.get("track") or track_item.__dict__.get("title") or download_query(request)
+        prepared_jobs.append((request, track_item.id, track_title, query, limit))
+    workers = min(SLSKD_TRACK_SEARCH_WORKERS, len(prepared_jobs))
     append_task_log(session, task, f"Searching {len(prepared_jobs)} track candidate set(s) with {workers} worker(s)")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
@@ -2534,7 +2540,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         session.commit()
 
     if search_jobs:
-        workers = min(3, len(search_jobs))
+        workers = min(SLSKD_TRACK_SEARCH_WORKERS, len(search_jobs))
         append_task_log(session, task, f"{artist} / {album}: searching {len(search_jobs)} track(s) with {workers} concurrent worker(s)")
         if task is not None:
             update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
@@ -3235,7 +3241,7 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
     ignored_candidates = raw_ignored_candidates if isinstance(raw_ignored_candidates, list) else []
     ignored = {candidate_identity(candidate) for candidate in ignored_candidates if isinstance(candidate, dict)}
     last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs, "rate_limited": False}}
-    for index, query in enumerate(download_query_variants(request)):
+    for index, query in enumerate(download_query_variants(request)[:SLSKD_TRACK_QUERY_LIMIT]):
         if not query or query in attempted:
             continue
         attempted.append(query)
@@ -3249,8 +3255,8 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                     query,
                     limit=max(12, len(ignored) + limit * 8),
                     poll_interval=0.75,
-                    timeout_seconds=6 if index < 4 else 4,
-                    timeout_buffer_seconds=1,
+                    timeout_seconds=10 if index < 3 else 8,
+                    timeout_buffer_seconds=2,
                 )
                 break
             except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
@@ -3420,23 +3426,24 @@ def download_query_variants(request: dict) -> list[str]:
     artist = str(request.get("artist") or "").strip()
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
-    album_values = text_search_values(album)
-    track_values = text_search_values(track)[:4]
+    album_values = text_search_values(album, max_values=3)
+    track_values = text_search_values(track, max_values=2)[:2]
     variants = []
-    for album_value in album_values:
-        for track_value in track_values:
-            variants.append(" ".join(part for part in [artist, album_value, track_value] if part))
-            variants.append(" ".join(part for part in [artist, album_value, track_value, "flac"] if part))
+    primary_album = album_values[0] if album_values else album
+    primary_track = track_values[0] if track_values else track
+    variants.append(" ".join(part for part in [artist, primary_album, primary_track] if part))
+    variants.append(" ".join(part for part in [artist, primary_track] if part))
+    variants.append(f"{artist} - {primary_track}".strip(" -"))
+    variants.append(" ".join(part for part in [primary_album, primary_track] if part))
+    variants.append(primary_track)
+    for album_value in album_values[1:]:
+        variants.append(" ".join(part for part in [artist, album_value, primary_track] if part))
+    if request.get("require_lossless"):
+        variants.append(" ".join(part for part in [artist, primary_album, primary_track, "flac"] if part))
     variants.extend(
-        [
-            " ".join(part for part in [artist, track] if part),
-            f"{artist} - {track}".strip(" -"),
-        ]
+        " ".join(part for part in [artist, primary_album, track_value] if part)
+        for track_value in track_values[1:]
     )
-    for album_value in album_values:
-        variants.append(" ".join(part for part in [album_value, track] if part))
-        variants.append(" ".join(part for part in [album_value, track, "flac"] if part))
-    variants.append(track)
     return unique_nonempty(variants)
 
 
