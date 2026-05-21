@@ -95,8 +95,12 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
     global _last_search_created_at
     payload = {
         "searchText": query,
+        "searchTimeout": timeout_seconds * 1000,
         "timeout": timeout_seconds * 1000,
+        "fileLimit": 10000,
+        "responseLimit": 250,
         "filterResponses": True,
+        "maximumPeerQueueLength": 1000000,
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
     }
