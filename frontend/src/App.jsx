@@ -133,6 +133,7 @@ function App() {
   const syncToastTaskIds = useRef(new Set());
   const checkFileTaskIds = useRef(new Set());
   const localNotificationCounter = useRef(0);
+  const onlineStateRef = useRef(typeof navigator === "undefined" ? true : navigator.onLine);
 
   const theme = dark ? "app dark" : "app";
   const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
@@ -180,6 +181,27 @@ function App() {
     const timeout = window.setTimeout(() => setToast(null), 5200);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => {
+    const handleOffline = () => {
+      if (onlineStateRef.current === false) return;
+      onlineStateRef.current = false;
+      notify("Offline", "Connection lost.", "ui_warning");
+    };
+    const handleOnline = () => {
+      if (onlineStateRef.current === true) return;
+      onlineStateRef.current = true;
+      notify("Back online", "Connection restored.", "ui_notice");
+      if (token) refreshAll();
+    };
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("online", handleOnline);
+    if (typeof navigator !== "undefined" && navigator.onLine === false) handleOffline();
+    return () => {
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("online", handleOnline);
+    };
+  }, [token]);
 
   useEffect(() => {
     if (!token) return;
@@ -2088,7 +2110,11 @@ function ApprovalNode({
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
   const statusMeta = itemStatusMeta(item);
-  const downloadProgress = item.kind === "download" ? downloadStatusProgress(statusMeta) : null;
+  const hasDownloadCandidateChildren = children.some((child) => {
+    const grandchildren = childrenById.get(child.id) || [];
+    return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
+  });
+  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? downloadStatusProgress(statusMeta) : null;
   if (hiddenAlternateCandidate) return null;
 
   function updateChecked(checked) {

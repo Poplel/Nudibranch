@@ -34,6 +34,7 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 5
+REPLACEMENT_SEARCH_RETRY_SECONDS = 15
 TRANSFER_COMPLETE_PERCENT = 99.5
 DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
 DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_removed"}
@@ -1074,14 +1075,28 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -
     root = settings.downloads_path
     if not root.exists():
         return {"imported": 0, "errors": []}
-    imported = 0
     errors: list[str] = []
     manifest_result = import_manifest_download_batches(session, minimum_age_seconds)
-    imported += manifest_result["imported"]
+    manifest_imported = manifest_result["imported"]
     errors.extend(manifest_result["errors"])
     manifest_waiting = manifest_result.get("waiting", 0)
     manifest_ready = manifest_result.get("ready", 0)
     manifest_failed = manifest_result.get("failed", 0)
+    if manifest_imported:
+        session.flush()
+        create_notification(
+            session,
+            title="Downloaded album imported",
+            body=f"{manifest_imported} tracks were added to the library.",
+            event_type="tool_completed",
+            target_url="/library",
+        )
+        append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
+        enqueue_task(session, "jellyfin_scan", {})
+        return {"imported": manifest_imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+    if manifest_waiting or manifest_ready or manifest_failed:
+        return {"imported": 0, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+    imported = 0
     now = time.time()
     known_paths = existing_library_and_proposal_paths(session)
     for file_path in sorted(root.rglob("*")):
@@ -1159,11 +1174,6 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
-    revived_items = revive_exhausted_slskd_downloads(session, batch)
-    if revived_items:
-        append_task_log(session, None, f"Download batch {batch.title}: revived {revived_items} exhausted slskd item(s) for another automatic search")
-        batch.status = ProposalStatus.executing
-        session.flush()
     blocking_items = selected_download_blockers(batch)
     if blocking_items:
         for item in blocking_items:
@@ -1338,36 +1348,6 @@ def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
         elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
             blockers.append(item)
     return blockers
-
-
-def revive_exhausted_slskd_downloads(session: Session, batch: ProposalBatch) -> int:
-    revived = 0
-    for item in batch.items:
-        if not item.selected or item.kind != ProposalKind.download or item.status != ProposalStatus.failed:
-            continue
-        payload = json.loads(item.payload_json or "{}")
-        request = payload.get("request") or {}
-        if payload.get("action") != "queue_download" or not payload.get("auto_retry_exhausted"):
-            continue
-        retry_started = retry_download_entry(
-            session,
-            batch,
-            {
-                "batch_id": item.batch_id,
-                "item_id": item.id,
-                "parent_id": item.parent_id,
-                "request": request,
-                "candidate": payload.get("candidate") or {},
-                "failed_candidates": [],
-                "basename": remote_basename((payload.get("candidate") or {}).get("filename") or ""),
-                "queued_at": datetime.now(timezone.utc).isoformat(),
-            },
-            item,
-            "starting a fresh automatic slskd search cycle",
-        )
-        if retry_started:
-            revived += 1
-    return revived
 
 
 def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
@@ -1586,6 +1566,8 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
         status = transfer.get("status") if transfer else None
         return f"transfer failed: {error or status or 'unknown error'}"
     age = manifest_entry_age_seconds(entry)
+    if entry.get("status") == "retrying" and age >= REPLACEMENT_SEARCH_RETRY_SECONDS:
+        return str(entry.get("retry_reason") or "continuing automatic replacement search")
     if transfer_is_complete_or_finishing(transfer):
         if age >= COMPLETED_MISSING_FILE_RETRY_SECONDS:
             return "slskd reported complete but the file was not found"
@@ -1624,7 +1606,7 @@ def queued_transfer_retry_seconds(entry: dict) -> int:
 
 
 def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str, transfer: dict | None = None) -> bool:
-    retry_count = int(entry.get("retry_count") or 0)
+    retry_count = max(0, min(int(entry.get("retry_count") or 0), MAX_DOWNLOAD_AUTO_RETRIES))
     current_candidate = entry.get("candidate") or {}
     failed_candidates = manifest_failed_candidates(entry)
     if current_candidate:
@@ -1635,6 +1617,8 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
                 "reason": reason,
             }
         )
+    if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+        return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
     set_download_item_status(item, f"{reason}; searching for another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
@@ -1656,8 +1640,6 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         "warning",
     )
     cancel_existing_slskd_transfer(session, transfer, item, reason)
-    if retry_count > MAX_DOWNLOAD_AUTO_RETRIES:
-        return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     try:
         search_result = search_slskd_for_request(session, request, limit=8)
         candidates = filter_ignored_candidates(search_result.get("candidates") or [], failed_candidates)
