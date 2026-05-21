@@ -90,6 +90,9 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
     payload = {
         "searchText": query,
         "timeout": timeout_seconds * 1000,
+        "filterResponses": True,
+        "minimumResponseFileCount": 1,
+        "minimumPeerUploadSpeed": 0,
     }
     response = client.post("/api/v0/searches", json=payload)
     if response.status_code in {400, 415, 422}:

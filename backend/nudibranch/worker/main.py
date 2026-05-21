@@ -339,31 +339,36 @@ def add_track_search_candidate_items(
     slskd_url = settings.get("slskd_url", "")
     api_key = settings.get("slskd_api_key", "")
     added = 0
-    workers = min(3, len(jobs))
-    append_task_log(session, task, f"Searching {len(jobs)} track candidate set(s) with {workers} worker(s)")
+    prepared_jobs = [(request, track_item.id, track_item.title, query, limit) for request, track_item, query, limit in jobs]
+    workers = min(3, len(prepared_jobs))
+    append_task_log(session, task, f"Searching {len(prepared_jobs)} track candidate set(s) with {workers} worker(s)")
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, {**request, "multiple_candidates": True}, limit): (request, track_item, query)
-            for request, track_item, query, limit in jobs
+            executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, {**request, "multiple_candidates": True}, limit): (request, track_item_id, track_title, query)
+            for request, track_item_id, track_title, query, limit in prepared_jobs
         }
         for future in as_completed(futures):
-            request, track_item, query = futures[future]
+            request, track_item_id, track_title, query = futures[future]
             try:
                 result = future.result()
             except Exception as error:  # noqa: BLE001 - one failed search should leave the rest of the review usable.
                 result = {"candidates": [], "diagnostics": {"query_logs": [f"slskd track search failed for {query}: {error}"]}}
             for line in result.get("diagnostics", {}).get("query_logs") or []:
                 append_task_log(session, task, line)
+            track_item = session.get(ProposalItem, track_item_id)
+            if not track_item:
+                append_task_log(session, task, f"{track_title}: skipped candidate results because the review row was removed", "warning")
+                continue
             candidates = result.get("candidates") or []
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
                 added += len(candidates[:5])
                 set_item_payload_status(track_item, f"{len(candidates[:5])} candidates ready")
-                append_task_log(session, task, f"{track_item.title}: {len(candidates[:5])} track candidate(s) ready")
+                append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
             else:
                 set_item_payload_status(track_item, "no slskd candidates found")
                 add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_item.title}: no slskd candidates found; YouTube fallback left unselected", "warning")
+                append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
             session.commit()
     return added
 
@@ -3393,19 +3398,22 @@ def download_query_variants(request: dict) -> list[str]:
     album = str(request.get("album") or "").strip()
     track = str(request.get("track") or request.get("title") or "").strip()
     album_values = text_search_values(album)
-    track_values = text_search_values(track)[:3]
+    track_values = text_search_values(track)[:4]
     variants = []
-    for album_value in album_values:
-        variants.append(" ".join(part for part in [album_value, track] if part))
-        variants.append(" ".join(part for part in [album_value, track, "flac"] if part))
-    variants.append(track)
-    for track_value in track_values:
-        variants.append(" ".join(part for part in [artist, track_value] if part))
-        variants.append(f"{artist} - {track_value}".strip(" -"))
     for album_value in album_values:
         for track_value in track_values:
             variants.append(" ".join(part for part in [artist, album_value, track_value] if part))
             variants.append(" ".join(part for part in [artist, album_value, track_value, "flac"] if part))
+    variants.extend(
+        [
+            " ".join(part for part in [artist, track] if part),
+            f"{artist} - {track}".strip(" -"),
+        ]
+    )
+    for album_value in album_values:
+        variants.append(" ".join(part for part in [album_value, track] if part))
+        variants.append(" ".join(part for part in [album_value, track, "flac"] if part))
+    variants.append(track)
     return unique_nonempty(variants)
 
 
