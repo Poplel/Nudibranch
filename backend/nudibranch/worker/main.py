@@ -41,6 +41,7 @@ DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_remove
 DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
 DOWNLOAD_SLOT_STATUSES = {"queued", "downloading"}
 DOWNLOAD_SLOT_STALE_SECONDS = 75
+DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
 SLSKD_TRACK_SEARCH_WORKERS = 1
@@ -883,14 +884,14 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
             append_task_log(session, task, f"{item.title}: queueing candidate {label}")
             result = queue_slskd_download(slskd_url, api_key, candidate)
             record_download_manifest_entry(request, candidate, item)
-            set_download_item_status(item, "downloading: initialized in slskd")
+            set_download_item_status(item, "queued in slskd; waiting for transfer state")
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
-                set_download_item_status(candidate_item, "downloading: initialized in slskd")
+                set_download_item_status(candidate_item, "queued in slskd; waiting for transfer state")
                 item.title = candidate_item.title
                 item.new_value = candidate_item.new_value
                 item.payload_json = candidate_item.payload_json
-            append_task_log(session, task, f"{item.title}: slskd accepted candidate {label}; download initialized")
+            append_task_log(session, task, f"{item.title}: slskd accepted candidate {label}; waiting for transfer progress")
             return result
         except Exception as error:  # noqa: BLE001 - try the next available candidate for this track.
             attempts.append(f"{label}: {error}")
@@ -1047,7 +1048,7 @@ def record_download_manifest_entry(request: dict, candidate: dict, item: Proposa
             "basename": remote_basename(filename),
             "initialized_at": datetime.now(timezone.utc).isoformat(),
             "queued_at": datetime.now(timezone.utc).isoformat(),
-            "status": "downloading",
+            "status": "queued",
         }
     )
     save_download_manifest(entries[-500:])
@@ -1088,6 +1089,10 @@ def update_download_manifest_entry(target: dict, status: str, **fields: object) 
             entry.update(fields)
             break
     save_download_manifest(entries)
+
+
+def remove_download_manifest_entry(target: dict) -> None:
+    save_download_manifest([entry for entry in load_download_manifest() if entry != target and not same_manifest_entry(entry, target)])
 
 
 def same_manifest_entry(entry: dict, target: dict) -> bool:
@@ -1256,6 +1261,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         return {"imported": 0, "errors": []}
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
+    entries = defer_excess_download_slot_entries(session, batch, entries)
     manifest_item_ids = {entry.get("item_id") for entry in entries}
     if not expected_item_ids.issubset(manifest_item_ids):
         available_slots = download_slots_available(session, load_download_manifest())
@@ -1263,6 +1269,9 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         waiting_missing = 0
         for item_id in sorted(expected_item_ids - manifest_item_ids):
             item = session.get(ProposalItem, item_id)
+            if item and reconnect_existing_slskd_transfer(session, item):
+                queued_missing += 1
+                continue
             if available_slots <= 0:
                 set_download_item_status(item, "waiting for download slot")
                 waiting_missing += 1
@@ -1419,6 +1428,44 @@ def reconcile_manifest_entries_to_selected_items(session: Session, batch: Propos
     return reconciled
 
 
+def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, entries: list[dict]) -> list[dict]:
+    limit = slskd_concurrent_download_limit(session)
+    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
+    if transfer_error_message:
+        return entries
+    active_pairs = [
+        (entry, transfer)
+        for entry in entries
+        if entry.get("status") in DOWNLOAD_SLOT_STATUSES
+        for transfer in [transfer_lookup.get(manifest_entry_key(entry))]
+        if transfer_holds_download_slot(transfer)
+    ]
+    if len(active_pairs) <= limit:
+        return entries
+    started_pairs = [(entry, transfer) for entry, transfer in active_pairs if transfer_has_started(transfer)]
+    waiting_pairs = sorted(
+        [(entry, transfer) for entry, transfer in active_pairs if not transfer_has_started(transfer)],
+        key=lambda pair: str(pair[0].get("queued_at") or pair[0].get("initialized_at") or ""),
+    )
+    keep_ids = {id(entry) for entry, _transfer in started_pairs}
+    remaining_capacity = max(0, limit - len(started_pairs))
+    keep_ids.update(id(entry) for entry, _transfer in waiting_pairs[:remaining_capacity])
+    deferred: set[int] = set()
+    for entry, transfer in waiting_pairs[remaining_capacity:]:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        reason = f"download slot limit {limit} reached"
+        if not item or not cancel_existing_slskd_transfer(session, transfer, item, reason):
+            continue
+        remove_download_manifest_entry(entry)
+        set_download_item_status(item, "waiting for download slot")
+        append_task_log(session, None, f"{entry_download_label(entry)}: deferred queued slskd transfer because {reason}")
+        deferred.add(id(entry))
+    if deferred:
+        batch.status = ProposalStatus.executing
+        session.flush()
+    return [entry for entry in entries if id(entry) not in deferred or id(entry) in keep_ids]
+
+
 def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
     blockers = []
     for item in batch.items:
@@ -1476,16 +1523,60 @@ def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item
         )
 
 
-def slskd_transfer_lookup(session: Session, entries: list[dict]) -> tuple[dict[tuple[str, str, str], dict], str | None]:
+def reconnect_existing_slskd_transfer(session: Session, item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download":
+        return False
+    request = payload.get("request") or {}
+    candidate = payload.get("candidate") or {}
+    if not request or not candidate:
+        return False
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        append_task_log(session, None, f"{item.title}: could not inspect slskd before recreating queue record: {transfer_error_message}", "warning")
+        return False
+    entry = {
+        "batch_id": item.batch_id,
+        "item_id": item.id,
+        "parent_id": item.parent_id,
+        "request": request,
+        "candidate": {
+            "username": candidate.get("username"),
+            "filename": candidate.get("filename"),
+            "folder": candidate.get("folder"),
+        },
+        "basename": remote_basename(candidate.get("filename") or ""),
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "initialized_at": datetime.now(timezone.utc).isoformat(),
+        "status": "queued",
+    }
+    transfer = matching_download_transfer(entry, transfers)
+    if not transfer or transfer_is_failed(transfer):
+        return False
+    record_download_manifest_entry(request, candidate, item)
+    update_manifest_transfer_tracking(entry, transfer)
+    set_download_item_status(item, transfer_wait_status(entry, transfer, "reconnected to existing slskd transfer"))
+    item.status = ProposalStatus.executing
+    append_task_log(session, None, f"{item.title}: existing slskd transfer found; queue record recreated without requeueing")
+    return True
+
+
+def slskd_download_transfer_list(session: Session) -> tuple[list[dict], str | None]:
     settings = integration_settings(session)
     slskd_url = settings.get("slskd_url", "")
     api_key = settings.get("slskd_api_key", "")
     if not slskd_url or not api_key:
-        return {}, "slskd settings are missing"
+        return [], "slskd settings are missing"
     try:
-        transfers = download_transfers(slskd_url, api_key)
+        return download_transfers(slskd_url, api_key), None
     except Exception as error:  # noqa: BLE001 - folder scans can still catch completed files.
-        return {}, f"slskd transfer status unavailable: {error}"
+        return [], f"slskd transfer status unavailable: {error}"
+
+
+def slskd_transfer_lookup(session: Session, entries: list[dict]) -> tuple[dict[tuple[str, str, str], dict], str | None]:
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        return {}, transfer_error_message
     lookup: dict[tuple[str, str, str], dict] = {}
     for entry in entries:
         transfer = matching_download_transfer(entry, transfers)
@@ -1696,11 +1787,32 @@ def slskd_concurrent_download_limit(session: Session) -> int:
     return max(1, min(limit, 12))
 
 
-def active_download_slot_count(entries: list[dict]) -> int:
-    return sum(1 for entry in entries if manifest_entry_uses_download_slot(entry))
+def active_download_slot_count(session: Session, entries: list[dict]) -> int:
+    slot_entries = [entry for entry in entries if entry.get("status") in DOWNLOAD_SLOT_STATUSES]
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        append_task_log(session, None, f"{transfer_error_message}; preserving current download slots", "warning")
+        return sum(1 for entry in slot_entries if manifest_entry_uses_recent_download_slot(entry))
+    transfer_lookup: dict[tuple[str, str, str], dict] = {}
+    for entry in slot_entries:
+        transfer = matching_download_transfer(entry, transfers)
+        if transfer:
+            transfer_lookup[manifest_entry_key(entry)] = transfer
+    global_active = sum(1 for transfer in transfers if transfer_holds_download_slot(transfer))
+    active = 0
+    for entry in slot_entries:
+        transfer = transfer_lookup.get(manifest_entry_key(entry))
+        if transfer:
+            update_manifest_transfer_tracking(entry, transfer)
+            if transfer_holds_download_slot(transfer):
+                active += 1
+            continue
+        if manifest_entry_waiting_for_slskd_record(entry):
+            active += 1
+    return max(active, global_active)
 
 
-def manifest_entry_uses_download_slot(entry: dict) -> bool:
+def manifest_entry_uses_recent_download_slot(entry: dict) -> bool:
     if entry.get("status") not in DOWNLOAD_SLOT_STATUSES:
         return False
     last_seen_age = manifest_seconds_since(entry.get("last_transfer_seen_at"))
@@ -1709,8 +1821,24 @@ def manifest_entry_uses_download_slot(entry: dict) -> bool:
     return manifest_entry_age_seconds(entry) <= DOWNLOAD_SLOT_STALE_SECONDS
 
 
+def manifest_entry_waiting_for_slskd_record(entry: dict) -> bool:
+    initialized_age = manifest_seconds_since(entry.get("initialized_at"))
+    if initialized_age is not None:
+        return initialized_age <= DOWNLOAD_SLOT_PENDING_RECORD_SECONDS
+    return manifest_entry_age_seconds(entry) <= DOWNLOAD_SLOT_PENDING_RECORD_SECONDS
+
+
+def transfer_holds_download_slot(transfer: dict | None) -> bool:
+    if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
+        return False
+    status = str(transfer.get("status") or "").casefold()
+    if transfer_has_started(transfer) or transfer_is_queued_or_waiting(transfer):
+        return True
+    return bool(status and not any(token in status for token in ("complete", "succeeded", "fail", "error", "cancel", "abort", "reject", "timeout")))
+
+
 def download_slots_available(session: Session, entries: list[dict]) -> int:
-    return max(0, slskd_concurrent_download_limit(session) - active_download_slot_count(entries))
+    return max(0, slskd_concurrent_download_limit(session) - active_download_slot_count(session, entries))
 
 
 def queue_existing_retry_candidate(
@@ -1737,7 +1865,7 @@ def queue_existing_retry_candidate(
                     "request": request,
                     "candidate": candidate,
                     "failed_candidates": failed_candidates[-25:],
-                    "status": f"existing alternate candidate initialized ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
+                    "status": f"existing alternate candidate queued ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
                     "auto_retry_exhausted": False,
                 }
             )
@@ -1753,14 +1881,14 @@ def queue_existing_retry_candidate(
                     "item_id": item.id,
                     "basename": remote_basename(candidate.get("filename") or ""),
                 },
-                "downloading",
+                "queued",
                 retry_count=retry_count,
                 failed_candidates=failed_candidates[-25:],
                 queued_at=datetime.now(timezone.utc).isoformat(),
                 initialized_at=datetime.now(timezone.utc).isoformat(),
             )
-            set_download_item_status(item, f"downloading: existing alternate initialized in slskd ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
-            append_task_log(session, None, f"{item.title}: existing alternate candidate initialized after {reason}")
+            set_download_item_status(item, f"queued in slskd: existing alternate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+            append_task_log(session, None, f"{item.title}: existing alternate candidate queued after {reason}")
             return True
         except Exception as error:  # noqa: BLE001 - keep walking the already reviewed alternates.
             failed_candidates.append(
@@ -1870,14 +1998,14 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
                 "item_id": item.id,
                 "basename": remote_basename(candidate.get("filename") or ""),
             },
-            "downloading",
+            "queued",
             retry_count=retry_count,
             failed_candidates=failed_candidates[-25:],
             queued_at=datetime.now(timezone.utc).isoformat(),
             initialized_at=datetime.now(timezone.utc).isoformat(),
         )
-        set_download_item_status(item, f"downloading: replacement initialized in slskd ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
-        append_task_log(session, None, f"{item.title}: replacement candidate initialized after {reason}")
+        set_download_item_status(item, f"queued in slskd: replacement candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate queued after {reason}")
         return True
     except Exception as error:  # noqa: BLE001 - immediately try again on the next scan without duplicating rows.
         failed_candidates.append(
@@ -1903,19 +2031,21 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         return True
 
 
-def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item: ProposalItem, reason: str) -> None:
+def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item: ProposalItem, reason: str) -> bool:
     if not transfer:
-        return
+        return False
     transfer_id = str(transfer.get("id") or "")
     username = str(transfer.get("username") or "")
     if not transfer_id or not username:
-        return
+        return False
     settings = integration_settings(session)
     try:
         if cancel_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), username, transfer_id, remove=True):
             append_task_log(session, None, f"{item.title}: cancelled previous slskd transfer before retrying: {reason}", "warning")
+            return True
     except Exception as error:  # noqa: BLE001 - retry can still proceed if slskd already removed the record.
         append_task_log(session, None, f"{item.title}: could not cancel previous slskd transfer before retrying: {error}", "warning")
+    return False
 
 
 def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:
@@ -2026,7 +2156,7 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Pat
         if now - stat.st_mtime < minimum_age_seconds:
             return None, "downloaded; settling before verification"
         return file_path, "downloaded; ready for verification"
-    return None, "download initialized; checking slskd transfer"
+    return None, "queued in slskd; checking transfer state"
 
 
 def manifest_wait_status(entry: dict, wait_status: str) -> str:
@@ -2091,8 +2221,12 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             status = f"downloading {average_progress:.0f}% · {downloaded} of {total} staged"
         elif average_progress > 0:
             status = f"downloading {average_progress:.0f}% · 0 of {total} staged"
+        elif any("waiting for download slot" in status for status in statuses):
+            status = f"waiting for download slot · 0 of {total} staged"
+        elif any("queued in slskd" in status or "download queued in slskd" in status for status in statuses):
+            status = f"queued in slskd · 0 of {total} staged"
         else:
-            status = f"download initialized · 0 of {total} staged"
+            status = f"waiting for transfer progress · 0 of {total} staged"
         set_item_payload_status(item, status)
 
 
@@ -4977,7 +5111,7 @@ async def worker_loop() -> None:
                             append_task_log(
                                 session,
                                 None,
-                                f"Download scan checked {scan_result.get('waiting', 0)} downloading, {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
+                                f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
                             )
                             last_download_scan_summary = summary
                             last_download_scan_log = now
