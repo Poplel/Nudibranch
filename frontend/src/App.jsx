@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  Compass,
   Database,
   Download,
   FileAudio,
@@ -49,6 +50,7 @@ const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint
 
 const navItems = [
   ["Library", Music],
+  ["Discover", Compass],
   ["Import/Add", HardDriveUpload],
   ["Wishlist", Sparkles],
   ["Task Queue", ListChecks],
@@ -62,6 +64,7 @@ const navItems = [
 
 const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the managed library.",
+  Discover: "Search MusicBrainz for artists, albums, and tracks to request or queue.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
   Wishlist: "Request music and track each item through approval and download.",
   "Wishlist Approvals": "Review user wishlist requests and choose what moves to the task queue.",
@@ -798,6 +801,35 @@ function App() {
     }
   }
 
+  async function searchDiscover(query) {
+    return api(`/discover/search?q=${encodeURIComponent(query)}`);
+  }
+
+  async function queueDiscoverDownloads(downloadRequests) {
+    setLoading(true);
+    setError("");
+    try {
+      const task = await api("/discover/task-queue", {
+        method: "POST",
+        body: JSON.stringify({ download_requests: downloadRequests }),
+      });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Discover queued", body: `${downloadRequests.length} download request${downloadRequests.length === 1 ? "" : "s"} added to the task queue.` });
+      setPage("Task Queue");
+      window.setTimeout(() => {
+        refreshApprovals();
+        refreshTasks();
+      }, 2500);
+      return task;
+    } catch (discoverError) {
+      setError(discoverError.message);
+      notify("Discover failed", discoverError.message, "ui_error");
+      throw discoverError;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function scanImportFolder() {
     setLoading(true);
     setError("");
@@ -1386,6 +1418,14 @@ function App() {
                 onQueue={addTracksToPlayerQueue}
               />
             )}
+            {page === "Discover" && (
+              <DiscoverView
+                user={user}
+                onSearch={searchDiscover}
+                onWishlist={createWishlistItem}
+                onQueue={queueDiscoverDownloads}
+              />
+            )}
             {page === "Task Queue" && (
               <Approvals
                 approvals={approvals}
@@ -1489,7 +1529,7 @@ function App() {
                 onUpdateOwnPin={updateOwnPin}
               />
             )}
-            {!["Library", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
+            {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector
@@ -2245,7 +2285,8 @@ function ImportWizard({
   }, [onDownloadRequestsChange]);
 
   function addManualAlbum(album) {
-    setManualAlbums((current) => [...current, album]);
+    if (!album?.artist || !album?.name) return;
+    setManualAlbums((current) => mergeManualAlbums(current, [album]));
     setAlbumRecords((current) => ({
       ...current,
       [albumRecordKey(album.artist, album.name)]: album.tracks,
@@ -2332,7 +2373,8 @@ function AlbumSearchPanel({ onAdd, onLookup, onSearch, initialArtist = "", initi
     event.preventDefault();
     if (!artist.trim() || !album.trim()) return;
     setSearched(true);
-    setResults(await onSearch(artist.trim(), album.trim()));
+    const searchResults = await onSearch(artist.trim(), album.trim());
+    setResults(dedupeAlbumResults(searchResults));
   }
 
   async function addResult(result) {
@@ -2395,6 +2437,159 @@ function AlbumResultArt({ src }) {
     );
   }
   return <img src={src} alt="" onError={() => setFailed(true)} />;
+}
+
+function dedupeAlbumResults(results = []) {
+  const seen = new Set();
+  return results.filter((result) => {
+    if (!result?.title || !result?.artist) return false;
+    const key = `${normalizeName(result.artist)}::${normalizeName(result.title)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function ArtistAvatar({ artist }) {
+  const [failed, setFailed] = useState(false);
+  if (artist?.image_url && !failed) {
+    return <img className="artist-avatar" src={artist.image_url} alt="" onError={() => setFailed(true)} />;
+  }
+  return <span className="artist-avatar">{initials(artist?.name)}</span>;
+}
+
+function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [openArtists, setOpenArtists] = useState(() => new Set());
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const canQueue = hasPermission(user, "downloads:manage");
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!query.trim()) return;
+    setSearching(true);
+    try {
+      const data = await onSearch(query.trim());
+      setResults(data);
+      setOpenArtists(new Set((data.artists || []).map((artist) => artist.id)));
+      const focusAlbum = data.focus?.album_id;
+      if (focusAlbum) setOpenAlbums(new Set([focusAlbum]));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function albumRequests(album) {
+    return (album.tracks || []).map((track) => ({
+      artist: album.artist,
+      album: album.title,
+      track: track.title,
+      track_number: track.track_number,
+      disc_number: track.disc_number,
+      duration_ms: track.length || track.duration_ms,
+      musicbrainz_album_id: album.id,
+      musicbrainz_recording_id: track.musicbrainz_recording_id || track.id,
+    }));
+  }
+
+  async function addAlbumWishlist(album) {
+    await onWishlist({ kind: "album", artist: album.artist, album: album.title, track: null });
+  }
+
+  async function addTrackWishlist(album, track) {
+    await onWishlist({ kind: "track", artist: album.artist, album: album.title, track: track.title });
+  }
+
+  return (
+    <div className="discover-view">
+      <form className="discover-search" onSubmit={submit}>
+        <Search size={17} />
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search artist, album, or track" />
+        <button className="primary" disabled={searching || !query.trim()}>
+          {searching ? "Searching" : "Search"}
+        </button>
+      </form>
+      {!results ? (
+        <EmptyState title="Search MusicBrainz" body="Find an artist, album, or track, then add it to your wishlist or task queue." />
+      ) : (results.artists || []).length === 0 ? (
+        <EmptyState title="No discover results" body="Try a more specific artist, album, or track title." />
+      ) : (
+        <div className="discover-results">
+          {(results.artists || []).map((artist) => (
+            <section className="discover-artist" key={artist.id}>
+              <div className="discover-heading">
+                <button className="row-icon-button" onClick={() => toggleSet(setOpenArtists, artist.id)} title="Toggle artist">
+                  {openArtists.has(artist.id) ? <ChevronDown size={17} /> : <ChevronRight size={17} />}
+                </button>
+                <button className="discover-heading-title" onClick={() => toggleSet(setOpenArtists, artist.id)}>
+                  <ArtistAvatar artist={artist} />
+                  <span>
+                    <strong>{artist.name}</strong>
+                    <small>{artist.disambiguation || `${(artist.albums || []).length} album result${(artist.albums || []).length === 1 ? "" : "s"}`}</small>
+                  </span>
+                </button>
+                <button
+                  className="secondary compact"
+                  onClick={() => onWishlist({ kind: "artist", artist: artist.name, album: null, track: null })}
+                >
+                  <Heart size={15} />
+                  Wishlist
+                </button>
+              </div>
+              {openArtists.has(artist.id) && (
+                <div className="discover-album-list">
+                  {(artist.albums || []).map((album) => (
+                    <div className="discover-album" key={album.id}>
+                      <button className="discover-album-main" onClick={() => toggleSet(setOpenAlbums, album.id)}>
+                        <AlbumResultArt src={album.cover_art_url} />
+                        <span>
+                          <strong>{album.title}</strong>
+                          <small>{[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}</small>
+                        </span>
+                      </button>
+                      <div className="discover-actions">
+                        <button className="secondary compact" onClick={() => addAlbumWishlist(album)}>
+                          <Heart size={15} />
+                          Wishlist
+                        </button>
+                        {canQueue && (
+                          <button className="primary compact-button" onClick={() => onQueue(albumRequests(album))} disabled={(album.tracks || []).length === 0}>
+                            <ListChecks size={15} />
+                            Queue
+                          </button>
+                        )}
+                      </div>
+                      {openAlbums.has(album.id) && (
+                        <div className="discover-track-list">
+                          {(album.tracks || []).map((track, index) => (
+                            <div className="discover-track" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
+                              <span>{trackNumberLabel(track)}</span>
+                              <strong>{track.title}</strong>
+                              <small>{formatDuration(track.length || track.duration_ms)}</small>
+                              <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
+                                <Heart size={15} />
+                              </button>
+                              {canQueue && (
+                                <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks: [track] }))} title="Queue track">
+                                  <ListChecks size={15} />
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
@@ -3034,6 +3229,7 @@ function ImportTree({
                               {
                                 id: `${albumId}:manual:${nextNumber}`,
                                 track_number: nextNumber,
+                                disc_number: 1,
                                 title: `Track ${nextNumber}`,
                                 reason: "Manual slot",
                               },
@@ -3058,7 +3254,7 @@ function ImportTree({
                         />
                       ) : (
                         <GhostTrackRow
-                          key={`${albumId}:${slot.track_number}:${slot.title}`}
+                          key={`${albumId}:${slot.disc_number || 1}:${slot.track_number}:${slot.title}`}
                           slot={slot}
                           checked={downloadSelections.has(slot.id)}
                           onChecked={(checked) => setSingleDownloadSelection(slot.id, checked)}
@@ -3550,6 +3746,7 @@ function hasPermission(user, permission) {
 function canViewPage(user, page) {
   if (!user) return page === "Settings";
   if (page === "Library") return hasPermission(user, "library:read");
+  if (page === "Discover") return hasPermission(user, "wishlist:manage_own");
   if (page === "Import/Add") return hasPermission(user, "import:run");
   if (page === "Wishlist") return hasPermission(user, "wishlist:manage_own");
   if (page === "Task Queue") return hasPermission(user, "approvals:manage");
@@ -3557,13 +3754,37 @@ function canViewPage(user, page) {
   if (page === "Playlists") return hasPermission(user, "playlists:manage");
   if (page === "Activity") return hasPermission(user, "activity:read");
   if (page === "Tools") {
-    return ["jellyfin:manage", "downloads:manage", "library:manage", "backups:manage", "activity:read"].some((permission) =>
+    return ["jellyfin:manage", "downloads:manage", "library:manage", "backups:manage", "activity:read", "settings:manage"].some((permission) =>
       hasPermission(user, permission),
     );
   }
   if (page === "Users") return true;
   if (page === "Settings") return true;
   return false;
+}
+
+function initials(value) {
+  return String(value || "?")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "?";
+}
+
+function trackNumberLabel(track) {
+  const disc = track.disc_number && Number(track.disc_number) > 1 ? `${track.disc_number}.` : "";
+  const number = track.track_number ? String(track.track_number).padStart(2, "0") : "##";
+  return `${disc}${number}`;
+}
+
+function formatDuration(value) {
+  const ms = Number(value || 0);
+  if (!ms) return "";
+  const totalSeconds = Math.round(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
 }
 
 function copyStylesToWindow(targetWindow) {
@@ -3605,7 +3826,7 @@ function GhostTrackRow({ slot, checked, onChecked, onDismiss, onDrop }) {
         Download
       </label>
       <span className="ghost-title">
-        {slot.track_number ? String(slot.track_number).padStart(2, "0") : "#"}-{slot.title}
+        {trackNumberLabel(slot)}-{slot.title}
       </span>
       <small>{slot.reason}</small>
       <button className="row-icon-button" onClick={onDismiss} title="Dismiss slot">
@@ -3630,7 +3851,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
       album.slots.forEach((slot) => {
         if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
         if (isGenericTrackTitle(slot.title)) return;
-        requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number, duration_ms: slot.length || slot.duration_ms });
+        requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number, disc_number: slot.disc_number, duration_ms: slot.length || slot.duration_ms });
       });
     });
   });
@@ -3640,7 +3861,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
     slots.forEach((slot) => {
       if (!downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
       if (isGenericTrackTitle(slot.title)) return;
-      requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number, duration_ms: slot.length || slot.duration_ms });
+      requests.push({ artist: artistName, album: albumName, track: slot.title, track_number: slot.track_number, disc_number: slot.disc_number, duration_ms: slot.length || slot.duration_ms });
     });
   });
   return requests;
@@ -3665,6 +3886,7 @@ function manualAlbumsFromDownloadRequests(requests = []) {
     const entry = albumMap.get(key);
     entry.tracks.push({
       track_number: request.track_number || entry.tracks.length + 1,
+      disc_number: request.disc_number || 1,
       title: request.track || request.title || `Track ${index + 1}`,
     });
   });
@@ -3702,7 +3924,7 @@ function selectedSlotIdsForRequests(grouped, requests = []) {
         const match = requests.some((request) => {
           const sameArtist = normalizeName(request.artist || "Unknown Artist") === normalizeName(artist.name);
           const sameAlbum = normalizeName(request.album || "Singles") === normalizeName(album.name);
-          const sameNumber = request.track_number && Number(request.track_number) === Number(slot.track_number);
+          const sameNumber = request.track_number && Number(request.track_number) === Number(slot.track_number) && Number(request.disc_number || 1) === Number(slot.disc_number || 1);
           const sameTitle = normalizeName(request.track || request.title || "") === normalizeName(slot.title);
           return sameArtist && sameAlbum && (sameNumber || sameTitle);
         });
@@ -3714,7 +3936,7 @@ function selectedSlotIdsForRequests(grouped, requests = []) {
 }
 
 function downloadTrackKey(track) {
-  return `${track.track_number || ""}:${normalizeName(track.title || track.track || "")}`;
+  return `${track.disc_number || 1}:${track.track_number || ""}:${normalizeName(track.title || track.track || "")}`;
 }
 
 function artistGhostSlots(artist, dismissedGhosts) {
@@ -3827,6 +4049,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
     ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
+    ["Clear discover art cache", "Remove cached artist and album artwork used by Discover.", "clear-discover-cache", "settings:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
@@ -5256,18 +5479,22 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
   const trackMap = new Map();
   files.forEach((file) => {
     const trackNumber = file.metadata?.track_number;
-    if (trackNumber && !trackMap.has(trackNumber)) trackMap.set(trackNumber, file);
+    const discNumber = file.metadata?.disc_number || 1;
+    const key = `${discNumber}:${trackNumber}`;
+    if (trackNumber && !trackMap.has(key)) trackMap.set(key, file);
   });
   const usedPaths = new Set();
   const slots = expectedTracks.map((track, index) => {
     const trackNumber = track.track_number || index + 1;
-    const file = trackMap.get(trackNumber);
+    const discNumber = track.disc_number || 1;
+    const file = trackMap.get(`${discNumber}:${trackNumber}`);
     if (file) usedPaths.add(file.path);
     return file
-      ? { id: file.path, track_number: trackNumber, title: file.metadata?.title || track.title, file }
+      ? { id: file.path, track_number: trackNumber, disc_number: discNumber, title: file.metadata?.title || track.title, file }
       : {
-          id: `${artistName}:${album.name}:${trackNumber}:${track.title}`,
+          id: `${artistName}:${album.name}:${discNumber}:${trackNumber}:${track.title}`,
           track_number: trackNumber,
+          disc_number: discNumber,
           title: track.title || `Track ${trackNumber}`,
           reason: recordTracks ? "Missing from album record" : libraryAlbum ? "Missing from import" : "Album slot",
         };
@@ -5278,6 +5505,7 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
     slots.push({
       id: file.path,
       track_number: trackNumber,
+      disc_number: file.metadata?.disc_number || 1,
       title: file.metadata?.title || `Track ${trackNumber}`,
       file,
       unmatched: true,

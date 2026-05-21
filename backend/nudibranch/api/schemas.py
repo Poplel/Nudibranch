@@ -271,6 +271,10 @@ class AlbumLookupRequest(BaseModel):
     release_id: str | None = None
 
 
+class DiscoverTaskQueueRequest(BaseModel):
+    download_requests: list[dict[str, Any]] = Field(min_length=1)
+
+
 class LibraryMetadataProposalRequest(BaseModel):
     target_type: str = Field(pattern="^(artist|album|track)$")
     target_id: str

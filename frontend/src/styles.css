@@ -876,6 +876,135 @@ nav button:hover,
   font-size: 12px;
 }
 
+.discover-view {
+  display: grid;
+  gap: 12px;
+}
+
+.discover-search {
+  display: grid;
+  grid-template-columns: 20px minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.discover-search input {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.discover-results,
+.discover-album-list,
+.discover-track-list {
+  display: grid;
+  gap: 8px;
+}
+
+.discover-artist,
+.discover-album {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+}
+
+.discover-heading {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+}
+
+.discover-heading-title,
+.discover-album-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.discover-heading-title strong,
+.discover-heading-title small,
+.discover-album-main strong,
+.discover-album-main small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discover-heading-title small,
+.discover-album-main small,
+.discover-track small {
+  color: var(--muted);
+}
+
+.artist-avatar {
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 700;
+  object-fit: cover;
+}
+
+.discover-album-list {
+  padding: 0 8px 8px 48px;
+}
+
+.discover-album {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+}
+
+.discover-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.discover-track-list {
+  grid-column: 1 / -1;
+  padding-left: 62px;
+}
+
+.discover-track {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 64px 32px 32px;
+  gap: 8px;
+  align-items: center;
+  min-height: 36px;
+  border-top: 1px solid var(--line);
+}
+
+.discover-track strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tree-action-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -2305,9 +2434,18 @@ nav button:hover,
   }
 
   .ghost-track-row,
+  .discover-search,
+  .discover-heading,
+  .discover-album,
+  .discover-track,
   .album-search-panel,
   .metadata-editor {
     grid-template-columns: 1fr;
+  }
+
+  .discover-album-list,
+  .discover-track-list {
+    padding-left: 0;
   }
 
   .metadata-add-row {

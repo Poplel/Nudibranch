@@ -19,7 +19,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import itunes_album_artwork, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed
@@ -40,6 +40,7 @@ DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "stage
 DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_removed"}
 DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
 DOWNLOAD_SLOT_STATUSES = {"queued", "downloading"}
+DOWNLOAD_SLOT_STALE_SECONDS = 75
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 MIN_SLSKD_ALBUM_CONTEXT_CONFIDENCE = 0.45
 SLSKD_TRACK_SEARCH_WORKERS = 1
@@ -1696,7 +1697,16 @@ def slskd_concurrent_download_limit(session: Session) -> int:
 
 
 def active_download_slot_count(entries: list[dict]) -> int:
-    return sum(1 for entry in entries if entry.get("status") in DOWNLOAD_SLOT_STATUSES)
+    return sum(1 for entry in entries if manifest_entry_uses_download_slot(entry))
+
+
+def manifest_entry_uses_download_slot(entry: dict) -> bool:
+    if entry.get("status") not in DOWNLOAD_SLOT_STATUSES:
+        return False
+    last_seen_age = manifest_seconds_since(entry.get("last_transfer_seen_at"))
+    if last_seen_age is not None:
+        return last_seen_age <= DOWNLOAD_SLOT_STALE_SECONDS
+    return manifest_entry_age_seconds(entry) <= DOWNLOAD_SLOT_STALE_SECONDS
 
 
 def download_slots_available(session: Session, entries: list[dict]) -> int:
@@ -3985,6 +3995,12 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
     return {"requested": True}
 
 
+def run_clear_discover_cache(session: Session, _payload: dict) -> dict:
+    removed = clear_discover_art_cache()
+    create_notification(session, title="Discover cache cleared", body=f"{removed} cached file(s) removed.", event_type="tool_completed", target_url="/tools")
+    return {"removed": removed}
+
+
 def run_check_files(session: Session, _payload: dict) -> dict:
     settings = get_settings()
     library_root = settings.library_path.resolve()
@@ -4921,6 +4937,7 @@ TASK_HANDLERS = {
     "process_wishlist": run_process_wishlist,
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
     "jellyfin_scan": run_jellyfin_scan,
+    "clear_discover_cache": run_clear_discover_cache,
     "check_files": run_check_files,
     "check_lyrics": run_check_lyrics,
     "check_album_covers": run_check_album_covers,
@@ -5033,6 +5050,7 @@ def task_notification_title(task_type: str) -> str:
         "restore_default": "Restore",
         "restore_backup": "Restore",
         "clear_downloads": "Clear downloads",
+        "clear_discover_cache": "Clear discover cache",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
@@ -5043,7 +5061,7 @@ def task_target_url(task_type: str) -> str:
         return "/import"
     if task_type in {"sync_favorites_jellyfin"}:
         return "/playlists"
-    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads"}:
+    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
         return "/tools"
     return "/activity"
 

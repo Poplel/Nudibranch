@@ -17,6 +17,7 @@ from nudibranch.api.schemas import (
     BackupRestoreRequest,
     CheckFileFixRequest,
     DeviceRegistration,
+    DiscoverTaskQueueRequest,
     FavoritesOut,
     ImportMusicBrainzLookupRequest,
     IntegrationSettings,
@@ -79,7 +80,7 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.app_log import tail_app_log
-from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
+from nudibranch.services.metadata_lookup import cache_discover_art, discover_music, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.settings_store import integration_settings, update_integration_settings
@@ -812,6 +813,48 @@ def album_search(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
+@router.get("/discover/search", tags=["discover"])
+def discover_search(
+    q: str = Query(min_length=1, max_length=180),
+    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+) -> dict:
+    try:
+        return with_cached_discover_art(discover_music(q))
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
+
+
+@router.get("/discover/art/{filename}", tags=["discover"])
+def discover_art(filename: str, _: User = Depends(require_permission(Permission.wishlist_manage_own))) -> FileResponse:
+    safe_name = Path(filename).name
+    path = get_settings().config_path / "discover-art-cache" / safe_name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Cached artwork not found")
+    return FileResponse(path)
+
+
+@router.post("/discover/task-queue", response_model=TaskOut, tags=["discover"])
+def discover_task_queue(
+    payload: DiscoverTaskQueueRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.downloads_manage)),
+) -> TaskOut:
+    task = enqueue_task(session, "propose_import", {"path": None, "files": [], "download_requests": payload.download_requests})
+    return serialize_task(task)
+
+
+def with_cached_discover_art(payload: dict) -> dict:
+    for artist in payload.get("artists") or []:
+        artist["image_url"] = cache_discover_art(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
+        for album in artist.get("albums") or []:
+            album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+    for album in payload.get("albums") or []:
+        album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+    return payload
+
+
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"])
 def list_wishlist(
     session: Session = Depends(get_session),
@@ -1271,6 +1314,14 @@ def tool_jellyfin_scan(
     _: User = Depends(require_permission(Permission.jellyfin_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
+
+
+@router.post("/tools/clear-discover-cache", response_model=TaskOut, tags=["tools"])
+def tool_clear_discover_cache(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "clear_discover_cache", {}))
 
 
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"])
