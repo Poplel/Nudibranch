@@ -367,8 +367,7 @@ def add_track_search_candidate_items(
                 append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
             else:
                 set_item_payload_status(track_item, "no slskd candidates found")
-                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
+                append_task_log(session, task, f"{track_title}: no slskd candidates found", "warning")
             session.commit()
     return added
 
@@ -2556,8 +2555,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     retry_tracks += 1
                     status = "slskd rate limited; no candidate yet" if search_result.get("diagnostics", {}).get("rate_limited") else "no slskd candidate found"
                     set_item_payload_status(track_item, status)
-                    append_task_log(session, task, f"{track_title}: {status}; YouTube fallback left unselected", "warning")
-                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
+                    append_task_log(session, task, f"{track_title}: {status}", "warning")
                 completed_tracks += 1
                 session.commit()
                 if task is not None:
