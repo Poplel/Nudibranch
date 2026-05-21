@@ -1,8 +1,13 @@
 import time
+from threading import Lock
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+SLSKD_SEARCH_CREATE_INTERVAL_SECONDS = 1.25
+_search_create_lock = Lock()
+_last_search_created_at = 0.0
 
 
 def slskd_headers(api_key: str) -> dict[str, str]:
@@ -87,6 +92,7 @@ def search_slskd_detailed(
 
 
 def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> httpx.Response:
+    global _last_search_created_at
     payload = {
         "searchText": query,
         "timeout": timeout_seconds * 1000,
@@ -94,9 +100,25 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
     }
-    response = client.post("/api/v0/searches", json=payload)
-    if response.status_code in {400, 415, 422}:
-        return client.post("/api/v0/searches", json={"searchText": query})
+    response: httpx.Response | None = None
+    for attempt in range(5):
+        with _search_create_lock:
+            elapsed = time.monotonic() - _last_search_created_at
+            if elapsed < SLSKD_SEARCH_CREATE_INTERVAL_SECONDS:
+                time.sleep(SLSKD_SEARCH_CREATE_INTERVAL_SECONDS - elapsed)
+            response = client.post("/api/v0/searches", json=payload)
+            _last_search_created_at = time.monotonic()
+            if response.status_code in {400, 415, 422}:
+                elapsed = time.monotonic() - _last_search_created_at
+                if elapsed < SLSKD_SEARCH_CREATE_INTERVAL_SECONDS:
+                    time.sleep(SLSKD_SEARCH_CREATE_INTERVAL_SECONDS - elapsed)
+                response = client.post("/api/v0/searches", json={"searchText": query})
+                _last_search_created_at = time.monotonic()
+        if response.status_code != 429 or attempt == 4:
+            return response
+        time.sleep(min(12.0, 2.5 * (attempt + 1)))
+    if response is None:
+        raise RuntimeError("slskd search could not be created")
     return response
 
 

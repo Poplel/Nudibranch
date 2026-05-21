@@ -3241,7 +3241,7 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
         attempted.append(query)
         query_logs.append(f"slskd track search started: {query}")
         result = None
-        for attempt in range(5):
+        for attempt in range(7):
             try:
                 result = search_slskd_detailed(
                     slskd_url,
@@ -3254,9 +3254,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 )
                 break
             except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
-                if is_rate_limit_error(error) and attempt < 4:
+                if is_rate_limit_error(error) and attempt < 6:
                     rate_limited = True
-                    delay = 1.5 * (attempt + 1)
+                    delay = min(10.0, 2.0 * (attempt + 1))
                     query_logs.append(f"slskd track search rate limited: {query}; retrying in {delay:g}s")
                     time.sleep(delay)
                     continue
@@ -3274,7 +3274,8 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 break
         if result is None:
             if rate_limited:
-                break
+                query_logs.append(f"slskd track search deferred after rate limits: {query}; trying the next query variant")
+                time.sleep(3)
             continue
         result["diagnostics"]["query"] = query
         result["diagnostics"]["queries"] = attempted.copy()
