@@ -3907,7 +3907,10 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         for playlist in playlists:
             jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
             jellyfin_items: list[dict] = []
+            created_jellyfin_playlist = False
             if jellyfin_playlist_id:
+                if playlist.jellyfin_playlist_id != jellyfin_playlist_id:
+                    playlist.jellyfin_playlist_id = jellyfin_playlist_id
                 try:
                     jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
                 except JellyfinPlaylistMissing:
@@ -3924,31 +3927,38 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                     else:
                         jellyfin_playlist_id = None
             if not jellyfin_playlist_id:
-                created = client.post("/Playlists", params={"name": playlist.name, "userId": user_id, "mediaType": "Audio"})
-                created.raise_for_status()
-                jellyfin_playlist_id = created.json().get("Id")
+                created = create_jellyfin_playlist(client, user_id, playlist.name)
+                jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
                 playlist.jellyfin_playlist_id = jellyfin_playlist_id
                 session.flush()
                 jellyfin_items = []
-            local_item_ids = [item_id for item_id in (find_jellyfin_audio_item(client, user_id, entry.track) for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at))) if item_id]
+                created_jellyfin_playlist = True
+            local_item_ids: list[str] = []
+            unmapped_local_tracks: list[str] = []
+            for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at)):
+                item_id = find_jellyfin_audio_item(client, user_id, entry.track)
+                if item_id:
+                    local_item_ids.append(item_id)
+                else:
+                    unmapped_local_tracks.append(entry.track.title)
+                    append_task_log(session, None, f"{playlist.name}: could not find Jellyfin audio item for {entry.track.title}", "warning")
             jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
-            if conflict_winner == "jellyfin" or playlist.name in imported_playlist_names:
+            should_pull_from_jellyfin = (conflict_winner == "jellyfin" and not created_jellyfin_playlist) or playlist.name in imported_playlist_names
+            if should_pull_from_jellyfin:
                 pulled_tracks += sync_playlist_from_jellyfin(session, playlist, jellyfin_items)
             else:
-                removed = remove_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, set(local_item_ids))
-                missing_ids = [item_id for item_id in local_item_ids if item_id not in set(jellyfin_item_ids)]
-                if missing_ids:
+                if unmapped_local_tracks:
+                    append_task_log(session, None, f"{playlist.name}: skipped Jellyfin overwrite because {len(unmapped_local_tracks)} Nudibranch track(s) are not visible in Jellyfin", "warning")
+                elif jellyfin_item_ids != local_item_ids:
                     try:
-                        add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
+                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
                     except JellyfinPlaylistMissing:
                         append_task_log(session, None, f"Jellyfin playlist {playlist.name} disappeared during sync; recreating it", "warning")
-                        created = client.post("/Playlists", params={"name": playlist.name, "userId": user_id, "mediaType": "Audio"})
-                        created.raise_for_status()
-                        jellyfin_playlist_id = created.json().get("Id")
+                        created = create_jellyfin_playlist(client, user_id, playlist.name)
+                        jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
                         playlist.jellyfin_playlist_id = jellyfin_playlist_id
                         session.flush()
-                        add_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, missing_ids)
-                pushed_tracks += len(missing_ids) + removed
+                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
             synced_playlists += 1
     session.commit()
     create_notification(
@@ -4662,7 +4672,10 @@ def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: 
 
 def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str) -> list[dict]:
     try:
-        response = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": user_id})
+        response = client.get(
+            f"/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "fields": "Path,ProviderIds,RunTimeTicks"},
+        )
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
         if error.response.status_code == 404:
@@ -4673,7 +4686,29 @@ def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str
     return response.json().get("Items", [])
 
 
+def create_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> httpx.Response:
+    response = client.post(
+        "/Playlists",
+        json={"Name": name, "UserId": user_id, "MediaType": "Audio", "Ids": []},
+    )
+    if response.is_success:
+        return response
+    fallback = client.post("/Playlists", params={"name": name, "userId": user_id, "mediaType": "Audio"})
+    fallback.raise_for_status()
+    return fallback
+
+
+def jellyfin_playlist_id_from_response(response: httpx.Response) -> str:
+    payload = response.json()
+    playlist_id = payload.get("Id") or payload.get("id")
+    if not playlist_id:
+        raise RuntimeError("Jellyfin created a playlist but did not return a playlist id")
+    return str(playlist_id)
+
+
 def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
+    if not item_ids:
+        return
     response = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(item_ids), "userId": user_id})
     if response.is_success:
         return
@@ -4692,19 +4727,36 @@ def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id:
         raise RuntimeError(f"Jellyfin playlist sync failed for {len(failures)} item(s): {'; '.join(failures[:3])}")
 
 
-def remove_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, items: list[dict], keep_item_ids: set[str]) -> int:
-    entry_ids = [
-        str(item.get("PlaylistItemId") or item.get("PlaylistItemID") or "")
-        for item in items
-        if item.get("Id") not in keep_item_ids and (item.get("PlaylistItemId") or item.get("PlaylistItemID"))
-    ]
+def jellyfin_playlist_entry_id(item: dict) -> str:
+    return str(item.get("PlaylistItemId") or item.get("PlaylistItemID") or "")
+
+
+def remove_jellyfin_playlist_entry_ids(client: httpx.Client, playlist_id: str, entry_ids: list[str]) -> int:
     if not entry_ids:
         return 0
-    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"entryIds": ",".join(entry_ids), "userId": user_id})
-    if response.status_code in {404, 405, 501}:
+    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"entryIds": ",".join(entry_ids)})
+    if response.status_code == 404:
+        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
+    if response.status_code in {405, 501}:
         return 0
     response.raise_for_status()
     return len(entry_ids)
+
+
+def remove_jellyfin_playlist_items(client: httpx.Client, _user_id: str, playlist_id: str, items: list[dict], keep_item_ids: set[str]) -> int:
+    entry_ids = [
+        jellyfin_playlist_entry_id(item)
+        for item in items
+        if item.get("Id") not in keep_item_ids and jellyfin_playlist_entry_id(item)
+    ]
+    return remove_jellyfin_playlist_entry_ids(client, playlist_id, entry_ids)
+
+
+def replace_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, current_items: list[dict], desired_item_ids: list[str]) -> int:
+    entry_ids = [entry_id for entry_id in (jellyfin_playlist_entry_id(item) for item in current_items) if entry_id]
+    removed = remove_jellyfin_playlist_entry_ids(client, playlist_id, entry_ids)
+    add_jellyfin_playlist_items(client, user_id, playlist_id, desired_item_ids)
+    return removed + len(desired_item_ids)
 
 
 def sync_playlist_from_jellyfin(session: Session, playlist: Playlist, jellyfin_items: list[dict]) -> int:
@@ -4713,6 +4765,8 @@ def sync_playlist_from_jellyfin(session: Session, playlist: Playlist, jellyfin_i
         track = find_local_track_for_jellyfin_item(session, item)
         if track:
             next_entries.append((track, index))
+        else:
+            append_task_log(session, None, f"{playlist.name}: Jellyfin item {item.get('Name') or item.get('Id')} is not in Nudibranch yet", "warning")
     current_entries = list(playlist.tracks)
     current_by_track_id = {entry.track_id: entry for entry in current_entries}
     next_track_ids = {track.id for track, _ in next_entries}
@@ -4738,42 +4792,127 @@ def find_local_track_for_jellyfin_item(session: Session, item: dict) -> Track | 
         track = session.scalar(select(Track).where(Track.path == path))
         if track:
             return track
+    provider_ids = jellyfin_provider_ids(item)
+    recording_id = provider_ids.get("musicbrainztrack") or provider_ids.get("musicbrainzrecording")
+    if recording_id:
+        track = session.scalar(select(Track).where(func.lower(Track.musicbrainz_recording_id) == recording_id))
+        if track:
+            return track
     name = item.get("Name")
     if not name:
         return None
     candidates = list(
         session.scalars(
             select(Track)
-            .where(Track.title == name)
+            .where(func.lower(Track.title) == name.casefold())
             .options(selectinload(Track.album).selectinload(Album.artist))
         )
     )
-    artist_names = {
-        normalize_match_text(value)
-        for value in [item.get("AlbumArtist"), item.get("Artist"), *(item.get("Artists") or [])]
-        if value
-    }
+    artist_names = jellyfin_artist_names(item)
     album_name = normalize_match_text(item.get("Album"))
     for track in candidates:
-        artist_match = not artist_names or normalize_match_text(track.album.artist.name) in artist_names
-        album_match = not album_name or normalize_match_text(track.album.title) == album_name
-        if artist_match and album_match:
+        album = track.album
+        artist_match = not artist_names or normalize_match_text(album.artist.name if album and album.artist else None) in artist_names
+        album_match = not album_name or normalize_match_text(album.title if album else None) == album_name
+        duration_match = jellyfin_duration_matches(track, item)
+        if artist_match and album_match and duration_match:
             return track
-    return candidates[0] if candidates else None
+    return None
 
 
 def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -> str | None:
     response = client.get(
         f"/Users/{user_id}/Items",
-        params={"Recursive": "true", "IncludeItemTypes": "Audio", "SearchTerm": track.title},
+        params={
+            "Recursive": "true",
+            "IncludeItemTypes": "Audio",
+            "SearchTerm": track.title,
+            "Fields": "Path,ProviderIds,RunTimeTicks",
+        },
     )
     response.raise_for_status()
-    normalized_path = str(track.path or "").lower()
+    best_item: dict | None = None
+    best_score = 0.0
     for item in response.json().get("Items", []):
-        path = str(item.get("Path") or "").lower()
-        if normalized_path and path == normalized_path:
-            return item.get("Id")
-    return (response.json().get("Items") or [{}])[0].get("Id")
+        score = jellyfin_audio_match_score(track, item)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item and best_score >= 0.65:
+        return best_item.get("Id")
+    return None
+
+
+def jellyfin_provider_ids(item: dict) -> dict[str, str]:
+    provider_ids = item.get("ProviderIds") or item.get("ProviderIDs") or {}
+    if not isinstance(provider_ids, dict):
+        return {}
+    return {normalize_match_text(key): normalize_match_text(value) for key, value in provider_ids.items() if value}
+
+
+def jellyfin_artist_names(item: dict) -> set[str]:
+    artists = item.get("Artists") or []
+    if isinstance(artists, str):
+        artists = [artists]
+    return {
+        normalize_match_text(value)
+        for value in [item.get("AlbumArtist"), item.get("Artist"), *artists]
+        if value
+    }
+
+
+def jellyfin_duration_ms(item: dict) -> int | None:
+    ticks = item.get("RunTimeTicks")
+    try:
+        return round(int(ticks) / 10000) if ticks is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def jellyfin_duration_matches(track: Track, item: dict) -> bool:
+    item_duration = jellyfin_duration_ms(item)
+    if not track.duration_ms or not item_duration:
+        return True
+    return abs(track.duration_ms - item_duration) <= 10000
+
+
+def jellyfin_audio_match_score(track: Track, item: dict) -> float:
+    if track.path and str(item.get("Path") or "").lower() == str(track.path).lower():
+        return 1.0
+    provider_ids = jellyfin_provider_ids(item)
+    recording_id = normalize_match_text(track.musicbrainz_recording_id)
+    if recording_id and recording_id in {
+        provider_ids.get("musicbrainztrack"),
+        provider_ids.get("musicbrainzrecording"),
+    }:
+        return 0.98
+
+    title = normalize_match_text(track.title)
+    item_title = normalize_match_text(item.get("Name"))
+    if not title or title != item_title:
+        return 0.0
+
+    score = 0.45
+    album = track.album
+    artist_name = normalize_match_text(album.artist.name if album and album.artist else None)
+    item_artists = jellyfin_artist_names(item)
+    if artist_name and artist_name in item_artists:
+        score += 0.25
+    elif item_artists:
+        return 0.0
+
+    album_title = normalize_match_text(album.title if album else None)
+    item_album = normalize_match_text(item.get("Album"))
+    if album_title and item_album and album_title == item_album:
+        score += 0.2
+    elif item_album:
+        score -= 0.2
+
+    if jellyfin_duration_matches(track, item):
+        score += 0.1
+    else:
+        score -= 0.2
+    return score
 
 
 TASK_HANDLERS = {
