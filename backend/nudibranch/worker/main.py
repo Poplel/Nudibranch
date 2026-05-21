@@ -270,14 +270,14 @@ def add_download_candidate_review_items(
         )
         session.add(track_item)
         session.flush()
-        grouped.setdefault(album_key, []).append((normalize_download_request(request, artist, album, title), track_item))
+        grouped.setdefault(album_key, []).append((normalize_download_request(request, artist, album, title), track_item.id, title))
     session.commit()
 
     total_tracks = max(1, len(download_requests))
     completed = 0
     candidates_added = 0
     for (artist, album), track_items in grouped.items():
-        requests = [request for request, _track_item in track_items]
+        requests = [request for request, _track_item_id, _track_title in track_items]
         append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
         pools = search_album_folder_pools(session, artist, album, requests, task, limit=8)
         if pools:
@@ -285,20 +285,25 @@ def add_download_candidate_review_items(
         else:
             append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; falling back to track searches", "warning")
         missing_track_jobs: list[tuple[dict, ProposalItem, str, int]] = []
-        for request, track_item in track_items:
+        for request, track_item_id, track_title in track_items:
+            track_item = session.get(ProposalItem, track_item_id)
+            if not track_item:
+                append_task_log(session, task, f"{track_title}: skipped candidate preparation because the review row was removed", "warning")
+                completed += 1
+                continue
             query = download_query(request)
             candidates = candidates_from_folder_pools(pools, request, limit=5)
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates)
                 candidates_added += len(candidates)
                 set_item_payload_status(track_item, f"{len(candidates)} candidates ready")
-                append_task_log(session, task, f"{track_item.title}: {len(candidates)} album-level candidate(s) ready")
+                append_task_log(session, task, f"{track_title}: {len(candidates)} album-level candidate(s) ready")
             else:
                 set_item_payload_status(track_item, "searching track candidates")
                 missing_track_jobs.append((request, track_item, query, 5))
             completed += 1
             if task is not None:
-                update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_item.title}")
+                update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
         if missing_track_jobs:
             candidates_added += add_track_search_candidate_items(session, batch, missing_track_jobs, task)
         if (artist, album) in album_items:
@@ -366,8 +371,14 @@ def add_track_search_candidate_items(
                 set_item_payload_status(track_item, f"{len(candidates[:5])} candidates ready")
                 append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
             else:
-                set_item_payload_status(track_item, "no slskd candidates found")
-                append_task_log(session, task, f"{track_title}: no slskd candidates found", "warning")
+                rate_limited = bool(result.get("diagnostics", {}).get("rate_limited"))
+                status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidates found"
+                set_item_payload_status(track_item, status)
+                if rate_limited:
+                    append_task_log(session, task, f"{track_title}: {status}", "warning")
+                else:
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
+                    append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
             session.commit()
     return added
 
@@ -2457,7 +2468,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     )
     session.add(album_item)
     session.flush()
-    track_items: list[tuple[dict, ProposalItem]] = []
+    track_items: list[tuple[dict, str, str]] = []
     for request in requests:
         query = download_query(request)
         track_title = request.get("track") or request.get("title") or query
@@ -2470,7 +2481,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         )
         session.add(track_item)
         session.flush()
-        track_items.append((request, track_item))
+        track_items.append((request, track_item.id, track_title))
     session.commit()
 
     slskd_tracks = 0
@@ -2499,9 +2510,12 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     match_threshold = slskd_album_match_threshold(integration)
     if folder_pool and not folder_pool.get("match_threshold"):
         folder_pool["match_threshold"] = match_threshold
-    for request, track_item in track_items:
+    for request, track_item_id, track_title in track_items:
+        track_item = session.get(ProposalItem, track_item_id)
+        if not track_item:
+            append_task_log(session, task, f"{track_title}: skipped candidate preparation because the review row was removed", "warning")
+            continue
         query = download_query(request)
-        track_title = request.get("track") or request.get("title") or query
         set_item_payload_status(track_item, f"searching {track_title}")
         folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
         if folder_candidates:
@@ -2516,7 +2530,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
         else:
             candidate_limit = 5
-            search_jobs.append((request, track_item, track_title, query, candidate_limit))
+            search_jobs.append((request, track_item.id, track_title, query, candidate_limit))
         session.commit()
 
     if search_jobs:
@@ -2526,11 +2540,11 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
             update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item, track_title, query)
-                for request, track_item, track_title, query, candidate_limit in search_jobs
+                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item_id, track_title, query)
+                for request, track_item_id, track_title, query, candidate_limit in search_jobs
             }
             for future in as_completed(futures):
-                request, track_item, track_title, query = futures[future]
+                request, track_item_id, track_title, query = futures[future]
                 try:
                     search_result = future.result()
                 except Exception as error:  # noqa: BLE001 - keep creating candidates for the rest of the album.
@@ -2540,6 +2554,11 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     }
                 for line in search_result.get("diagnostics", {}).get("query_logs") or []:
                     append_task_log(session, task, line)
+                track_item = session.get(ProposalItem, track_item_id)
+                if not track_item:
+                    append_task_log(session, task, f"{track_title}: skipped candidate results because the review row was removed", "warning")
+                    completed_tracks += 1
+                    continue
                 candidates = search_result["candidates"]
                 diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
                 if candidates and not request.get("multiple_candidates") and not folder_pool:
@@ -2553,9 +2572,14 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
                 else:
                     retry_tracks += 1
-                    status = "slskd rate limited; no candidate yet" if search_result.get("diagnostics", {}).get("rate_limited") else "no slskd candidate found"
+                    rate_limited = bool(search_result.get("diagnostics", {}).get("rate_limited"))
+                    status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidate found"
                     set_item_payload_status(track_item, status)
-                    append_task_log(session, task, f"{track_title}: {status}", "warning")
+                    if rate_limited:
+                        append_task_log(session, task, f"{track_title}: {status}", "warning")
+                    else:
+                        add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
+                        append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
                 completed_tracks += 1
                 session.commit()
                 if task is not None:

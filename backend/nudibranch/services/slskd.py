@@ -342,9 +342,13 @@ def search_identifier(payload: Any) -> str | None:
     if isinstance(payload, str):
         return payload
     if isinstance(payload, dict):
-        for key in ("id", "searchId", "search_id"):
+        for key in ("id", "Id", "ID", "searchId", "SearchId", "search_id"):
             if payload.get(key):
                 return str(payload[key])
+        for key in ("data", "Data", "result", "Result", "search", "Search"):
+            nested = search_identifier(payload.get(key))
+            if nested:
+                return nested
     return None
 
 
@@ -428,16 +432,35 @@ def extract_folder_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
     return candidates
 
 
-def response_list(payload: Any) -> list[Any]:
+def response_list(payload: Any, depth: int = 0) -> list[Any]:
+    if depth > 5:
+        return []
+    if isinstance(payload, list):
+        return payload
     if isinstance(payload, dict):
-        for key in ("responses", "Responses", "results", "Results", "data"):
+        for key in ("responses", "Responses", "results", "Results", "data", "Data", "items", "Items"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
             if isinstance(value, dict):
-                return response_mapping_to_list(value)
-    if isinstance(payload, list):
-        return payload
+                nested = response_list(value, depth + 1)
+                if nested:
+                    return nested
+                mapped = response_mapping_to_list(value)
+                if mapped:
+                    return mapped
+
+        mapped = response_mapping_to_list(payload)
+        if mapped and any(isinstance(response, dict) and response_files(response) for response in mapped):
+            return mapped
+
+        best: list[Any] = []
+        for value in payload.values():
+            nested = response_list(value, depth + 1)
+            if len(nested) > len(best):
+                best = nested
+        if best:
+            return best
     return []
 
 
@@ -466,7 +489,7 @@ def search_diagnostics(payload: Any) -> dict[str, int]:
 
 
 def response_username(response: dict[str, Any]) -> str | None:
-    user = response.get("username") or response.get("userName") or response.get("UserName")
+    user = response.get("username") or response.get("userName") or response.get("UserName") or response.get("name") or response.get("Name")
     if isinstance(user, str):
         return user
     user = response.get("user") or response.get("User")
@@ -478,7 +501,7 @@ def response_username(response: dict[str, Any]) -> str | None:
 
 
 def response_files(response: dict[str, Any]) -> list[Any]:
-    for key in ("files", "Files", "results", "Results"):
+    for key in ("files", "Files", "results", "Results", "fileList", "FileList", "sharedFiles", "SharedFiles", "items", "Items"):
         value = response.get(key)
         if isinstance(value, list):
             return value
@@ -492,7 +515,15 @@ def normalize_file(file_info: Any) -> dict[str, Any] | None:
         return {"filename": file_info}
     if not isinstance(file_info, dict):
         return None
-    filename = file_info.get("filename") or file_info.get("fileName") or file_info.get("Filename") or file_info.get("name")
+    filename = (
+        file_info.get("filename")
+        or file_info.get("fileName")
+        or file_info.get("Filename")
+        or file_info.get("name")
+        or file_info.get("Name")
+        or file_info.get("path")
+        or file_info.get("Path")
+    )
     if not filename:
         return None
     return {
