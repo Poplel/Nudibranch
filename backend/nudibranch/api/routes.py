@@ -79,7 +79,7 @@ from nudibranch.db.models import (
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
-from nudibranch.services.app_log import tail_app_log
+from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.metadata_lookup import cache_discover_art, discover_music, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
@@ -818,11 +818,24 @@ def discover_search(
     q: str = Query(min_length=1, max_length=180),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> dict:
+    write_app_log("Discover API search requested", feature="discover", query=q, user_id=user.id)
     try:
-        return with_cached_discover_art(discover_music(q))
+        payload = with_cached_discover_art(discover_music(q))
+        write_app_log(
+            "Discover API search returned",
+            feature="discover",
+            query=q,
+            user_id=user.id,
+            artists=len(payload.get("artists") or []),
+            albums=len(payload.get("albums") or []),
+            tracks=len(payload.get("tracks") or []),
+        )
+        return payload
     except httpx.HTTPStatusError as error:
+        write_app_log("Discover API search failed: MusicBrainz status error", level="error", feature="discover", query=q, user_id=user.id, error=str(error))
         raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
     except httpx.RequestError as error:
+        write_app_log("Discover API search failed: MusicBrainz unreachable", level="error", feature="discover", query=q, user_id=user.id, error=str(error))
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
@@ -831,7 +844,9 @@ def discover_art(filename: str, _: User = Depends(require_permission(Permission.
     safe_name = Path(filename).name
     path = get_settings().config_path / "discover-art-cache" / safe_name
     if not path.exists() or not path.is_file():
+        write_app_log("Discover cached art missing", level="warning", feature="discover", filename=safe_name)
         raise HTTPException(status_code=404, detail="Cached artwork not found")
+    write_app_log("Discover cached art served", feature="discover", filename=safe_name)
     return FileResponse(path)
 
 
@@ -839,18 +854,23 @@ def discover_art(filename: str, _: User = Depends(require_permission(Permission.
 def discover_task_queue(
     payload: DiscoverTaskQueueRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.downloads_manage)),
+    user: User = Depends(require_permission(Permission.downloads_manage)),
 ) -> TaskOut:
+    write_app_log("Discover task queue requested", feature="discover", user_id=user.id, downloads=len(payload.download_requests))
     task = enqueue_task(session, "propose_import", {"path": None, "files": [], "download_requests": payload.download_requests})
+    write_app_log("Discover task queue created", feature="discover", user_id=user.id, task_id=task.id, downloads=len(payload.download_requests))
     return serialize_task(task)
 
 
 def with_cached_discover_art(payload: dict) -> dict:
     for artist in payload.get("artists") or []:
+        write_app_log("Discover caching artist art", feature="discover", artist=artist.get("name"), artist_id=artist.get("id"))
         artist["image_url"] = cache_discover_art(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
         for album in artist.get("albums") or []:
+            write_app_log("Discover caching album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
             album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
     for album in payload.get("albums") or []:
+        write_app_log("Discover caching top-level album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
         album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
     return payload
 
@@ -876,6 +896,15 @@ def create_wishlist_item(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> WishlistOut:
+    write_app_log(
+        "Wishlist add requested",
+        feature=payload.source or "wishlist",
+        user_id=user.id,
+        kind=payload.kind,
+        artist=payload.artist,
+        album=payload.album,
+        track=payload.track,
+    )
     reconcile_stale_approved_wishlist_items(session, user)
     existing = session.scalar(
         select(WishlistItem)
@@ -887,12 +916,32 @@ def create_wishlist_item(
         .where(WishlistItem.status.in_(["wanted", "review", "approved"]))
     )
     if existing:
+        write_app_log(
+            "Wishlist add reused existing item",
+            feature=payload.source or "wishlist",
+            user_id=user.id,
+            item_id=existing.id,
+            kind=payload.kind,
+            artist=payload.artist,
+            album=payload.album,
+            track=payload.track,
+        )
         return serialize_wishlist_item(existing)
-    item = WishlistItem(user_id=user.id, **payload.model_dump())
+    item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
     session.add(item)
     session.commit()
     session.refresh(item)
+    write_app_log(
+        "Wishlist item created",
+        feature=payload.source or "wishlist",
+        user_id=user.id,
+        item_id=item.id,
+        kind=item.kind,
+        artist=item.artist,
+        album=item.album,
+        track=item.track,
+    )
     return serialize_wishlist_item(item)
 
 

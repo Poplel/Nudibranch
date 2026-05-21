@@ -110,6 +110,7 @@ class WishlistCreate(BaseModel):
     artist: str
     album: str | None = None
     track: str | None = None
+    source: str | None = None
 
 
 class WishlistOut(WishlistCreate):

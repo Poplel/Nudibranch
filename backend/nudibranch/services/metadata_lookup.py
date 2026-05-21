@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import httpx
 
 from nudibranch.core.config import get_settings
+from nudibranch.services.app_log import write_app_log
 from nudibranch.services.imports import read_audio_metadata
 
 
@@ -112,14 +113,14 @@ def search_album_releases(artist: str, album: str) -> list[dict]:
         seen.add(key)
         results.append(
             {
-            "id": release.get("id"),
-            "title": release.get("title"),
-            "artist": artist_credit(release.get("artist-credit", [])) or artist,
-            "date": release.get("date"),
-            "country": release.get("country"),
-            "score": release.get("score"),
-            "track_count": release.get("track-count"),
-            "cover_art_url": cover_art_url(release.get("id"), release) or itunes_art,
+                "id": release.get("id"),
+                "title": release.get("title"),
+                "artist": artist_credit(release.get("artist-credit", [])) or artist,
+                "date": release.get("date"),
+                "country": release.get("country"),
+                "score": release.get("score"),
+                "track_count": release.get("track-count"),
+                "cover_art_url": cover_art_url(release.get("id"), release) or itunes_art,
             }
         )
     return results
@@ -129,18 +130,37 @@ def discover_music(query: str) -> dict:
     query = query.strip()
     if not query:
         return {"artists": [], "albums": [], "tracks": [], "focus": None}
+    write_app_log("Discover search started", feature="discover", query=query)
     artists = search_artists(query, limit=5)
+    write_app_log("Discover artist search completed", feature="discover", query=query, artists=len(artists))
     albums = search_releases(query, limit=8)
+    write_app_log("Discover album search completed", feature="discover", query=query, albums=len(albums))
     tracks = search_recordings(query, limit=8)
+    write_app_log("Discover track search completed", feature="discover", query=query, tracks=len(tracks))
     artist_map = {artist["id"]: artist for artist in artists if artist.get("id")}
     for album in albums:
-        if album.get("artist_id") and album["artist_id"] not in artist_map:
-            artist_map[album["artist_id"]] = {"id": album["artist_id"], "name": album["artist"], "albums": []}
+        artist_key = album.get("artist_id") or discover_artist_key(album.get("artist"))
+        if artist_key and artist_key not in artist_map:
+            artist_map[artist_key] = {"id": artist_key, "name": album["artist"], "albums": []}
+        if artist_key:
+            album["artist_id"] = artist_key
     for track in tracks:
-        if track.get("artist_id") and track["artist_id"] not in artist_map:
-            artist_map[track["artist_id"]] = {"id": track["artist_id"], "name": track["artist"], "albums": []}
+        artist_key = track.get("artist_id") or discover_artist_key(track.get("artist"))
+        if artist_key and artist_key not in artist_map:
+            artist_map[artist_key] = {"id": artist_key, "name": track["artist"], "albums": []}
+        if artist_key:
+            track["artist_id"] = artist_key
     for artist in artist_map.values():
-        artist["albums"] = discover_artist_albums(artist["id"], artist["name"], limit=8)
+        if str(artist.get("id") or "").startswith("artist-name:"):
+            artist["albums"] = []
+            write_app_log("Discover artist album lookup skipped for name-only artist", feature="discover", query=query, artist=artist.get("name"))
+        else:
+            try:
+                artist["albums"] = discover_artist_albums(artist["id"], artist["name"], limit=8)
+                write_app_log("Discover artist album lookup completed", feature="discover", query=query, artist=artist.get("name"), albums=len(artist["albums"]))
+            except httpx.HTTPError as error:
+                artist["albums"] = []
+                write_app_log("Discover artist album lookup failed", level="warning", feature="discover", query=query, artist=artist.get("name"), error=str(error))
         for album in albums:
             if album.get("artist_id") == artist.get("id"):
                 ensure_artist_album(artist, album)
@@ -164,7 +184,21 @@ def discover_music(query: str) -> dict:
         focus = {"kind": "album", "artist_id": albums[0].get("artist_id"), "album_id": albums[0].get("id")}
     elif artists:
         focus = {"kind": "artist", "artist_id": artists[0].get("id")}
-    return {"artists": list(artist_map.values()), "albums": albums, "tracks": tracks, "focus": focus}
+    result = {"artists": list(artist_map.values()), "albums": albums, "tracks": tracks, "focus": focus}
+    write_app_log(
+        "Discover search completed",
+        feature="discover",
+        query=query,
+        artists=len(result["artists"]),
+        albums=len(albums),
+        tracks=len(tracks),
+    )
+    return result
+
+
+def discover_artist_key(artist: str | None) -> str | None:
+    normalized = normalize(artist)
+    return f"artist-name:{normalized}" if normalized else None
 
 
 def ensure_artist_album(artist: dict, album: dict) -> None:
@@ -239,7 +273,7 @@ def search_recordings(query: str, limit: int = 8) -> list[dict]:
         artist_id = first_artist_id(recording.get("artist-credit", []))
         artist = artist_credit(recording.get("artist-credit", []))
         key = (normalize(artist), normalize(recording.get("title")), normalize(release.get("title")))
-        if not recording.get("id") or not recording.get("title") or key in seen:
+        if not recording.get("id") or not recording.get("title") or not artist or key in seen:
             continue
         seen.add(key)
         tracks.append(
@@ -261,12 +295,17 @@ def search_recordings(query: str, limit: int = 8) -> list[dict]:
 def discover_artist_albums(artist_id: str, artist_name: str, limit: int = 8) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/release/",
-        params={"fmt": "json", "artist": artist_id, "status": "official", "limit": min(limit * 3, 25), "inc": "artist-credits"},
+        params={"fmt": "json", "artist": artist_id, "limit": min(limit * 3, 25), "inc": "artist-credits"},
         timeout=20,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
-    albums = normalize_release_results(response.json().get("releases", []), fallback_artist=artist_name, fallback_artist_id=artist_id)
+    releases = [
+        release
+        for release in response.json().get("releases", [])
+        if not release.get("status") or str(release.get("status")).lower() == "official"
+    ]
+    albums = normalize_release_results(releases, fallback_artist=artist_name, fallback_artist_id=artist_id)
     albums = sorted(albums, key=lambda album: (album.get("date") or "9999", album.get("title") or ""))
     hydrated = []
     for album in albums[:limit]:
@@ -435,6 +474,7 @@ def cover_art_url(release_id: str | None, release: dict | None = None) -> str | 
 
 def cache_discover_art(url: str | None, cache_key: str) -> str | None:
     if not url:
+        write_app_log("Discover art cache skipped: no source URL", feature="discover", cache_key=cache_key)
         return None
     cache_dir = get_settings().config_path / "discover-art-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -453,25 +493,31 @@ def cache_discover_art(url: str | None, cache_key: str) -> str | None:
             if age <= DISCOVER_CACHE_TTL_SECONDS and hits < DISCOVER_CACHE_MAX_HITS:
                 metadata["hits"] = hits + 1
                 meta_path.write_text(json_dumps(metadata), encoding="utf-8")
+                write_app_log("Discover art cache hit", feature="discover", cache_key=cache_key, hits=metadata["hits"])
                 return f"/api/v1/discover/art/{image_path.name}"
         except (OSError, ValueError, TypeError):
-            pass
+            write_app_log("Discover art cache metadata unreadable; refreshing", level="warning", feature="discover", cache_key=cache_key)
     try:
+        write_app_log("Discover art cache download started", feature="discover", cache_key=cache_key, source_url=url)
         response = httpx.get(url, timeout=15, headers={"User-Agent": USER_AGENT})
         response.raise_for_status()
         image_path.write_bytes(response.content)
         meta_path.write_text(json_dumps({"source_url": url, "fetched_at": now, "hits": 1}), encoding="utf-8")
+        write_app_log("Discover art cache download completed", feature="discover", cache_key=cache_key, bytes=len(response.content))
         return f"/api/v1/discover/art/{image_path.name}"
-    except httpx.HTTPError:
+    except httpx.HTTPError as error:
+        write_app_log("Discover art cache download failed; using remote URL", level="warning", feature="discover", cache_key=cache_key, error=str(error))
         return url
 
 
 def clear_discover_art_cache() -> int:
     cache_dir = get_settings().config_path / "discover-art-cache"
     if not cache_dir.exists():
+        write_app_log("Discover art cache clear skipped: cache directory missing", feature="discover")
         return 0
     count = sum(1 for path in cache_dir.iterdir() if path.is_file())
     shutil.rmtree(cache_dir)
+    write_app_log("Discover art cache cleared", feature="discover", removed=count)
     return count
 
 

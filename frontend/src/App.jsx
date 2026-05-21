@@ -2495,11 +2495,11 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
   }
 
   async function addAlbumWishlist(album) {
-    await onWishlist({ kind: "album", artist: album.artist, album: album.title, track: null });
+    await onWishlist({ kind: "album", artist: album.artist, album: album.title, track: null, source: "discover" });
   }
 
   async function addTrackWishlist(album, track) {
-    await onWishlist({ kind: "track", artist: album.artist, album: album.title, track: track.title });
+    await onWishlist({ kind: "track", artist: album.artist, album: album.title, track: track.title, source: "discover" });
   }
 
   return (
@@ -2532,7 +2532,7 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
                 </button>
                 <button
                   className="secondary compact"
-                  onClick={() => onWishlist({ kind: "artist", artist: artist.name, album: null, track: null })}
+                  onClick={() => onWishlist({ kind: "artist", artist: artist.name, album: null, track: null, source: "discover" })}
                 >
                   <Heart size={15} />
                   Wishlist
