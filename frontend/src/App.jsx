@@ -2020,10 +2020,11 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
   const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
   const selectedItems = batch.items.filter((item) => item.selected);
+  const selectedExecutableItems = selectedItems.filter(isExecutableApprovalItem);
   const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
   const locked = batch.status === "executing";
-  const candidatesSearching = batch.kind === "download" && batch.items.some(isCandidateSearchItem);
-  const runDisabled = locked || candidatesSearching || selectedItems.length === 0;
+  const candidatesSearching = batch.items.some(isCandidateSearchItem);
+  const runDisabled = locked || candidatesSearching || selectedExecutableItems.length === 0;
 
   useEffect(() => {
     setOpenItems(new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
@@ -2042,7 +2043,7 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
           <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(selectedItems)} disabled={runDisabled}>
+          <button className="primary" onClick={() => onApprove(selectedExecutableItems)} disabled={runDisabled}>
             <Check size={16} />
             {locked ? "Running" : candidatesSearching ? "Searching candidates" : "Run selected"}
           </button>
@@ -4478,6 +4479,15 @@ function itemMusicRef(item) {
 function isReadyApprovalItem(item) {
   const status = String(itemStatusMeta(item) || item.status || "").toLowerCase();
   return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
+}
+
+function isExecutableApprovalItem(item) {
+  if (["executing", "completed", "rejected"].includes(item.status)) return false;
+  const payload = parseJsonObject(item.payload_json);
+  if (item.kind === "import_files") return Boolean(item.old_value && item.new_value);
+  if (item.kind === "metadata") return Boolean(payload.target_type);
+  if (["delete", "file_move", "playlist", "download", "lyrics"].includes(item.kind)) return Boolean(payload.action);
+  return false;
 }
 
 function isCandidateSearchItem(item) {
