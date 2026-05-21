@@ -133,6 +133,8 @@ function App() {
   const checkFileTaskIds = useRef(new Set());
   const localNotificationCounter = useRef(0);
   const onlineStateRef = useRef(typeof navigator === "undefined" ? true : navigator.onLine);
+  const appearanceHydratedUserId = useRef(null);
+  const appearanceSaveVersion = useRef(0);
 
   const theme = dark ? "app dark" : "app";
   const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
@@ -229,13 +231,19 @@ function App() {
   }, [user, page, visibleNavItems]);
 
   useEffect(() => {
-    if (!user?.id) return;
+    if (!user?.id) {
+      appearanceHydratedUserId.current = null;
+      setAppearanceReady(false);
+      return;
+    }
+    if (appearanceHydratedUserId.current === user.id) return;
+    appearanceHydratedUserId.current = user.id;
     setAppearanceReady(false);
     setDark(user.theme === "dark");
     setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
     setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
     setAppearanceReady(true);
-  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint]);
+  }, [user?.id]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -257,7 +265,8 @@ function App() {
     ) {
       return;
     }
-    saveOwnAppearance(appearance);
+    const timeout = window.setTimeout(() => saveOwnAppearance(appearance), 250);
+    return () => window.clearTimeout(timeout);
   }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, appearanceReady, dark, accentColor, backgroundTint]);
 
   async function api(path, options = {}) {
@@ -557,11 +566,13 @@ function App() {
   }
 
   async function saveOwnAppearance(appearance) {
+    const version = ++appearanceSaveVersion.current;
     try {
       const updated = await api("/me/appearance", {
         method: "PUT",
         body: JSON.stringify(appearance),
       });
+      if (version !== appearanceSaveVersion.current) return;
       setUser(updated);
       setUsers((current) => upsertUser(current, updated));
     } catch (appearanceError) {
