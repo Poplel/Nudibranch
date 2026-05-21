@@ -90,7 +90,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
     payload = {
         "searchText": query,
         "timeout": timeout_seconds * 1000,
-        "filterResponses": True,
+        "filterResponses": False,
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
     }
