@@ -23,6 +23,8 @@ class UserOut(BaseModel):
     is_admin: bool
     permissions: list[str]
     theme: str = "light"
+    accent_color: str = "#356df3"
+    background_tint: str = "#356df3"
 
 
 class PermissionOut(BaseModel):
@@ -50,6 +52,8 @@ class UserPinUpdate(BaseModel):
 
 class UserAppearanceUpdate(BaseModel):
     theme: str = Field(pattern="^(light|dark)$")
+    accent_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    background_tint: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
 
 
 class PlayerStateUpdate(BaseModel):

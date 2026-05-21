@@ -52,6 +52,12 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "theme" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'light'"))
         session.commit()
+    if "accent_color" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN accent_color VARCHAR(16) NOT NULL DEFAULT '#356df3'"))
+        session.commit()
+    if "background_tint" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN background_tint VARCHAR(16) NOT NULL DEFAULT '#356df3'"))
+        session.commit()
     move_task_result_logs_to_app_log(session)
 
 

@@ -82,6 +82,8 @@ class User(Base):
     api_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     theme: Mapped[str] = mapped_column(String(16), default="light", nullable=False)
+    accent_color: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
+    background_tint: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     permissions: Mapped[list["UserPermission"]] = relationship(back_populates="user", cascade="all, delete-orphan")

@@ -216,6 +216,8 @@ def update_own_appearance(
     user: User = Depends(get_current_user),
 ) -> UserOut:
     user.theme = payload.theme
+    user.accent_color = payload.accent_color
+    user.background_tint = payload.background_tint
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -1837,6 +1839,8 @@ def serialize_user(user: User) -> UserOut:
         is_admin=user.is_admin,
         permissions=effective_permission_values(user),
         theme=user.theme if user.theme in {"light", "dark"} else "light",
+        accent_color=user.accent_color or "#356df3",
+        background_tint=user.background_tint or "#356df3",
     )
 
 

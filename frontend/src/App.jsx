@@ -232,20 +232,10 @@ function App() {
     if (!user?.id) return;
     setAppearanceReady(false);
     setDark(user.theme === "dark");
-    const saved = localStorage.getItem(APPEARANCE_LAST_KEY);
-    if (!saved) {
-      setAppearanceReady(true);
-      return;
-    }
-    try {
-      const appearance = JSON.parse(saved);
-      setAccentColor(appearance.accentColor || DEFAULT_APPEARANCE.accentColor);
-      setBackgroundTint(appearance.backgroundTint || DEFAULT_APPEARANCE.backgroundTint);
-    } catch {
-      localStorage.removeItem(APPEARANCE_LAST_KEY);
-    }
+    setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
+    setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
     setAppearanceReady(true);
-  }, [user?.id, user?.theme]);
+  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint]);
 
   useEffect(() => {
     if (!user?.id) return;
@@ -255,10 +245,20 @@ function App() {
 
   useEffect(() => {
     if (!user?.id || !appearanceReady) return;
-    const themeName = dark ? "dark" : "light";
-    if ((user.theme || "light") === themeName) return;
-    saveOwnAppearance(themeName);
-  }, [user?.id, user?.theme, appearanceReady, dark]);
+    const appearance = {
+      theme: dark ? "dark" : "light",
+      accent_color: accentColor,
+      background_tint: backgroundTint,
+    };
+    if (
+      (user.theme || "light") === appearance.theme &&
+      (user.accent_color || DEFAULT_APPEARANCE.accentColor) === appearance.accent_color &&
+      (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint
+    ) {
+      return;
+    }
+    saveOwnAppearance(appearance);
+  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, appearanceReady, dark, accentColor, backgroundTint]);
 
   async function api(path, options = {}) {
     const isFormData = options.body instanceof FormData;
@@ -556,11 +556,11 @@ function App() {
     }
   }
 
-  async function saveOwnAppearance(themeName) {
+  async function saveOwnAppearance(appearance) {
     try {
       const updated = await api("/me/appearance", {
         method: "PUT",
-        body: JSON.stringify({ theme: themeName }),
+        body: JSON.stringify(appearance),
       });
       setUser(updated);
       setUsers((current) => upsertUser(current, updated));
