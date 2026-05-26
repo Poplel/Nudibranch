@@ -3194,7 +3194,9 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                 (
                     f"slskd album search finished: {query}: "
                     f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
-                    f"{len(result.get('folder_candidates') or [])} folder candidates"
+                    f"{len(result.get('folder_candidates') or [])} folder candidates "
+                    f"(slskd reported {diagnostics.get('response_count', 0)} responses/{diagnostics.get('file_count', 0)} files, "
+                    f"complete={diagnostics.get('is_complete')})"
                 ),
             )
             if not diagnostics.get("responses"):
@@ -3821,7 +3823,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
             (
                 f"slskd track search finished: {query}: "
                 f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
-                f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls"
+                f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls "
+                f"(slskd reported {diagnostics.get('response_count', 0)} responses/{diagnostics.get('file_count', 0)} files, "
+                f"complete={diagnostics.get('is_complete')})"
             ),
         )
         if not diagnostics.get("responses"):

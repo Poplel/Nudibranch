@@ -68,6 +68,9 @@ def search_slskd_detailed(
                 responses = current_responses
             if isinstance(payload, dict):
                 diagnostics["state"] = str(payload.get("state") or payload.get("State") or payload.get("status") or payload.get("Status") or "")
+                diagnostics["is_complete"] = search_is_complete(payload)
+                diagnostics["response_count"] = int_value(payload.get("responseCount") or payload.get("ResponseCount"))
+                diagnostics["file_count"] = int_value(payload.get("fileCount") or payload.get("FileCount"))
                 diagnostics["payload_shape"] = payload_shape(payload)
             diagnostics.update(search_diagnostics(payload))
             diagnostics["response_growth"] = len(responses) - last_response_count
@@ -78,7 +81,8 @@ def search_slskd_detailed(
             else:
                 settled_polls = 0
             last_response_count = len(responses)
-            if wait_for_settled_results and (len(responses) >= 250 or (diagnostics["polls"] >= 3 and settled_polls >= 2)):
+            search_done = bool(diagnostics.get("is_complete")) or str(diagnostics.get("state") or "").lower() in {"completed", "complete", "stopped"}
+            if wait_for_settled_results and (len(responses) >= 250 or (responses and settled_polls >= 2) or (search_done and diagnostics["polls"] >= 2)):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
@@ -86,11 +90,11 @@ def search_slskd_detailed(
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
-            if candidates and not wait_for_settled_results and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+            if candidates and not wait_for_settled_results and (search_done or diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
-            if folder_candidates and not wait_for_settled_results and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+            if folder_candidates and not wait_for_settled_results and (search_done or diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 diagnostics["candidates"] = 0
                 return {"candidates": [], "folder_candidates": folder_candidates, "diagnostics": diagnostics}
             time.sleep(poll_interval)
@@ -523,6 +527,24 @@ def payload_shape(payload: Any) -> str:
                 break
         return " ".join(parts)
     return type(payload).__name__
+
+
+def search_is_complete(payload: dict[str, Any]) -> bool:
+    raw = payload.get("isComplete")
+    if raw is None:
+        raw = payload.get("IsComplete")
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.lower() in {"true", "1", "yes", "completed", "complete"}
+    return False
+
+
+def int_value(raw: Any) -> int:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
 
 
 def response_mapping_to_list(mapping: dict[str, Any]) -> list[Any]:
