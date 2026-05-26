@@ -3197,6 +3197,8 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                     f"{len(result.get('folder_candidates') or [])} folder candidates"
                 ),
             )
+            if not diagnostics.get("responses"):
+                append_task_log(session, task, f"slskd album search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}", "warning")
         except Exception as error:
             append_task_log(session, task, f"slskd album search failed: {query}: {error}", "warning")
             continue
@@ -3822,6 +3824,8 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls"
             ),
         )
+        if not diagnostics.get("responses"):
+            query_logs.append(f"slskd track search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}")
         for rejected_line in rejected:
             query_logs.append(f"slskd candidate rejected: {rejected_line}")
         if result["candidates"]:

@@ -1,4 +1,5 @@
 import time
+import uuid
 from threading import Lock
 from typing import Any
 from urllib.parse import quote
@@ -36,9 +37,10 @@ def search_slskd_detailed(
         raise ValueError("slskd API key is required")
 
     with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
-        created = create_search(client, query, timeout_seconds, filter_responses=filter_responses)
+        requested_search_id = str(uuid.uuid4())
+        created = create_search(client, query, timeout_seconds, search_id=requested_search_id, filter_responses=filter_responses)
         created.raise_for_status()
-        search_id = search_identifier(created.json())
+        search_id = search_identifier(created.json()) or requested_search_id
         if not search_id:
             raise ValueError("slskd did not return a search id")
 
@@ -66,6 +68,7 @@ def search_slskd_detailed(
                 responses = current_responses
             if isinstance(payload, dict):
                 diagnostics["state"] = str(payload.get("state") or payload.get("State") or payload.get("status") or payload.get("Status") or "")
+                diagnostics["payload_shape"] = payload_shape(payload)
             diagnostics.update(search_diagnostics(payload))
             diagnostics["response_growth"] = len(responses) - last_response_count
             candidates = extract_candidates(responses, query)
@@ -97,10 +100,11 @@ def search_slskd_detailed(
         return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
 
 
-def create_search(client: httpx.Client, query: str, timeout_seconds: int, filter_responses: bool = False) -> httpx.Response:
+def create_search(client: httpx.Client, query: str, timeout_seconds: int, search_id: str, filter_responses: bool = False) -> httpx.Response:
     global _last_search_created_at
     payload = {
         "searchText": query,
+        "id": search_id,
         "searchTimeout": timeout_seconds * 1000,
         "timeout": timeout_seconds * 1000,
         "fileLimit": 10000,
@@ -122,7 +126,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int, filter
                 elapsed = time.monotonic() - _last_search_created_at
                 if elapsed < SLSKD_SEARCH_CREATE_INTERVAL_SECONDS:
                     time.sleep(SLSKD_SEARCH_CREATE_INTERVAL_SECONDS - elapsed)
-                response = client.post("/api/v0/searches", json={"searchText": query, "filterResponses": filter_responses})
+                response = client.post("/api/v0/searches", json={"id": search_id, "searchText": query, "filterResponses": filter_responses})
                 _last_search_created_at = time.monotonic()
         if response.status_code != 429 or attempt == 4:
             return response
@@ -413,7 +417,7 @@ def extract_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                     "size": file_info.get("size"),
                     "duration": file_info.get("duration"),
                     "bitrate": file_info.get("bitrate"),
-                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots"),
+                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots") or response.get("hasFreeUploadSlot"),
                     "upload_speed": response.get("uploadSpeed") or response.get("UploadSpeed"),
                     "queue_length": response.get("queueLength") or response.get("QueueLength"),
                     "quality": quality_label(file_info),
@@ -452,7 +456,7 @@ def extract_folder_candidates(payload: Any, query: str) -> list[dict[str, Any]]:
                     "size": file_info.get("size"),
                     "duration": file_info.get("duration"),
                     "bitrate": file_info.get("bitrate"),
-                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots"),
+                    "free_upload_slots": response.get("freeUploadSlots") or response.get("FreeUploadSlots") or response.get("hasFreeUploadSlot"),
                     "upload_speed": response.get("uploadSpeed") or response.get("UploadSpeed"),
                     "queue_length": response.get("queueLength") or response.get("QueueLength"),
                     "quality": quality_label(file_info),
@@ -470,6 +474,8 @@ def response_list(payload: Any, depth: int = 0) -> list[Any]:
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
+        if response_username(payload) and response_files(payload):
+            return [payload]
         for key in ("responses", "Responses", "results", "Results", "data", "Data", "items", "Items"):
             value = payload.get(key)
             if isinstance(value, list):
@@ -494,6 +500,29 @@ def response_list(payload: Any, depth: int = 0) -> list[Any]:
         if best:
             return best
     return []
+
+
+def payload_shape(payload: Any) -> str:
+    if isinstance(payload, list):
+        first = payload[0] if payload else None
+        if isinstance(first, dict):
+            return f"list[{len(payload)}] first_keys={','.join(list(first.keys())[:8])}"
+        return f"list[{len(payload)}]"
+    if isinstance(payload, dict):
+        parts = [f"keys={','.join(list(payload.keys())[:10])}"]
+        for key in ("responses", "Responses", "results", "Results", "data", "Data", "items", "Items"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                parts.append(f"{key}=list[{len(value)}]")
+                if value and isinstance(value[0], dict):
+                    parts.append(f"{key}_first_keys={','.join(list(value[0].keys())[:8])}")
+                break
+            if isinstance(value, dict):
+                parts.append(f"{key}=dict[{len(value)}]")
+                parts.append(f"{key}_keys={','.join(list(value.keys())[:8])}")
+                break
+        return " ".join(parts)
+    return type(payload).__name__
 
 
 def response_mapping_to_list(mapping: dict[str, Any]) -> list[Any]:
@@ -533,13 +562,18 @@ def response_username(response: dict[str, Any]) -> str | None:
 
 
 def response_files(response: dict[str, Any]) -> list[Any]:
+    files: list[Any] = []
     for key in ("files", "Files", "results", "Results", "fileList", "FileList", "sharedFiles", "SharedFiles", "items", "Items"):
         value = response.get(key)
         if isinstance(value, list):
-            return value
+            files.extend(value)
         if isinstance(value, dict):
-            return list(value.values())
-    return []
+            files.extend(value.values())
+    for key in ("lockedFiles", "LockedFiles"):
+        value = response.get(key)
+        if isinstance(value, list):
+            files.extend(value)
+    return files
 
 
 def normalize_file(file_info: Any) -> dict[str, Any] | None:
