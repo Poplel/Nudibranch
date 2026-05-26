@@ -46,9 +46,9 @@ DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 SLSKD_TRACK_SEARCH_WORKERS = 1
 SLSKD_TRACK_QUERY_LIMIT = 6
-SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 6
-SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 1
-SLSKD_ALBUM_SEARCH_POLL_INTERVAL = 0.5
+SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 15
+SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 3
+SLSKD_ALBUM_SEARCH_POLL_INTERVAL = 1.0
 LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
@@ -3332,7 +3332,7 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                 poll_interval=SLSKD_ALBUM_SEARCH_POLL_INTERVAL,
                 timeout_seconds=SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS,
                 timeout_buffer_seconds=SLSKD_ALBUM_SEARCH_BUFFER_SECONDS,
-                wait_for_settled_results=False,
+                wait_for_settled_results=True,
             )
             diagnostics = result.get("diagnostics") or {}
             append_task_log(

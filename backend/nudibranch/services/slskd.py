@@ -99,7 +99,7 @@ def search_slskd_detailed(
                 return {"candidates": [], "folder_candidates": folder_candidates, "diagnostics": diagnostics}
             if (
                 not responses
-                and diagnostics["polls"] >= 5
+                and diagnostics.get("is_complete")
                 and diagnostics.get("response_count", 0) > 0
                 and diagnostics.get("file_count", 0) > 0
             ):
