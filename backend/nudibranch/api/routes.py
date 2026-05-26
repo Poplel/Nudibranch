@@ -862,16 +862,36 @@ def discover_task_queue(
     return serialize_task(task)
 
 
+DISCOVER_INLINE_ART_CACHE_LIMIT = 12
+
+
 def with_cached_discover_art(payload: dict) -> dict:
+    cached_images = 0
+
+    def cache_or_defer(source_url: str | list[str] | None, cache_key: str) -> str | None:
+        nonlocal cached_images
+        sources = source_url if isinstance(source_url, list) else [source_url]
+        fallback_url = next((url for url in sources if url), None)
+        if cached_images >= DISCOVER_INLINE_ART_CACHE_LIMIT:
+            write_app_log(
+                "Discover art cache deferred to keep search responsive",
+                feature="discover",
+                cache_key=cache_key,
+                inline_limit=DISCOVER_INLINE_ART_CACHE_LIMIT,
+            )
+            return fallback_url
+        cached_images += 1
+        return cache_discover_art(source_url, cache_key)
+
     for artist in payload.get("artists") or []:
         write_app_log("Discover caching artist art", feature="discover", artist=artist.get("name"), artist_id=artist.get("id"))
-        artist["image_url"] = cache_discover_art(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
+        artist["image_url"] = cache_or_defer(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
         for album in artist.get("albums") or []:
             write_app_log("Discover caching album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
-            album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+            album["cover_art_url"] = cache_or_defer(album.get("cover_art_urls") or album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
     for album in payload.get("albums") or []:
         write_app_log("Discover caching top-level album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
-        album["cover_art_url"] = cache_discover_art(album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+        album["cover_art_url"] = cache_or_defer(album.get("cover_art_urls") or album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
     return payload
 
 

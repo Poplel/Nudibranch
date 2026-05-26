@@ -377,7 +377,8 @@ def normalize_release_results(releases: list[dict], fallback_artist: str | None 
                 "country": release.get("country"),
                 "score": release.get("score"),
                 "track_count": release.get("track-count"),
-                "cover_art_url": cover_art_url(release_id, release) or itunes_album_artwork(artist, title),
+                "cover_art_urls": cover_art_urls(release_id, release, artist, title),
+                "cover_art_url": first_cover_art_url(release_id, release, artist, title),
                 "tracks": [],
             }
         )
@@ -502,6 +503,26 @@ def escape_query(value: str) -> str:
     return value.replace('"', "")
 
 
+def first_cover_art_url(release_id: str | None, release: dict | None, artist: str, album: str) -> str | None:
+    urls = cover_art_urls(release_id, release, artist, album)
+    return urls[0] if urls else None
+
+
+def cover_art_urls(release_id: str | None, release: dict | None = None, artist: str | None = None, album: str | None = None) -> list[str]:
+    urls = []
+    release_url = cover_art_url(release_id, release)
+    if release_url:
+        urls.append(release_url)
+    release_group_id = ((release or {}).get("release-group") or {}).get("id")
+    if release_group_id:
+        urls.append(f"https://coverartarchive.org/release-group/{release_group_id}/front-250")
+    if artist and album:
+        itunes_url = itunes_album_artwork(artist, album)
+        if itunes_url:
+            urls.append(itunes_url)
+    return unique_urls(urls)
+
+
 def cover_art_url(release_id: str | None, release: dict | None = None) -> str | None:
     if not release_id:
         return None
@@ -511,13 +532,28 @@ def cover_art_url(release_id: str | None, release: dict | None = None) -> str | 
     return f"https://coverartarchive.org/release/{release_id}/front-250"
 
 
-def cache_discover_art(url: str | None, cache_key: str) -> str | None:
-    if not url:
+def unique_urls(urls: list[str | None]) -> list[str]:
+    result = []
+    seen = set()
+    for url in urls:
+        if not url:
+            continue
+        key = str(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def cache_discover_art(url: str | list[str] | None, cache_key: str) -> str | None:
+    urls = unique_urls(url if isinstance(url, list) else [url])
+    if not urls:
         write_app_log("Discover art cache skipped: no source URL", feature="discover", cache_key=cache_key)
         return None
     cache_dir = get_settings().config_path / "discover-art-cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    ext = Path(urlparse(url).path).suffix.lower()
+    ext = Path(urlparse(urls[0]).path).suffix.lower()
     if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
         ext = ".jpg"
     safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cache_key).strip("-")[:160] or "art"
@@ -536,17 +572,22 @@ def cache_discover_art(url: str | None, cache_key: str) -> str | None:
                 return f"/api/v1/discover/art/{image_path.name}"
         except (OSError, ValueError, TypeError):
             write_app_log("Discover art cache metadata unreadable; refreshing", level="warning", feature="discover", cache_key=cache_key)
-    try:
-        write_app_log("Discover art cache download started", feature="discover", cache_key=cache_key, source_url=url)
-        response = httpx.get(url, timeout=15, headers={"User-Agent": USER_AGENT})
-        response.raise_for_status()
-        image_path.write_bytes(response.content)
-        meta_path.write_text(json_dumps({"source_url": url, "fetched_at": now, "hits": 1}), encoding="utf-8")
-        write_app_log("Discover art cache download completed", feature="discover", cache_key=cache_key, bytes=len(response.content))
-        return f"/api/v1/discover/art/{image_path.name}"
-    except httpx.HTTPError as error:
-        write_app_log("Discover art cache download failed; using remote URL", level="warning", feature="discover", cache_key=cache_key, error=str(error))
-        return url
+    for candidate_url in urls:
+        try:
+            write_app_log("Discover art cache download started", feature="discover", cache_key=cache_key, source_url=candidate_url)
+            response = httpx.get(candidate_url, timeout=6, follow_redirects=True, headers={"User-Agent": USER_AGENT})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if "image" not in content_type:
+                raise ValueError(f"expected image content, got {content_type or 'unknown content type'}")
+            image_path.write_bytes(response.content)
+            meta_path.write_text(json_dumps({"source_url": candidate_url, "fetched_at": now, "hits": 1}), encoding="utf-8")
+            write_app_log("Discover art cache download completed", feature="discover", cache_key=cache_key, bytes=len(response.content))
+            return f"/api/v1/discover/art/{image_path.name}"
+        except (httpx.HTTPError, ValueError) as error:
+            write_app_log("Discover art cache download failed; trying fallback", level="warning", feature="discover", cache_key=cache_key, source_url=candidate_url, error=str(error))
+    write_app_log("Discover art cache exhausted all source URLs", level="warning", feature="discover", cache_key=cache_key, sources=len(urls))
+    return urls[-1]
 
 
 def clear_discover_art_cache() -> int:

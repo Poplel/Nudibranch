@@ -3180,9 +3180,10 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                 settings.get("slskd_url", ""),
                 settings.get("slskd_api_key", ""),
                 query,
-                limit=60,
-                timeout_seconds=12,
-                timeout_buffer_seconds=2,
+                limit=120,
+                timeout_seconds=14,
+                timeout_buffer_seconds=4,
+                wait_for_settled_results=True,
             )
             diagnostics = result.get("diagnostics") or {}
             append_task_log(
@@ -3225,10 +3226,15 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
         if len(accepted_after_query) >= folder_try_limit:
             append_task_log(session, task, f"{artist} / {album}: found {len(accepted_after_query)} matching lossless folder(s); stopping album search at configured try limit {folder_try_limit}")
             break
-    if not pools:
-        return []
     ranked = ranked_album_folder_pools(pools, requests, match_threshold)
     accepted = accepted_album_folder_pools(ranked, match_threshold)
+    if not accepted:
+        append_task_log(session, task, f"{artist} / {album}: album queries did not locate enough confident folders; trying track-seed folder discovery", "warning")
+        add_seed_track_folder_pools(session, task, settings, artist, album, requests, pools, match_threshold, folder_try_limit)
+        ranked = ranked_album_folder_pools(pools, requests, match_threshold)
+        accepted = accepted_album_folder_pools(ranked, match_threshold)
+    if not pools:
+        return []
     if not accepted:
         if ranked:
             best_score, best_pool = ranked[0]
@@ -3277,6 +3283,69 @@ def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list
         key=album_folder_pool_sort_key,
         reverse=True,
     )
+
+
+def add_seed_track_folder_pools(
+    session: Session,
+    task: Task | None,
+    settings: dict[str, str],
+    artist: str,
+    album: str,
+    requests: list[dict],
+    pools: dict[tuple[str, str], dict],
+    match_threshold: float,
+    folder_try_limit: int,
+) -> None:
+    seed_requests = representative_album_seed_requests(requests, limit=min(3, folder_try_limit))
+    for index, request in enumerate(seed_requests, start=1):
+        track_title = request.get("track") or request.get("title") or f"track {index}"
+        append_task_log(session, task, f"{artist} / {album}: seed search {index}/{len(seed_requests)} using {track_title}")
+        result = search_slskd_for_request_with_settings(
+            settings.get("slskd_url", ""),
+            settings.get("slskd_api_key", ""),
+            {**request, "artist": artist, "album": album, "require_lossless": True, "multiple_candidates": True},
+            limit=8,
+        )
+        for line in result.get("diagnostics", {}).get("query_logs") or []:
+            append_task_log(session, task, line)
+        added = 0
+        for candidate in result.get("candidates") or []:
+            pool = lossless_folder_pool(download_folder_pool(candidate))
+            if not pool:
+                continue
+            key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+            current = pools.setdefault(key, {**pool, "files": [], "queries": []})
+            current["queries"].append(str(candidate.get("query") or download_query(request)))
+            known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
+            for file_info in pool.get("files") or []:
+                filename = str(file_info.get("filename") or "")
+                if filename and filename not in known_filenames:
+                    current["files"].append(file_info)
+                    known_filenames.add(filename)
+                    added += 1
+        ranked = ranked_album_folder_pools(pools, requests, match_threshold)
+        accepted = accepted_album_folder_pools(ranked, match_threshold)
+        append_task_log(session, task, f"{artist} / {album}: seed search from {track_title} added {added} lossless file(s); {len(accepted)} folder(s) now meet album confidence")
+        if accepted:
+            break
+
+
+def representative_album_seed_requests(requests: list[dict], limit: int) -> list[dict]:
+    if not requests or limit <= 0:
+        return []
+    if len(requests) <= limit:
+        return requests
+    indexes = [0, len(requests) // 2, len(requests) - 1]
+    chosen = []
+    seen = set()
+    for index in indexes:
+        if index in seen:
+            continue
+        seen.add(index)
+        chosen.append(requests[index])
+        if len(chosen) >= limit:
+            break
+    return chosen
 
 
 def accepted_album_folder_pools(ranked: list[tuple[tuple[int, float, float, float, int, int], dict]], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
@@ -4611,10 +4680,11 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
                 duration_ms=track.get("length"),
                 musicbrainz_album_id=record.get("musicbrainz_album_id"),
                 musicbrainz_recording_id=track.get("musicbrainz_recording_id"),
+                require_lossless=True,
                 workflow="missing_tracks",
             )
             created += 1
-            append_task_log(session, task, f"{album.artist.name} / {album.title}: queued missing track review item for {track.get('title')}")
+            append_task_log(session, task, f"{album.artist.name} / {album.title}: queued missing track review item for {track.get('title')} with lossless candidate matching")
     if created == 0:
         session.delete(batch)
         create_notification(

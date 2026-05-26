@@ -27,6 +27,7 @@ def search_slskd_detailed(
     poll_interval: float = 1.0,
     timeout_seconds: int = 12,
     timeout_buffer_seconds: int = 3,
+    wait_for_settled_results: bool = False,
 ) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
@@ -73,15 +74,19 @@ def search_slskd_detailed(
             else:
                 settled_polls = 0
             last_response_count = len(responses)
-            if candidates and limit == 1:
+            if wait_for_settled_results and (len(responses) >= 250 or (diagnostics["polls"] >= 3 and settled_polls >= 2)):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
-            if candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+            if candidates and limit == 1 and not wait_for_settled_results:
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
-            if folder_candidates and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+            if candidates and not wait_for_settled_results and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
+                ranked = rank_candidates(candidates)[:limit]
+                diagnostics["candidates"] = len(ranked)
+                return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
+            if folder_candidates and not wait_for_settled_results and (diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 diagnostics["candidates"] = 0
                 return {"candidates": [], "folder_candidates": folder_candidates, "diagnostics": diagnostics}
             time.sleep(poll_interval)
