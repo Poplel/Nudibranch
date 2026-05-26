@@ -1,4 +1,3 @@
-import logging
 import time
 import uuid
 from threading import Lock
@@ -8,7 +7,6 @@ from urllib.parse import quote
 import httpx
 
 SLSKD_SEARCH_CREATE_INTERVAL_SECONDS = 1.25
-logger = logging.getLogger(__name__)
 _search_create_lock = Lock()
 _last_search_created_at = 0.0
 
@@ -144,7 +142,6 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int, search
 
 def search_payload(client: httpx.Client, search_id: str) -> Any:
     state_response = client.get(f"/api/v0/searches/{quote(str(search_id), safe='')}")
-    logger.warning("[DEBUG] slskd search state raw %s (%s): %s", search_id, state_response.status_code, state_response.text[:500])
     state_response.raise_for_status()
     state_payload = state_response.json()
 
@@ -166,7 +163,6 @@ def search_payload(client: httpx.Client, search_id: str) -> Any:
 
 def search_responses_payload(client: httpx.Client, search_id: str) -> dict[str, Any] | None:
     response = client.get(f"/api/v0/searches/{quote(str(search_id), safe='')}/responses")
-    logger.warning("[DEBUG] slskd search responses raw %s (%s): %s", search_id, response.status_code, response.text[:500])
     if response.status_code in {404, 405}:
         return None
     response.raise_for_status()
