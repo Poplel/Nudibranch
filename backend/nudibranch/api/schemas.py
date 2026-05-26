@@ -214,6 +214,7 @@ class IntegrationSettings(BaseModel):
     slskd_url: str = ""
     slskd_api_key: str = ""
     slskd_album_match_threshold: str = "72"
+    slskd_album_folder_tries: str = "5"
     slskd_concurrent_downloads: str = "1"
     playlist_conflict_winner: str = "nudibranch"
     favorite_playlist_id: str = ""

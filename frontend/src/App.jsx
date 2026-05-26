@@ -4418,6 +4418,7 @@ function SettingsPanel({
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
+            ["slskd_album_folder_tries", "Album folder tries"],
             ["slskd_concurrent_downloads", "Concurrent slskd downloads"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
             ["youtube_cookies_path", "YouTube cookies file"],
@@ -4459,10 +4460,10 @@ function SettingsPanel({
               ) : (
                 <input
                   readOnly={key === "youtube_cookies_path"}
-                  type={["slskd_album_match_threshold", "slskd_concurrent_downloads"].includes(key) ? "number" : key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
-                  min={key === "slskd_album_match_threshold" ? "50" : key === "slskd_concurrent_downloads" ? "1" : undefined}
-                  max={key === "slskd_album_match_threshold" ? "95" : key === "slskd_concurrent_downloads" ? "12" : undefined}
-                  step={["slskd_album_match_threshold", "slskd_concurrent_downloads"].includes(key) ? "1" : undefined}
+                  type={["slskd_album_match_threshold", "slskd_album_folder_tries", "slskd_concurrent_downloads"].includes(key) ? "number" : key.endsWith("api_key") && !shownIntegrationKeys[key] ? "password" : "text"}
+                  min={key === "slskd_album_match_threshold" ? "50" : ["slskd_album_folder_tries", "slskd_concurrent_downloads"].includes(key) ? "1" : undefined}
+                  max={key === "slskd_album_match_threshold" ? "95" : ["slskd_album_folder_tries", "slskd_concurrent_downloads"].includes(key) ? "12" : undefined}
+                  step={["slskd_album_match_threshold", "slskd_album_folder_tries", "slskd_concurrent_downloads"].includes(key) ? "1" : undefined}
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
                 />

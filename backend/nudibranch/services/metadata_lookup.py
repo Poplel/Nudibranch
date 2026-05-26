@@ -15,6 +15,9 @@ from nudibranch.services.imports import read_audio_metadata
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
 DISCOVER_CACHE_TTL_SECONDS = 24 * 60 * 60
 DISCOVER_CACHE_MAX_HITS = 3
+MUSICBRAINZ_TIMEOUT_SECONDS = 8
+DISCOVER_ARTIST_ALBUM_LIMIT = 6
+DISCOVER_ALBUM_TRACK_HYDRATION_LIMIT = 4
 
 
 def lookup_recording_by_musicbrainz_metadata(file_info: dict) -> list[dict]:
@@ -131,11 +134,11 @@ def discover_music(query: str) -> dict:
     if not query:
         return {"artists": [], "albums": [], "tracks": [], "focus": None}
     write_app_log("Discover search started", feature="discover", query=query)
-    artists = search_artists(query, limit=5)
+    artists = safe_discover_lookup("artist", query, lambda: search_artists(query, limit=5), [])
     write_app_log("Discover artist search completed", feature="discover", query=query, artists=len(artists))
-    albums = search_releases(query, limit=8)
+    albums = safe_discover_lookup("album", query, lambda: search_releases(query, limit=8), [])
     write_app_log("Discover album search completed", feature="discover", query=query, albums=len(albums))
-    tracks = search_recordings(query, limit=8)
+    tracks = safe_discover_lookup("track", query, lambda: search_recordings(query, limit=8), [])
     write_app_log("Discover track search completed", feature="discover", query=query, tracks=len(tracks))
     artist_map = {artist["id"]: artist for artist in artists if artist.get("id")}
     for album in albums:
@@ -150,20 +153,29 @@ def discover_music(query: str) -> dict:
             artist_map[artist_key] = {"id": artist_key, "name": track["artist"], "albums": []}
         if artist_key:
             track["artist_id"] = artist_key
+    should_expand_artist_albums = not albums and not tracks
+    expanded_artists = 0
+    hydrated_albums = 0
     for artist in artist_map.values():
         if str(artist.get("id") or "").startswith("artist-name:"):
             artist["albums"] = []
             write_app_log("Discover artist album lookup skipped for name-only artist", feature="discover", query=query, artist=artist.get("name"))
-        else:
+        elif should_expand_artist_albums and expanded_artists < 2:
             try:
-                artist["albums"] = discover_artist_albums(artist["id"], artist["name"], limit=8)
+                artist["albums"] = discover_artist_albums(artist["id"], artist["name"], limit=DISCOVER_ARTIST_ALBUM_LIMIT)
+                expanded_artists += 1
                 write_app_log("Discover artist album lookup completed", feature="discover", query=query, artist=artist.get("name"), albums=len(artist["albums"]))
             except httpx.HTTPError as error:
                 artist["albums"] = []
                 write_app_log("Discover artist album lookup failed", level="warning", feature="discover", query=query, artist=artist.get("name"), error=str(error))
+        else:
+            artist["albums"] = []
+            write_app_log("Discover artist album lookup deferred", feature="discover", query=query, artist=artist.get("name"))
         for album in albums:
             if album.get("artist_id") == artist.get("id"):
-                ensure_artist_album(artist, album)
+                hydrate_tracks = hydrated_albums < DISCOVER_ALBUM_TRACK_HYDRATION_LIMIT
+                if ensure_artist_album(artist, album, hydrate_tracks=hydrate_tracks):
+                    hydrated_albums += 1
         for track in tracks:
             if track.get("artist_id") == artist.get("id") and track.get("album_id"):
                 ensure_artist_album(
@@ -175,6 +187,7 @@ def discover_music(query: str) -> dict:
                         "artist_id": artist.get("id"),
                         "tracks": [track],
                     },
+                    hydrate_tracks=False,
                 )
         artist["image_url"] = next((album.get("cover_art_url") for album in artist["albums"] if album.get("cover_art_url")), None)
     focus = None
@@ -196,12 +209,21 @@ def discover_music(query: str) -> dict:
     return result
 
 
+def safe_discover_lookup(kind: str, query: str, lookup, fallback):
+    try:
+        write_app_log("Discover lookup started", feature="discover", kind=kind, query=query)
+        return lookup()
+    except httpx.HTTPError as error:
+        write_app_log("Discover lookup failed", level="warning", feature="discover", kind=kind, query=query, error=str(error))
+        return fallback
+
+
 def discover_artist_key(artist: str | None) -> str | None:
     normalized = normalize(artist)
     return f"artist-name:{normalized}" if normalized else None
 
 
-def ensure_artist_album(artist: dict, album: dict) -> None:
+def ensure_artist_album(artist: dict, album: dict, hydrate_tracks: bool = True) -> bool:
     albums = artist.setdefault("albums", [])
     existing = next((entry for entry in albums if entry.get("id") == album.get("id") or normalize(entry.get("title")) == normalize(album.get("title"))), None)
     if existing:
@@ -210,19 +232,28 @@ def ensure_artist_album(artist: dict, album: dict) -> None:
         for track in album.get("tracks") or []:
             if normalize(track.get("title")) not in seen:
                 existing_tracks.append(track)
-        return
+        return False
     hydrated = dict(album)
-    if not hydrated.get("tracks") and hydrated.get("id"):
-        record = lookup_album_tracks(hydrated.get("artist") or artist.get("name"), hydrated.get("title") or "", hydrated.get("id"))
-        hydrated["tracks"] = dedupe_tracks(record.get("tracks") or [])
+    did_hydrate = False
+    if hydrate_tracks and not hydrated.get("tracks") and hydrated.get("id"):
+        try:
+            write_app_log("Discover album track hydration started", feature="discover", artist=artist.get("name"), album=hydrated.get("title"))
+            record = lookup_album_tracks(hydrated.get("artist") or artist.get("name"), hydrated.get("title") or "", hydrated.get("id"))
+            hydrated["tracks"] = dedupe_tracks(record.get("tracks") or [])
+            did_hydrate = True
+            write_app_log("Discover album track hydration completed", feature="discover", artist=artist.get("name"), album=hydrated.get("title"), tracks=len(hydrated["tracks"]))
+        except httpx.HTTPError as error:
+            hydrated["tracks"] = []
+            write_app_log("Discover album track hydration failed", level="warning", feature="discover", artist=artist.get("name"), album=hydrated.get("title"), error=str(error))
     albums.insert(0, hydrated)
+    return did_hydrate
 
 
 def search_artists(query: str, limit: int = 5) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/artist/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -251,7 +282,7 @@ def search_releases(query: str, limit: int = 8) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -262,7 +293,7 @@ def search_recordings(query: str, limit: int = 8) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/recording/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit, "inc": "artist-credits+releases"},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -292,11 +323,11 @@ def search_recordings(query: str, limit: int = 8) -> list[dict]:
     return tracks
 
 
-def discover_artist_albums(artist_id: str, artist_name: str, limit: int = 8) -> list[dict]:
+def discover_artist_albums(artist_id: str, artist_name: str, limit: int = DISCOVER_ARTIST_ALBUM_LIMIT) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "artist": artist_id, "limit": min(limit * 3, 25), "inc": "artist-credits"},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -308,9 +339,17 @@ def discover_artist_albums(artist_id: str, artist_name: str, limit: int = 8) -> 
     albums = normalize_release_results(releases, fallback_artist=artist_name, fallback_artist_id=artist_id)
     albums = sorted(albums, key=lambda album: (album.get("date") or "9999", album.get("title") or ""))
     hydrated = []
-    for album in albums[:limit]:
-        record = lookup_album_tracks(album["artist"], album["title"], album["id"])
-        hydrated.append({**album, "tracks": dedupe_tracks(record.get("tracks") or [])})
+    for index, album in enumerate(albums[:limit]):
+        if index < DISCOVER_ALBUM_TRACK_HYDRATION_LIMIT:
+            try:
+                write_app_log("Discover artist album hydration started", feature="discover", artist=artist_name, album=album.get("title"))
+                record = lookup_album_tracks(album["artist"], album["title"], album["id"])
+                hydrated.append({**album, "tracks": dedupe_tracks(record.get("tracks") or [])})
+                write_app_log("Discover artist album hydration completed", feature="discover", artist=artist_name, album=album.get("title"), tracks=len(hydrated[-1].get("tracks") or []))
+                continue
+            except httpx.HTTPError as error:
+                write_app_log("Discover artist album hydration failed", level="warning", feature="discover", artist=artist_name, album=album.get("title"), error=str(error))
+        hydrated.append(album)
     return hydrated
 
 
@@ -366,7 +405,7 @@ def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) 
     response = httpx.get(
         f"https://musicbrainz.org/ws/2/release/{release_id}",
         params={"fmt": "json", "inc": "recordings+media+artist-credits"},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -399,7 +438,7 @@ def find_releases(artist: str, album: str, limit: int = 5) -> list[dict]:
     response = httpx.get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "query": query, "limit": limit},
-        timeout=20,
+        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
