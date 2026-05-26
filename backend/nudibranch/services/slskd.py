@@ -97,6 +97,14 @@ def search_slskd_detailed(
             if folder_candidates and not wait_for_settled_results and (search_done or diagnostics["polls"] >= 3 or len(responses) >= 30 or settled_polls >= 1):
                 diagnostics["candidates"] = 0
                 return {"candidates": [], "folder_candidates": folder_candidates, "diagnostics": diagnostics}
+            if (
+                not responses
+                and diagnostics["polls"] >= 5
+                and diagnostics.get("response_count", 0) > 0
+                and diagnostics.get("file_count", 0) > 0
+            ):
+                diagnostics["response_payload_unavailable"] = True
+                return {"candidates": [], "folder_candidates": [], "diagnostics": diagnostics}
             time.sleep(poll_interval)
         ranked = rank_candidates(extract_candidates(responses or payload, query))[:limit]
         folder_candidates = extract_folder_candidates(responses or payload, query)
@@ -141,13 +149,9 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int, search
 
 
 def search_payload(client: httpx.Client, search_id: str) -> Any:
-    responses_response = client.get(f"/api/v0/searches/{search_id}/responses")
-    if responses_response.status_code not in {404, 405}:
-        responses_response.raise_for_status()
-        responses_payload = responses_response.json()
-        responses = response_list(responses_payload)
-        if responses:
-            return {"responses": responses}
+    responses_payload = search_responses_payload(client, search_id)
+    if responses_payload:
+        return responses_payload
 
     state_response = client.get(f"/api/v0/searches/{search_id}", params={"includeResponses": "true"})
     state_response.raise_for_status()
@@ -156,8 +160,27 @@ def search_payload(client: httpx.Client, search_id: str) -> Any:
     if responses:
         return state_payload
     if isinstance(state_payload, dict):
+        for alternate_id in (state_payload.get("token"), state_payload.get("Token"), state_payload.get("id"), state_payload.get("Id")):
+            if not alternate_id or str(alternate_id) == str(search_id):
+                continue
+            responses_payload = search_responses_payload(client, str(alternate_id))
+            if responses_payload:
+                return {**state_payload, **responses_payload}
+    if isinstance(state_payload, dict):
         return {**state_payload, "responses": responses}
     return state_payload
+
+
+def search_responses_payload(client: httpx.Client, search_id: str) -> dict[str, Any] | None:
+    response = client.get(f"/api/v0/searches/{quote(str(search_id), safe='')}/responses")
+    if response.status_code in {404, 405}:
+        return None
+    response.raise_for_status()
+    payload = response.json()
+    responses = response_list(payload)
+    if not responses:
+        return None
+    return {"responses": responses}
 
 
 def queue_slskd_download(slskd_url: str, api_key: str, candidate: dict[str, Any]) -> dict[str, Any]:

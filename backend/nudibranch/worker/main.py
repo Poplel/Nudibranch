@@ -46,6 +46,9 @@ DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
 MIN_SLSKD_TRACK_CONFIDENCE = 0.60
 SLSKD_TRACK_SEARCH_WORKERS = 1
 SLSKD_TRACK_QUERY_LIMIT = 6
+SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 6
+SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 1
+SLSKD_ALBUM_SEARCH_POLL_INTERVAL = 0.5
 LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
@@ -290,7 +293,7 @@ def add_download_candidate_review_items(
         if pools:
             append_task_log(session, task, f"{artist} / {album}: using {len(pools)} ranked album folder(s) for candidates")
         else:
-            append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; falling back to track searches", "warning")
+            append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; track searches skipped for album workflow", "warning")
         missing_track_jobs: list[tuple[dict, ProposalItem, str, int]] = []
         for request, track_item_id, track_title in track_items:
             track_item = session.get(ProposalItem, track_item_id)
@@ -404,8 +407,10 @@ def add_track_search_candidate_items(
 
 
 def should_use_track_search_fallback(album: str, requests: list[dict]) -> bool:
-    if any(request.get("require_lossless") or request.get("workflow") in {"missing_tracks", "lossless_replacement"} for request in requests):
-        return True
+    if any(request.get("workflow") in {"missing_tracks", "lossless_replacement"} for request in requests):
+        return False
+    if any(request.get("require_lossless") for request in requests) and len(requests) > 1:
+        return False
     normalized_album = fuzzy_text(album)
     if normalized_album in {"", "singles", "unknown album", "unknown"}:
         return True
@@ -3324,9 +3329,10 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                 settings.get("slskd_api_key", ""),
                 query,
                 limit=120,
-                timeout_seconds=14,
-                timeout_buffer_seconds=4,
-                wait_for_settled_results=True,
+                poll_interval=SLSKD_ALBUM_SEARCH_POLL_INTERVAL,
+                timeout_seconds=SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS,
+                timeout_buffer_seconds=SLSKD_ALBUM_SEARCH_BUFFER_SECONDS,
+                wait_for_settled_results=False,
             )
             diagnostics = result.get("diagnostics") or {}
             append_task_log(
@@ -3376,10 +3382,7 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
     ranked = ranked_album_folder_pools(pools, requests, match_threshold)
     accepted = accepted_album_folder_pools(ranked, match_threshold)
     if not accepted:
-        append_task_log(session, task, f"{artist} / {album}: album queries did not locate enough confident folders; trying track-seed folder discovery", "warning")
-        add_seed_track_folder_pools(session, task, settings, artist, album, requests, pools, match_threshold, folder_try_limit)
-        ranked = ranked_album_folder_pools(pools, requests, match_threshold)
-        accepted = accepted_album_folder_pools(ranked, match_threshold)
+        append_task_log(session, task, f"{artist} / {album}: album queries did not locate enough confident folders; skipping individual track seed searches", "warning")
     if not pools:
         return []
     if not accepted:
