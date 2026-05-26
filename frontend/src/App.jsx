@@ -2187,7 +2187,7 @@ function ApprovalNode({
     const grandchildren = childrenById.get(child.id) || [];
     return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
   });
-  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? downloadStatusProgress(statusMeta) : null;
+  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? downloadStatusProgressForItem(item) : null;
   if (hiddenAlternateCandidate) return null;
 
   function updateChecked(checked) {
@@ -5240,6 +5240,8 @@ function downloadProgressSummary(approvals) {
   let failed = 0;
   let selected = 0;
   let waiting = 0;
+  let queued = 0;
+  let staging = 0;
   let verifying = 0;
   let verified = 0;
   let partial = 0;
@@ -5247,6 +5249,7 @@ function downloadProgressSummary(approvals) {
     const status = itemStatusMeta(item);
     const lower = String(status || "").toLowerCase();
     const payload = parseJsonObject(item.payload_json);
+    const structuredProgress = downloadStatusProgressForItem(item);
     const hasRetried = /retry|retried|replacement|stalled/.test(lower) || (payload.failed_candidates || []).length > 0;
     if (hasRetried) retried += 1;
     if (item.status === "failed" || /need attention|failed|mismatch|could not be verified/.test(lower)) {
@@ -5269,9 +5272,12 @@ function downloadProgressSummary(approvals) {
       selected += 1;
       continue;
     }
-    const progress = downloadStatusProgress(status);
+    const progress = structuredProgress || downloadStatusProgress(status);
     if (progress) {
-      if (/downloading\s+\d+(?:\.\d+)?%/.test(lower)) downloading += 1;
+      if (progress.stage === "downloading" || /downloading\s+\d+(?:\.\d+)?%/.test(lower)) downloading += 1;
+      else if (["staging", "transferring", "importing"].includes(progress.stage)) staging += 1;
+      else if (progress.stage === "verifying") verifying += 1;
+      else if (progress.stage === "queued") queued += 1;
       else waiting += 1;
       partial += progress.indeterminate ? 0 : progress.value;
       continue;
@@ -5283,11 +5289,15 @@ function downloadProgressSummary(approvals) {
   const percent = total ? partial / total : 0;
   const notStarted = selected === total && downloading === 0 && finished === 0 && failed === 0;
   const verificationPending = finished === total && verified < total && failed === 0;
-  const waitingForDownload = waiting > 0 && downloading === 0 && finished === 0 && failed === 0;
+  const waitingForDownload = (waiting > 0 || queued > 0) && downloading === 0 && finished === 0 && failed === 0;
   const label = notStarted
     ? `${selected} selected candidates`
     : waitingForDownload
-      ? `${waiting}/${total} downloading`
+      ? `${queued || waiting}/${total} queued`
+    : downloading > 0
+      ? `${downloading}/${total} downloading`
+    : staging > 0
+      ? `${staging}/${total} staging`
     : verificationPending
       ? `Verification pending for ${total} downloads`
       : verifying > 0
@@ -5297,7 +5307,7 @@ function downloadProgressSummary(approvals) {
     percent,
     indeterminate: !notStarted && downloading > 0 && partial === 0,
     label,
-    detail: `${downloading} downloading · ${retried} retried · ${finished} finished · ${failed} failed`,
+    detail: `${queued} queued · ${downloading} downloading · ${staging} staging · ${retried} retried · ${finished} finished · ${failed} failed`,
   };
 }
 
@@ -5322,6 +5332,19 @@ function downloadStatusProgress(status) {
     return { value: 0, label: text, indeterminate: false };
   }
   return null;
+}
+
+function downloadStatusProgressForItem(item) {
+  const payload = parseJsonObject(item.payload_json);
+  const progress = payload.download_progress;
+  if (!progress || typeof progress !== "object") return downloadStatusProgress(payload.status);
+  const value = Number(progress.value ?? progress.progress ?? 0);
+  return {
+    value: Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0,
+    label: progress.label || payload.status || itemStatusMeta(item),
+    indeterminate: Boolean(progress.indeterminate),
+    stage: progress.stage || "queued",
+  };
 }
 
 function downloadBatchNodeId(batchId) {

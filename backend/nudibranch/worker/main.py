@@ -30,10 +30,11 @@ MAX_DOWNLOAD_AUTO_RETRIES = 6
 ZERO_PROGRESS_RETRY_SECONDS = 90
 STALLED_PROGRESS_RETRY_SECONDS = 150
 MISSING_TRANSFER_RETRY_SECONDS = 45
+RECENT_TRANSFER_DISAPPEARED_RETRY_SECONDS = 10
 COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
-DOWNLOAD_SCAN_INTERVAL_SECONDS = 5
+DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 REPLACEMENT_SEARCH_RETRY_SECONDS = 15
 TRANSFER_COMPLETE_PERCENT = 99.5
 DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
@@ -1320,7 +1321,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             if staged_path.exists():
                 verified_entries.append((entry, staged_path, entry["metadata"]))
                 ready_count += 1
-                set_download_item_status(item, "verified; queued for batch import")
+                set_download_item_status(item, "verified; queued for batch import", stage="verified", progress=100)
                 continue
 
         transfer = transfer_lookup.get(manifest_entry_key(entry))
@@ -1332,6 +1333,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             try:
                 file_path = stage_downloaded_file(session, batch, entry, file_path)
                 wait_status = "staged; ready for verification"
+                set_download_item_status(item, wait_status, stage="staging", progress=100)
             except Exception as error:  # noqa: BLE001 - keep the batch visible and retryable.
                 failed_count += 1
                 if item:
@@ -1351,9 +1353,15 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 continue
             if transfer_error_message and not transfer:
                 wait_status = f"{transfer_error_message}; {wait_status}"
-            status = transfer_wait_status(entry, transfer, wait_status)
             update_manifest_transfer_tracking(entry, transfer)
-            set_download_item_status(item, status)
+            progress_state = transfer_progress_state(entry, transfer, wait_status)
+            set_download_item_status(
+                item,
+                progress_state["label"],
+                stage=progress_state.get("stage"),
+                progress=progress_state.get("progress"),
+                indeterminate=progress_state.get("indeterminate"),
+            )
             if transfer_is_failed(transfer) and item:
                 item.status = ProposalStatus.failed
                 failed_count += 1
@@ -1361,7 +1369,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 waiting_count += 1
             continue
 
-        set_download_item_status(item, "verifying with MusicBrainz")
+        set_download_item_status(item, "verifying with MusicBrainz", stage="verifying", progress=100, indeterminate=True)
         update_download_manifest_entry(entry, "verifying", path=str(file_path), verifying_at=datetime.now(timezone.utc).isoformat())
         entry.update({"status": "verifying", "path": str(file_path)})
         append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with MusicBrainz")
@@ -1384,7 +1392,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             continue
         metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
         update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
-        set_download_item_status(item, "verified; queued for batch import")
+        set_download_item_status(item, "verified; queued for batch import", stage="verified", progress=100)
         append_task_log(session, None, f"{entry_download_label(entry)}: MusicBrainz metadata verified")
         verified_entries.append((entry, file_path, metadata))
         ready_count += 1
@@ -1396,7 +1404,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
 
     try:
         for entry, _file_path, _metadata in verified_entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch")
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch", stage="importing", progress=100, indeterminate=True)
         append_task_log(session, None, f"{batch.title}: all {len(verified_entries)} staged track(s) verified; importing batch")
         imported = import_verified_download_batch(session, batch, verified_entries)
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
@@ -1618,6 +1626,7 @@ def matching_download_transfer(entry: dict, transfers: list[dict]) -> dict | Non
     expected_user = str(candidate.get("username") or "").casefold()
     expected_filename = normalize_remote_path(candidate.get("filename"))
     expected_basename = str(entry.get("basename") or remote_basename(expected_filename)).casefold()
+    matches: list[dict] = []
     for transfer in transfers:
         transfer_user = str(transfer.get("username") or "").casefold()
         if expected_user and transfer_user and transfer_user != expected_user:
@@ -1631,10 +1640,38 @@ def matching_download_transfer(entry: dict, transfers: list[dict]) -> dict | Non
                 continue
             transfer_basename = path.rsplit("/", 1)[-1].casefold()
             if expected_basename and transfer_basename == expected_basename:
-                return transfer
+                matches.append(transfer)
+                break
             if expected_filename and (path.endswith(expected_filename) or expected_filename.endswith(path)):
-                return transfer
-    return None
+                matches.append(transfer)
+                break
+    if not matches:
+        return None
+    return max(matches, key=download_transfer_preference)
+
+
+def download_transfer_preference(transfer: dict) -> tuple[int, float]:
+    if transfer_is_failed(transfer):
+        state_rank = 0
+    elif transfer_is_complete_or_finishing(transfer):
+        state_rank = 1
+    elif transfer_holds_download_slot(transfer):
+        state_rank = 3
+    else:
+        state_rank = 2
+    return (state_rank, transfer_event_timestamp(transfer))
+
+
+def transfer_event_timestamp(transfer: dict) -> float:
+    for key in ("updatedAt", "UpdatedAt", "endedAt", "EndedAt", "startedAt", "StartedAt", "enqueuedAt", "EnqueuedAt", "requestedAt", "RequestedAt"):
+        raw = transfer.get(key)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
 
 
 def normalize_remote_path(value: object) -> str:
@@ -1678,6 +1715,23 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
             return manifest_wait_status(entry, f"download queued in slskd: {status}")
         return manifest_wait_status(entry, f"download status from slskd: {status}")
     return manifest_wait_status(entry, fallback)
+
+
+def transfer_progress_state(entry: dict, transfer: dict | None, fallback: str) -> dict:
+    status = transfer_wait_status(entry, transfer, fallback)
+    if not transfer:
+        return {"stage": "queued", "progress": 0, "label": status}
+    if transfer_is_failed(transfer):
+        return {"stage": "failed", "progress": transfer_percent(transfer) or 0, "label": status}
+    if transfer_is_complete_or_finishing(transfer):
+        return {"stage": "transferring", "progress": 100, "label": status, "indeterminate": True}
+    percent = transfer_percent(transfer)
+    if percent is not None:
+        stage = "downloading" if percent > 0 or transfer_has_started(transfer) else "queued"
+        return {"stage": stage, "progress": percent, "label": status}
+    if transfer_is_queued_or_waiting(transfer):
+        return {"stage": "queued", "progress": 0, "label": status}
+    return {"stage": "transferring", "progress": 0, "label": status, "indeterminate": True}
 
 
 def transfer_percent(transfer: dict | None) -> float | None:
@@ -1752,6 +1806,11 @@ def transfer_is_failed(transfer: dict | None) -> bool:
     return bool(error) or any(token in status for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
 
 
+def transfer_status_is_failed(status: object) -> bool:
+    lowered = str(status or "").casefold()
+    return any(token in lowered for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
+
+
 def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     if transfer_is_failed(transfer):
         error = transfer.get("error") if transfer else None
@@ -1766,8 +1825,17 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
         return None
     if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
         return "transfer stayed queued"
-    if not transfer and age >= MISSING_TRANSFER_RETRY_SECONDS:
-        return "slskd transfer disappeared before the file arrived"
+    if not transfer:
+        last_error = entry.get("last_transfer_error")
+        last_status = entry.get("last_transfer_status")
+        if last_error or transfer_status_is_failed(last_status):
+            return f"transfer failed: {last_error or last_status or 'unknown error'}"
+        last_seen_age = manifest_seconds_since(entry.get("last_transfer_seen_at"))
+        if last_seen_age is not None and last_seen_age >= RECENT_TRANSFER_DISAPPEARED_RETRY_SECONDS:
+            return "slskd transfer disappeared before the file arrived"
+        if age >= MISSING_TRANSFER_RETRY_SECONDS:
+            return "slskd transfer did not appear after queueing"
+        return None
     percent = transfer_percent(transfer)
     if percent is None:
         return None
@@ -2107,9 +2175,23 @@ def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> Non
         return
     percent = transfer.get("percent")
     now = datetime.now(timezone.utc).isoformat()
+    manifest_status = entry.get("status") or "queued"
+    if transfer_is_failed(transfer):
+        manifest_status = "queued"
+    elif transfer_is_complete_or_finishing(transfer):
+        manifest_status = "downloading"
+    elif transfer_has_started(transfer):
+        manifest_status = "downloading"
+    elif transfer_is_queued_or_waiting(transfer):
+        manifest_status = "queued"
     fields: dict[str, object] = {
         "last_transfer_seen_at": now,
         "last_transfer_status": transfer.get("status"),
+        "last_transfer_id": transfer.get("id"),
+        "last_transfer_error": transfer.get("error"),
+        "last_transfer_bytes_transferred": transfer.get("bytes_transferred"),
+        "last_transfer_bytes_remaining": transfer.get("bytes_remaining"),
+        "last_transfer_average_speed": transfer.get("average_speed"),
     }
     if isinstance(percent, (int, float)):
         bounded = max(0, min(100, float(percent)))
@@ -2117,8 +2199,8 @@ def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> Non
         fields["last_transfer_percent"] = bounded
         if last_percent is None or abs(last_percent - bounded) >= 0.5:
             fields["last_transfer_progress_at"] = now
-    update_download_manifest_entry(entry, entry.get("status") or "queued", **fields)
-    entry.update(fields)
+    update_download_manifest_entry(entry, manifest_status, **fields)
+    entry.update({"status": manifest_status, **fields})
 
 
 def manifest_entry_age_seconds(entry: dict) -> int:
@@ -2223,11 +2305,12 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             or (leaf.status.value if hasattr(leaf.status, "value") else str(leaf.status))
             for leaf in leaves
         ]
+        progress_payloads = [json.loads(leaf.payload_json or "{}").get("download_progress") or {} for leaf in leaves]
         downloaded = sum(1 for status in statuses if download_status_is_downloaded(status))
         verified = sum(1 for status in statuses if download_status_is_verified(status))
-        failed = sum(1 for status in statuses if "failed" in status or "mismatch" in status or "could not be verified" in status)
+        failed = sum(1 for status in statuses if "need attention" in status or "failed" in status or "mismatch" in status or "could not be verified" in status)
         total = len(leaves)
-        progress_values = [download_status_progress_value(status) for status in statuses]
+        progress_values = [download_status_progress_value(status, payload) for status, payload in zip(statuses, progress_payloads)]
         average_progress = sum(progress_values) / max(1, total)
         if failed:
             status = f"{failed} of {total} need attention"
@@ -2246,7 +2329,8 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             status = f"queued in slskd · 0 of {total} staged"
         else:
             status = f"waiting for transfer progress · 0 of {total} staged"
-        set_item_payload_status(item, status)
+        stage = "failed" if failed else "verified" if verified == total else "verifying" if downloaded == total else "downloading" if average_progress > 0 else "queued"
+        set_item_payload_status(item, status, download_progress_payload(status, stage=stage, progress=average_progress, indeterminate=stage in {"verifying"}))
 
 
 def download_status_is_downloaded(status: str) -> bool:
@@ -2259,7 +2343,9 @@ def download_status_is_verified(status: str) -> bool:
     return any(token in lowered for token in ("verified", "importing"))
 
 
-def download_status_progress_value(status: str) -> float:
+def download_status_progress_value(status: str, progress_payload: dict | None = None) -> float:
+    if isinstance(progress_payload, dict) and isinstance(progress_payload.get("value"), (int, float)):
+        return max(0.0, min(100.0, float(progress_payload["value"])))
     lowered = str(status or "").casefold()
     if download_status_is_downloaded(status):
         return 100.0
@@ -3130,19 +3216,74 @@ def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> 
     )
 
 
-def set_item_payload_status(item: ProposalItem, status: str) -> None:
+def set_item_payload_status(item: ProposalItem, status: str, download_progress: dict | None = None) -> None:
     payload = json.loads(item.payload_json or "{}")
     payload["status"] = status
+    if download_progress is not None:
+        payload["download_progress"] = download_progress
     item.payload_json = json.dumps(payload)
 
 
-def set_download_item_status(item: ProposalItem | None, status: str) -> None:
+def set_download_item_status(
+    item: ProposalItem | None,
+    status: str,
+    *,
+    stage: str | None = None,
+    progress: float | None = None,
+    indeterminate: bool | None = None,
+) -> None:
     if not item:
         return
-    set_item_payload_status(item, status)
+    progress_payload = download_progress_payload(status, stage=stage, progress=progress, indeterminate=indeterminate)
+    set_item_payload_status(item, status, progress_payload)
     if item.parent and item.parent.kind == ProposalKind.download:
-        set_item_payload_status(item.parent, status)
+        set_item_payload_status(item.parent, status, progress_payload)
         item.parent.status = ProposalStatus.executing
+
+
+def download_progress_payload(status: str, *, stage: str | None = None, progress: float | None = None, indeterminate: bool | None = None) -> dict:
+    lowered = str(status or "").casefold()
+    value = max(0.0, min(100.0, float(progress))) if isinstance(progress, (int, float)) else None
+    resolved_stage = stage
+    resolved_indeterminate = bool(indeterminate)
+    if resolved_stage is None:
+        if any(token in lowered for token in ("need attention", "failed", "mismatch", "could not be verified")):
+            resolved_stage = "failed"
+            value = 0 if value is None else value
+        elif "verified" in lowered:
+            resolved_stage = "verified"
+            value = 100
+        elif "importing" in lowered:
+            resolved_stage = "importing"
+            value = 100
+            resolved_indeterminate = True
+        elif "verifying" in lowered:
+            resolved_stage = "verifying"
+            value = 100 if value is None else value
+            resolved_indeterminate = True
+        elif any(token in lowered for token in ("downloaded", "staged", "moving completed file")):
+            resolved_stage = "staging"
+            value = 100
+            resolved_indeterminate = "moving" in lowered
+        elif match := re.search(r"downloading\s+(\d+(?:\.\d+)?)%", lowered):
+            resolved_stage = "downloading"
+            value = max(0.0, min(100.0, float(match.group(1))))
+        elif any(token in lowered for token in ("waiting for download slot", "queued", "requested", "initializing", "checking transfer state")):
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+        elif any(token in lowered for token in ("searching", "retrying", "replacement")):
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+            resolved_indeterminate = True
+        else:
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+    return {
+        "stage": resolved_stage,
+        "value": 0 if value is None else value,
+        "label": status,
+        "indeterminate": resolved_indeterminate,
+    }
 
 
 def download_folder_pool(candidate: dict) -> dict | None:

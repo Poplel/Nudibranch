@@ -196,7 +196,7 @@ def download_transfers(slskd_url: str, api_key: str) -> list[dict[str, Any]]:
     if not slskd_url or not api_key:
         return []
     with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
-        response = client.get("/api/v0/transfers/downloads")
+        response = client.get("/api/v0/transfers/downloads", params={"includeRemoved": "true"})
         if response.status_code in {404, 405}:
             return []
         response.raise_for_status()
@@ -225,7 +225,7 @@ def flatten_download_transfers(payload: Any) -> list[dict[str, Any]]:
             "local_path": transfer_local_path(value),
             "error": transfer_error(value),
         }
-        key = (str(transfer.get("username") or ""), str(transfer.get("filename") or ""), str(transfer.get("local_path") or ""))
+        key = (str(transfer.get("username") or ""), str(transfer.get("filename") or ""), str(transfer.get("id") or transfer.get("local_path") or transfer.get("status") or ""))
         if key in seen:
             return
         seen.add(key)
@@ -371,10 +371,28 @@ def transfer_local_path(value: dict[str, Any]) -> str | None:
 
 
 def transfer_error(value: dict[str, Any]) -> str | None:
-    for key in ("error", "Error", "message", "Message", "exception", "Exception"):
+    for key in (
+        "error",
+        "Error",
+        "message",
+        "Message",
+        "exception",
+        "Exception",
+        "exceptionMessage",
+        "ExceptionMessage",
+        "stateMessage",
+        "StateMessage",
+        "statusMessage",
+        "StatusMessage",
+        "reason",
+        "Reason",
+    ):
         raw = value.get(key)
         if isinstance(raw, str) and raw:
             return raw
+    status = transfer_status(value)
+    if status and any(token in status.casefold() for token in ("fail", "error", "cancel", "abort", "reject", "timeout")):
+        return status
     return None
 
 
