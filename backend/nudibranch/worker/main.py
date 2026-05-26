@@ -403,6 +403,8 @@ def add_track_search_candidate_items(
 
 
 def should_use_track_search_fallback(album: str, requests: list[dict]) -> bool:
+    if any(request.get("require_lossless") or request.get("workflow") in {"missing_tracks", "lossless_replacement"} for request in requests):
+        return True
     normalized_album = fuzzy_text(album)
     if normalized_album in {"", "singles", "unknown album", "unknown"}:
         return True

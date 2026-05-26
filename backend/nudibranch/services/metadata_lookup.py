@@ -15,7 +15,8 @@ from nudibranch.services.imports import read_audio_metadata
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
 DISCOVER_CACHE_TTL_SECONDS = 24 * 60 * 60
 DISCOVER_CACHE_MAX_HITS = 3
-MUSICBRAINZ_TIMEOUT_SECONDS = 8
+MUSICBRAINZ_TIMEOUT_SECONDS = 20
+MUSICBRAINZ_RETRY_COUNT = 3
 DISCOVER_ARTIST_ALBUM_LIMIT = 6
 DISCOVER_ALBUM_TRACK_HYDRATION_LIMIT = 4
 
@@ -250,11 +251,9 @@ def ensure_artist_album(artist: dict, album: dict, hydrate_tracks: bool = True) 
 
 
 def search_artists(query: str, limit: int = 5) -> list[dict]:
-    response = httpx.get(
+    response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/artist/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     seen = set()
@@ -279,22 +278,18 @@ def search_artists(query: str, limit: int = 5) -> list[dict]:
 
 
 def search_releases(query: str, limit: int = 8) -> list[dict]:
-    response = httpx.get(
+    response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     return normalize_release_results(response.json().get("releases", []))
 
 
 def search_recordings(query: str, limit: int = 8) -> list[dict]:
-    response = httpx.get(
+    response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/recording/",
         params={"fmt": "json", "query": escape_query(query), "limit": limit, "inc": "artist-credits+releases"},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     tracks = []
@@ -324,11 +319,9 @@ def search_recordings(query: str, limit: int = 8) -> list[dict]:
 
 
 def discover_artist_albums(artist_id: str, artist_name: str, limit: int = DISCOVER_ARTIST_ALBUM_LIMIT) -> list[dict]:
-    response = httpx.get(
+    response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "artist": artist_id, "limit": min(limit * 3, 25), "inc": "artist-credits"},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     releases = [
@@ -403,11 +396,9 @@ def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) 
         return {"artist": artist, "album": album, "tracks": [], "source": "musicbrainz"}
 
     release_id = release["id"]
-    response = httpx.get(
+    response = musicbrainz_get(
         f"https://musicbrainz.org/ws/2/release/{release_id}",
         params={"fmt": "json", "inc": "recordings+media+artist-credits"},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     detail = response.json()
@@ -436,14 +427,34 @@ def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) 
 
 def find_releases(artist: str, album: str, limit: int = 5) -> list[dict]:
     query = f'artist:"{escape_query(artist)}" AND release:"{escape_query(album)}"'
-    response = httpx.get(
+    response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "query": query, "limit": limit},
-        timeout=MUSICBRAINZ_TIMEOUT_SECONDS,
-        headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
     return response.json().get("releases", [])
+
+
+def musicbrainz_get(url: str, params: dict | None = None) -> httpx.Response:
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(1, MUSICBRAINZ_RETRY_COUNT + 1):
+        try:
+            if attempt > 1:
+                write_app_log("MusicBrainz request retrying", feature="musicbrainz", url=url, attempt=attempt)
+                time.sleep(min(2.5, 0.75 * attempt))
+            response = httpx.get(
+                url,
+                params=params,
+                timeout=httpx.Timeout(MUSICBRAINZ_TIMEOUT_SECONDS, connect=8),
+                headers={"User-Agent": USER_AGENT},
+            )
+            response.raise_for_status()
+            return response
+        except httpx.HTTPError as error:
+            last_error = error
+            write_app_log("MusicBrainz request failed", level="warning", feature="musicbrainz", url=url, attempt=attempt, error=str(error))
+    assert last_error is not None
+    raise last_error
 
 
 def find_release(artist: str, album: str) -> dict | None:

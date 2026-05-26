@@ -28,6 +28,7 @@ def search_slskd_detailed(
     timeout_seconds: int = 12,
     timeout_buffer_seconds: int = 3,
     wait_for_settled_results: bool = False,
+    filter_responses: bool = False,
 ) -> dict[str, Any]:
     if not slskd_url:
         raise ValueError("slskd URL is required")
@@ -35,7 +36,7 @@ def search_slskd_detailed(
         raise ValueError("slskd API key is required")
 
     with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=10) as client:
-        created = create_search(client, query, timeout_seconds)
+        created = create_search(client, query, timeout_seconds, filter_responses=filter_responses)
         created.raise_for_status()
         search_id = search_identifier(created.json())
         if not search_id:
@@ -96,7 +97,7 @@ def search_slskd_detailed(
         return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
 
 
-def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> httpx.Response:
+def create_search(client: httpx.Client, query: str, timeout_seconds: int, filter_responses: bool = False) -> httpx.Response:
     global _last_search_created_at
     payload = {
         "searchText": query,
@@ -104,7 +105,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
         "timeout": timeout_seconds * 1000,
         "fileLimit": 10000,
         "responseLimit": 250,
-        "filterResponses": True,
+        "filterResponses": filter_responses,
         "maximumPeerQueueLength": 1000000,
         "minimumResponseFileCount": 1,
         "minimumPeerUploadSpeed": 0,
@@ -121,7 +122,7 @@ def create_search(client: httpx.Client, query: str, timeout_seconds: int) -> htt
                 elapsed = time.monotonic() - _last_search_created_at
                 if elapsed < SLSKD_SEARCH_CREATE_INTERVAL_SECONDS:
                     time.sleep(SLSKD_SEARCH_CREATE_INTERVAL_SECONDS - elapsed)
-                response = client.post("/api/v0/searches", json={"searchText": query})
+                response = client.post("/api/v0/searches", json={"searchText": query, "filterResponses": filter_responses})
                 _last_search_created_at = time.monotonic()
         if response.status_code != 429 or attempt == 4:
             return response
