@@ -3644,12 +3644,33 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
     return result_pools
 
 
+# Cap how many folders get the expensive per-track file matching. A popular album can return
+# hundreds of valid folders from slskd; fully scoring every one against every requested track is
+# what made candidate preparation take minutes. We only need a handful of folders to try.
+ALBUM_FOLDER_FULL_SCORE_LIMIT = 16
+
+
 def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list[dict], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
-    return sorted(
-        ((score_album_folder_pool(pool, requests, threshold), pool) for pool in pools.values()),
-        key=album_folder_pool_sort_key,
-        reverse=True,
-    )
+    expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
+    expected_album = str(requests[0].get("album") or "") if requests else ""
+    # Phase 1: cheap pre-rank using only folder-name signals (no per-track file matching).
+    prelim: list[tuple[float, float, int, dict]] = []
+    for pool in pools.values():
+        files = lossless_folder_files(pool.get("files") or [])
+        folder_segments = album_folder_segments(pool)
+        artist_score = best_segment_score(expected_artist, folder_segments)
+        album_score = album_folder_name_score(expected_album, pool)
+        prelim.append((album_score, artist_score, len(files), pool))
+    prelim.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    # Phase 2: fully score only the most promising folders; the rest keep their cheap scores so
+    # they remain available but rank below the fully-scored matches.
+    scored: list[tuple[tuple[int, float, float, float, int, int], dict]] = []
+    for index, (album_score, artist_score, lossless, pool) in enumerate(prelim):
+        if index < ALBUM_FOLDER_FULL_SCORE_LIMIT and lossless and album_score >= threshold:
+            scored.append((score_album_folder_pool(pool, requests, threshold), pool))
+        else:
+            scored.append(((0, 0.0, artist_score, album_score, lossless, lossless), pool))
+    return sorted(scored, key=album_folder_pool_sort_key, reverse=True)
 
 
 def add_seed_track_folder_pools(
