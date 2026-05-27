@@ -5832,9 +5832,53 @@ TASK_HANDLERS = {
 }
 
 
+def check_mount_writability(session: Session) -> None:
+    """Probe the folders the download pipeline writes to and warn loudly if any is read-only.
+
+    Surfaces mount/permission problems (e.g. an NFS share that squashes the container's user) at
+    startup, instead of only after a full album has downloaded and fails to import.
+    """
+    settings = get_settings()
+    mounts = [
+        ("library", settings.library_path, True),
+        ("downloads", settings.downloads_path, True),
+        ("staging", settings.staging_path, False),
+    ]
+    for name, path, critical in mounts:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".nudibranch-writetest"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception as error:  # noqa: BLE001 - report the problem, never crash the worker.
+            append_task_log(
+                session,
+                None,
+                f"Startup check: the {name} folder ({path}) is NOT writable: {error}. "
+                "Downloads can stage but imports/writes there will fail until the mount's "
+                "permissions are fixed (file ownership / the container's user, or the NFS share).",
+                "error" if critical else "warning",
+            )
+            if name == "library":
+                create_notification(
+                    session,
+                    title="Library folder is not writable",
+                    body=(
+                        f"The worker cannot write to the library folder ({path}). Downloaded "
+                        "tracks will stage but cannot be imported. Fix the mount's write permissions."
+                    ),
+                    event_type="task_failed",
+                    target_url="/downloads",
+                )
+        else:
+            append_task_log(session, None, f"Startup check: the {name} folder ({path}) is writable")
+    session.commit()
+
+
 async def worker_loop() -> None:
     with SessionLocal() as session:
         init_db(session)
+        check_mount_writability(session)
 
     last_download_scan = 0.0
     last_download_scan_summary = ""
