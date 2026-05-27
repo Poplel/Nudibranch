@@ -1043,12 +1043,28 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
 
 
 def download_manifest_path() -> Path:
+    # Internal worker state — keep it on the local config volume, not the (NAS) downloads share,
+    # so frequent rewrites never hit share permission/latency issues.
+    return get_settings().config_path / ".nudibranch-downloads.json"
+
+
+def legacy_download_manifest_path() -> Path:
     return get_settings().downloads_path / ".nudibranch-downloads.json"
 
 
 def load_download_manifest() -> list[dict]:
     path = download_manifest_path()
     if not path.exists():
+        # One-time migration from the old location in the downloads folder.
+        legacy = legacy_download_manifest_path()
+        if legacy.exists():
+            try:
+                payload = json.loads(legacy.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+            if isinstance(payload, list):
+                save_download_manifest(payload)
+                return payload
         return []
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
