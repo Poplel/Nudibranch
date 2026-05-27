@@ -3131,7 +3131,20 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
     diagnostic_lines = []
     append_task_log(session, task, f"{artist} / {album}: searching slskd for lossless album folders")
     folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
-    folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit)
+    album_queries = album_search_query_variants(artist, album, requests)
+    # Report progress across the whole prepare phase: one step per album-search query, then one
+    # per track, so the "x of n" counter keeps climbing during the (slow) album search too.
+    total_tracks = max(1, len(album_queries) + len(track_items))
+    search_progress = {"done": 0}
+
+    def album_search_progress(message: str) -> None:
+        search_progress["done"] = min(search_progress["done"] + 1, len(album_queries))
+        if task is not None:
+            update_task_progress(session, task, search_progress["done"], total_tracks, message)
+
+    folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit, progress_callback=album_search_progress)
+    # Credit any queries skipped by an early exit so the counter flows into the per-track phase.
+    search_progress["done"] = len(album_queries)
     folder_pool = folder_pools[0] if folder_pools else None
     if folder_pool:
         diagnostic_lines.append(
@@ -3144,9 +3157,8 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
         )
     else:
         append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
-    total_tracks = max(1, len(track_items))
     search_jobs = []
-    completed_tracks = 0
+    completed_tracks = search_progress["done"]
     integration = integration_settings(session)
     slskd_url = integration.get("slskd_url", "")
     api_key = integration.get("slskd_api_key", "")
@@ -3484,7 +3496,7 @@ def search_album_folder_pool(session: Session, artist: str, album: str, requests
     return pools[0] if pools else None
 
 
-def search_album_folder_pools(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, limit: int = 5) -> list[dict]:
+def search_album_folder_pools(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, limit: int = 5, progress_callback=None) -> list[dict]:
     if not requests:
         return []
     settings = integration_settings(session)
@@ -3493,8 +3505,11 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
         return []
     match_threshold = slskd_album_match_threshold(settings)
     folder_try_limit = min(max(1, limit), slskd_album_folder_try_limit(settings))
+    requested_track_count = len(requests)
     pools: dict[tuple[str, str], dict] = {}
-    for query in queries:
+    for query_index, query in enumerate(queries, start=1):
+        if progress_callback is not None:
+            progress_callback(f"Searching album folders ({query_index}/{len(queries)})")
         try:
             append_task_log(session, task, f"slskd album search started: {query}")
             result = search_slskd_detailed(
@@ -3549,6 +3564,12 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
             task,
             f"{artist} / {album}: {query} added {added_from_query} lossless file(s); {len(accepted_after_query)} folder(s) now meet album confidence",
         )
+        best_matched = max((score[0] for score, _pool in accepted_after_query), default=0)
+        # Stop as soon as a single folder already covers the whole album — more query variants
+        # won't improve on a complete, confident match and just cost time.
+        if best_matched >= requested_track_count:
+            append_task_log(session, task, f"{artist} / {album}: found a complete album folder ({best_matched}/{requested_track_count} tracks); stopping album search early")
+            break
         if len(accepted_after_query) >= folder_try_limit:
             append_task_log(session, task, f"{artist} / {album}: found {len(accepted_after_query)} matching lossless folder(s); stopping album search at configured try limit {folder_try_limit}")
             break
@@ -4275,7 +4296,16 @@ def album_search_query_variants(artist: str, album: str, requests: list[dict]) -
     primary_artist = artist_values[0] if artist_values else artist
     primary_album = album_values[0] if album_values else album
     years = release_year_values(requests)
+    require_lossless = any(request.get("require_lossless") for request in requests)
+    flac_variants = [
+        " ".join(part for part in [primary_artist, primary_album, "flac"] if part),
+        " ".join(part for part in [primary_album, primary_artist, "flac"] if part),
+    ]
     variants: list[str] = []
+    # For lossless requests the FLAC-qualified queries narrow straight to the target folders, so
+    # try them first; otherwise they go last as a fallback.
+    if require_lossless:
+        variants.extend(flac_variants)
     variants.append(" ".join(part for part in [primary_artist, primary_album] if part))
     variants.append(" ".join(part for part in [primary_album, primary_artist] if part))
     for year in years[:2]:
@@ -4286,8 +4316,8 @@ def album_search_query_variants(artist: str, album: str, requests: list[dict]) -
         variants.append(" ".join(part for part in [album_value, primary_artist] if part))
     for artist_value in artist_values[1:]:
         variants.append(" ".join(part for part in [artist_value, primary_album] if part))
-    variants.append(" ".join(part for part in [primary_artist, primary_album, "flac"] if part))
-    variants.append(" ".join(part for part in [primary_album, primary_artist, "flac"] if part))
+    if not require_lossless:
+        variants.extend(flac_variants)
     return unique_nonempty(variants)
 
 
