@@ -778,6 +778,12 @@ def batch_has_open_downloads(batch: ProposalBatch) -> bool:
 
 def import_track_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
+    replace_track_id = payload.get("replace_track_id")
+    if replace_track_id:
+        track = session.get(Track, replace_track_id)
+        if track:
+            replace_library_track_file(session, track, Path(item.old_value), Path(item.new_value), payload)
+            return
     import_file_to_library(session, Path(item.old_value), Path(item.new_value), payload)
 
 
@@ -1351,7 +1357,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     manifest_item_ids = {entry.get("item_id") for entry in entries}
 
-    verified_entries: list[tuple[dict, Path, dict]] = []
+    staged_entries: list[tuple[dict, Path]] = []
     errors: list[str] = []
     waiting_count = 0
     ready_count = 0
@@ -1390,24 +1396,19 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             set_download_item_status(item, "needs attention; could not be downloaded automatically")
             failed_count += 1
             continue
-        if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
-            staged_path = Path(str(entry["path"]))
-            if staged_path.exists():
-                verified_entries.append((entry, staged_path, entry["metadata"]))
-                ready_count += 1
-                set_download_item_status(item, "verified; queued for batch import", stage="verified", progress=100)
-                continue
 
         transfer = transfer_lookup.get(manifest_entry_key(entry))
         if entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
             apply_transfer_path_to_manifest(entry, transfer)
 
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
+
+        # Move a freshly-downloaded file into staging (no MusicBrainz verification — that now
+        # happens via the manual add-to-library review below). Already-staged entries return
+        # their staged path here and skip the move.
         if file_path and entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
             try:
                 file_path = stage_downloaded_file(session, batch, entry, file_path)
-                wait_status = "staged; ready for verification"
-                set_download_item_status(item, wait_status, stage="staging", progress=100)
             except Exception as error:  # noqa: BLE001 - keep the batch visible and retryable.
                 failed_count += 1
                 if item:
@@ -1417,114 +1418,66 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
                 continue
 
-        if not file_path:
-            retry_reason = None if wait_status.startswith("downloaded; settling") else download_retry_reason(entry, transfer)
-            if item and retry_reason and not transfer_error_message:
-                if retry_download_entry(session, batch, entry, item, retry_reason, transfer, available_slots=download_slot_tracker):
-                    waiting_count += 1
-                    continue
-                failed_count += 1
-                continue
-            if transfer_error_message and not transfer:
-                wait_status = f"{transfer_error_message}; {wait_status}"
-            update_manifest_transfer_tracking(entry, transfer)
-            progress_state = transfer_progress_state(entry, transfer, wait_status)
-            set_download_item_status(
-                item,
-                progress_state["label"],
-                stage=progress_state.get("stage"),
-                progress=progress_state.get("progress"),
-                indeterminate=progress_state.get("indeterminate"),
-            )
-            if transfer_is_failed(transfer) and item:
-                item.status = ProposalStatus.failed
-                failed_count += 1
-            else:
-                waiting_count += 1
+        if file_path:
+            staged_entries.append((entry, file_path))
+            ready_count += 1
+            set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
             continue
 
-        set_download_item_status(item, "verifying with MusicBrainz", stage="verifying", progress=100, indeterminate=True)
-        update_download_manifest_entry(entry, "verifying", path=str(file_path), verifying_at=datetime.now(timezone.utc).isoformat())
-        entry.update({"status": "verifying", "path": str(file_path)})
-        append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with MusicBrainz")
-        session.flush()
-        try:
-            verification = verify_downloaded_file(session, file_path, entry)
-        except Exception as error:  # noqa: BLE001 - one unverifiable file must not abort the whole download scan.
-            append_task_log(session, None, f"{entry_download_label(entry)}: verification error: {error}", "warning")
-            verification = {
-                "status": "mismatch",
-                "request": entry.get("request") or {},
-                "metadata": {},
-                "message": f"{file_path.name}: verification error: {error}",
-            }
-        if verification["status"] == "mismatch":
-            if handle_download_mismatch(session, batch, entry, file_path, verification):
+        # Not downloaded yet — keep waiting on / retrying the transfer.
+        retry_reason = None if wait_status.startswith("downloaded; settling") else download_retry_reason(entry, transfer)
+        if item and retry_reason and not transfer_error_message:
+            if retry_download_entry(session, batch, entry, item, retry_reason, transfer, available_slots=download_slot_tracker):
                 waiting_count += 1
-            else:
-                failed_count += 1
-                errors.append(verification["message"])
+                continue
+            failed_count += 1
             continue
-        if verification["status"] != "verified":
-            message = verification.get("message") or f"{file_path.name} could not be verified with MusicBrainz metadata."
-            if handle_download_mismatch(session, batch, entry, file_path, {**verification, "message": message}):
-                waiting_count += 1
-            else:
-                failed_count += 1
-                errors.append(message)
-            continue
-        metadata = {**read_audio_metadata(file_path), **verification.get("metadata", {})}
-        update_download_manifest_entry(entry, "verified", path=str(file_path), metadata=metadata)
-        set_download_item_status(item, "verified; queued for batch import", stage="verified", progress=100)
-        append_task_log(session, None, f"{entry_download_label(entry)}: MusicBrainz metadata verified")
-        verified_entries.append((entry, file_path, metadata))
-        ready_count += 1
+        if transfer_error_message and not transfer:
+            wait_status = f"{transfer_error_message}; {wait_status}"
+        update_manifest_transfer_tracking(entry, transfer)
+        progress_state = transfer_progress_state(entry, transfer, wait_status)
+        set_download_item_status(
+            item,
+            progress_state["label"],
+            stage=progress_state.get("stage"),
+            progress=progress_state.get("progress"),
+            indeterminate=progress_state.get("indeterminate"),
+        )
+        if transfer_is_failed(transfer) and item:
+            item.status = ProposalStatus.failed
+            failed_count += 1
+        else:
+            waiting_count += 1
+        continue
 
     update_download_container_statuses(batch)
     session.flush()
 
-    if not verified_entries:
-        return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
-
-    # Wishlist and plain album downloads import a whole album at a time: hold verified tracks
-    # until the album has settled (nothing left actively downloading) so tracks are not added to
-    # the library one by one. Missing-track and lossless-replacement downloads fill individual
-    # gaps and still import each track the moment it lands.
-    if download_entries_import_per_album(entries) and waiting_count > 0:
-        for entry, _file_path, _metadata in verified_entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; waiting for the rest of the album", stage="verified", progress=100)
+    # Add the album to the library as a unit: wait until the whole batch has settled (nothing
+    # still downloading or retrying) before presenting it, so tracks aren't reviewed piecemeal.
+    if waiting_count > 0:
+        for entry, _staged_path in staged_entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for the rest of the album", stage="staging", progress=100)
         return {"imported": 0, "errors": errors, "waiting": waiting_count + ready_count, "ready": 0, "failed": failed_count}
 
-    # Import the verified tracks. The batch is only finalized (staging cleaned up, marked
-    # complete) once nothing else is waiting, failed, or blocked, so one slow or unfindable
-    # track can no longer strand the tracks that already downloaded and verified.
-    batch_complete = waiting_count == 0 and failed_count == 0 and not blocking_items
+    if not staged_entries:
+        return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
+
+    # Downloads have settled. Instead of MusicBrainz auto-verification + auto-import, present a
+    # review task the user approves to add the staged files to the library.
     try:
-        for entry, _file_path, _metadata in verified_entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified track", stage="importing", progress=100, indeterminate=True)
-        append_task_log(session, None, f"{batch.title}: importing {len(verified_entries)} verified track(s)")
-        imported = import_verified_download_entries(session, batch, verified_entries, finalize=batch_complete)
-    except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
+        present_staged_downloads_for_library_review(session, batch, staged_entries, finalize=(failed_count == 0 and not blocking_items))
+    except Exception as error:  # noqa: BLE001 - keep the batch visible if the review can't be built.
         batch.status = ProposalStatus.failed
         message = describe_import_error(error)
-        append_task_log(session, None, f"{batch.title}: download import failed: {message}", "error")
-        # Notify once per distinct error; the batch keeps retrying quietly so it recovers as soon
-        # as the underlying problem (e.g. library write permissions) is fixed, without spamming.
+        append_task_log(session, None, f"{batch.title}: could not prepare the add-to-library review: {message}", "error")
         if _reported_download_import_failures.get(batch.id) != message:
             _reported_download_import_failures[batch.id] = message
-            create_notification(
-                session,
-                title="Download import failed",
-                body=message,
-                event_type="task_failed",
-                target_url="/downloads",
-            )
+            create_notification(session, title="Download import failed", body=message, event_type="task_failed", target_url="/downloads")
         session.commit()
         return {"imported": 0, "errors": [message], "waiting": 0, "ready": ready_count, "failed": 1}
     _reported_download_import_failures.pop(batch.id, None)
-    if batch_complete:
-        return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
-    return {"imported": imported, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
+    return {"imported": 0, "errors": errors, "waiting": 0, "ready": 0, "failed": failed_count}
 
 
 def reconcile_manifest_entries_to_selected_items(session: Session, batch: ProposalBatch, entries: list[dict], expected_item_ids: set[str]) -> list[dict]:
@@ -2614,6 +2567,90 @@ def finalize_completed_download_batch(session: Session, batch: ProposalBatch) ->
         if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
             item.status = ProposalStatus.completed
     batch.status = ProposalStatus.completed
+    session.flush()
+
+
+def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
+    """Turn a fully-downloaded, staged batch into a manual "add to library" review task.
+
+    No MusicBrainz verification: the files are staged and an import_files proposal is created in
+    the task queue. The user approves it to move the files into the library (replacing the
+    existing file for lossless-replacement requests). The download batch itself is marked done.
+    """
+    review_batch: ProposalBatch | None = None
+    artist_name: str | None = None
+    album_title: str | None = None
+    created = 0
+    for entry, staged_path in staged_entries:
+        # Per-item idempotency: never add the same downloaded track to a review twice (handles a
+        # track that fails, retries, and succeeds after the album was already presented).
+        item_id = str(entry.get("item_id") or "")
+        already_in_review = item_id and session.scalar(
+            select(ProposalItem.id)
+            .where(ProposalItem.kind == ProposalKind.import_files)
+            .where(ProposalItem.payload_json.like(f'%"source_download_item_id": "{item_id}"%'))
+            .limit(1)
+        )
+        if not already_in_review:
+            request = entry.get("request") or {}
+            metadata = normalize_download_metadata(read_audio_metadata(staged_path), request)
+            try:
+                write_audio_metadata(staged_path, metadata)
+            except Exception as error:  # noqa: BLE001 - tagging is best-effort; import still works.
+                append_task_log(session, None, f"{entry_download_label(entry)}: could not write tags before review: {error}", "warning")
+            replace_track_id = request.get("replace_track_id")
+            replace_track = session.get(Track, replace_track_id) if replace_track_id else None
+            target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
+            artist_name = artist_name or metadata.get("albumartist") or metadata.get("artist")
+            album_title = album_title or metadata.get("album")
+            if review_batch is None:
+                review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, tree_path="/task-queue")
+                session.add(review_batch)
+                session.flush()
+            session.add(
+                ProposalItem(
+                    batch_id=review_batch.id,
+                    title=metadata.get("title") or staged_path.stem,
+                    kind=ProposalKind.import_files,
+                    old_value=str(staged_path),
+                    new_value=str(target_path),
+                    payload_json=json.dumps(
+                        {
+                            "action": "replace_library_track" if replace_track else "import_download",
+                            "source_download_batch_id": batch.id,
+                            "source_download_item_id": item_id,
+                            "replace_track_id": replace_track.id if replace_track else None,
+                            "metadata": metadata,
+                        }
+                    ),
+                )
+            )
+            created += 1
+        # The download is done; the review task now owns the staged file.
+        update_download_manifest_entry(entry, "completed", path=str(staged_path))
+        download_item = session.get(ProposalItem, entry.get("item_id"))
+        if download_item:
+            download_item.status = ProposalStatus.completed
+            set_download_item_status(download_item, "downloaded; review to add to library", stage="staging", progress=100)
+    if review_batch is not None:
+        label = " – ".join(part for part in [artist_name, album_title] if part)
+        review_batch.title = f"Add to library: {label}" if label else "Add downloaded music to library"
+        session.flush()
+        append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
+        create_notification(
+            session,
+            title="Downloaded music ready to add",
+            body=f"{created} track(s) downloaded for {label or 'your request'}. Review and approve to add them to your library.",
+            event_type="approval_needed",
+            target_url="/task-queue",
+        )
+    if finalize:
+        # Mark the download batch complete WITHOUT cleaning staging — the review task still needs
+        # the staged files; they leave staging when it is approved and imported.
+        for item in batch.items:
+            if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
+                item.status = ProposalStatus.completed
+        batch.status = ProposalStatus.completed
     session.flush()
 
 
