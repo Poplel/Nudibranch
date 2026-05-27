@@ -1293,6 +1293,22 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
     return {"imported": imported, "errors": errors, "waiting": waiting, "ready": ready, "failed": failed}
 
 
+# Tracks the last import-failure message we notified per batch, so a persistent problem
+# (e.g. a read-only library mount) doesn't raise a notification on every 3-second scan.
+_reported_download_import_failures: dict[str, str] = {}
+
+
+def describe_import_error(error: Exception) -> str:
+    text = str(error)
+    if isinstance(error, PermissionError) or "Errno 13" in text or "Permission denied" in text:
+        return (
+            f"permission denied writing to the library ({text}). "
+            "The worker can read the library but cannot write into it — fix write permissions on "
+            "the library mount (file ownership / the container's PUID:PGID, or the NAS share ACL)."
+        )
+    return text
+
+
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
     # Items that need manual attention (an exhausted download, a pending YouTube fallback) keep
     # the batch from being finalized, but they no longer short-circuit the whole batch: tracks
@@ -1474,15 +1490,22 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         imported = import_verified_download_entries(session, batch, verified_entries, finalize=batch_complete)
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
         batch.status = ProposalStatus.failed
-        create_notification(
-            session,
-            title="Download import failed",
-            body=str(error),
-            event_type="task_failed",
-            target_url="/downloads",
-        )
+        message = describe_import_error(error)
+        append_task_log(session, None, f"{batch.title}: download import failed: {message}", "error")
+        # Notify once per distinct error; the batch keeps retrying quietly so it recovers as soon
+        # as the underlying problem (e.g. library write permissions) is fixed, without spamming.
+        if _reported_download_import_failures.get(batch.id) != message:
+            _reported_download_import_failures[batch.id] = message
+            create_notification(
+                session,
+                title="Download import failed",
+                body=message,
+                event_type="task_failed",
+                target_url="/downloads",
+            )
         session.commit()
-        return {"imported": 0, "errors": [str(error)], "waiting": 0, "ready": ready_count, "failed": 1}
+        return {"imported": 0, "errors": [message], "waiting": 0, "ready": ready_count, "failed": 1}
+    _reported_download_import_failures.pop(batch.id, None)
     if batch_complete:
         return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
     return {"imported": imported, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
