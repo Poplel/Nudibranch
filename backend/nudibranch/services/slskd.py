@@ -58,9 +58,16 @@ def search_slskd_detailed(
             "state": "created",
         }
         max_polls = poll_count or max(1, int((timeout_seconds + timeout_buffer_seconds) / poll_interval))
+        # Hard wall-clock ceiling so a slow/unresponsive slskd cannot block the caller
+        # (e.g. the worker's download scan) for minutes; HTTP latency can make each poll
+        # take far longer than poll_interval.
+        deadline = time.monotonic() + 2 * (timeout_seconds + timeout_buffer_seconds) + 10
         settled_polls = 0
         last_response_count = 0
         for _ in range(max_polls):
+            if time.monotonic() > deadline:
+                diagnostics["deadline_reached"] = True
+                break
             diagnostics["polls"] += 1
             payload = search_payload(client, search_id)
             current_responses = response_list(payload)
@@ -81,7 +88,7 @@ def search_slskd_detailed(
             else:
                 settled_polls = 0
             last_response_count = len(responses)
-            search_done = bool(diagnostics.get("is_complete")) or str(diagnostics.get("state") or "").lower() in {"completed", "complete", "stopped"}
+            search_done = bool(diagnostics.get("is_complete")) or search_state_is_complete(diagnostics.get("state"))
             if wait_for_settled_results and (len(responses) >= 250 or (responses and settled_polls >= 2) or (search_done and diagnostics["polls"] >= 2)):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
@@ -309,6 +316,48 @@ def looks_like_transfer_file(value: dict[str, Any]) -> bool:
     return any(key in value for key in transfer_keys)
 
 
+# slskd (via Soulseek.NET) serializes transfer and search state as a comma-separated
+# [Flags] enum, e.g. "Queued, Remotely", "InProgress", "Completed, Succeeded",
+# "Completed, Errored". Parse those flags explicitly instead of guessing from substrings
+# so a terminal "Completed, Errored" is never mistaken for a successful "Completed".
+TRANSFER_TERMINAL_FAILURE_FLAGS = frozenset({"cancelled", "canceled", "timedout", "errored", "rejected", "aborted", "fallenfromqueue"})
+
+
+def state_flags(status: Any) -> set[str]:
+    return {token.strip().casefold() for token in str(status or "").replace("|", ",").split(",") if token.strip()}
+
+
+def transfer_state_category(transfer: dict[str, Any] | None) -> str:
+    """Classify a slskd download transfer from its TransferStates flags.
+
+    Returns one of: succeeded, failed, in_progress, initializing, queued, completed, unknown.
+    """
+    if not isinstance(transfer, dict):
+        return "unknown"
+    flags = state_flags(transfer.get("status") or transfer.get("state") or transfer.get("State") or transfer.get("Status"))
+    if not flags:
+        return "unknown"
+    if "completed" in flags:
+        if "succeeded" in flags:
+            return "succeeded"
+        if flags & TRANSFER_TERMINAL_FAILURE_FLAGS:
+            return "failed"
+        return "completed"
+    if flags & TRANSFER_TERMINAL_FAILURE_FLAGS:
+        return "failed"
+    if "inprogress" in flags:
+        return "in_progress"
+    if "initializing" in flags:
+        return "initializing"
+    if "queued" in flags or "requested" in flags:
+        return "queued"
+    return "unknown"
+
+
+def search_state_is_complete(status: Any) -> bool:
+    return "completed" in state_flags(status)
+
+
 def transfer_status(value: dict[str, Any]) -> str | None:
     status = value.get("state") or value.get("State") or value.get("status") or value.get("Status")
     return str(status) if status is not None else None
@@ -404,7 +453,7 @@ def transfer_error(value: dict[str, Any]) -> str | None:
         if isinstance(raw, str) and raw:
             return raw
     status = transfer_status(value)
-    if status and any(token in status.casefold() for token in ("fail", "error", "cancel", "abort", "reject", "timeout")):
+    if status and transfer_state_category(value) == "failed":
         return status
     return None
 

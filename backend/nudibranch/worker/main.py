@@ -22,7 +22,7 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.settings_store import integration_settings
-from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed
+from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
@@ -1384,7 +1384,16 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         entry.update({"status": "verifying", "path": str(file_path)})
         append_task_log(session, None, f"{entry_download_label(entry)}: verifying staged file with MusicBrainz")
         session.flush()
-        verification = verify_downloaded_file(session, file_path, entry)
+        try:
+            verification = verify_downloaded_file(session, file_path, entry)
+        except Exception as error:  # noqa: BLE001 - one unverifiable file must not abort the whole download scan.
+            append_task_log(session, None, f"{entry_download_label(entry)}: verification error: {error}", "warning")
+            verification = {
+                "status": "mismatch",
+                "request": entry.get("request") or {},
+                "metadata": {},
+                "message": f"{file_path.name}: verification error: {error}",
+            }
         if verification["status"] == "mismatch":
             if handle_download_mismatch(session, batch, entry, file_path, verification):
                 waiting_count += 1
@@ -1711,7 +1720,6 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
     if not transfer:
         return manifest_wait_status(entry, fallback)
     status = str(transfer.get("status") or "").strip()
-    status_text = status.casefold()
     error = transfer.get("error")
     if transfer_is_failed(transfer):
         detail = f": {error}" if error else f": {status}" if status else ""
@@ -1724,8 +1732,6 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
             return manifest_wait_status(entry, f"download queued in slskd: {friendly_transfer_status(status)}")
         speed = transfer_speed_label(transfer)
         return f"downloading {percent:.0f}%{speed}"
-    if status_text in {"complete", "completed", "succeeded"} or "complete" in status_text:
-        return manifest_wait_status(entry, "moving completed file to staging")
     if status:
         if transfer_is_queued_or_waiting(transfer):
             return manifest_wait_status(entry, f"download queued in slskd: {status}")
@@ -1771,15 +1777,13 @@ def transfer_has_started(transfer: dict | None) -> bool:
             return True
     except (TypeError, ValueError):
         return False
-    status = str(transfer.get("status") or "").casefold()
-    return any(token in status for token in ("download", "progress", "succeeded", "complete"))
+    return transfer_state_category(transfer) in {"in_progress", "succeeded", "completed"}
 
 
 def transfer_is_queued_or_waiting(transfer: dict | None) -> bool:
     if not transfer:
         return False
-    status = str(transfer.get("status") or "").casefold()
-    return any(token in status for token in ("queue", "queued", "waiting", "requested", "initializing"))
+    return transfer_state_category(transfer) in {"queued", "initializing"}
 
 
 def friendly_transfer_status(status: str) -> str:
@@ -1807,9 +1811,11 @@ def transfer_speed_label(transfer: dict | None) -> str:
 def transfer_is_complete_or_finishing(transfer: dict | None) -> bool:
     if not transfer:
         return False
-    status = str(transfer.get("status") or "").casefold()
-    if status in {"complete", "completed", "succeeded"} or "complete" in status:
+    category = transfer_state_category(transfer)
+    if category in {"succeeded", "completed"}:
         return True
+    if category in {"failed", "queued", "initializing"}:
+        return False
     percent = transfer_percent(transfer)
     return percent is not None and percent >= TRANSFER_COMPLETE_PERCENT
 
@@ -1817,14 +1823,13 @@ def transfer_is_complete_or_finishing(transfer: dict | None) -> bool:
 def transfer_is_failed(transfer: dict | None) -> bool:
     if not transfer:
         return False
-    status = str(transfer.get("status") or "").casefold()
-    error = transfer.get("error")
-    return bool(error) or any(token in status for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
+    if transfer.get("error"):
+        return True
+    return transfer_state_category(transfer) == "failed"
 
 
 def transfer_status_is_failed(status: object) -> bool:
-    lowered = str(status or "").casefold()
-    return any(token in lowered for token in ("fail", "error", "cancel", "abort", "reject", "timeout"))
+    return transfer_state_category({"status": status}) == "failed"
 
 
 def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
@@ -1934,10 +1939,11 @@ def manifest_entry_waiting_for_slskd_record(entry: dict) -> bool:
 def transfer_holds_download_slot(transfer: dict | None) -> bool:
     if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
         return False
-    status = str(transfer.get("status") or "").casefold()
     if transfer_has_started(transfer) or transfer_is_queued_or_waiting(transfer):
         return True
-    return bool(status and not any(token in status for token in ("complete", "succeeded", "fail", "error", "cancel", "abort", "reject", "timeout")))
+    # An unrecognized but non-terminal state still occupies a slskd slot; count it so
+    # we never over-queue past the concurrent-download limit.
+    return transfer_state_category(transfer) == "unknown" and bool(transfer.get("status"))
 
 
 def download_slots_available(session: Session, entries: list[dict]) -> int:
