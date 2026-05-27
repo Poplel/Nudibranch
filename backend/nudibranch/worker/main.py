@@ -663,6 +663,11 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
             skipped += 1
 
+    # Import-wizard files are imported directly above (not via the download manifest), so trigger
+    # a Jellyfin rescan for them here. Download imports queue their own rescan as they complete.
+    if imported:
+        append_task_log(session, task, f"Imported {imported} file(s) into the library; queueing Jellyfin scan")
+        enqueue_task(session, "jellyfin_scan", {})
     downloaded_import = import_completed_downloads(session)
     open_downloads = batch_has_open_downloads(batch)
 
@@ -1662,7 +1667,11 @@ def reconnect_existing_slskd_transfer(session: Session, item: ProposalItem) -> b
         "status": "queued",
     }
     transfer = matching_download_transfer(entry, transfers)
-    if not transfer or transfer_is_failed(transfer):
+    # Only reconnect to a transfer that is actively downloading/queued. Reconnecting to a stale
+    # "completed" transfer (e.g. left over from a previous run or a different downloads path)
+    # whose file isn't present just loops on "reported complete but the file was not found"; let
+    # those fall through to a fresh download instead.
+    if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
         return False
     record_download_manifest_entry(request, candidate, item)
     update_manifest_transfer_tracking(entry, transfer)
@@ -1901,7 +1910,10 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
         return str(entry.get("retry_reason") or "continuing automatic replacement search")
     if transfer_is_complete_or_finishing(transfer):
         if age >= COMPLETED_MISSING_FILE_RETRY_SECONDS:
-            return "slskd reported complete but the file was not found"
+            downloads_root = get_settings().downloads_path
+            slskd_path = (transfer or {}).get("local_path")
+            where = f"; slskd wrote it to {slskd_path}" if slskd_path else ""
+            return f"slskd reported complete but the file was not found under {downloads_root}{where} (check that slskd's downloads dir is the same shared folder)"
         return None
     if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
         return "transfer stayed queued"
@@ -2126,6 +2138,13 @@ def retry_download_entry(
                 "reason": reason,
             }
         )
+    # A transfer slskd marked complete but whose file never arrived is a phantom (a stale record
+    # from a previous run, or a failed/cross-device move). Remove it now — before the slot gate,
+    # since a completed transfer holds no slot — so we stop reconnecting to it and can fetch a
+    # fresh copy.
+    if transfer is not None and transfer_is_complete_or_finishing(transfer):
+        cancel_existing_slskd_transfer(session, transfer, item, reason)
+        transfer = None
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     if not download_slot_available(available_slots):
@@ -2449,15 +2468,15 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             verify_percent = (verified / max(1, total)) * 100
             status = f"verifying {verify_percent:.0f}% · {verified} of {total} verified"
         elif downloaded:
-            status = f"downloading {average_progress:.0f}% · {downloaded} of {total} staged"
+            status = f"downloading {average_progress:.0f}% · {downloaded} of {total} downloaded"
         elif average_progress > 0:
-            status = f"downloading {average_progress:.0f}% · 0 of {total} staged"
+            status = f"downloading {average_progress:.0f}% · 0 of {total} downloaded"
         elif any("waiting for download slot" in status for status in statuses):
-            status = f"waiting for download slot · 0 of {total} staged"
+            status = f"waiting for download slot · {downloaded} of {total} downloaded"
         elif any("queued in slskd" in status or "download queued in slskd" in status for status in statuses):
-            status = f"queued in slskd · 0 of {total} staged"
+            status = f"queued in slskd · {downloaded} of {total} downloaded"
         else:
-            status = f"waiting for transfer progress · 0 of {total} staged"
+            status = f"waiting for transfer progress · {downloaded} of {total} downloaded"
         stage = "failed" if failed else "verified" if verified == total else "verifying" if downloaded == total else "downloading" if average_progress > 0 else "queued"
         set_item_payload_status(item, status, download_progress_payload(status, stage=stage, progress=average_progress, indeterminate=stage in {"verifying"}))
 
