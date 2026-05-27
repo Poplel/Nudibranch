@@ -585,11 +585,11 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             errors.append(f"Download search: {error}")
             finish_progress_step("Download candidate search failed")
 
-    download_slots = download_slots_available(session, load_download_manifest())
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     for item in direct_download_items:
         try:
             is_slskd_download = keeps_download_batch_open(item)
-            if is_slskd_download and download_slots <= 0:
+            if is_slskd_download and not download_slot_available(download_slot_tracker):
                 note_progress(f"Waiting for download slot for {item.title}", item)
                 set_download_item_status(item, "waiting for download slot")
                 item.status = ProposalStatus.executing
@@ -601,7 +601,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             item.status = ProposalStatus.executing if keeps_download_batch_open(item) else ProposalStatus.completed
             download_changes += 1
             if is_slskd_download:
-                download_slots -= 1
+                consume_download_slot(download_slot_tracker)
             finish_progress_step(f"Queued download for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
             failed_request = download_request_from_item(item)
@@ -623,6 +623,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
                     },
                     item,
                     f"candidate queue failed: {error}",
+                    available_slots=download_slot_tracker,
                 )
             if retry_started:
                 download_changes += 1
@@ -1287,9 +1288,9 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     entries = defer_excess_download_slot_entries(session, batch, entries)
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     manifest_item_ids = {entry.get("item_id") for entry in entries}
     if not expected_item_ids.issubset(manifest_item_ids):
-        available_slots = download_slots_available(session, load_download_manifest())
         queued_missing = 0
         waiting_missing = 0
         for item_id in sorted(expected_item_ids - manifest_item_ids):
@@ -1297,14 +1298,18 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             if item and reconnect_existing_slskd_transfer(session, item):
                 queued_missing += 1
                 continue
-            if available_slots <= 0:
+            if not download_slot_available(download_slot_tracker):
                 set_download_item_status(item, "waiting for download slot")
                 waiting_missing += 1
                 continue
-            if item and queue_missing_manifest_download(session, batch, item):
-                available_slots -= 1
-                queued_missing += 1
-                continue
+            if item:
+                slots_before = download_slot_tracker.get("available", 0)
+                if queue_missing_manifest_download(session, batch, item, available_slots=download_slot_tracker):
+                    if download_slot_tracker.get("available", 0) < slots_before:
+                        queued_missing += 1
+                    else:
+                        waiting_missing += 1
+                    continue
             set_download_item_status(item, "searching for slskd queue record")
             waiting_missing += 1
         update_download_container_statuses(batch)
@@ -1351,7 +1356,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if not file_path:
             retry_reason = None if wait_status.startswith("downloaded; settling") else download_retry_reason(entry, transfer)
             if item and retry_reason and not transfer_error_message:
-                if retry_download_entry(session, batch, entry, item, retry_reason, transfer):
+                if retry_download_entry(session, batch, entry, item, retry_reason, transfer, available_slots=download_slot_tracker):
                     waiting_count += 1
                     continue
                 failed_count += 1
@@ -1521,13 +1526,18 @@ def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
     return ids
 
 
-def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item: ProposalItem) -> bool:
+def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item: ProposalItem, available_slots: dict[str, int] | None = None) -> bool:
     payload = json.loads(item.payload_json or "{}")
     if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
         return False
+    if not download_slot_available(available_slots):
+        set_download_item_status(item, "waiting for download slot")
+        item.status = ProposalStatus.executing
+        return True
     try:
         set_download_item_status(item, "queue record missing; queueing download automatically")
         apply_download_item(session, item)
+        consume_download_slot(available_slots)
         item.status = ProposalStatus.executing
         batch.status = ProposalStatus.executing
         append_task_log(session, None, f"{item.title}: missing queue record was recreated automatically")
@@ -1552,6 +1562,7 @@ def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item
             },
             item,
             f"queue record missing and candidate failed: {error}",
+            available_slots=available_slots,
         )
 
 
@@ -1933,6 +1944,36 @@ def download_slots_available(session: Session, entries: list[dict]) -> int:
     return max(0, slskd_concurrent_download_limit(session) - active_download_slot_count(session, entries))
 
 
+def download_slot_available(slot_tracker: dict[str, int] | None) -> bool:
+    return slot_tracker is None or int(slot_tracker.get("available") or 0) > 0
+
+
+def consume_download_slot(slot_tracker: dict[str, int] | None) -> None:
+    if slot_tracker is not None:
+        slot_tracker["available"] = max(0, int(slot_tracker.get("available") or 0) - 1)
+
+
+def defer_download_for_slot(
+    session: Session,
+    item: ProposalItem,
+    entry: dict,
+    reason: str,
+    failed_candidates: list[dict],
+    retry_count: int,
+) -> bool:
+    update_download_manifest_entry(
+        entry,
+        "retrying",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    item.status = ProposalStatus.executing
+    set_download_item_status(item, "waiting for download slot")
+    append_task_log(session, None, f"{item.title}: waiting for download slot before retrying after {reason}")
+    return True
+
+
 def queue_existing_retry_candidate(
     session: Session,
     item: ProposalItem,
@@ -1940,6 +1981,7 @@ def queue_existing_retry_candidate(
     retry_count: int,
     failed_candidates: list[dict],
     reason: str,
+    available_slots: dict[str, int] | None = None,
 ) -> bool:
     settings = integration_settings(session)
     for candidate_item in existing_retry_candidate_items(session, item, failed_candidates):
@@ -1948,8 +1990,12 @@ def queue_existing_retry_candidate(
         request = entry.get("request") or candidate_payload.get("request") or {}
         label = candidate.get("filename") or candidate_item.title
         try:
+            if not download_slot_available(available_slots):
+                set_download_item_status(item, "waiting for download slot")
+                return False
             append_task_log(session, None, f"{item.title}: trying existing alternate candidate {label}")
             queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
+            consume_download_slot(available_slots)
             payload = json.loads(item.payload_json or "{}")
             payload.update(
                 {
@@ -1995,7 +2041,15 @@ def queue_existing_retry_candidate(
     return False
 
 
-def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, item: ProposalItem, reason: str, transfer: dict | None = None) -> bool:
+def retry_download_entry(
+    session: Session,
+    batch: ProposalBatch,
+    entry: dict,
+    item: ProposalItem,
+    reason: str,
+    transfer: dict | None = None,
+    available_slots: dict[str, int] | None = None,
+) -> bool:
     retry_count = max(0, min(int(entry.get("retry_count") or 0), MAX_DOWNLOAD_AUTO_RETRIES))
     current_candidate = entry.get("candidate") or {}
     failed_candidates = manifest_failed_candidates(entry)
@@ -2009,6 +2063,8 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         )
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
+    if not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
     set_download_item_status(item, f"{reason}; searching for another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
@@ -2030,7 +2086,7 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
         "warning",
     )
     cancel_existing_slskd_transfer(session, transfer, item, reason)
-    if queue_existing_retry_candidate(session, item, entry, retry_count, failed_candidates, reason):
+    if queue_existing_retry_candidate(session, item, entry, retry_count, failed_candidates, reason, available_slots=available_slots):
         return True
     try:
         search_result = search_slskd_for_request(session, request, limit=8)
@@ -2080,9 +2136,12 @@ def retry_download_entry(session: Session, batch: ProposalBatch, entry: dict, it
     item.title = f"slskd: {candidate.get('filename') or download_query(payload['request'])}"
     item.new_value = candidate.get("username")
     item.status = ProposalStatus.executing
+    if not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
     try:
         settings = integration_settings(session)
         queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
+        consume_download_slot(available_slots)
         record_download_manifest_entry(entry.get("request") or {}, candidate, item)
         update_download_manifest_entry(
             {
@@ -2376,7 +2435,14 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
     item = session.get(ProposalItem, entry.get("item_id"))
     if item:
         set_download_item_status(item, f"{verification['message']}; retrying another candidate")
-        retry_started = retry_download_entry(session, batch, entry, item, verification["message"])
+        retry_started = retry_download_entry(
+            session,
+            batch,
+            entry,
+            item,
+            verification["message"],
+            available_slots={"available": download_slots_available(session, load_download_manifest())},
+        )
         if retry_started:
             batch.status = ProposalStatus.executing
             create_notification(
