@@ -518,17 +518,29 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     elif batch.kind == ProposalKind.import_files and not executable_items and not download_items:
         errors.append("No approved import file operations were selected.")
 
+    # Import wizard files: import a whole album together and commit once per album so tracks are
+    # not added to the library one at a time.
+    executable_albums: dict[str, list[ProposalItem]] = {}
     for item in executable_items:
-        try:
-            note_progress(f"Importing {item.title}", item)
-            import_track_item(session, item)
-            item.status = ProposalStatus.completed
-            imported += 1
-            finish_progress_step(f"Imported {item.title}")
-        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
-            item.status = ProposalStatus.failed
-            errors.append(f"{item.title}: {error}")
-            finish_progress_step(f"Import failed for {item.title}")
+        executable_albums.setdefault(str(Path(item.new_value).parent), []).append(item)
+    for album_path, album_items in executable_albums.items():
+        album_label = Path(album_path).name or "album"
+        note_progress(f"Importing {len(album_items)} track(s) from {album_label}")
+        album_imported = 0
+        for item in album_items:
+            try:
+                import_track_item(session, item)
+                item.status = ProposalStatus.completed
+                imported += 1
+                album_imported += 1
+            except Exception as error:  # noqa: BLE001 - keep importing the rest of the album.
+                item.status = ProposalStatus.failed
+                errors.append(f"{item.title}: {error}")
+            progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, f"Imported {album_imported}/{len(album_items)} track(s) from {album_label}")
+        else:
+            session.commit()
 
     metadata_updated = 0
     for item in metadata_items:
@@ -1277,11 +1289,12 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
+    # Items that need manual attention (an exhausted download, a pending YouTube fallback) keep
+    # the batch from being finalized, but they no longer short-circuit the whole batch: tracks
+    # that already downloaded should still stage and import.
     blocking_items = selected_download_blockers(batch)
-    if blocking_items:
-        for item in blocking_items:
-            set_download_item_status(item, "needs attention before this batch can finish")
-        return {"imported": 0, "errors": [], "waiting": 0, "ready": 0, "failed": len(blocking_items)}
+    for blocker in blocking_items:
+        set_download_item_status(blocker, "needs attention before this batch can finish")
     all_download_item_ids = selected_slskd_download_item_ids(batch)
     if not all_download_item_ids:
         return {"imported": 0, "errors": []}
@@ -1292,7 +1305,8 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if (existing_item := session.get(ProposalItem, item_id)) and existing_item.status not in {ProposalStatus.completed, ProposalStatus.rejected}
     }
     if not expected_item_ids:
-        finalize_completed_download_batch(session, batch)
+        if not blocking_items:
+            finalize_completed_download_batch(session, batch)
         return {"imported": 0, "errors": []}
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
@@ -1312,6 +1326,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     # siblings are still waiting for a slot.
     for item_id in sorted(expected_item_ids - manifest_item_ids):
         item = session.get(ProposalItem, item_id)
+        if download_item_retry_exhausted(item):
+            set_download_item_status(item, "needs attention; could not be downloaded automatically")
+            failed_count += 1
+            continue
         if item and reconnect_existing_slskd_transfer(session, item):
             waiting_count += 1
             continue
@@ -1331,6 +1349,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
     for entry in entries:
         item = session.get(ProposalItem, entry.get("item_id"))
+        if download_item_retry_exhausted(item):
+            set_download_item_status(item, "needs attention; could not be downloaded automatically")
+            failed_count += 1
+            continue
         if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
             staged_path = Path(str(entry["path"]))
             if staged_path.exists():
@@ -1427,11 +1449,19 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     if not verified_entries:
         return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
 
-    # Import verified tracks as soon as they are ready instead of waiting for the whole batch.
-    # The batch is only finalized (staging cleaned up, marked complete) once nothing else is
-    # waiting or failed, so one slow or unfindable track can no longer strand the tracks that
-    # already downloaded and verified.
-    batch_complete = waiting_count == 0 and failed_count == 0
+    # Wishlist and plain album downloads import a whole album at a time: hold verified tracks
+    # until the album has settled (nothing left actively downloading) so tracks are not added to
+    # the library one by one. Missing-track and lossless-replacement downloads fill individual
+    # gaps and still import each track the moment it lands.
+    if download_entries_import_per_album(entries) and waiting_count > 0:
+        for entry, _file_path, _metadata in verified_entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "verified; waiting for the rest of the album", stage="verified", progress=100)
+        return {"imported": 0, "errors": errors, "waiting": waiting_count + ready_count, "ready": 0, "failed": failed_count}
+
+    # Import the verified tracks. The batch is only finalized (staging cleaned up, marked
+    # complete) once nothing else is waiting, failed, or blocked, so one slow or unfindable
+    # track can no longer strand the tracks that already downloaded and verified.
+    batch_complete = waiting_count == 0 and failed_count == 0 and not blocking_items
     try:
         for entry, _file_path, _metadata in verified_entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified track", stage="importing", progress=100, indeterminate=True)
@@ -1536,6 +1566,22 @@ def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
         elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
             blockers.append(item)
     return blockers
+
+
+def download_item_retry_exhausted(item: ProposalItem | None) -> bool:
+    return bool(item and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"))
+
+
+def download_entries_import_per_album(entries: list[dict]) -> bool:
+    """Whether a batch's downloads should import a whole album at a time.
+
+    Wishlist and plain album downloads import the album as a unit; missing-track and
+    lossless-replacement downloads fill individual gaps and import each track as it lands.
+    """
+    for entry in entries:
+        if (entry.get("request") or {}).get("workflow") in {"missing_tracks", "lossless_replacement"}:
+            return False
+    return True
 
 
 def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
