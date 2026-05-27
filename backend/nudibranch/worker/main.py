@@ -4598,6 +4598,18 @@ def run_check_files(session: Session, _payload: dict) -> dict:
     }
     missing_file_paths = sorted(path for path in db_paths if not Path(path).exists())
     missing_record_paths = sorted(path for path in disk_paths if path not in db_paths)
+    # Read metadata once for every file on disk that no record claims; it is reused both to
+    # relink moved files and to create records for genuinely new files.
+    orphan_records = {path: file_info_for_existing_library_file(Path(path)) for path in missing_record_paths}
+    # A migration (e.g. moving Nudibranch to a new VM) usually relocates files rather than
+    # deleting them. Re-point records at the matching file on disk instead of marking every
+    # track as needing a redownload.
+    relinked, consumed_orphans, relinked_paths = relink_moved_library_files(session, tracks_by_path, missing_file_paths, orphan_records)
+    if relinked:
+        append_task_log(session, None, f"File check relinked {relinked} record(s) to files that moved on disk")
+        session.flush()
+    missing_file_paths = [path for path in missing_file_paths if path not in relinked_paths]
+    missing_records = [info for path, info in orphan_records.items() if path not in consumed_orphans]
     missing_files = [
         {
             "track_id": tracks_by_path[path].id,
@@ -4609,22 +4621,157 @@ def run_check_files(session: Session, _payload: dict) -> dict:
         }
         for path in missing_file_paths
     ]
-    missing_records = [file_info_for_existing_library_file(Path(path)) for path in missing_record_paths]
     queued_missing_files = queue_missing_file_downloads(session, missing_files)
     queued_missing_records = queue_missing_record_imports(session, missing_records)
     create_notification(
         session,
         title="File check complete",
-        body=f"{len(missing_files)} records missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue.",
+        body=f"Relinked {relinked} moved file(s). {len(missing_files)} records still missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue.",
         event_type="tool_completed",
         target_url="/task-queue",
     )
     return {
+        "relinked": relinked,
         "missing_files": missing_files,
         "missing_records": [],
         "queued_missing_files": queued_missing_files,
         "queued_missing_records": queued_missing_records,
     }
+
+
+def relink_moved_library_files(
+    session: Session,
+    tracks_by_path: dict[str, Track],
+    missing_file_paths: list[str],
+    orphan_records: dict[str, dict],
+) -> tuple[int, set[str], set[str]]:
+    """Re-point records whose file moved on disk (e.g. after a VM migration) at the matching
+    orphan file instead of redownloading it.
+
+    Returns (relinked_count, consumed_orphan_paths, relinked_record_paths). Only orphan files
+    (present on disk but claimed by no record) are eligible targets, and each is used at most
+    once, so relinking never creates duplicate or conflicting paths.
+    """
+    consumed: set[str] = set()
+    relinked_paths: set[str] = set()
+    if not missing_file_paths or not orphan_records:
+        return 0, consumed, relinked_paths
+
+    orphans_by_basename: dict[str, list[str]] = {}
+    orphans_by_recording: dict[str, list[str]] = {}
+    orphans_by_metakey: dict[tuple[str, str, str], list[str]] = {}
+    for path, info in orphan_records.items():
+        orphans_by_basename.setdefault(Path(path).name.casefold(), []).append(path)
+        metadata = info.get("metadata") or {}
+        recording_id = normalize_match_text(metadata.get("musicbrainz_recording_id"))
+        if recording_id:
+            orphans_by_recording.setdefault(recording_id, []).append(path)
+        metakey = (
+            normalize_match_text(metadata.get("albumartist") or metadata.get("artist")),
+            normalize_match_text(metadata.get("album")),
+            normalize_match_text(metadata.get("title")),
+        )
+        if any(metakey):
+            orphans_by_metakey.setdefault(metakey, []).append(path)
+
+    album_moves: dict[str, str] = {}
+    relinked = 0
+    for old_path in missing_file_paths:
+        track = tracks_by_path.get(old_path)
+        if not track:
+            continue
+        match = relink_candidate(track, old_path, orphans_by_basename, orphans_by_recording, orphans_by_metakey, consumed)
+        if not match:
+            continue
+        track.path = match
+        consumed.add(match)
+        relinked_paths.add(old_path)
+        relinked += 1
+        if track.album_id:
+            album_moves[track.album_id] = str(Path(match).parent)
+
+    if relinked:
+        for album_id, parent in album_moves.items():
+            album = session.get(Album, album_id)
+            if album:
+                album.path = parent
+        session.flush()
+    return relinked, consumed, relinked_paths
+
+
+def relink_candidate(
+    track: Track,
+    old_path: str,
+    orphans_by_basename: dict[str, list[str]],
+    orphans_by_recording: dict[str, list[str]],
+    orphans_by_metakey: dict[tuple[str, str, str], list[str]],
+    consumed: set[str],
+) -> str | None:
+    old_basename = Path(old_path).name.casefold()
+
+    # 1. MusicBrainz recording id is the strongest signal and survives re-tagging/renames.
+    recording_id = normalize_match_text(track.musicbrainz_recording_id)
+    if recording_id:
+        available = [path for path in orphans_by_recording.get(recording_id, []) if path not in consumed]
+        if len(available) == 1:
+            return available[0]
+        if len(available) > 1:
+            by_name = [path for path in available if Path(path).name.casefold() == old_basename]
+            if len(by_name) == 1:
+                return by_name[0]
+            suffix = longest_path_suffix_match(old_path, available)
+            if suffix:
+                return suffix
+
+    # 2. Same filename (the common case: a plain move/copy keeps filenames intact).
+    available = [path for path in orphans_by_basename.get(old_basename, []) if path not in consumed]
+    if len(available) == 1:
+        return available[0]
+    if len(available) > 1:
+        suffix = longest_path_suffix_match(old_path, available)
+        if suffix:
+            return suffix
+
+    # 3. Artist / album / title metadata (handles files renamed during the migration).
+    album = track.album
+    metakey = (
+        normalize_match_text(album.artist.name if album and album.artist else None),
+        normalize_match_text(album.title if album else None),
+        normalize_match_text(track.title),
+    )
+    if any(metakey):
+        available = [path for path in orphans_by_metakey.get(metakey, []) if path not in consumed]
+        if len(available) == 1:
+            return available[0]
+        if len(available) > 1:
+            return longest_path_suffix_match(old_path, available)
+    return None
+
+
+def longest_path_suffix_match(old_path: str, candidates: list[str]) -> str | None:
+    """Pick the candidate sharing the longest trailing path-component run with old_path.
+
+    Returns a match only when a single candidate wins outright, so ambiguous cases are left
+    for manual review rather than guessed.
+    """
+    old_parts = [part.casefold() for part in Path(old_path).parts]
+    best_len = 0
+    best: list[str] = []
+    for candidate in candidates:
+        candidate_parts = [part.casefold() for part in Path(candidate).parts]
+        shared = 0
+        for left, right in zip(reversed(old_parts), reversed(candidate_parts)):
+            if left != right:
+                break
+            shared += 1
+        if shared > best_len:
+            best_len = shared
+            best = [candidate]
+        elif shared == best_len:
+            best.append(candidate)
+    if best_len >= 1 and len(best) == 1:
+        return best[0]
+    return None
 
 
 def queue_missing_file_downloads(session: Session, missing_files: list[dict]) -> int:

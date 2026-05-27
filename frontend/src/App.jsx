@@ -4123,14 +4123,18 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
 function CheckFilesResult({ result, onFix }) {
   const missingFiles = result?.missing_files || [];
   const missingRecords = result?.missing_records || [];
+  const relinked = result?.relinked || 0;
   if (missingRecords.length === 0) {
     return (
       <section className="check-files-panel">
         <h2>File Check</h2>
+        {relinked > 0 && <p>Relinked {relinked} record{relinked === 1 ? "" : "s"} to files that moved on disk.</p>}
         <p>
           {missingFiles.length
             ? `${missingFiles.length} records with missing files were added to the task queue.`
-            : "No untracked library files found."}
+            : relinked > 0
+              ? "All other records already match files on disk."
+              : "No untracked library files found."}
         </p>
       </section>
     );
@@ -4138,6 +4142,7 @@ function CheckFilesResult({ result, onFix }) {
   return (
     <section className="check-files-panel">
       <h2>File Check</h2>
+      {relinked > 0 && <p>Relinked {relinked} record{relinked === 1 ? "" : "s"} to files that moved on disk.</p>}
       {missingFiles.length > 0 && <p>{missingFiles.length} records with missing files were added to the task queue.</p>}
       <div className="check-files-grid">
         <div>
