@@ -1282,48 +1282,53 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         for item in blocking_items:
             set_download_item_status(item, "needs attention before this batch can finish")
         return {"imported": 0, "errors": [], "waiting": 0, "ready": 0, "failed": len(blocking_items)}
-    expected_item_ids = selected_slskd_download_item_ids(batch)
+    all_download_item_ids = selected_slskd_download_item_ids(batch)
+    if not all_download_item_ids:
+        return {"imported": 0, "errors": []}
+    # Tracks imported in an earlier incremental pass are done; don't reconsider or re-queue them.
+    expected_item_ids = {
+        item_id
+        for item_id in all_download_item_ids
+        if (existing_item := session.get(ProposalItem, item_id)) and existing_item.status not in {ProposalStatus.completed, ProposalStatus.rejected}
+    }
     if not expected_item_ids:
+        finalize_completed_download_batch(session, batch)
         return {"imported": 0, "errors": []}
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     entries = defer_excess_download_slot_entries(session, batch, entries)
     download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     manifest_item_ids = {entry.get("item_id") for entry in entries}
-    if not expected_item_ids.issubset(manifest_item_ids):
-        queued_missing = 0
-        waiting_missing = 0
-        for item_id in sorted(expected_item_ids - manifest_item_ids):
-            item = session.get(ProposalItem, item_id)
-            if item and reconnect_existing_slskd_transfer(session, item):
-                queued_missing += 1
-                continue
-            if not download_slot_available(download_slot_tracker):
-                set_download_item_status(item, "waiting for download slot")
-                waiting_missing += 1
-                continue
-            if item:
-                slots_before = download_slot_tracker.get("available", 0)
-                if queue_missing_manifest_download(session, batch, item, available_slots=download_slot_tracker):
-                    if download_slot_tracker.get("available", 0) < slots_before:
-                        queued_missing += 1
-                    else:
-                        waiting_missing += 1
-                    continue
-            set_download_item_status(item, "searching for slskd queue record")
-            waiting_missing += 1
-        update_download_container_statuses(batch)
-        session.flush()
-        return {"imported": 0, "errors": [], "waiting": queued_missing + waiting_missing, "ready": 0, "failed": 0}
-    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
-    if transfer_error_message:
-        for entry in entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
-    verified_entries = []
+
+    verified_entries: list[tuple[dict, Path, dict]] = []
     errors: list[str] = []
     waiting_count = 0
     ready_count = 0
     failed_count = 0
+
+    # Re-queue selected items that have no manifest entry yet (deferred for a download slot,
+    # missing a queue record, etc). This intentionally does NOT short-circuit staging and import
+    # of the entries we already have, so a finished download still reaches the library while its
+    # siblings are still waiting for a slot.
+    for item_id in sorted(expected_item_ids - manifest_item_ids):
+        item = session.get(ProposalItem, item_id)
+        if item and reconnect_existing_slskd_transfer(session, item):
+            waiting_count += 1
+            continue
+        if not download_slot_available(download_slot_tracker):
+            set_download_item_status(item, "waiting for download slot")
+            waiting_count += 1
+            continue
+        if item and queue_missing_manifest_download(session, batch, item, available_slots=download_slot_tracker):
+            waiting_count += 1
+            continue
+        set_download_item_status(item, "searching for slskd queue record")
+        waiting_count += 1
+
+    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
+    if transfer_error_message:
+        for entry in entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
     for entry in entries:
         item = session.get(ProposalItem, entry.get("item_id"))
         if entry.get("status") == "verified" and entry.get("path") and entry.get("metadata"):
@@ -1418,14 +1423,20 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
 
     update_download_container_statuses(batch)
     session.flush()
-    if waiting_count or failed_count or len(verified_entries) < len(expected_item_ids):
+
+    if not verified_entries:
         return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
 
+    # Import verified tracks as soon as they are ready instead of waiting for the whole batch.
+    # The batch is only finalized (staging cleaned up, marked complete) once nothing else is
+    # waiting or failed, so one slow or unfindable track can no longer strand the tracks that
+    # already downloaded and verified.
+    batch_complete = waiting_count == 0 and failed_count == 0
     try:
         for entry, _file_path, _metadata in verified_entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified batch", stage="importing", progress=100, indeterminate=True)
-        append_task_log(session, None, f"{batch.title}: all {len(verified_entries)} staged track(s) verified; importing batch")
-        imported = import_verified_download_batch(session, batch, verified_entries)
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "importing verified track", stage="importing", progress=100, indeterminate=True)
+        append_task_log(session, None, f"{batch.title}: importing {len(verified_entries)} verified track(s)")
+        imported = import_verified_download_entries(session, batch, verified_entries, finalize=batch_complete)
     except Exception as error:  # noqa: BLE001 - keep the batch visible in Downloads if finalization fails.
         batch.status = ProposalStatus.failed
         create_notification(
@@ -1437,7 +1448,9 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         )
         session.commit()
         return {"imported": 0, "errors": [str(error)], "waiting": 0, "ready": ready_count, "failed": 1}
-    return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
+    if batch_complete:
+        return {"imported": imported, "errors": errors, "waiting": 0, "ready": 0, "failed": 0}
+    return {"imported": imported, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
 
 
 def reconcile_manifest_entries_to_selected_items(session: Session, batch: ProposalBatch, entries: list[dict], expected_item_ids: set[str]) -> list[dict]:
@@ -2488,6 +2501,24 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
 
 
 def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
+    return import_verified_download_entries(session, batch, verified_entries, finalize=True)
+
+
+def finalize_completed_download_batch(session: Session, batch: ProposalBatch) -> None:
+    cleanup_download_staging_batch(batch.id)
+    for item in batch.items:
+        if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
+            item.status = ProposalStatus.completed
+    batch.status = ProposalStatus.completed
+    session.flush()
+
+
+def import_verified_download_entries(
+    session: Session,
+    batch: ProposalBatch,
+    verified_entries: list[tuple[dict, Path, dict]],
+    finalize: bool = True,
+) -> int:
     known_paths = existing_library_and_proposal_paths(session)
     imported = 0
     imported_albums: set[tuple[str, str]] = set()
@@ -2504,6 +2535,9 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
                 file_path.unlink()
                 append_task_log(session, None, f"{entry_download_label(entry)}: removed duplicate staged file because {target_path.name} already exists")
             update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
+            duplicate_item = session.get(ProposalItem, entry.get("item_id"))
+            if duplicate_item:
+                duplicate_item.status = ProposalStatus.completed
             continue
         payload = {
             "path": str(file_path),
@@ -2522,6 +2556,9 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
             append_task_log(session, None, f"{entry_download_label(entry)}: moved staged file into library at {target_path}")
         mark_matching_wishlist_completed(session, normalized_metadata)
         update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
+        imported_item = session.get(ProposalItem, entry.get("item_id"))
+        if imported_item:
+            imported_item.status = ProposalStatus.completed
         imported += 1
         known_paths.add(str(target_path))
         imported_albums.add(
@@ -2532,13 +2569,12 @@ def import_verified_download_batch(session: Session, batch: ProposalBatch, verif
         )
     for artist_name, album_title in sorted(imported_albums):
         ensure_album_cover_for_import(session, artist_name, album_title)
-    cleanup_download_staging_batch(batch.id)
-    for item in batch.items:
-        if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
-            item.status = ProposalStatus.completed
-    batch.status = ProposalStatus.completed
-    session.flush()
-    append_task_log(session, None, f"{batch.title}: library import finished for {imported} track(s)")
+    if finalize:
+        finalize_completed_download_batch(session, batch)
+        append_task_log(session, None, f"{batch.title}: library import finished for {imported} track(s)")
+    else:
+        session.flush()
+        append_task_log(session, None, f"{batch.title}: imported {imported} verified track(s); other tracks still in progress")
     return imported
 
 
