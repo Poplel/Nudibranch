@@ -26,7 +26,7 @@ from nudibranch.services.slskd import cancel_slskd_download, download_transfers,
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
 
-MAX_DOWNLOAD_AUTO_RETRIES = 6
+MAX_DOWNLOAD_AUTO_RETRIES = 5
 ZERO_PROGRESS_RETRY_SECONDS = 90
 STALLED_PROGRESS_RETRY_SECONDS = 150
 MISSING_TRANSFER_RETRY_SECONDS = 45
@@ -603,7 +603,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             is_slskd_download = keeps_download_batch_open(item)
             if is_slskd_download and not download_slot_available(download_slot_tracker):
                 note_progress(f"Waiting for download slot for {item.title}", item)
-                set_download_item_status(item, "waiting for download slot")
+                set_download_item_status(item, "waiting to download")
                 item.status = ProposalStatus.executing
                 download_changes += 1
                 finish_progress_step(f"Waiting for download slot for {item.title}")
@@ -1377,7 +1377,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             waiting_count += 1
             continue
         if not download_slot_available(download_slot_tracker):
-            set_download_item_status(item, "waiting for download slot")
+            set_download_item_status(item, "waiting to download")
             waiting_count += 1
             continue
         if item and queue_missing_manifest_download(session, batch, item, available_slots=download_slot_tracker):
@@ -1543,7 +1543,7 @@ def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, e
         if not item or not cancel_existing_slskd_transfer(session, transfer, item, reason):
             continue
         remove_download_manifest_entry(entry)
-        set_download_item_status(item, "waiting for download slot")
+        set_download_item_status(item, "waiting to download")
         append_task_log(session, None, f"{entry_download_label(entry)}: deferred queued slskd transfer because {reason}")
         deferred.add(id(entry))
     if deferred:
@@ -1596,7 +1596,7 @@ def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item
     if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
         return False
     if not download_slot_available(available_slots):
-        set_download_item_status(item, "waiting for download slot")
+        set_download_item_status(item, "waiting to download")
         item.status = ProposalStatus.executing
         return True
     try:
@@ -1950,12 +1950,10 @@ def queued_transfer_retry_seconds(entry: dict) -> int:
 
 
 def slskd_concurrent_download_limit(session: Session) -> int:
-    settings = integration_settings(session)
-    try:
-        limit = int(settings.get("slskd_concurrent_downloads") or 1)
-    except (TypeError, ValueError):
-        limit = 1
-    return max(1, min(limit, 12))
+    # Downloads are handled strictly one track at a time. The old configurable concurrency caused
+    # slot-accounting deadlocks (queued-remotely transfers counting against their own retries), so
+    # it is fixed at 1 and the slskd_concurrent_downloads setting is ignored.
+    return 1
 
 
 def active_download_slot_count(session: Session, entries: list[dict]) -> int:
@@ -2038,8 +2036,7 @@ def defer_download_for_slot(
         retry_reason=reason,
     )
     item.status = ProposalStatus.executing
-    set_download_item_status(item, "waiting for download slot")
-    append_task_log(session, None, f"{item.title}: waiting for download slot before retrying after {reason}")
+    set_download_item_status(item, "waiting to download")
     return True
 
 
@@ -2060,7 +2057,7 @@ def queue_existing_retry_candidate(
         label = candidate.get("filename") or candidate_item.title
         try:
             if not download_slot_available(available_slots):
-                set_download_item_status(item, "waiting for download slot")
+                set_download_item_status(item, "waiting to download")
                 return False
             append_task_log(session, None, f"{item.title}: trying existing alternate candidate {label}")
             queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
@@ -2130,20 +2127,23 @@ def retry_download_entry(
                 "reason": reason,
             }
         )
-    # A transfer slskd marked complete but whose file never arrived is a phantom (a stale record
-    # from a previous run, or a failed/cross-device move). Remove it now — before the slot gate,
-    # since a completed transfer holds no slot — so we stop reconnecting to it and can fetch a
-    # fresh copy.
-    if transfer is not None and transfer_is_complete_or_finishing(transfer):
+    # We are abandoning the current slskd transfer (stuck, stalled, failed, or a "complete" phantom
+    # whose file never arrived). Cancel it up front so its slot frees for the replacement — a retry
+    # is a 1:1 swap and must never be blocked by its own occupied slot (that was the "waiting for
+    # download slot" deadlock).
+    if transfer is not None:
+        freed_slot = transfer_holds_download_slot(transfer)
         cancel_existing_slskd_transfer(session, transfer, item, reason)
         transfer = None
+        if freed_slot and available_slots is not None:
+            available_slots["available"] = int(available_slots.get("available") or 0) + 1
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     if not download_slot_available(available_slots):
         return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
-    set_download_item_status(item, f"{reason}; searching for another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+    set_download_item_status(item, f"{reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
     payload = json.loads(item.payload_json or "{}")
     payload["auto_retry_exhausted"] = False
     item.payload_json = json.dumps(payload)
@@ -2158,10 +2158,9 @@ def retry_download_entry(
     append_task_log(
         session,
         None,
-        f"{item.title}: {reason}; searching for replacement candidate {retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES}",
+        f"{item.title}: {reason}; trying replacement candidate {retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES}",
         "warning",
     )
-    cancel_existing_slskd_transfer(session, transfer, item, reason)
     if queue_existing_retry_candidate(session, item, entry, retry_count, failed_candidates, reason, available_slots=available_slots):
         return True
     try:
@@ -2289,7 +2288,15 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
         failed_candidates=failed_candidates[-25:],
         retry_reason=reason,
     )
-    append_task_log(session, None, f"{item.title}: automatic replacement search exhausted: {reason}", "error")
+    label = entry_download_label(entry)
+    append_task_log(session, None, f"{label}: could not download from Soulseek after {retry_count} candidate(s): {reason}", "error")
+    create_notification(
+        session,
+        title="Download needs attention",
+        body=f"Couldn't download {label} from Soulseek after {retry_count} candidate(s). Use the YouTube fallback for this track to finish the album.",
+        event_type="task_failed",
+        target_url="/downloads",
+    )
     return False
 
 
@@ -2463,8 +2470,8 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
             status = f"downloading {average_progress:.0f}% · {downloaded} of {total} downloaded"
         elif average_progress > 0:
             status = f"downloading {average_progress:.0f}% · 0 of {total} downloaded"
-        elif any("waiting for download slot" in status for status in statuses):
-            status = f"waiting for download slot · {downloaded} of {total} downloaded"
+        elif any("waiting to download" in status for status in statuses):
+            status = f"waiting to download · {downloaded} of {total} downloaded"
         elif any("queued in slskd" in status or "download queued in slskd" in status for status in statuses):
             status = f"queued in slskd · {downloaded} of {total} downloaded"
         else:
@@ -3534,7 +3541,7 @@ def download_progress_payload(status: str, *, stage: str | None = None, progress
         elif match := re.search(r"downloading\s+(\d+(?:\.\d+)?)%", lowered):
             resolved_stage = "downloading"
             value = max(0.0, min(100.0, float(match.group(1))))
-        elif any(token in lowered for token in ("waiting for download slot", "queued", "requested", "initializing", "checking transfer state")):
+        elif any(token in lowered for token in ("waiting to download", "queued", "requested", "initializing", "checking transfer state")):
             resolved_stage = "queued"
             value = 0 if value is None else value
         elif any(token in lowered for token in ("searching", "retrying", "replacement")):
