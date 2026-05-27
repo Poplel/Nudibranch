@@ -9,7 +9,7 @@ services:
       - nudibranch-config:/app/config
       - nudibranch-import:/app/import
       - nudibranch-staging:/app/staging
-      - ${NUDIBRANCH_LIBRARY_PATH:-nudibranch-library}:/app/library
+      - nudibranch-library:/app/library
       - nudibranch-downloads:/app/downloads
       - nudibranch-trash:/app/trash
       - nudibranch-backups:/app/backups
@@ -32,7 +32,7 @@ services:
       - nudibranch-config:/app/config
       - nudibranch-import:/app/import
       - nudibranch-staging:/app/staging
-      - ${NUDIBRANCH_LIBRARY_PATH:-nudibranch-library}:/app/library
+      - nudibranch-library:/app/library
       - nudibranch-downloads:/app/downloads
       - nudibranch-trash:/app/trash
       - nudibranch-backups:/app/backups
