@@ -1,3 +1,4 @@
+import datetime
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -25,6 +26,20 @@ def _normalize_artist(r: dict) -> dict:
     }
 
 
+_COLLECTION_TYPE_PRIORITY = {"album": 0, "ep": 1, "single": 2}
+
+
+def _album_sort_key(a: dict) -> tuple:
+    """Sort key: Album < EP < Single < other, then newest-first within each tier."""
+    priority = _COLLECTION_TYPE_PRIORITY.get((a.get("collection_type") or "").lower(), 3)
+    date_str = a.get("date") or "0000-00-00"
+    try:
+        ts = datetime.date.fromisoformat(date_str).toordinal()
+    except ValueError:
+        ts = 0
+    return (priority, -ts)
+
+
 def _normalize_album(r: dict) -> dict:
     return {
         "id": str(r["collectionId"]),
@@ -33,6 +48,7 @@ def _normalize_album(r: dict) -> dict:
         "artist_id": str(r.get("artistId") or ""),
         "date": (r.get("releaseDate") or "")[:10],
         "track_count": r.get("trackCount", 0),
+        "collection_type": (r.get("collectionType") or "").lower(),
         "cover_art_url": _art_url(r.get("artworkUrl100")),
         "cover_art_urls": [_art_url(r.get("artworkUrl100"))] if r.get("artworkUrl100") else [],
         "tracks": [],
@@ -74,7 +90,7 @@ def artist_albums(artist_id: str, limit: int = 200) -> list[dict]:
         resp.raise_for_status()
         results = resp.json().get("results", [])
         albums = [_normalize_album(r) for r in results if r.get("wrapperType") == "collection"]
-        return sorted(albums, key=lambda a: a.get("date") or "", reverse=True)
+        return sorted(albums, key=_album_sort_key)
     except Exception as error:
         write_app_log("iTunes artist albums fetch failed", level="warning", feature="discover", error=str(error))
         return []
