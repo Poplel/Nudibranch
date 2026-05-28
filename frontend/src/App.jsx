@@ -4502,7 +4502,6 @@ function SettingsPanel({
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
             ["playlist_conflict_winner", "Conflicting playlist entries"],
-            ["favorite_playlist_id", "Favorites playlist"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
@@ -4532,18 +4531,6 @@ function SettingsPanel({
                 >
                   <option value="nudibranch">Nudibranch</option>
                   <option value="jellyfin">Jellyfin</option>
-                </select>
-              ) : key === "favorite_playlist_id" ? (
-                <select
-                  value={integrationDraft[key] || ""}
-                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
-                >
-                  <option value="">Default Favorites</option>
-                  {(playlists || []).map((playlist) => (
-                    <option key={playlist.id} value={playlist.id}>
-                      {playlist.name}
-                    </option>
-                  ))}
                 </select>
               ) : (
                 <input

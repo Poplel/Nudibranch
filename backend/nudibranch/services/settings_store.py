@@ -13,7 +13,6 @@ INTEGRATION_KEYS = {
     "slskd_album_folder_tries",
     "slskd_concurrent_downloads",
     "playlist_conflict_winner",
-    "favorite_playlist_id",
     "youtube_cookies_browser",
     "youtube_cookies_path",
 }
@@ -30,15 +29,11 @@ def integration_settings(session: Session) -> dict[str, str]:
         "slskd_album_folder_tries": "5",
         "slskd_concurrent_downloads": "1",
         "playlist_conflict_winner": "nudibranch",
-        "favorite_playlist_id": "",
         "youtube_cookies_browser": "",
         "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value
-    explicit_favorite = session.get(AppSetting, "favorite_playlist_explicit")
-    if not explicit_favorite or explicit_favorite.value != "1":
-        values["favorite_playlist_id"] = ""
     return values
 
 

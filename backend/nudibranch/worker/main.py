@@ -4778,31 +4778,39 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         if not user_id:
             raise ValueError("No Jellyfin user was found for playlist sync")
 
+        # Sync the Favorites playlist against Jellyfin's native IsFavorite flag (not a playlist)
+        favorites_playlist = ensure_favorites_playlist(session)
+        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, conflict_winner)
+        pulled_tracks += fav_changes
+        synced_playlists += 1
+
+        # Sync regular (non-protected) playlists with Jellyfin playlists
         jellyfin_playlists = list_jellyfin_playlists(client, user_id)
-        playlists = list(session.scalars(select(Playlist).order_by(Playlist.name.asc())))
-        local_by_name = {playlist.name: playlist for playlist in playlists}
-        imported_playlist_names = set()
+        # Import any Jellyfin playlists that don't exist locally yet
+        existing_playlists = list(session.scalars(select(Playlist).where(Playlist.protected.is_(False)).order_by(Playlist.name.asc())))
+        local_by_name = {playlist.name: playlist for playlist in existing_playlists}
+        imported_playlist_names: set[str] = set()
         for jellyfin_playlist in jellyfin_playlists.values():
             name = jellyfin_playlist.get("Name")
             if not name or name in local_by_name:
                 continue
-            playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
-            session.add(playlist)
+            new_playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
+            session.add(new_playlist)
             session.flush()
-            local_by_name[name] = playlist
-            playlists.append(playlist)
+            local_by_name[name] = new_playlist
+            existing_playlists.append(new_playlist)
             imported_playlist_names.add(name)
 
-        ensure_favorites_playlist(session)
-        playlists = list(
+        regular_playlists = list(
             session.scalars(
                 select(Playlist)
+                .where(Playlist.protected.is_(False))
                 .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
                 .order_by(Playlist.name.asc())
             )
         )
 
-        for playlist in playlists:
+        for playlist in regular_playlists:
             jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
             jellyfin_items: list[dict] = []
             created_jellyfin_playlist = False
@@ -4846,8 +4854,10 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                 pulled_tracks += sync_playlist_from_jellyfin(session, playlist, jellyfin_items)
             else:
                 if unmapped_local_tracks:
-                    append_task_log(session, None, f"{playlist.name}: skipped Jellyfin overwrite because {len(unmapped_local_tracks)} Nudibranch track(s) are not visible in Jellyfin", "warning")
-                elif jellyfin_item_ids != local_item_ids:
+                    # Some local tracks aren't in Jellyfin yet — skip to avoid wiping the Jellyfin playlist
+                    append_task_log(session, None, f"{playlist.name}: skipped Jellyfin overwrite because {len(unmapped_local_tracks)} track(s) are not visible in Jellyfin yet", "warning")
+                elif local_item_ids and jellyfin_item_ids != local_item_ids:
+                    # Only push if we have mapped items to avoid wiping Jellyfin with an empty list
                     try:
                         pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
                     except JellyfinPlaylistMissing:
@@ -4868,6 +4878,48 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         deliver_apns=False,
     )
     return {"synced": synced_playlists, "pushed_tracks": pushed_tracks, "pulled_tracks": pulled_tracks}
+
+
+def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, conflict_winner: str) -> int:
+    """Sync Nudibranch Favorites against Jellyfin's native IsFavorite flag on audio items."""
+    fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "500"},
+        )
+        resp.raise_for_status()
+        jellyfin_favorites: list[dict] = resp.json().get("Items", [])
+    except Exception as error:
+        append_task_log(session, None, f"Favorites sync: could not fetch Jellyfin favorites: {error}", "warning")
+        return 0
+
+    changes = 0
+    if conflict_winner == "jellyfin":
+        # Pull: Jellyfin IsFavorite → Nudibranch Favorites
+        changes = sync_playlist_from_jellyfin(session, favorites_playlist, jellyfin_favorites)
+    else:
+        # Push: Nudibranch Favorites → Jellyfin IsFavorite
+        jellyfin_favorite_ids = {item["Id"] for item in jellyfin_favorites if item.get("Id")}
+        nudibranch_item_ids: set[str] = set()
+        for entry in favorites_playlist.tracks:
+            item_id = find_jellyfin_audio_item(client, user_id, entry.track)
+            if item_id:
+                nudibranch_item_ids.add(item_id)
+                if item_id not in jellyfin_favorite_ids:
+                    try:
+                        client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
+                        changes += 1
+                    except Exception as error:
+                        append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
+        # Unmark Jellyfin audio items that are no longer in Nudibranch Favorites
+        for item_id in jellyfin_favorite_ids - nudibranch_item_ids:
+            try:
+                client.delete(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
+                changes += 1
+            except Exception as error:
+                append_task_log(session, None, f"Favorites sync: could not unmark favorite {item_id}: {error}", "warning")
+    return changes
 
 
 def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
@@ -5811,21 +5863,16 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
 
 
 def ensure_favorites_playlist(session: Session) -> Playlist:
-    configured_setting = session.get(AppSetting, "favorite_playlist_id")
-    configured_id = configured_setting.value if configured_setting else ""
-    explicit_setting = session.get(AppSetting, "favorite_playlist_explicit")
-    explicit_favorite = explicit_setting and explicit_setting.value == "1"
-    playlist = session.get(Playlist, configured_id) if explicit_favorite and configured_id else None
+    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)))
     if not playlist:
         playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
         playlist = Playlist(name="Favorites", protected=True)
         session.add(playlist)
         session.flush()
-    for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
-        protected_playlist.protected = False
-    playlist.protected = True
-    session.flush()
+    if not playlist.protected:
+        playlist.protected = True
+        session.flush()
     return playlist
 
 
@@ -5852,7 +5899,7 @@ def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str
     try:
         response = client.get(
             f"/Playlists/{playlist_id}/Items",
-            params={"userId": user_id, "fields": "Path,ProviderIds,RunTimeTicks"},
+            params={"userId": user_id, "Fields": "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"},
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as error:
@@ -6005,7 +6052,8 @@ def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -
             "Recursive": "true",
             "IncludeItemTypes": "Audio",
             "SearchTerm": track.title,
-            "Fields": "Path,ProviderIds,RunTimeTicks",
+            "Fields": "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album",
+            "Limit": "100",
         },
     )
     response.raise_for_status()

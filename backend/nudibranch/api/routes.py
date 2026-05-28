@@ -1756,8 +1756,6 @@ def update_integrations(
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> IntegrationSettings:
     update_integration_settings(session, payload.model_dump())
-    set_app_setting(session, "favorite_playlist_explicit", "1" if payload.favorite_playlist_id else "0")
-    get_or_create_favorites(session)
     session.commit()
     return IntegrationSettings(**integration_settings(session))
 
@@ -1910,26 +1908,17 @@ def remove_action_title(action: str) -> str:
 
 
 def get_or_create_favorites(session: Session) -> Playlist:
-    configured_setting = session.get(AppSetting, "favorite_playlist_id")
-    configured_id = configured_setting.value if configured_setting else ""
-    explicit_setting = session.get(AppSetting, "favorite_playlist_explicit")
-    explicit_favorite = explicit_setting and explicit_setting.value == "1"
-    playlist = session.get(Playlist, configured_id) if explicit_favorite and configured_id else None
+    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)))
     if not playlist:
         playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
     if not playlist:
         playlist = Playlist(name="Favorites", protected=True)
         session.add(playlist)
         session.flush()
-    mark_favorite_playlist(session, playlist)
+    if not playlist.protected:
+        playlist.protected = True
+        session.flush()
     return playlist
-
-
-def mark_favorite_playlist(session: Session, playlist: Playlist) -> None:
-    for protected_playlist in session.scalars(select(Playlist).where(Playlist.protected.is_(True), Playlist.id != playlist.id)):
-        protected_playlist.protected = False
-    playlist.protected = True
-    session.flush()
 
 
 def set_app_setting(session: Session, key: str, value: str) -> None:
