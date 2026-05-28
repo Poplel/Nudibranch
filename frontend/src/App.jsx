@@ -3432,9 +3432,10 @@ function MetadataEditor({ metadata, onChange }) {
 }
 
 function AlbumDetails({ artist, album, coverUrl, details = {}, onAddGhost }) {
+  const [artFailed, setArtFailed] = useState(false);
   return (
     <div className="album-details">
-      <div className="album-art">{coverUrl ? <img src={coverUrl} alt="" /> : <Music size={24} />}</div>
+      <div className="album-art">{coverUrl && !artFailed ? <img src={coverUrl} alt="" onError={() => setArtFailed(true)} /> : <Music size={24} />}</div>
       <div className="album-detail-grid">
         <label>Artist</label>
         <strong>{artist}</strong>
@@ -3477,6 +3478,7 @@ function LibraryMetadataEditor({
   const initialValues = useMemo(() => initialFieldValues(fields), [targetId]);
   const [draft, setDraft] = useState(() => initialFieldValues(fields));
   const [lookupOpen, setLookupOpen] = useState(false);
+  const [artFailed, setArtFailed] = useState(false);
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
   );
@@ -3512,7 +3514,7 @@ function LibraryMetadataEditor({
 
   return (
     <div className="album-details metadata-panel">
-      {coverUrl !== undefined && <div className="album-art">{coverUrl ? <img src={coverUrl} alt="" /> : <Music size={24} />}</div>}
+      {coverUrl !== undefined && <div className="album-art">{coverUrl && !artFailed ? <img src={coverUrl} alt="" onError={() => setArtFailed(true)} /> : <Music size={24} />}</div>}
       <div className="library-metadata-form">
         <strong>{title}</strong>
         {Object.entries(details).map(([key, value]) => (
@@ -5571,7 +5573,7 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
   const matchStatus = libraryAlbum ? (matchedCount >= expectedTracks.length ? "full" : "partial") : "new";
   return {
     ...album,
-    cover_art_url: album.cover_art_url || libraryAlbum?.cover_path,
+    cover_art_url: album.cover_art_url || "",
     files,
     slots,
     matchStatus,
