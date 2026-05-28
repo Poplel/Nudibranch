@@ -671,6 +671,13 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     downloaded_import = import_completed_downloads(session)
     open_downloads = batch_has_open_downloads(batch)
 
+    if not errors and not open_downloads:
+        # Clear leftover grouping rows (artist/album containers) once the batch has executed, so a
+        # spent candidate review doesn't linger in the task queue showing empty artist/album rows.
+        for item in batch.items:
+            if item.status in {ProposalStatus.pending, ProposalStatus.executing} and not json.loads(item.payload_json or "{}").get("action"):
+                item.status = ProposalStatus.completed
+
     if errors:
         batch.status = ProposalStatus.failed
     elif open_downloads:
@@ -1194,8 +1201,8 @@ def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, f
     )
     entry.update({"status": "staged", "path": str(destination), "download_path": str(file_path)})
     item = session.get(ProposalItem, entry.get("item_id"))
-    set_download_item_status(item, "staged; queued for MusicBrainz verification")
-    append_task_log(session, None, f"{entry_download_label(entry)}: staged for MusicBrainz verification")
+    set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+    append_task_log(session, None, f"{entry_download_label(entry)}: moved to staging")
     return destination
 
 
@@ -2127,15 +2134,19 @@ def retry_download_entry(
                 "reason": reason,
             }
         )
-    # We are abandoning the current slskd transfer (stuck, stalled, failed, or a "complete" phantom
-    # whose file never arrived). Cancel it up front so its slot frees for the replacement — a retry
-    # is a 1:1 swap and must never be blocked by its own occupied slot (that was the "waiting for
-    # download slot" deadlock).
+    holds_slot = transfer is not None and transfer_holds_download_slot(transfer)
+    # If we can't act yet (no free slot) and the current transfer isn't occupying a slot we could
+    # reclaim, just wait — do NOT cancel/re-queue every scan. Re-queuing a failed transfer each
+    # scan churned the track, spammed the log, and stopped retry_count from ever advancing.
+    if not holds_slot and retry_count < MAX_DOWNLOAD_AUTO_RETRIES and not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
+    # We're proceeding (or exhausting): abandon the current transfer now. Cancelling a slot-holding
+    # transfer frees its slot for the 1:1 replacement swap (this was the "waiting for download slot"
+    # deadlock); a failed transfer holds no slot, so there is nothing to give back.
     if transfer is not None:
-        freed_slot = transfer_holds_download_slot(transfer)
         cancel_existing_slskd_transfer(session, transfer, item, reason)
         transfer = None
-        if freed_slot and available_slots is not None:
+        if holds_slot and available_slots is not None:
             available_slots["available"] = int(available_slots.get("available") or 0) + 1
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
@@ -2585,9 +2596,31 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
     existing file for lossless-replacement requests). The download batch itself is marked done.
     """
     review_batch: ProposalBatch | None = None
-    artist_name: str | None = None
-    album_title: str | None = None
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    first_artist: str | None = None
+    first_album: str | None = None
     created = 0
+
+    def ensure_review_tree(artist: str, album: str) -> str:
+        nonlocal review_batch
+        if review_batch is None:
+            review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, tree_path="/task-queue")
+            session.add(review_batch)
+            session.flush()
+        if artist not in artist_items:
+            artist_item = ProposalItem(batch_id=review_batch.id, title=artist, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist}))
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+        album_key = (artist, album)
+        if album_key not in album_items:
+            album_item = ProposalItem(batch_id=review_batch.id, parent_id=artist_items[artist].id, title=album, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist, "album": album}))
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        return album_items[album_key].id
+
     for entry, staged_path in staged_entries:
         # Per-item idempotency: never add the same downloaded track to a review twice (handles a
         # track that fails, retries, and succeeds after the album was already presented).
@@ -2608,15 +2641,15 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             replace_track_id = request.get("replace_track_id")
             replace_track = session.get(Track, replace_track_id) if replace_track_id else None
             target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
-            artist_name = artist_name or metadata.get("albumartist") or metadata.get("artist")
-            album_title = album_title or metadata.get("album")
-            if review_batch is None:
-                review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, tree_path="/task-queue")
-                session.add(review_batch)
-                session.flush()
+            artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+            album = metadata.get("album") or "Unknown Album"
+            first_artist = first_artist or artist
+            first_album = first_album or album
+            album_item_id = ensure_review_tree(artist, album)
             session.add(
                 ProposalItem(
                     batch_id=review_batch.id,
+                    parent_id=album_item_id,
                     title=metadata.get("title") or staged_path.stem,
                     kind=ProposalKind.import_files,
                     old_value=str(staged_path),
@@ -2640,7 +2673,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             download_item.status = ProposalStatus.completed
             set_download_item_status(download_item, "downloaded; review to add to library", stage="staging", progress=100)
     if review_batch is not None:
-        label = " – ".join(part for part in [artist_name, album_title] if part)
+        label = " – ".join(part for part in [first_artist, first_album] if part)
         review_batch.title = f"Add to library: {label}" if label else "Add downloaded music to library"
         session.flush()
         append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
