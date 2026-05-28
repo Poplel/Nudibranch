@@ -4055,6 +4055,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
     ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "downloads:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
+    ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash on approval.", "check-duplicates", "library:manage"],
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
     ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],

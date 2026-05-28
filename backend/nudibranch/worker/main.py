@@ -4640,6 +4640,19 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
             raise FileNotFoundError(f"{resolved} no longer exists")
         resolved.unlink()
         return
+    if payload.get("action") == "trash_duplicate":
+        settings = get_settings()
+        if source_path.exists():
+            settings.trash_path.mkdir(parents=True, exist_ok=True)
+            trash_dest = unique_destination(settings.trash_path / source_path.name)
+            shutil.move(str(source_path), str(trash_dest))
+            append_task_log(session, None, f"Moved duplicate to trash: {trash_dest.name}")
+        if track:
+            album = track.album
+            session.delete(track)
+            session.flush()
+            cleanup_empty_album_artist(session, album)
+        return
     target_path = unique_destination(Path(item.new_value or ""))
     if not source_path.exists():
         raise FileNotFoundError(f"{source_path} no longer exists")
@@ -5118,6 +5131,115 @@ def queue_missing_file_downloads(session: Session, missing_files: list[dict]) ->
         )
     session.flush()
     return len(rows)
+
+
+def run_check_duplicates(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Find tracks with the same artist + album + title appearing in multiple files and queue a
+    review batch to move the duplicate copies to trash (keeping the best copy of each song)."""
+    tracks = list(
+        session.scalars(
+            select(Track).options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    groups: dict[tuple[str, str, str], list[Track]] = {}
+    for track in tracks:
+        if not track.path or not track.album or not track.album.artist:
+            continue
+        key = (
+            normalize_match_text(track.album.artist.name),
+            normalize_match_text(track.album.title),
+            normalize_match_text(track.title),
+        )
+        if not all(key):
+            continue
+        groups.setdefault(key, []).append(track)
+    duplicate_groups = {key: items for key, items in groups.items() if len(items) > 1}
+    if not duplicate_groups:
+        create_notification(
+            session,
+            title="Duplicate check complete",
+            body="No duplicate tracks were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"songs_with_duplicates": 0, "files_queued": 0}
+
+    batch = ProposalBatch(title="Remove duplicate library files", kind=ProposalKind.delete, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+
+    def file_size(track: Track) -> int:
+        if not track.path:
+            return 0
+        try:
+            return Path(track.path).stat().st_size
+        except OSError:
+            return 0
+
+    def ensure_tree(artist_name: str, album_title: str) -> str:
+        if artist_name not in artist_items:
+            ai = ProposalItem(
+                batch_id=batch.id,
+                title=artist_name,
+                kind=ProposalKind.delete,
+                payload_json=json.dumps({"artist": artist_name}),
+            )
+            session.add(ai)
+            session.flush()
+            artist_items[artist_name] = ai
+        album_key = (artist_name, album_title)
+        if album_key not in album_items:
+            ali = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_items[artist_name].id,
+                title=album_title,
+                kind=ProposalKind.delete,
+                payload_json=json.dumps({"artist": artist_name, "album": album_title}),
+            )
+            session.add(ali)
+            session.flush()
+            album_items[album_key] = ali
+        return album_items[album_key].id
+
+    queued = 0
+    for group in duplicate_groups.values():
+        # Keep the best copy: lossless > larger file > lower id (stable). Trash the rest.
+        sorted_group = sorted(group, key=lambda t: (0 if t.is_lossless else 1, -file_size(t), t.id or ""))
+        keeper = sorted_group[0]
+        for dup in sorted_group[1:]:
+            album = dup.album
+            artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+            album_title = album.title if album else "Unknown Album"
+            album_item_id = ensure_tree(artist_name, album_title)
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=album_item_id,
+                    title=dup.title,
+                    kind=ProposalKind.delete,
+                    old_value=dup.path,
+                    payload_json=json.dumps(
+                        {
+                            "action": "trash_duplicate",
+                            "track_id": dup.id,
+                            "keeping_track_id": keeper.id,
+                            "keeping_path": keeper.path,
+                        }
+                    ),
+                )
+            )
+            queued += 1
+    session.flush()
+    create_notification(
+        session,
+        title="Duplicate review ready",
+        body=f"{queued} duplicate file(s) across {len(duplicate_groups)} song(s). Review and approve to move them to trash.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"songs_with_duplicates": len(duplicate_groups), "files_queued": queued}
 
 
 def queue_missing_record_imports(session: Session, missing_records: list[dict]) -> int:
@@ -5979,6 +6101,7 @@ TASK_HANDLERS = {
     "jellyfin_scan": run_jellyfin_scan,
     "clear_discover_cache": run_clear_discover_cache,
     "check_files": run_check_files,
+    "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
     "check_album_covers": run_check_album_covers,
     "check_missing_tracks": run_check_missing_tracks,
@@ -6125,6 +6248,7 @@ def task_notification_title(task_type: str) -> str:
         "sync_favorites_jellyfin": "Playlist sync",
         "jellyfin_scan": "Jellyfin scan",
         "check_files": "File check",
+        "check_duplicates": "Duplicate check",
         "check_lyrics": "Lyrics check",
         "check_album_covers": "Album cover check",
         "check_missing_tracks": "Missing tracks check",
@@ -6145,7 +6269,7 @@ def task_target_url(task_type: str) -> str:
         return "/import"
     if task_type in {"sync_favorites_jellyfin"}:
         return "/playlists"
-    if task_type in {"check_files", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
         return "/tools"
     return "/activity"
 

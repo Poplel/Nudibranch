@@ -1401,6 +1401,14 @@ def tool_check_files(
     return serialize_task(enqueue_task(session, "check_files", {}))
 
 
+@router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"])
+def tool_check_duplicates(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_duplicates", {}))
+
+
 @router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"])
 def tool_check_lyrics(
     session: Session = Depends(get_session),
