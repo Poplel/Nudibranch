@@ -959,6 +959,21 @@ nav button:hover,
   min-height: 40px;
 }
 
+.discover-show-more {
+  padding: 6px 12px;
+  margin-left: calc(1 * 18px + 24px + 15px);
+  color: var(--accent);
+  font-size: 13px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.discover-show-more:hover {
+  text-decoration: underline;
+}
+
 .tree-action-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr);

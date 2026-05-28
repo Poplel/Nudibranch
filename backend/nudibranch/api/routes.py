@@ -80,7 +80,9 @@ from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.app_log import tail_app_log, write_app_log
-from nudibranch.services.metadata_lookup import cache_discover_art, discover_music, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
+from nudibranch.services.itunes import album_tracks as itunes_album_tracks
+from nudibranch.services.itunes import discover_music
+from nudibranch.services.metadata_lookup import cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.settings_store import integration_settings, update_integration_settings
@@ -863,6 +865,15 @@ def discover_art(
         raise HTTPException(status_code=404, detail="Cached artwork not found")
     write_app_log("Discover cached art served", feature="discover", filename=safe_name)
     return FileResponse(path)
+
+
+@router.get("/discover/album-tracks/{album_id}", tags=["discover"])
+def discover_album_tracks(
+    album_id: str,
+    _: User = Depends(require_permission(Permission.wishlist_manage_own)),
+) -> dict:
+    tracks = itunes_album_tracks(album_id)
+    return {"tracks": tracks}
 
 
 @router.post("/discover/task-queue", response_model=TaskOut, tags=["discover"])
