@@ -818,13 +818,12 @@ def album_search(
 @router.get("/discover/search", tags=["discover"])
 def discover_search(
     q: str = Query(min_length=1, max_length=180),
-    type: str = Query("all"),
     background_tasks: BackgroundTasks = None,
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> dict:
-    write_app_log("Discover API search requested", feature="discover", query=q, type=type, user_id=user.id)
+    write_app_log("Discover API search requested", feature="discover", query=q, user_id=user.id)
     try:
-        payload = discover_music(q, type=type)
+        payload = discover_music(q)
         # Fast path: serve already-cached art, return external URLs for misses (no downloads, no blocking)
         with_cached_discover_art(payload, fast_only=True)
         # Background: download missing art so the next search is instant

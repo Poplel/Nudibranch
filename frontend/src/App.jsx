@@ -801,8 +801,8 @@ function App() {
     }
   }
 
-  async function searchDiscover(query, type = "all") {
-    return api(`/discover/search?q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}`);
+  async function searchDiscover(query) {
+    return api(`/discover/search?q=${encodeURIComponent(query)}`);
   }
 
   async function fetchDiscoverAlbumTracks(albumId) {
@@ -2470,7 +2470,6 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
-  const [searchType, setSearchType] = useState("all");
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [expandedAllAlbums, setExpandedAllAlbums] = useState(() => new Set());
@@ -2505,7 +2504,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
     if (!query.trim()) return;
     setSearching(true);
     try {
-      const data = await onSearch(query.trim(), searchType);
+      const data = await onSearch(query.trim());
       setResults(data);
       setOpenArtists(new Set((data.artists || []).map((artist) => artist.id)));
       setExpandedAllAlbums(new Set());
@@ -2552,12 +2551,6 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
       <form className="discover-search" onSubmit={submit}>
         <Search size={17} />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search artist, album, or track" />
-        <select className="discover-type-select" value={searchType} onChange={(event) => setSearchType(event.target.value)}>
-          <option value="all">All</option>
-          <option value="artist">Artist</option>
-          <option value="album">Album</option>
-          <option value="track">Track</option>
-        </select>
         <button className="primary" disabled={searching || !query.trim()}>
           {searching ? "Searching" : "Search"}
         </button>

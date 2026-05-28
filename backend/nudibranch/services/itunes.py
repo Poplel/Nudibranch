@@ -29,6 +29,22 @@ def _normalize_artist(r: dict) -> dict:
 _COLLECTION_TYPE_PRIORITY = {"album": 0, "ep": 1, "single": 2}
 
 
+def _artist_match_score(name: str, query: str) -> int:
+    """Lower = better match. Used to sort artists so exact matches float to the top."""
+    n, q = name.lower().strip(), query.lower().strip()
+    if n == q:
+        return 0
+    if n.startswith(q + " ") or n.startswith(q):
+        return 1
+    if q in n:
+        return 2
+    q_words = set(q.split())
+    n_words = set(n.split())
+    if q_words and q_words.issubset(n_words):
+        return 3
+    return 4
+
+
 def _album_sort_key(a: dict) -> tuple:
     """Sort key: Album < EP < Single < other, then newest-first within each tier."""
     priority = _COLLECTION_TYPE_PRIORITY.get((a.get("collection_type") or "").lower(), 3)
@@ -212,6 +228,10 @@ def discover_music(query: str, type: str = "all") -> dict:
             album_map[alb_id]["tracks"].append(clean)
         write_app_log("Discover track search completed", feature="discover", query=query)
 
-    result = {"artists": list(artist_map.values()), "albums": [], "tracks": [], "focus": None}
+    sorted_artists = sorted(
+        artist_map.values(),
+        key=lambda a: _artist_match_score(a.get("name", ""), query),
+    )
+    result = {"artists": sorted_artists, "albums": [], "tracks": [], "focus": None}
     write_app_log("Discover search completed", feature="discover", query=query, artists=len(result["artists"]))
     return result
