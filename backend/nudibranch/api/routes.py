@@ -816,11 +816,12 @@ def album_search(
 @router.get("/discover/search", tags=["discover"])
 def discover_search(
     q: str = Query(min_length=1, max_length=180),
+    type: str = Query("all"),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> dict:
-    write_app_log("Discover API search requested", feature="discover", query=q, user_id=user.id)
+    write_app_log("Discover API search requested", feature="discover", query=q, type=type, user_id=user.id)
     try:
-        payload = with_cached_discover_art(discover_music(q))
+        payload = with_cached_discover_art(discover_music(q, type=type))
         write_app_log(
             "Discover API search returned",
             feature="discover",
@@ -840,7 +841,15 @@ def discover_search(
 
 
 @router.get("/discover/art/{filename}", tags=["discover"])
-def discover_art(filename: str, _: User = Depends(require_permission(Permission.wishlist_manage_own))) -> FileResponse:
+def discover_art(
+    filename: str,
+    api_key: str = Query(""),
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    permissions = {permission.permission for permission in user.permissions} if user else set()
+    if not user or (not user.is_admin and Permission.wishlist_manage_own not in permissions):
+        raise HTTPException(status_code=401, detail="Invalid API key")
     safe_name = Path(filename).name
     path = get_settings().config_path / "discover-art-cache" / safe_name
     if not path.exists() or not path.is_file():

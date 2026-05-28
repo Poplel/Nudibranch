@@ -801,8 +801,8 @@ function App() {
     }
   }
 
-  async function searchDiscover(query) {
-    return api(`/discover/search?q=${encodeURIComponent(query)}`);
+  async function searchDiscover(query, type = "all") {
+    return api(`/discover/search?q=${encodeURIComponent(query)}&type=${encodeURIComponent(type)}`);
   }
 
   async function queueDiscoverDownloads(downloadRequests) {
@@ -814,8 +814,7 @@ function App() {
         body: JSON.stringify({ download_requests: downloadRequests }),
       });
       setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Discover queued", body: `${downloadRequests.length} download request${downloadRequests.length === 1 ? "" : "s"} added to the task queue.` });
-      setPage("Task Queue");
+      setToast({ title: "Added to task queue", body: `${downloadRequests.length} download request${downloadRequests.length === 1 ? "" : "s"} queued.` });
       window.setTimeout(() => {
         refreshApprovals();
         refreshTasks();
@@ -1424,6 +1423,7 @@ function App() {
                 onSearch={searchDiscover}
                 onWishlist={createWishlistItem}
                 onQueue={queueDiscoverDownloads}
+                apiKey={token}
               />
             )}
             {page === "Task Queue" && (
@@ -2458,21 +2458,30 @@ function ArtistAvatar({ artist }) {
   return <span className="artist-avatar">{initials(artist?.name)}</span>;
 }
 
-function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
+function DiscoverView({ user, onSearch, onWishlist, onQueue, apiKey }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
+  const [searchType, setSearchType] = useState("all");
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const canWishlist = hasPermission(user, "wishlist:manage_own");
   const canQueue = hasPermission(user, "downloads:manage");
+
+  function artUrl(src) {
+    if (!src || !apiKey) return src || null;
+    if (src.startsWith(`${API_BASE}/discover/art/`)) {
+      return `${src}?api_key=${encodeURIComponent(apiKey)}`;
+    }
+    return src;
+  }
 
   async function submit(event) {
     event.preventDefault();
     if (!query.trim()) return;
     setSearching(true);
     try {
-      const data = await onSearch(query.trim());
+      const data = await onSearch(query.trim(), searchType);
       setResults(data);
       setOpenArtists(new Set((data.artists || []).map((artist) => artist.id)));
       const focusAlbum = data.focus?.album_id;
@@ -2509,6 +2518,12 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
       <form className="discover-search" onSubmit={submit}>
         <Search size={17} />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search artist, album, or track" />
+        <select className="discover-type-select" value={searchType} onChange={(event) => setSearchType(event.target.value)}>
+          <option value="all">All</option>
+          <option value="artist">Artist</option>
+          <option value="album">Album</option>
+          <option value="track">Track</option>
+        </select>
         <button className="primary" disabled={searching || !query.trim()}>
           {searching ? "Searching" : "Search"}
         </button>
@@ -2533,7 +2548,7 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
           {(results.artists || []).map((artist) => (
             <div key={artist.id}>
               <div className="tree-action-row discover-tree-row">
-                <ArtistAvatar artist={artist} />
+                <ArtistAvatar artist={{ ...artist, image_url: artUrl(artist.image_url) }} />
                 <TreeRow
                   icon={Sparkles}
                   open={openArtists.has(artist.id)}
@@ -2552,7 +2567,7 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue }) {
                   {(artist.albums || []).map((album) => (
                     <div key={album.id}>
                       <div className="tree-action-row discover-tree-row">
-                        <AlbumResultArt src={album.cover_art_url} />
+                        <AlbumResultArt src={artUrl(album.cover_art_url)} />
                         <TreeRow
                           depth={1}
                           icon={Folder}

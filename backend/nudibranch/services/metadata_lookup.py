@@ -130,16 +130,19 @@ def search_album_releases(artist: str, album: str) -> list[dict]:
     return results
 
 
-def discover_music(query: str) -> dict:
+def discover_music(query: str, type: str = "all") -> dict:
     query = query.strip()
     if not query:
         return {"artists": [], "albums": [], "tracks": [], "focus": None}
-    write_app_log("Discover search started", feature="discover", query=query)
-    artists = safe_discover_lookup("artist", query, lambda: search_artists(query, limit=5), [])
+    write_app_log("Discover search started", feature="discover", query=query, type=type)
+    search_artists_flag = type in ("all", "artist")
+    search_albums_flag = type in ("all", "album")
+    search_tracks_flag = type in ("all", "track")
+    artists = safe_discover_lookup("artist", query, lambda: search_artists(query, limit=5), []) if search_artists_flag else []
     write_app_log("Discover artist search completed", feature="discover", query=query, artists=len(artists))
-    albums = safe_discover_lookup("album", query, lambda: search_releases(query, limit=8), [])
+    albums = safe_discover_lookup("album", query, lambda: search_releases(query, limit=8), []) if search_albums_flag else []
     write_app_log("Discover album search completed", feature="discover", query=query, albums=len(albums))
-    tracks = safe_discover_lookup("track", query, lambda: search_recordings(query, limit=8), [])
+    tracks = safe_discover_lookup("track", query, lambda: search_recordings(query, limit=8), []) if search_tracks_flag else []
     write_app_log("Discover track search completed", feature="discover", query=query, tracks=len(tracks))
     artist_map = {artist["id"]: artist for artist in artists if artist.get("id")}
     for album in albums:
