@@ -111,7 +111,7 @@ PERMISSION_SECTIONS = {
 }
 
 
-@router.post("/auth/login", response_model=LoginResponse, tags=["auth"])
+@router.post("/auth/login", response_model=LoginResponse, tags=["auth"], summary="Log in with PIN")
 def login(payload: LoginRequest, session: Session = Depends(get_session)) -> LoginResponse:
     pin_hash = hash_secret(payload.pin)
     user = session.scalar(select(User).where(User.pin_hash == pin_hash))
@@ -124,12 +124,12 @@ def login(payload: LoginRequest, session: Session = Depends(get_session)) -> Log
     return LoginResponse(user_id=user.id, display_name=user.display_name, api_key=api_key, is_admin=user.is_admin)
 
 
-@router.get("/me", response_model=UserOut, tags=["users"])
+@router.get("/me", response_model=UserOut, tags=["users"], summary="Get current user")
 def me(user: User = Depends(get_current_user)) -> UserOut:
     return serialize_user(user)
 
 
-@router.get("/permissions", response_model=list[PermissionOut], tags=["users"])
+@router.get("/permissions", response_model=list[PermissionOut], tags=["users"], summary="List available permissions")
 def permission_catalog(_: User = Depends(get_current_user)) -> list[PermissionOut]:
     return [
         PermissionOut(value=permission.value, label=permission_label(permission), section=PERMISSION_SECTIONS.get(permission, "System"))
@@ -137,7 +137,7 @@ def permission_catalog(_: User = Depends(get_current_user)) -> list[PermissionOu
     ]
 
 
-@router.get("/users", response_model=list[UserOut], tags=["users"])
+@router.get("/users", response_model=list[UserOut], tags=["users"], summary="List users")
 def list_users(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.users_manage)),
@@ -146,7 +146,7 @@ def list_users(
     return [serialize_user(user) for user in users]
 
 
-@router.post("/users", response_model=UserOut, tags=["users"])
+@router.post("/users", response_model=UserOut, tags=["users"], summary="Create user")
 def create_user(
     payload: UserCreate,
     session: Session = Depends(get_session),
@@ -164,7 +164,7 @@ def create_user(
     return serialize_user(load_user(session, user.id))
 
 
-@router.patch("/users/{user_id}", response_model=UserOut, tags=["users"])
+@router.patch("/users/{user_id}", response_model=UserOut, tags=["users"], summary="Update user")
 def update_user(
     user_id: str,
     payload: UserUpdate,
@@ -186,7 +186,7 @@ def update_user(
     return serialize_user(load_user(session, user.id))
 
 
-@router.post("/users/{user_id}/pin", response_model=UserOut, tags=["users"])
+@router.post("/users/{user_id}/pin", response_model=UserOut, tags=["users"], summary="Update user PIN")
 def update_user_pin(
     user_id: str,
     payload: UserPinUpdate,
@@ -201,7 +201,7 @@ def update_user_pin(
     return serialize_user(load_user(session, user.id))
 
 
-@router.post("/me/pin", response_model=UserOut, tags=["users"])
+@router.post("/me/pin", response_model=UserOut, tags=["users"], summary="Update own PIN")
 def update_own_pin(
     payload: UserPinUpdate,
     session: Session = Depends(get_session),
@@ -212,7 +212,7 @@ def update_own_pin(
     return serialize_user(load_user(session, user.id))
 
 
-@router.put("/me/appearance", response_model=UserOut, tags=["users"])
+@router.put("/me/appearance", response_model=UserOut, tags=["users"], summary="Update appearance settings")
 def update_own_appearance(
     payload: UserAppearanceUpdate,
     session: Session = Depends(get_session),
@@ -225,7 +225,7 @@ def update_own_appearance(
     return serialize_user(load_user(session, user.id))
 
 
-@router.post("/player/status", tags=["users"])
+@router.post("/player/status", tags=["users"], summary="Update player state", response_model=dict)
 def update_player_status(
     payload: PlayerStateUpdate,
     session: Session = Depends(get_session),
@@ -250,7 +250,7 @@ def update_player_status(
     return {"ok": True}
 
 
-@router.get("/users/playback", tags=["users"])
+@router.get("/users/playback", tags=["users"], summary="Get all users' playback state", response_model=dict)
 def users_playback(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.activity_read)),
@@ -262,7 +262,7 @@ def users_playback(
     }
 
 
-@router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"])
+@router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"], summary="Get library tree")
 def library_tree(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_read)),
@@ -315,7 +315,7 @@ def library_tree(
     ]
 
 
-@router.post("/library/metadata", response_model=ProposalBatchOut, tags=["library"])
+@router.post("/library/metadata", response_model=ProposalBatchOut, tags=["library"], summary="Propose metadata edit")
 def propose_library_metadata(
     payload: LibraryMetadataProposalRequest,
     session: Session = Depends(get_session),
@@ -358,7 +358,7 @@ def propose_library_metadata(
     return serialize_batch(batch)
 
 
-@router.post("/library/remove", response_model=ProposalBatchOut, tags=["library"])
+@router.post("/library/remove", response_model=ProposalBatchOut, tags=["library"], summary="Propose library removal")
 def propose_library_remove(
     payload: LibraryRemoveProposalRequest,
     session: Session = Depends(get_session),
@@ -401,7 +401,7 @@ def propose_library_remove(
     return serialize_batch(batch)
 
 
-@router.post("/library/albums/{album_id}/musicbrainz-match", tags=["library"])
+@router.post("/library/albums/{album_id}/musicbrainz-match", tags=["library"], summary="Match album to MusicBrainz", response_model=dict)
 def musicbrainz_match_library_album(
     album_id: str,
     session: Session = Depends(get_session),
@@ -434,7 +434,7 @@ def musicbrainz_match_library_album(
     }
 
 
-@router.post("/library/tracks/{track_id}/musicbrainz-match", tags=["library"])
+@router.post("/library/tracks/{track_id}/musicbrainz-match", tags=["library"], summary="Match track to MusicBrainz", response_model=dict)
 def musicbrainz_match_library_track(
     track_id: str,
     session: Session = Depends(get_session),
@@ -698,7 +698,7 @@ def queue_musicbrainz_replacement_downloads(session: Session, results: list[dict
     return batch
 
 
-@router.get("/library/tracks/{track_id}/stream", tags=["library"])
+@router.get("/library/tracks/{track_id}/stream", tags=["library"], summary="Stream track audio", response_class=FileResponse)
 def stream_track(
     track_id: str,
     api_key: str = Query(""),
@@ -717,7 +717,7 @@ def stream_track(
     return FileResponse(path)
 
 
-@router.get("/library/albums/{album_id}/cover", tags=["library"])
+@router.get("/library/albums/{album_id}/cover", tags=["library"], summary="Get album cover art", response_class=FileResponse)
 def album_cover(
     album_id: str,
     api_key: str = Query(""),
@@ -740,7 +740,7 @@ def album_cover(
     return FileResponse(resolved)
 
 
-@router.post("/imports/scan", tags=["imports"])
+@router.post("/imports/scan", tags=["imports"], summary="Scan staging directory for audio files", response_model=dict)
 def scan_imports(
     payload: ImportScanRequest,
     _: User = Depends(require_permission(Permission.import_run)),
@@ -752,7 +752,7 @@ def scan_imports(
     return {"files": files, "count": len(files)}
 
 
-@router.post("/imports/propose", response_model=TaskOut, tags=["imports"])
+@router.post("/imports/propose", response_model=TaskOut, tags=["imports"], summary="Enqueue import proposal")
 def propose_import(
     payload: ImportScanRequest,
     session: Session = Depends(get_session),
@@ -770,7 +770,7 @@ def propose_import(
     return serialize_task(task)
 
 
-@router.post("/imports/musicbrainz-match", tags=["imports"])
+@router.post("/imports/musicbrainz-match", tags=["imports"], summary="Look up MusicBrainz recording by file metadata", response_model=dict)
 def musicbrainz_match_import(
     payload: ImportMusicBrainzLookupRequest,
     session: Session = Depends(get_session),
@@ -787,7 +787,7 @@ def musicbrainz_match_import(
     return {"candidates": candidates}
 
 
-@router.post("/imports/album-lookup", tags=["imports"])
+@router.post("/imports/album-lookup", tags=["imports"], summary="Look up album tracks from MusicBrainz", response_model=dict)
 def album_lookup(
     payload: AlbumLookupRequest,
     user: User = Depends(get_current_user),
@@ -801,7 +801,7 @@ def album_lookup(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
-@router.post("/imports/album-search", tags=["imports"])
+@router.post("/imports/album-search", tags=["imports"], summary="Search MusicBrainz for album releases", response_model=dict)
 def album_search(
     payload: AlbumLookupRequest,
     user: User = Depends(get_current_user),
@@ -815,7 +815,7 @@ def album_search(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
-@router.get("/discover/search", tags=["discover"])
+@router.get("/discover/search", tags=["discover"], summary="Search music via iTunes")
 def discover_search(
     q: str = Query(min_length=1, max_length=180),
     background_tasks: BackgroundTasks = None,
@@ -847,7 +847,7 @@ def discover_search(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
-@router.get("/discover/art/{filename}", tags=["discover"])
+@router.get("/discover/art/{filename}", tags=["discover"], summary="Serve cached album art", response_class=FileResponse)
 def discover_art(
     filename: str,
     api_key: str = Query(""),
@@ -866,7 +866,7 @@ def discover_art(
     return FileResponse(path)
 
 
-@router.get("/discover/album-tracks/{album_id}", tags=["discover"])
+@router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)
 def discover_album_tracks(
     album_id: str,
     _: User = Depends(require_permission(Permission.wishlist_manage_own)),
@@ -875,7 +875,7 @@ def discover_album_tracks(
     return {"tracks": tracks}
 
 
-@router.post("/discover/task-queue", response_model=TaskOut, tags=["discover"])
+@router.post("/discover/task-queue", response_model=TaskOut, tags=["discover"], summary="Add discovered tracks to download queue")
 def discover_task_queue(
     payload: DiscoverTaskQueueRequest,
     session: Session = Depends(get_session),
@@ -927,7 +927,7 @@ def with_cached_discover_art(payload: dict, fast_only: bool = False) -> dict:
     return payload
 
 
-@router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"])
+@router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"], summary="List wishlist")
 def list_wishlist(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
@@ -942,7 +942,7 @@ def list_wishlist(
     return [serialize_wishlist_item(item) for item in items]
 
 
-@router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"])
+@router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"], summary="Add to wishlist")
 def create_wishlist_item(
     payload: WishlistCreate,
     session: Session = Depends(get_session),
@@ -997,7 +997,7 @@ def create_wishlist_item(
     return serialize_wishlist_item(item)
 
 
-@router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"])
+@router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"], summary="Remove from wishlist")
 def remove_wishlist_item(
     item_id: str,
     session: Session = Depends(get_session),
@@ -1013,7 +1013,7 @@ def remove_wishlist_item(
     return serialize_wishlist_item(item)
 
 
-@router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"])
+@router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="Get wishlist items pending approval")
 def list_wishlist_approvals(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
@@ -1035,7 +1035,7 @@ def list_wishlist_approvals(
     return [serialize_batch(batch) for batch in visible_batches]
 
 
-@router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"])
+@router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"], summary="Approve or deny wishlist batch")
 def propose_wishlist_items(
     payload: WishlistApprovalRequest | None = None,
     session: Session = Depends(get_session),
@@ -1116,7 +1116,7 @@ def propose_wishlist_items(
     return serialize_batch(batch)
 
 
-@router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"])
+@router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"], summary="Get the Favorites playlist")
 def favorites_playlist(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
@@ -1127,7 +1127,7 @@ def favorites_playlist(
     return serialize_favorites(session, playlist)
 
 
-@router.get("/playlists", response_model=list[FavoritesOut], tags=["playlists"])
+@router.get("/playlists", response_model=list[FavoritesOut], tags=["playlists"], summary="List all playlists")
 def list_playlists(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
@@ -1138,7 +1138,7 @@ def list_playlists(
     return [serialize_favorites(session, playlist) for playlist in playlists]
 
 
-@router.post("/playlists", response_model=FavoritesOut, tags=["playlists"])
+@router.post("/playlists", response_model=FavoritesOut, tags=["playlists"], summary="Create playlist")
 def create_playlist(
     payload: PlaylistCreate,
     session: Session = Depends(get_session),
@@ -1157,7 +1157,7 @@ def create_playlist(
     return serialize_favorites(session, playlist)
 
 
-@router.patch("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"])
+@router.patch("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"], summary="Rename playlist")
 def propose_playlist_rename(
     playlist_id: str,
     payload: PlaylistUpdate,
@@ -1195,7 +1195,7 @@ def propose_playlist_rename(
     return serialize_batch(batch)
 
 
-@router.delete("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"])
+@router.delete("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"], summary="Delete playlist")
 def propose_playlist_delete(
     playlist_id: str,
     session: Session = Depends(get_session),
@@ -1223,7 +1223,7 @@ def propose_playlist_delete(
     return serialize_batch(batch)
 
 
-@router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"])
+@router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"], summary="Add tracks to playlist")
 def add_playlist_tracks(
     playlist_id: str,
     payload: PlaylistAddTracks,
@@ -1247,7 +1247,7 @@ def add_playlist_tracks(
     return serialize_favorites(session, playlist)
 
 
-@router.delete("/playlists/{playlist_id}/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+@router.delete("/playlists/{playlist_id}/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Remove track from playlist")
 def remove_playlist_track(
     playlist_id: str,
     track_id: str,
@@ -1270,7 +1270,7 @@ def remove_playlist_track(
     return serialize_favorites(session, playlist)
 
 
-@router.post("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+@router.post("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Add track to Favorites")
 def add_favorite_track(
     track_id: str,
     session: Session = Depends(get_session),
@@ -1288,7 +1288,7 @@ def add_favorite_track(
     return serialize_favorites(session, playlist)
 
 
-@router.delete("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"])
+@router.delete("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Remove track from Favorites")
 def remove_favorite_track(
     track_id: str,
     session: Session = Depends(get_session),
@@ -1307,7 +1307,7 @@ def remove_favorite_track(
     return serialize_favorites(session, playlist)
 
 
-@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"])
+@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Sync playlists and favorites with Jellyfin")
 def sync_playlists(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
@@ -1315,7 +1315,7 @@ def sync_playlists(
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
 
-@router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"])
+@router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")
 def propose_favorite_position(
     entry_id: str,
     payload: PlaylistPositionProposalRequest,
@@ -1361,7 +1361,7 @@ def propose_favorite_position(
     return serialize_batch(batch)
 
 
-@router.post("/playlists/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"])
+@router.post("/playlists/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder playlist entry")
 def propose_playlist_position(
     entry_id: str,
     payload: PlaylistPositionProposalRequest,
@@ -1400,7 +1400,7 @@ def propose_playlist_position(
     return serialize_batch(batch)
 
 
-@router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"])
+@router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"], summary="Process wishlist into download tasks")
 def process_wishlist(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.downloads_manage)),
@@ -1409,7 +1409,7 @@ def process_wishlist(
     return serialize_task(task)
 
 
-@router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"], summary="Trigger Jellyfin library scan")
 def tool_jellyfin_scan(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.jellyfin_manage)),
@@ -1417,7 +1417,7 @@ def tool_jellyfin_scan(
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
 
 
-@router.post("/tools/clear-discover-cache", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/clear-discover-cache", response_model=TaskOut, tags=["tools"], summary="Clear discover art cache")
 def tool_clear_discover_cache(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
@@ -1425,7 +1425,7 @@ def tool_clear_discover_cache(
     return serialize_task(enqueue_task(session, "clear_discover_cache", {}))
 
 
-@router.post("/tools/check-files", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-files", response_model=TaskOut, tags=["tools"], summary="Check library files for issues")
 def tool_check_files(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1433,7 +1433,7 @@ def tool_check_files(
     return serialize_task(enqueue_task(session, "check_files", {}))
 
 
-@router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"], summary="Check for duplicate files")
 def tool_check_duplicates(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1441,7 +1441,7 @@ def tool_check_duplicates(
     return serialize_task(enqueue_task(session, "check_duplicates", {}))
 
 
-@router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"], summary="Check for missing lyrics")
 def tool_check_lyrics(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1449,7 +1449,7 @@ def tool_check_lyrics(
     return serialize_task(enqueue_task(session, "check_lyrics", {}))
 
 
-@router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")
 def tool_check_album_covers(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1457,7 +1457,7 @@ def tool_check_album_covers(
     return serialize_task(enqueue_task(session, "check_album_covers", {}))
 
 
-@router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"])
+@router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"], summary="Apply file check fix")
 def propose_check_file_fix(
     payload: CheckFileFixRequest,
     session: Session = Depends(get_session),
@@ -1556,7 +1556,7 @@ def propose_check_file_fix(
     return serialize_batch(batch)
 
 
-@router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"], summary="Check for missing tracks")
 def tool_check_missing_tracks(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.downloads_manage)),
@@ -1564,7 +1564,7 @@ def tool_check_missing_tracks(
     return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
 
 
-@router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"], summary="Check for non-lossless files")
 def tool_check_non_lossless(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1572,7 +1572,7 @@ def tool_check_non_lossless(
     return serialize_task(enqueue_task(session, "check_non_lossless", {}))
 
 
-@router.post("/tools/normalize-volume", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/normalize-volume", response_model=TaskOut, tags=["tools"], summary="Normalize volume (ReplayGain)")
 def tool_normalize_volume(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
@@ -1580,7 +1580,7 @@ def tool_normalize_volume(
     return serialize_task(enqueue_task(session, "normalize_volume", {}))
 
 
-@router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"], summary="Clear completed downloads")
 def tool_clear_downloads(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.downloads_manage)),
@@ -1588,7 +1588,7 @@ def tool_clear_downloads(
     return serialize_task(enqueue_task(session, "clear_downloads", {}))
 
 
-@router.post("/tools/backup", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/backup", response_model=TaskOut, tags=["tools"], summary="Create library backup")
 def tool_backup(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.backups_manage)),
@@ -1596,7 +1596,7 @@ def tool_backup(
     return serialize_task(enqueue_task(session, "backup_now", {}))
 
 
-@router.get("/tools/backups", tags=["tools"])
+@router.get("/tools/backups", tags=["tools"], summary="List available backups", response_model=dict)
 def list_backups(
     _: User = Depends(require_permission(Permission.backups_manage)),
 ) -> dict:
@@ -1606,7 +1606,7 @@ def list_backups(
     return {"backups": [{"path": str(path), "name": path.name, "size_bytes": path.stat().st_size} for path in backups]}
 
 
-@router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"], summary="Restore from latest backup")
 def tool_restore_default(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.backups_manage)),
@@ -1614,7 +1614,7 @@ def tool_restore_default(
     return serialize_task(enqueue_task(session, "restore_default", {}))
 
 
-@router.post("/tools/restore-backup", response_model=TaskOut, tags=["tools"])
+@router.post("/tools/restore-backup", response_model=TaskOut, tags=["tools"], summary="Restore from specific backup")
 def tool_restore_backup(
     payload: BackupRestoreRequest,
     session: Session = Depends(get_session),
@@ -1628,7 +1628,7 @@ def tool_restore_backup(
     return serialize_task(enqueue_task(session, "restore_backup", {"backup_path": str(backup_path)}))
 
 
-@router.post("/settings/youtube-cookies", response_model=IntegrationSettings, tags=["settings"])
+@router.post("/settings/youtube-cookies", response_model=IntegrationSettings, tags=["settings"], summary="Upload YouTube cookies file")
 async def upload_youtube_cookies(
     browser: str = Query(""),
     file: UploadFile = File(...),
@@ -1646,7 +1646,7 @@ async def upload_youtube_cookies(
     return IntegrationSettings(**update_integration_settings(session, values))
 
 
-@router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"])
+@router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")
 def list_approvals(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
@@ -1666,7 +1666,7 @@ def list_approvals(
     return [serialize_batch(batch) for batch in batches]
 
 
-@router.post("/approvals/{batch_id}/selection", tags=["approvals"])
+@router.post("/approvals/{batch_id}/selection", tags=["approvals"], summary="Update approval item selection", response_model=ProposalBatchOut)
 def update_selection(
     batch_id: str,
     payload: ProposalSelectionUpdate,
@@ -1677,7 +1677,7 @@ def update_selection(
     return {"batch_id": batch_id, "updated": count}
 
 
-@router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"])
+@router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"], summary="Approve proposal batch")
 def approve(
     batch_id: str,
     payload: ProposalApproveRequest | None = None,
@@ -1691,7 +1691,7 @@ def approve(
     return serialize_task(task)
 
 
-@router.post("/approvals/{batch_id}/reject", tags=["approvals"])
+@router.post("/approvals/{batch_id}/reject", tags=["approvals"], summary="Reject proposal items", response_model=ProposalBatchOut)
 def reject(
     batch_id: str,
     payload: ProposalRejectRequest,
@@ -1702,7 +1702,7 @@ def reject(
     return {"batch_id": batch_id, "removed": count}
 
 
-@router.get("/tasks", response_model=list[TaskOut], tags=["tasks"])
+@router.get("/tasks", response_model=list[TaskOut], tags=["tasks"], summary="List background tasks")
 def list_tasks(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.activity_read)),
@@ -1711,7 +1711,7 @@ def list_tasks(
     return [serialize_task(task) for task in tasks]
 
 
-@router.get("/logs", response_model=list[LogEntryOut], tags=["tasks"])
+@router.get("/logs", response_model=list[LogEntryOut], tags=["tasks"], summary="Get application log")
 def list_logs(
     limit: int = Query(500, ge=1, le=2000),
     _: User = Depends(require_permission(Permission.activity_read)),
@@ -1719,7 +1719,7 @@ def list_logs(
     return [serialize_log_entry(entry) for entry in tail_app_log(limit)]
 
 
-@router.post("/tasks/{task_id}/cancel", response_model=TaskOut, tags=["tasks"])
+@router.post("/tasks/{task_id}/cancel", response_model=TaskOut, tags=["tasks"], summary="Cancel task")
 def cancel_existing_task(
     task_id: str,
     session: Session = Depends(get_session),
@@ -1732,7 +1732,7 @@ def cancel_existing_task(
     return serialize_task(task)
 
 
-@router.post("/tasks", response_model=TaskOut, tags=["tasks"])
+@router.post("/tasks", response_model=TaskOut, tags=["tasks"], summary="Enqueue a task directly")
 def create_task(
     payload: TaskCreate,
     session: Session = Depends(get_session),
@@ -1741,7 +1741,7 @@ def create_task(
     return serialize_task(enqueue_task(session, payload.type, payload.payload))
 
 
-@router.get("/settings/integrations", response_model=IntegrationSettings, tags=["settings"])
+@router.get("/settings/integrations", response_model=IntegrationSettings, tags=["settings"], summary="Get integration settings")
 def get_integrations(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
@@ -1749,7 +1749,7 @@ def get_integrations(
     return IntegrationSettings(**integration_settings(session))
 
 
-@router.put("/settings/integrations", response_model=IntegrationSettings, tags=["settings"])
+@router.put("/settings/integrations", response_model=IntegrationSettings, tags=["settings"], summary="Update integration settings")
 def update_integrations(
     payload: IntegrationSettings,
     session: Session = Depends(get_session),
@@ -1760,7 +1760,7 @@ def update_integrations(
     return IntegrationSettings(**integration_settings(session))
 
 
-@router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"])
+@router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"], summary="List notifications")
 def list_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),
@@ -1773,7 +1773,7 @@ def list_notifications(
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
 
 
-@router.post("/notifications/devices", tags=["notifications"])
+@router.post("/notifications/devices", tags=["notifications"], summary="Register push notification device", response_model=dict)
 def register_device(
     payload: DeviceRegistration,
     session: Session = Depends(get_session),
@@ -1785,7 +1785,7 @@ def register_device(
     return {"device_id": device.id, "enabled": device.enabled}
 
 
-@router.post("/notifications/read", tags=["notifications"])
+@router.post("/notifications/read", tags=["notifications"], summary="Mark notifications as read", response_model=list[NotificationOut])
 def mark_notifications_read(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),
@@ -1798,7 +1798,7 @@ def mark_notifications_read(
     return {"updated": len(notifications)}
 
 
-@router.delete("/notifications", tags=["notifications"])
+@router.delete("/notifications", tags=["notifications"], summary="Dismiss all notifications", response_model=dict)
 def clear_notifications(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.notifications_read)),

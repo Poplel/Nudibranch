@@ -10,11 +10,29 @@ from nudibranch.db.session import SessionLocal
 
 settings = get_settings()
 
+_TAGS_METADATA = [
+    {"name": "auth", "description": "PIN-based authentication. Returns an API key used as a Bearer token or `api_key` query parameter on all other endpoints."},
+    {"name": "users", "description": "User accounts, permissions, appearance preferences, and real-time player state."},
+    {"name": "library", "description": "Browse the music library tree, update metadata, propose removals, and stream audio files or album art."},
+    {"name": "imports", "description": "Scan the staging directory for new audio files, look up album/track metadata from MusicBrainz, and enqueue import proposals."},
+    {"name": "discover", "description": "Search for music via iTunes, retrieve album tracks, fetch cached album art, and add downloads to the task queue."},
+    {"name": "wishlist", "description": "Manage the download wishlist. Users can add items; admins can approve or deny them, which creates download tasks."},
+    {"name": "playlists", "description": "Create and manage playlists. The protected Favorites playlist syncs with Jellyfin's native IsFavorite flag; other playlists sync as Jellyfin playlists."},
+    {"name": "approvals", "description": "Review proposal batches (metadata edits, file removals, playlist changes). Approve or reject individual items."},
+    {"name": "tasks", "description": "Inspect the background task queue and application log."},
+    {"name": "tools", "description": "Administrative one-shot tools: library/file health checks, volume normalisation, duplicate detection, backups and restore."},
+    {"name": "settings", "description": "Read and update integration settings (Jellyfin, slskd, YouTube cookies)."},
+    {"name": "notifications", "description": "In-app and APNS push notifications. Register devices, mark notifications read, dismiss all."},
+    {"name": "system", "description": "Health-check endpoint."},
+]
+
 app = FastAPI(
     title="Nudibranch API",
     version=__version__,
+    description="REST API for Nudibranch, a self-hosted Jellyfin music companion. Handles library management, music discovery, downloads via slskd/YouTube, playlist sync with Jellyfin, and multi-user access control.",
     openapi_url="/api/v1/openapi.json",
     docs_url="/docs",
+    openapi_tags=_TAGS_METADATA,
 )
 
 app.add_middleware(
