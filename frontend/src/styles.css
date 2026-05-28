@@ -922,11 +922,15 @@ nav button:hover,
   place-items: center;
   width: 32px;
   height: 32px;
+  min-height: 32px;
+  max-height: 32px;
   border-radius: 4px;
   background: var(--accent-soft);
   color: var(--accent-strong);
   font-weight: 700;
   object-fit: cover;
+  flex-shrink: 0;
+  overflow: hidden;
 }
 
 .discover-tree {
@@ -945,7 +949,10 @@ nav button:hover,
 .library-row-actions .album-result img {
   width: 28px;
   height: 28px;
+  min-height: 28px;
+  max-height: 28px;
   flex-shrink: 0;
+  object-fit: cover;
 }
 
 .discover-tree .tree-row {

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import func, select
@@ -817,11 +817,17 @@ def album_search(
 def discover_search(
     q: str = Query(min_length=1, max_length=180),
     type: str = Query("all"),
+    background_tasks: BackgroundTasks = None,
     user: User = Depends(require_permission(Permission.wishlist_manage_own)),
 ) -> dict:
     write_app_log("Discover API search requested", feature="discover", query=q, type=type, user_id=user.id)
     try:
-        payload = with_cached_discover_art(discover_music(q, type=type))
+        payload = discover_music(q, type=type)
+        # Fast path: serve already-cached art, return external URLs for misses (no downloads, no blocking)
+        with_cached_discover_art(payload, fast_only=True)
+        # Background: download missing art so the next search is instant
+        if background_tasks is not None:
+            background_tasks.add_task(with_cached_discover_art, payload)
         write_app_log(
             "Discover API search returned",
             feature="discover",
@@ -871,36 +877,43 @@ def discover_task_queue(
     return serialize_task(task)
 
 
-DISCOVER_INLINE_ART_CACHE_LIMIT = 12
+def _cached_art_url_fast(source_url: str | list[str] | None, cache_key: str) -> str | None:
+    """Return the cached local URL if already on disk, otherwise the first external source URL. No downloads."""
+    sources = source_url if isinstance(source_url, list) else ([source_url] if source_url else [])
+    fallback_url = next((url for url in sources if url), None)
+    cache_dir = get_settings().config_path / "discover-art-cache"
+    if cache_dir.exists():
+        safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cache_key).strip("-")[:160] or "art"
+        for ext in (".jpg", ".jpeg", ".png", ".webp"):
+            image_path = cache_dir / f"{safe_key}{ext}"
+            if image_path.exists():
+                return f"/api/v1/discover/art/{image_path.name}"
+    return fallback_url
 
 
-def with_cached_discover_art(payload: dict) -> dict:
-    cached_images = 0
+def with_cached_discover_art(payload: dict, fast_only: bool = False) -> dict:
+    """Resolve art URLs in the payload.
+    fast_only=True: serve cached files (disk check only), fall back to external URL — no downloads, safe for request path.
+    fast_only=False: download missing images to cache (blocks, use in background task).
+    """
 
-    def cache_or_defer(source_url: str | list[str] | None, cache_key: str) -> str | None:
-        nonlocal cached_images
-        sources = source_url if isinstance(source_url, list) else [source_url]
-        fallback_url = next((url for url in sources if url), None)
-        if cached_images >= DISCOVER_INLINE_ART_CACHE_LIMIT:
-            write_app_log(
-                "Discover art cache deferred to keep search responsive",
-                feature="discover",
-                cache_key=cache_key,
-                inline_limit=DISCOVER_INLINE_ART_CACHE_LIMIT,
-            )
-            return fallback_url
-        cached_images += 1
+    def resolve(source_url: str | list[str] | None, cache_key: str) -> str | None:
+        if fast_only:
+            return _cached_art_url_fast(source_url, cache_key)
         return cache_discover_art(source_url, cache_key)
 
     for artist in payload.get("artists") or []:
-        write_app_log("Discover caching artist art", feature="discover", artist=artist.get("name"), artist_id=artist.get("id"))
-        artist["image_url"] = cache_or_defer(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
+        artist["image_url"] = resolve(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
         for album in artist.get("albums") or []:
-            write_app_log("Discover caching album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
-            album["cover_art_url"] = cache_or_defer(album.get("cover_art_urls") or album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+            album["cover_art_url"] = resolve(
+                album.get("cover_art_urls") or album.get("cover_art_url"),
+                f"album-{album.get('id') or album.get('artist')}-{album.get('title')}",
+            )
     for album in payload.get("albums") or []:
-        write_app_log("Discover caching top-level album art", feature="discover", artist=album.get("artist"), album=album.get("title"), album_id=album.get("id"))
-        album["cover_art_url"] = cache_or_defer(album.get("cover_art_urls") or album.get("cover_art_url"), f"album-{album.get('id') or album.get('artist')}-{album.get('title')}")
+        album["cover_art_url"] = resolve(
+            album.get("cover_art_urls") or album.get("cover_art_url"),
+            f"album-{album.get('id') or album.get('artist')}-{album.get('title')}",
+        )
     return payload
 
 
