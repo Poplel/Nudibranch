@@ -794,6 +794,37 @@ def import_track_item(session: Session, item: ProposalItem) -> None:
     import_file_to_library(session, Path(item.old_value), Path(item.new_value), payload)
 
 
+def find_library_track(session: Session, artist_name: str, album_title: str, title: str):
+    """Return an existing library Track with the same artist + album + title, else None.
+
+    Matching is case/whitespace-insensitive. A track is only a duplicate when all three match, so
+    the same song on a different album is never treated as a duplicate.
+    """
+    artist_key = normalize_match_text(artist_name)
+    album_key = normalize_match_text(album_title)
+    title_key = normalize_match_text(title)
+    if not (artist_key and album_key and title_key):
+        return None
+    candidates = session.scalars(
+        select(Track)
+        .join(Album, Album.id == Track.album_id)
+        .join(Artist, Artist.id == Album.artist_id)
+        .where(func.lower(Album.title) == album_title.lower())
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    )
+    for track in candidates:
+        album = track.album
+        if not album or not album.artist:
+            continue
+        if (
+            normalize_match_text(album.artist.name) == artist_key
+            and normalize_match_text(album.title) == album_key
+            and normalize_match_text(track.title) == title_key
+        ):
+            return track
+    return None
+
+
 def import_file_to_library(session: Session, source_path: Path, target_path: Path, payload: dict) -> None:
     metadata = payload.get("metadata", {})
     if not source_path.exists():
@@ -804,16 +835,24 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
         raise ValueError("source file size changed after review")
 
     create_record_only = payload.get("action") == "create_library_record"
+    artist_name = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+    album_title = metadata.get("album") or "Unknown Album"
+    track_title = metadata.get("title") or target_path.stem
+
+    # Never create a 100%-certain duplicate: same artist + album + title already in the library.
+    # (The same title on a different album is fine — albums are matched too.) This guards every
+    # import/download path. Leave the source file in place so nothing is silently lost.
+    duplicate = find_library_track(session, artist_name, album_title, track_title)
+    if duplicate and str(duplicate.path or "") != str(target_path):
+        append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
+        return
+
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if target_path.exists() and not create_record_only:
         raise FileExistsError(f"{target_path} already exists")
 
     if not create_record_only:
         shutil.move(str(source_path), str(target_path))
-
-    artist_name = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
-    album_title = metadata.get("album") or "Unknown Album"
-    track_title = metadata.get("title") or target_path.stem
 
     artist = session.scalar(select(Artist).where(Artist.name == artist_name))
     if not artist:
@@ -5303,10 +5342,16 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
             for track in album.tracks
             if track.track_number
         }
+        existing_titles = {normalize_match_text(track.title) for track in album.tracks if track.title}
         for track in record.get("tracks", []):
             track_number = track.get("track_number")
             disc_number = track.get("disc_number") or 1
-            if not track_number or (disc_number, track_number) in existing_positions:
+            title_key = normalize_match_text(track.get("title"))
+            # Skip tracks already on the album — by position OR by title — so we never re-download
+            # something the album already has (the cause of the duplicate imports).
+            if not track_number:
+                continue
+            if (disc_number, track_number) in existing_positions or (title_key and title_key in existing_titles):
                 continue
             add_download_request_item(
                 session,
