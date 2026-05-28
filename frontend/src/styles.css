@@ -936,15 +936,16 @@ nav button:hover,
 }
 
 .discover-tree-row {
-  grid-template-columns: auto minmax(0, 1fr);
   padding-right: 8px;
 }
 
 .discover-tree .album-result-art,
-.discover-tree .album-result img {
-  width: 32px;
-  height: 32px;
-  margin-left: calc(var(--depth, 0) * 18px + 24px);
+.discover-tree .album-result img,
+.library-row-actions .album-result-art,
+.library-row-actions .album-result img {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
 }
 
 .discover-tree .tree-row {

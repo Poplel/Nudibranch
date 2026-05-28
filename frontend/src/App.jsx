@@ -1764,6 +1764,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTr
                       meta={`${album.tracks.length} tracks`}
                       onToggle={() => toggleSet(setOpenAlbums, album.id)}
                     />
+                    <AlbumResultArt src={album._coverUrl} />
                     <QuickLibraryActions
                       onPlay={() => onPlay(albumTracks(artist, album))}
                       onQueue={() => onQueue(albumTracks(artist, album))}
@@ -2548,7 +2549,6 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue, apiKey }) {
           {(results.artists || []).map((artist) => (
             <div key={artist.id}>
               <div className="tree-action-row discover-tree-row">
-                <ArtistAvatar artist={{ ...artist, image_url: artUrl(artist.image_url) }} />
                 <TreeRow
                   icon={Sparkles}
                   open={openArtists.has(artist.id)}
@@ -2556,6 +2556,7 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue, apiKey }) {
                   meta={artist.disambiguation || `${(artist.albums || []).length} album result${(artist.albums || []).length === 1 ? "" : "s"}`}
                   onToggle={() => toggleSet(setOpenArtists, artist.id)}
                 />
+                <ArtistAvatar artist={{ ...artist, image_url: artUrl(artist.image_url) }} />
                 {canWishlist && (
                   <button className="row-icon-button" onClick={() => onWishlist({ kind: "artist", artist: artist.name, album: null, track: null, source: "discover" })} title="Add artist to wishlist">
                     <Heart size={15} />
@@ -2567,7 +2568,6 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue, apiKey }) {
                   {(artist.albums || []).map((album) => (
                     <div key={album.id}>
                       <div className="tree-action-row discover-tree-row">
-                        <AlbumResultArt src={artUrl(album.cover_art_url)} />
                         <TreeRow
                           depth={1}
                           icon={Folder}
@@ -2576,6 +2576,7 @@ function DiscoverView({ user, onSearch, onWishlist, onQueue, apiKey }) {
                           meta={[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}
                           onToggle={() => toggleSet(setOpenAlbums, album.id)}
                         />
+                        <AlbumResultArt src={artUrl(album.cover_art_url)} />
                         {canWishlist && (
                           <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
                             <Heart size={15} />
