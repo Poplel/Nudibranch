@@ -276,6 +276,10 @@ class AlbumLookupRequest(BaseModel):
     release_id: str | None = None
 
 
+class PlaylistImportRequest(BaseModel):
+    url: str
+
+
 class DiscoverTaskQueueRequest(BaseModel):
     download_requests: list[dict[str, Any]] = Field(min_length=1)
 

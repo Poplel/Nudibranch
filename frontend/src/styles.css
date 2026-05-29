@@ -1982,6 +1982,120 @@ nav button:hover,
   color: var(--text);
 }
 
+.inspector-section {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.inspector-section-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  padding: 5px 6px;
+}
+
+.inspector-section-toggle svg:last-child {
+  margin-left: auto;
+}
+
+.inspector-section-content {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0 2px;
+}
+
+.inspector-section-content button {
+  justify-content: center;
+  width: 100%;
+}
+
+.playlist-import-url {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mode-toggle {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.mode-toggle button {
+  flex: 1;
+  border: none;
+  border-radius: 0;
+  padding: 5px 0;
+  font-size: 12px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.mode-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mode-toggle button + button {
+  border-left: 1px solid var(--line);
+}
+
+.inspector-hint {
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin: 0;
+}
+
+.playlist-import-preview {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.playlist-import-preview li {
+  display: grid;
+  grid-template-rows: auto auto;
+  overflow: hidden;
+}
+
+.playlist-import-preview li strong,
+.playlist-import-preview li span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.playlist-import-preview li span {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.playlist-import-preview li.more {
+  color: var(--fg-muted);
+  font-size: 11px;
+  padding-top: 2px;
+}
+
+.error-text {
+  font-size: 12px;
+  color: var(--danger, #e55);
+  margin: 0;
+}
+
 .diff {
   display: grid;
   gap: 6px;

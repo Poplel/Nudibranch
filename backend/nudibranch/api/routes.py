@@ -36,6 +36,7 @@ from nudibranch.api.schemas import (
     PlaylistPositionProposalRequest,
     PlayerStateUpdate,
     PlaylistTrackOut,
+    PlaylistImportRequest,
     PlaylistUpdate,
     PermissionOut,
     ProposalBatchOut,
@@ -842,6 +843,93 @@ def album_search(
         raise HTTPException(status_code=502, detail=lookup_error_detail("MusicBrainz", error)) from error
     except httpx.RequestError as error:
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
+
+
+@router.post("/imports/playlist-url", tags=["imports"], summary="Fetch track list from a public Spotify or Apple Music playlist URL")
+def import_playlist_url(
+    payload: PlaylistImportRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    require_album_lookup_access(user)
+    return _scrape_playlist_url(payload.url)
+
+
+def _scrape_playlist_url(url: str) -> dict:
+    import json as _json
+    import re as _re
+
+    url_lower = url.lower()
+    if "open.spotify.com" in url_lower or ("spotify.com" in url_lower and "/playlist/" in url_lower):
+        source = "Spotify"
+    elif "music.apple.com" in url_lower and "/playlist/" in url_lower:
+        source = "Apple Music"
+    else:
+        raise HTTPException(status_code=400, detail="URL must be a Spotify (open.spotify.com/playlist/…) or Apple Music (music.apple.com/…/playlist/…) playlist link.")
+
+    try:
+        resp = httpx.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }, timeout=20, follow_redirects=True)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        raise HTTPException(status_code=502, detail=f"Could not fetch {source} playlist page: HTTP {error.response.status_code}") from error
+    except httpx.RequestError as error:
+        raise HTTPException(status_code=502, detail=f"Could not reach {source}: network error") from error
+
+    html = resp.text
+    tracks: list[dict] = []
+
+    if source == "Spotify":
+        m = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, _re.DOTALL)
+        if m:
+            try:
+                data = _json.loads(m.group(1))
+                track_list = (
+                    data.get("props", {})
+                    .get("pageProps", {})
+                    .get("serverSideData", {})
+                    .get("playlist", {})
+                    .get("trackList", [])
+                )
+                for item in track_list:
+                    meta = item.get("trackMetadata") or {}
+                    title = meta.get("trackName") or ""
+                    artist = meta.get("artistName") or ""
+                    album = meta.get("albumName") or None
+                    if title:
+                        tracks.append({"title": title, "artist": artist, "album": album})
+            except (_json.JSONDecodeError, AttributeError):
+                pass
+
+    elif source == "Apple Music":
+        for m in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
+            try:
+                data = _json.loads(m.group(1))
+                if data.get("@type") in ("MusicPlaylist", "ItemList"):
+                    items = data.get("track") or data.get("itemListElement") or []
+                    for item in items:
+                        entry = item if item.get("@type") == "MusicRecording" else item.get("item", {})
+                        title = entry.get("name") or ""
+                        by_artist = entry.get("byArtist") or {}
+                        artist = (by_artist.get("name") or "") if isinstance(by_artist, dict) else ""
+                        in_album = entry.get("inAlbum") or {}
+                        album = (in_album.get("name") or None) if isinstance(in_album, dict) else None
+                        if title:
+                            tracks.append({"title": title, "artist": artist, "album": album})
+                    if tracks:
+                        break
+            except (_json.JSONDecodeError, AttributeError):
+                continue
+
+    if not tracks:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not extract any tracks from this {source} URL. Make sure the playlist is public and the link points directly to a playlist."
+        )
+
+    return {"source": source, "tracks": tracks, "count": len(tracks)}
 
 
 @router.get("/discover/search", tags=["discover"], summary="Search music via iTunes")

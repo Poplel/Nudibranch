@@ -123,6 +123,12 @@ function App() {
   const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
   const [playlistInspectorActions, setPlaylistInspectorActions] = useState(null);
   const [mappingSyncStats, setMappingSyncStats] = useState(null);
+  const [playlistImportOpen, setPlaylistImportOpen] = useState(false);
+  const [playlistImportUrl, setPlaylistImportUrl] = useState("");
+  const [playlistImportMode, setPlaylistImportMode] = useState("songs");
+  const [playlistImportLoading, setPlaylistImportLoading] = useState(false);
+  const [playlistImportTracks, setPlaylistImportTracks] = useState(null);
+  const [playlistImportError, setPlaylistImportError] = useState("");
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -1170,7 +1176,7 @@ function App() {
     try {
       const task = await api("/playlists/sync", { method: "POST" });
       setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Track mapping queued", body: "Jellyfin track mapping was added to activity." });
+      setToast({ title: "Playlist sync queued", body: "Jellyfin playlist sync was added to activity." });
       return task;
     } catch (syncError) {
       setError(syncError.message);
@@ -1178,6 +1184,57 @@ function App() {
       throw syncError;
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function fetchPlaylistTracks(url) {
+    setPlaylistImportLoading(true);
+    setPlaylistImportError("");
+    setPlaylistImportTracks(null);
+    try {
+      const data = await api("/imports/playlist-url", { method: "POST", body: JSON.stringify({ url }) });
+      setPlaylistImportTracks(data);
+    } catch (err) {
+      setPlaylistImportError(err.message || "Failed to fetch playlist.");
+    } finally {
+      setPlaylistImportLoading(false);
+    }
+  }
+
+  async function addPlaylistToImport(tracks, mode) {
+    setPlaylistImportLoading(true);
+    try {
+      if (mode === "songs") {
+        const requests = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title }));
+        setImportDownloadRequests((prev) => [...prev, ...requests]);
+        setToast({ title: "Added to import", body: `${requests.length} track${requests.length === 1 ? "" : "s"} added to import queue.` });
+      } else {
+        // Albums mode: group by unique album, look up full tracklist from MusicBrainz for each
+        const seen = new Map();
+        for (const t of tracks) {
+          const key = `${(t.artist || "").toLowerCase()}::${(t.album || t.title || "").toLowerCase()}`;
+          if (!seen.has(key)) seen.set(key, { artist: t.artist, albumHint: t.album || t.title });
+        }
+        const allRequests = [];
+        for (const { artist, albumHint } of seen.values()) {
+          try {
+            const albumData = await lookupImportAlbum(artist, albumHint);
+            (albumData.tracks || []).forEach((track) => {
+              allRequests.push({
+                artist: albumData.artist || artist,
+                album: albumData.album || albumHint,
+                track: track.title,
+                track_number: track.track_number,
+                disc_number: track.disc_number,
+              });
+            });
+          } catch { /* skip albums that can't be resolved */ }
+        }
+        setImportDownloadRequests((prev) => [...prev, ...allRequests]);
+        setToast({ title: "Added to import", body: `${allRequests.length} track${allRequests.length === 1 ? "" : "s"} from ${seen.size} album${seen.size === 1 ? "" : "s"} added.` });
+      }
+    } finally {
+      setPlaylistImportLoading(false);
     }
   }
 
@@ -2663,7 +2720,15 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                               </button>
                             )}
                             {canQueue && (
-                              <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks }))} disabled={tracks.length === 0 && !tracksLoading} title="Queue album">
+                              <button className="row-icon-button" onClick={async () => {
+                                let allTracks = albumTracksCache.get(album.id);
+                                if (!allTracks && onFetchTracks) {
+                                  const data = await onFetchTracks(album.id);
+                                  allTracks = data.tracks || [];
+                                  setAlbumTracksCache((prev) => new Map([...prev, [album.id, allTracks]]));
+                                }
+                                onQueue(albumRequests({ ...album, tracks: allTracks || tracks }));
+                              }} disabled={tracksLoading} title="Queue album">
                                 <ListChecks size={15} />
                               </button>
                             )}
@@ -4697,6 +4762,78 @@ function Inspector({
           )}
         </div>
       )}
+      {page === "Import/Add" && (
+        <div className="inspector-section">
+          <button
+            className="secondary inspector-section-toggle"
+            onClick={() => setPlaylistImportOpen((o) => !o)}
+          >
+            <Music size={15} />
+            Import from playlist
+            {playlistImportOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
+          {playlistImportOpen && (
+            <div className="inspector-section-content">
+              <input
+                className="playlist-import-url"
+                placeholder="Spotify or Apple Music playlist URL"
+                value={playlistImportUrl}
+                onChange={(e) => setPlaylistImportUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && playlistImportUrl.trim()) fetchPlaylistTracks(playlistImportUrl.trim());
+                }}
+              />
+              <div className="mode-toggle">
+                <button
+                  className={playlistImportMode === "songs" ? "active" : ""}
+                  onClick={() => setPlaylistImportMode("songs")}
+                >
+                  Songs
+                </button>
+                <button
+                  className={playlistImportMode === "albums" ? "active" : ""}
+                  onClick={() => setPlaylistImportMode("albums")}
+                >
+                  Albums
+                </button>
+              </div>
+              <button
+                className="secondary"
+                onClick={() => fetchPlaylistTracks(playlistImportUrl.trim())}
+                disabled={!playlistImportUrl.trim() || playlistImportLoading}
+              >
+                {playlistImportLoading && !playlistImportTracks ? "Fetching…" : "Fetch playlist"}
+              </button>
+              {playlistImportError && <p className="error-text">{playlistImportError}</p>}
+              {playlistImportTracks && (
+                <>
+                  <p className="inspector-hint">{playlistImportTracks.count} tracks from {playlistImportTracks.source}</p>
+                  <ul className="playlist-import-preview">
+                    {playlistImportTracks.tracks.slice(0, 6).map((t, i) => (
+                      <li key={i}>
+                        <strong>{t.title}</strong>
+                        <span>{t.artist}</span>
+                      </li>
+                    ))}
+                    {playlistImportTracks.count > 6 && (
+                      <li className="more">+{playlistImportTracks.count - 6} more</li>
+                    )}
+                  </ul>
+                  <button
+                    className="primary"
+                    onClick={() => addPlaylistToImport(playlistImportTracks.tracks, playlistImportMode)}
+                    disabled={playlistImportLoading}
+                  >
+                    {playlistImportLoading
+                      ? (playlistImportMode === "albums" ? "Looking up albums…" : "Adding…")
+                      : (playlistImportMode === "albums" ? "Queue albums" : "Queue songs")}
+                  </button>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {page === "Playlists" && playlistActions && (
         <div className="inspector-actions">
           <input
@@ -4713,11 +4850,11 @@ function Inspector({
           </button>
           <button className="secondary" onClick={playlistActions.onSync}>
             <RefreshCw size={16} />
-            Sync track mapping
+            Sync playlists
           </button>
           {mappingSyncStats && (
             <div className="metadata-grid inspector-stats" style={{ marginTop: 8 }}>
-              <label>Last mapped</label>
+              <label>Last synced</label>
               <strong>{fmtTimeAgo(mappingSyncStats.last_run_at)}</strong>
               <label>Runs</label>
               <strong>{mappingSyncStats.run_count}</strong>
@@ -4806,7 +4943,7 @@ function inspectorStats({
     const rows = [];
     if (mappingSyncStats) {
       const lastRun = mappingSyncStats.last_run_at ? fmtTimeAgo(mappingSyncStats.last_run_at) : "never";
-      rows.push(["Track mapping", lastRun], ["Runs (session)", mappingSyncStats.run_count]);
+      rows.push(["Playlist sync", lastRun], ["Runs (session)", mappingSyncStats.run_count]);
     }
     return { summary: "", rows };
   }
