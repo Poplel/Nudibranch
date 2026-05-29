@@ -4437,6 +4437,8 @@ function SettingsPanel({
   const [showApiKey, setShowApiKey] = useState(false);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
+  const [jellyfinUsers, setJellyfinUsers] = useState(null);
+  const [jellyfinUsersLoading, setJellyfinUsersLoading] = useState(false);
   const canViewApiKey =
     user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
 
@@ -4501,6 +4503,7 @@ function SettingsPanel({
           {[
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
+            ["jellyfin_user_id", "Jellyfin user"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
@@ -4511,7 +4514,40 @@ function SettingsPanel({
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
-              {key === "youtube_cookies_browser" ? (
+              {key === "jellyfin_user_id" ? (
+                <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+                  <select
+                    value={integrationDraft[key] || ""}
+                    onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+                  >
+                    <option value="">Auto (first user)</option>
+                    {(jellyfinUsers || []).map((u) => (
+                      <option key={u.id} value={u.id}>{u.name}</option>
+                    ))}
+                    {integrationDraft[key] && !(jellyfinUsers || []).some((u) => u.id === integrationDraft[key]) && (
+                      <option value={integrationDraft[key]}>{integrationDraft[key]}</option>
+                    )}
+                  </select>
+                  <button
+                    className="secondary compact"
+                    type="button"
+                    disabled={jellyfinUsersLoading}
+                    onClick={async () => {
+                      setJellyfinUsersLoading(true);
+                      try {
+                        const data = await api("/settings/jellyfin-users");
+                        setJellyfinUsers(data);
+                      } catch {
+                        setJellyfinUsers([]);
+                      } finally {
+                        setJellyfinUsersLoading(false);
+                      }
+                    }}
+                  >
+                    {jellyfinUsersLoading ? "…" : "Load users"}
+                  </button>
+                </div>
+              ) : key === "youtube_cookies_browser" ? (
                 <select
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}

@@ -211,6 +211,7 @@ class DeviceRegistration(BaseModel):
 class IntegrationSettings(BaseModel):
     jellyfin_url: str = ""
     jellyfin_api_key: str = ""
+    jellyfin_user_id: str = ""
     slskd_url: str = ""
     slskd_api_key: str = ""
     slskd_album_match_threshold: str = "72"

@@ -1750,6 +1750,24 @@ def get_integrations(
     return IntegrationSettings(**integration_settings(session))
 
 
+@router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key")
+def list_jellyfin_users(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> list[dict]:
+    settings = integration_settings(session)
+    url = settings.get("jellyfin_url", "").rstrip("/")
+    key = settings.get("jellyfin_api_key", "")
+    if not url or not key:
+        return []
+    try:
+        response = httpx.get(f"{url}/Users", headers={"X-Emby-Token": key}, timeout=10)
+        response.raise_for_status()
+        return [{"id": u["Id"], "name": u["Name"]} for u in (response.json() or []) if u.get("Id") and u.get("Name")]
+    except Exception:
+        return []
+
+
 @router.put("/settings/integrations", response_model=IntegrationSettings, tags=["settings"], summary="Update integration settings")
 def update_integrations(
     payload: IntegrationSettings,

@@ -4771,11 +4771,16 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     pushed_tracks = 0
     pulled_tracks = 0
     with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
-        users = client.get("/Users")
-        users.raise_for_status()
-        user_id = (users.json() or [{}])[0].get("Id")
-        if not user_id:
-            raise ValueError("No Jellyfin user was found for playlist sync")
+        configured_user_id = settings.get("jellyfin_user_id", "").strip()
+        if configured_user_id:
+            user_id = configured_user_id
+        else:
+            users_resp = client.get("/Users")
+            users_resp.raise_for_status()
+            user_id = (users_resp.json() or [{}])[0].get("Id")
+            if not user_id:
+                raise ValueError("No Jellyfin user was found for playlist sync")
+        append_task_log(session, None, f"Playlist sync: using Jellyfin user {user_id}")
 
         # Pre-fetch all Jellyfin audio items once — used for local matching instead of per-track API calls
         audio_index = _fetch_all_jellyfin_audio(client, user_id)
