@@ -1273,25 +1273,20 @@ def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session 
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
     with client:
-        existing_items: list[dict] = []
+        # Fetch the current item metadata, update Name, POST back in-place
         try:
-            ir = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id})
-            if ir.is_success:
-                existing_items = ir.json().get("Items", [])
-        except Exception:
-            pass
-        body: dict = {"Name": name, "UserId": jf_user_id, "MediaType": "Audio"}
-        item_ids = [item["Id"] for item in existing_items if item.get("Id")]
-        if item_ids:
-            body["Ids"] = item_ids
-        try:
-            cr = client.post("/Playlists", json=body)
-            cr.raise_for_status()
+            item_resp = client.get(f"/Users/{jf_user_id}/Items/{playlist_id}")
+            item_resp.raise_for_status()
+            item_data = item_resp.json()
         except httpx.HTTPStatusError as error:
-            raise HTTPException(status_code=error.response.status_code, detail=f"Jellyfin: {error.response.text}")
-        new_id = cr.json().get("Id") or cr.json().get("PlaylistId") or ""
-        client.delete(f"/Items/{playlist_id}")
-        return _jf_playlist_out(session, client, jf_user_id, new_id, name)
+            raise HTTPException(status_code=error.response.status_code, detail="Playlist not found in Jellyfin")
+        item_data["Name"] = name
+        try:
+            update_resp = client.post(f"/Items/{playlist_id}", json=item_data)
+            update_resp.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            raise HTTPException(status_code=error.response.status_code, detail=f"Jellyfin rename failed: {error.response.text}")
+        return _jf_playlist_out(session, client, jf_user_id, playlist_id, name)
 
 
 @router.delete("/playlists/{playlist_id}", status_code=204, tags=["playlists"], summary="Delete playlist")
