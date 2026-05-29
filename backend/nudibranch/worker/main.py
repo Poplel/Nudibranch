@@ -4921,11 +4921,17 @@ def _find_in_audio_index(audio_index: list[dict], track: Track) -> str | None:
 
 def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, conflict_winner: str, audio_index: list[dict]) -> int:
     """Sync Nudibranch Favorites against Jellyfin's native IsFavorite flag on audio items."""
+    nudibranch_tracks = list(favorites_playlist.tracks)
+    # For pull: always fetch; for push with empty playlist: no HTTP call needed
+    if conflict_winner != "jellyfin" and not nudibranch_tracks:
+        append_task_log(session, None, "Favorites sync: Nudibranch Favorites is empty, nothing to push")
+        return 0
+
     fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
     try:
         resp = client.get(
             f"/Users/{user_id}/Items",
-            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "2000"},
+            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "500"},
         )
         resp.raise_for_status()
         jellyfin_favorites: list[dict] = resp.json().get("Items", [])
@@ -4938,26 +4944,16 @@ def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: st
         # Pull: Jellyfin IsFavorite → Nudibranch Favorites
         changes = sync_playlist_from_jellyfin(session, favorites_playlist, jellyfin_favorites)
     else:
-        # Push: Nudibranch Favorites → Jellyfin IsFavorite (use pre-fetched index, no per-track API calls)
+        # Push: Nudibranch Favorites → Jellyfin IsFavorite (merge only — never unmark Jellyfin favorites)
         jellyfin_favorite_ids = {item["Id"] for item in jellyfin_favorites if item.get("Id")}
-        nudibranch_item_ids: set[str] = set()
-        for entry in favorites_playlist.tracks:
+        for entry in nudibranch_tracks:
             item_id = _find_in_audio_index(audio_index, entry.track)
-            if item_id:
-                nudibranch_item_ids.add(item_id)
-                if item_id not in jellyfin_favorite_ids:
-                    try:
-                        client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
-                        changes += 1
-                    except Exception as error:
-                        append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
-        # Unmark Jellyfin audio items that are no longer in Nudibranch Favorites
-        for item_id in jellyfin_favorite_ids - nudibranch_item_ids:
-            try:
-                client.delete(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
-                changes += 1
-            except Exception as error:
-                append_task_log(session, None, f"Favorites sync: could not unmark favorite {item_id}: {error}", "warning")
+            if item_id and item_id not in jellyfin_favorite_ids:
+                try:
+                    client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
+                    changes += 1
+                except Exception as error:
+                    append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
     return changes
 
 
@@ -6315,16 +6311,20 @@ async def worker_loop() -> None:
                 else:
                     append_task_log(session, task, f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}")
                     complete_task(session, task, result)
-            except Exception as error:  # noqa: BLE001 - worker must persist task failures.
-                append_task_log(session, task, f"{task.type} failed unexpectedly: {error}", "error")
-                create_notification(
-                    session,
-                    title=f"{task.type} failed",
-                    body=str(error),
-                    event_type="task_failed",
-                    target_url="/activity",
-                )
-                fail_task(session, task, str(error))
+            except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
+                append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
+                try:
+                    create_notification(
+                        session,
+                        title=f"{task.type} failed",
+                        body=str(error),
+                        event_type="task_failed",
+                        target_url="/activity",
+                    )
+                    fail_task(session, task, str(error))
+                except Exception:  # noqa: BLE001
+                    pass
+                raise  # re-raise SystemExit/KeyboardInterrupt so the process exits cleanly
 
 
 def task_notification_title(task_type: str) -> str:
