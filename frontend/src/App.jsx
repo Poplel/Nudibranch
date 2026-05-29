@@ -1116,37 +1116,33 @@ function App() {
     }
   }
 
-  async function proposePlaylistRename(playlistId, name) {
+  async function renamePlaylist(playlistId, name) {
     setLoading(true);
     setError("");
     try {
-      const batch = await api(`/playlists/${playlistId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ name }),
-      });
-      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
-      setToast({ title: "Playlist change queued", body: "The rename was added to the task queue." });
-      return batch;
+      const playlist = await api(`/playlists/${playlistId}`, { method: "PATCH", body: JSON.stringify({ name }) });
+      await refreshPlaylists();
+      setToast({ title: "Playlist renamed", body: playlist.name });
+      return playlist;
     } catch (playlistError) {
       setError(playlistError.message);
-      notify("Playlist queue failed", playlistError.message, "ui_error");
+      notify("Rename failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
       setLoading(false);
     }
   }
 
-  async function proposePlaylistDelete(playlistId) {
+  async function deletePlaylist(playlistId) {
     setLoading(true);
     setError("");
     try {
-      const batch = await api(`/playlists/${playlistId}`, { method: "DELETE" });
-      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
-      setToast({ title: "Playlist change queued", body: "The delete request was added to the task queue." });
-      return batch;
+      await api(`/playlists/${playlistId}`, { method: "DELETE" });
+      await refreshPlaylists();
+      setToast({ title: "Playlist deleted" });
     } catch (playlistError) {
       setError(playlistError.message);
-      notify("Playlist queue failed", playlistError.message, "ui_error");
+      notify("Delete failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
       setLoading(false);
@@ -1159,11 +1155,11 @@ function App() {
     try {
       const task = await api("/playlists/sync", { method: "POST" });
       setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Playlist sync queued", body: "Playlist sync was added to activity." });
+      setToast({ title: "Track mapping queued", body: "Jellyfin track mapping was added to activity." });
       return task;
     } catch (syncError) {
       setError(syncError.message);
-      notify("Playlist sync failed", syncError.message, "ui_error");
+      notify("Sync failed", syncError.message, "ui_error");
       throw syncError;
     } finally {
       setLoading(false);
@@ -1542,9 +1538,8 @@ function App() {
                 library={library}
                 onCreatePlaylist={createPlaylist}
                 onAddToPlaylist={addTracksToPlaylist}
-                onQueuePosition={proposePlaylistPosition}
-                onQueueRename={proposePlaylistRename}
-                onQueueDelete={proposePlaylistDelete}
+                onRename={renamePlaylist}
+                onDelete={deletePlaylist}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
                 onSync={syncPlaylists}
@@ -2884,7 +2879,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onQueuePosition, onQueueRename, onQueueDelete, onPlay, onQueue, onSync, onInspectorActionsChange }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onQueue, onSync, onInspectorActionsChange }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set());
   const [addOpen, setAddOpen] = useState(null);
   const [editOpen, setEditOpen] = useState(null);
@@ -2973,8 +2968,8 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                 playlist={playlist}
                 draftName={playlistDraftName}
                 setDraftName={setPlaylistDraftName}
-                onRename={() => onQueueRename(playlist.id, playlistDraftName.trim()).then(() => setEditOpen(null))}
-                onDelete={() => onQueueDelete(playlist.id).then(() => setEditOpen(null))}
+                onRename={() => onRename(playlist.id, playlistDraftName.trim()).then(() => setEditOpen(null))}
+                onDelete={() => onDelete(playlist.id).then(() => setEditOpen(null))}
               />
             )}
             {addOpen === playlist.id && (
@@ -3002,22 +2997,6 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                         onPlay={() => onPlay([playlistPlayableTrack(track)])}
                         onQueue={() => onQueue([playlistPlayableTrack(track)])}
                       />
-                      <label className="playlist-order-field">
-                        <span>Order</span>
-                        <input
-                          value={draftPositions[track.id] ?? String(track.position || "")}
-                          inputMode="numeric"
-                          onChange={(event) => updateDraft(track.id, event.target.value)}
-                          onBlur={() => submitPosition(track)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter") event.currentTarget.blur();
-                            if (event.key === "Escape") {
-                              updateDraft(track.id, String(track.position || ""));
-                              event.currentTarget.blur();
-                            }
-                          }}
-                        />
-                      </label>
                     </div>
                   ))}
                 </div>

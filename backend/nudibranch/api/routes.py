@@ -1145,205 +1145,222 @@ def propose_wishlist_items(
     return serialize_batch(batch)
 
 
-@router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"], summary="Get the Favorites playlist")
-def favorites_playlist(
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
-    playlist = get_or_create_favorites(session, user.id)
-    session.commit()
-    session.refresh(playlist)
-    return serialize_favorites(session, playlist)
+# ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
+
+def _jf_client(session: Session, user: User) -> "tuple[httpx.Client | None, str | None]":
+    if not user.jellyfin_user_id:
+        return None, None
+    settings = integration_settings(session)
+    url = settings.get("jellyfin_url", "").rstrip("/")
+    key = settings.get("jellyfin_api_key", "")
+    if not url or not key:
+        return None, None
+    return httpx.Client(base_url=url, headers={"X-Emby-Token": key}, timeout=10), user.jellyfin_user_id
+
+
+def _build_playlist_out(pl_id: str, pl_name: str, items: list[dict], session: Session, *, protected: bool = False) -> FavoritesOut:
+    jf_ids = [item["Id"] for item in items if item.get("Id")]
+    tracks_by_jf_id: dict[str, Track] = {}
+    if jf_ids:
+        for track in session.scalars(
+            select(Track).where(Track.jellyfin_item_id.in_(jf_ids)).options(selectinload(Track.album).selectinload(Album.artist))
+        ):
+            if track.jellyfin_item_id:
+                tracks_by_jf_id[track.jellyfin_item_id] = track
+    playlist_tracks: list[PlaylistTrackOut] = []
+    track_ids: list[str] = []
+    for i, item in enumerate(items):
+        jf_id = item.get("Id", "")
+        track = tracks_by_jf_id.get(jf_id)
+        entry_id = item.get("PlaylistItemId") or jf_id
+        if track:
+            track_ids.append(track.id)
+            artist_name = track.album.artist.name if track.album and track.album.artist else ""
+            album_title = track.album.title if track.album else ""
+            playlist_tracks.append(PlaylistTrackOut(
+                id=entry_id,
+                track_id=track.id,
+                position=i + 1,
+                title=item.get("Name") or track.title,
+                artist=(item.get("Artists") or [artist_name])[0] if item.get("Artists") else artist_name,
+                album=item.get("Album") or album_title,
+                format=track.format,
+            ))
+    return FavoritesOut(id=pl_id, name=pl_name, protected=protected, track_ids=track_ids, tracks=playlist_tracks, track_count=len(items))
+
+
+def _jf_favorites_out(session: Session, client: httpx.Client, jf_user_id: str) -> FavoritesOut:
+    try:
+        resp = client.get(f"/Users/{jf_user_id}/Items", params={"Filters": "IsFavorite", "IncludeItemTypes": "Audio", "Recursive": "true", "Limit": "500"})
+        resp.raise_for_status()
+        items = resp.json().get("Items", [])
+    except Exception:
+        items = []
+    return _build_playlist_out("favorites", "Favorites", items, session, protected=True)
+
+
+def _jf_playlist_out(session: Session, client: httpx.Client, jf_user_id: str, pl_id: str, pl_name: str) -> FavoritesOut:
+    if not pl_name:
+        try:
+            nr = client.get(f"/Users/{jf_user_id}/Items/{pl_id}")
+            if nr.is_success:
+                pl_name = nr.json().get("Name", pl_id)
+        except Exception:
+            pl_name = pl_id
+    try:
+        resp = client.get(f"/Playlists/{pl_id}/Items", params={"userId": jf_user_id})
+        resp.raise_for_status()
+        items = resp.json().get("Items", [])
+    except Exception:
+        items = []
+    return _build_playlist_out(pl_id, pl_name, items, session)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"], summary="Get Favorites")
+def favorites_playlist(session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        return FavoritesOut(id="favorites", name="Favorites", protected=True, track_ids=[], tracks=[], track_count=0)
+    with client:
+        return _jf_favorites_out(session, client, jf_user_id)
 
 
 @router.get("/playlists", response_model=list[FavoritesOut], tags=["playlists"], summary="List all playlists")
-def list_playlists(
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> list[FavoritesOut]:
-    get_or_create_favorites(session, user.id)
-    session.commit()
-    playlists = list(session.scalars(select(Playlist).where(Playlist.user_id == user.id).order_by(Playlist.name.asc())))
-    return [serialize_favorites(session, playlist) for playlist in playlists]
+def list_playlists(session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> list[FavoritesOut]:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        return []
+    with client:
+        result: list[FavoritesOut] = [_jf_favorites_out(session, client, jf_user_id)]
+        try:
+            resp = client.get(f"/Users/{jf_user_id}/Items", params={"IncludeItemTypes": "Playlist", "Recursive": "true", "Limit": "1000"})
+            resp.raise_for_status()
+            for pl in resp.json().get("Items", []):
+                pl_id, pl_name = pl.get("Id", ""), pl.get("Name", "")
+                if pl_id and pl_name:
+                    result.append(_jf_playlist_out(session, client, jf_user_id, pl_id, pl_name))
+        except Exception:
+            pass
+        return result
 
 
 @router.post("/playlists", response_model=FavoritesOut, tags=["playlists"], summary="Create playlist")
-def create_playlist(
-    payload: PlaylistCreate,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
+def create_playlist(payload: PlaylistCreate, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
-    existing = session.scalar(select(Playlist).where(Playlist.name == name, Playlist.user_id == user.id))
-    if existing:
-        return serialize_favorites(session, existing)
-    playlist = Playlist(name=name, user_id=user.id)
-    session.add(playlist)
-    session.commit()
-    session.refresh(playlist)
-    enqueue_task(session, "sync_favorites_jellyfin", {})
-    return serialize_favorites(session, playlist)
+    with client:
+        try:
+            resp = client.post("/Playlists", json={"Name": name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": []})
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            raise HTTPException(status_code=error.response.status_code, detail=f"Jellyfin: {error.response.text}")
+        pl_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
+        return _jf_playlist_out(session, client, jf_user_id, pl_id, name)
 
 
-@router.patch("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"], summary="Rename playlist")
-def propose_playlist_rename(
-    playlist_id: str,
-    payload: PlaylistUpdate,
-    session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
-) -> ProposalBatchOut:
-    playlist = session.get(Playlist, playlist_id)
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.protected:
-        raise HTTPException(status_code=400, detail="Favorites cannot be renamed")
+@router.patch("/playlists/{playlist_id}", response_model=FavoritesOut, tags=["playlists"], summary="Rename playlist")
+def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
-    if name == playlist.name:
-        raise HTTPException(status_code=400, detail="Playlist name is already set")
-    existing = session.scalar(select(Playlist).where(Playlist.name == name, Playlist.id != playlist.id))
-    if existing:
-        raise HTTPException(status_code=400, detail="A playlist with that name already exists")
-    batch = ProposalBatch(title=f"Rename playlist {playlist.name}", kind=ProposalKind.playlist, tree_path=f"/playlists/{playlist.name}")
-    session.add(batch)
-    session.flush()
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            title=playlist.name,
-            kind=ProposalKind.playlist,
-            old_value=playlist.name,
-            new_value=name,
-            payload_json=json.dumps({"action": "rename_playlist", "playlist_id": playlist.id, "name": name}),
-        )
-    )
-    session.commit()
-    session.refresh(batch)
-    return serialize_batch(batch)
+    with client:
+        existing_items: list[dict] = []
+        try:
+            ir = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id})
+            if ir.is_success:
+                existing_items = ir.json().get("Items", [])
+        except Exception:
+            pass
+        body: dict = {"Name": name, "UserId": jf_user_id, "MediaType": "Audio"}
+        item_ids = [item["Id"] for item in existing_items if item.get("Id")]
+        if item_ids:
+            body["Ids"] = item_ids
+        try:
+            cr = client.post("/Playlists", json=body)
+            cr.raise_for_status()
+        except httpx.HTTPStatusError as error:
+            raise HTTPException(status_code=error.response.status_code, detail=f"Jellyfin: {error.response.text}")
+        new_id = cr.json().get("Id") or cr.json().get("PlaylistId") or ""
+        client.delete(f"/Items/{playlist_id}")
+        return _jf_playlist_out(session, client, jf_user_id, new_id, name)
 
 
-@router.delete("/playlists/{playlist_id}", response_model=ProposalBatchOut, tags=["playlists"], summary="Delete playlist")
-def propose_playlist_delete(
-    playlist_id: str,
-    session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
-) -> ProposalBatchOut:
-    playlist = session.get(Playlist, playlist_id)
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    if playlist.protected:
-        raise HTTPException(status_code=400, detail="Favorites cannot be deleted")
-    batch = ProposalBatch(title=f"Delete playlist {playlist.name}", kind=ProposalKind.playlist, tree_path=f"/playlists/{playlist.name}")
-    session.add(batch)
-    session.flush()
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            title=playlist.name,
-            kind=ProposalKind.playlist,
-            old_value=playlist.name,
-            payload_json=json.dumps({"action": "delete_playlist", "playlist_id": playlist.id}),
-        )
-    )
-    session.commit()
-    session.refresh(batch)
-    return serialize_batch(batch)
+@router.delete("/playlists/{playlist_id}", status_code=204, tags=["playlists"], summary="Delete playlist")
+def delete_playlist(playlist_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> None:
+    client, _ = _jf_client(session, user)
+    if not client:
+        return
+    with client:
+        client.delete(f"/Items/{playlist_id}")
 
 
 @router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"], summary="Add tracks to playlist")
-def add_playlist_tracks(
-    playlist_id: str,
-    payload: PlaylistAddTracks,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
-    playlist = session.scalar(select(Playlist).where(Playlist.id == playlist_id, Playlist.user_id == user.id))
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    existing_track_ids = {entry.track_id for entry in playlist.tracks}
+def add_playlist_tracks(playlist_id: str, payload: PlaylistAddTracks, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     tracks = list(session.scalars(select(Track).where(Track.id.in_(payload.track_ids))))
-    next_position = max([entry.position for entry in playlist.tracks] or [0]) + 1
-    for track in tracks:
-        if track.id in existing_track_ids:
-            continue
-        session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=next_position))
-        next_position += 1
-    session.commit()
-    session.refresh(playlist)
-    enqueue_task(session, "sync_favorites_jellyfin", {})
-    return serialize_favorites(session, playlist)
+    with client:
+        if playlist_id == "favorites":
+            for track in tracks:
+                if track.jellyfin_item_id:
+                    try:
+                        client.post(f"/Users/{jf_user_id}/FavoriteItems/{track.jellyfin_item_id}")
+                    except Exception:
+                        pass
+            return _jf_favorites_out(session, client, jf_user_id)
+        jf_ids = [t.jellyfin_item_id for t in tracks if t.jellyfin_item_id]
+        if not jf_ids:
+            raise HTTPException(status_code=400, detail="None of the selected tracks are in Jellyfin yet. Run a sync first.")
+        try:
+            client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(jf_ids), "userId": jf_user_id}).raise_for_status()
+        except httpx.HTTPStatusError as error:
+            raise HTTPException(status_code=error.response.status_code, detail=f"Jellyfin: {error.response.text}")
+        return _jf_playlist_out(session, client, jf_user_id, playlist_id, "")
 
 
 @router.delete("/playlists/{playlist_id}/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Remove track from playlist")
-def remove_playlist_track(
-    playlist_id: str,
-    track_id: str,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
-    playlist = session.scalar(select(Playlist).where(Playlist.id == playlist_id, Playlist.user_id == user.id))
-    if not playlist:
-        raise HTTPException(status_code=404, detail="Playlist not found")
-    items = list(
-        session.scalars(
-            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id, PlaylistTrack.track_id == track_id)
-        )
-    )
-    for item in items:
-        session.delete(item)
-    session.commit()
-    session.refresh(playlist)
-    enqueue_task(session, "sync_favorites_jellyfin", {})
-    return serialize_favorites(session, playlist)
-
-
-@router.post("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Add track to Favorites")
-def add_favorite_track(
-    track_id: str,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
+def remove_playlist_track(playlist_id: str, track_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     track = session.get(Track, track_id)
-    if not track:
-        raise HTTPException(status_code=404, detail="Track not found")
-    playlist = get_or_create_favorites(session, user.id)
-    if not any(entry.track_id == track_id for entry in playlist.tracks):
-        session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=len(playlist.tracks) + 1))
-        session.commit()
-        session.refresh(playlist)
-    enqueue_task(session, "sync_favorites_jellyfin", {})
-    return serialize_favorites(session, playlist)
+    with client:
+        if playlist_id == "favorites":
+            if track and track.jellyfin_item_id:
+                try:
+                    client.delete(f"/Users/{jf_user_id}/FavoriteItems/{track.jellyfin_item_id}")
+                except Exception:
+                    pass
+            return _jf_favorites_out(session, client, jf_user_id)
+        if not track or not track.jellyfin_item_id:
+            raise HTTPException(status_code=404, detail="Track not found in Jellyfin")
+        try:
+            ir = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id})
+            items = ir.json().get("Items", []) if ir.is_success else []
+        except Exception:
+            items = []
+        entry_ids = [item["PlaylistItemId"] for item in items if item.get("Id") == track.jellyfin_item_id and item.get("PlaylistItemId")]
+        if entry_ids:
+            client.delete(f"/Playlists/{playlist_id}/Items", params={"EntryIds": ",".join(entry_ids)})
+        return _jf_playlist_out(session, client, jf_user_id, playlist_id, "")
 
 
-@router.delete("/playlists/favorites/tracks/{track_id}", response_model=FavoritesOut, tags=["playlists"], summary="Remove track from Favorites")
-def remove_favorite_track(
-    track_id: str,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> FavoritesOut:
-    playlist = get_or_create_favorites(session, user.id)
-    items = list(
-        session.scalars(
-            select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id, PlaylistTrack.track_id == track_id)
-        )
-    )
-    for item in items:
-        session.delete(item)
-    session.commit()
-    enqueue_task(session, "sync_favorites_jellyfin", {})
-    return serialize_favorites(session, playlist)
+@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Sync Jellyfin track mapping")
+def sync_playlists(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> TaskOut:
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
 
-@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Sync playlists and favorites with Jellyfin")
-def sync_playlists(
-    session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
-) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {"notify": True}))
-
+# ── (removed) proposal-based position reorder — position is order from Jellyfin ──
 
 @router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")
 def propose_favorite_position(
