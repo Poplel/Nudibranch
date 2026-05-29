@@ -4823,6 +4823,9 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             )
         )
 
+        # Build ID-keyed lookup for name reconciliation
+        jellyfin_by_id = {v.get("Id"): v for v in jellyfin_playlists.values() if v.get("Id")}
+
         append_task_log(session, None, f"Playlist sync: syncing {len(regular_playlists)} regular playlist(s)")
         for playlist in regular_playlists:
             append_task_log(session, None, f"Playlist sync: processing '{playlist.name}'")
@@ -4854,6 +4857,31 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                 session.flush()
                 jellyfin_items = []
                 created_jellyfin_playlist = True
+
+            # Name reconciliation: keep both sides in sync
+            jellyfin_meta = jellyfin_by_id.get(jellyfin_playlist_id) if not created_jellyfin_playlist else None
+            if jellyfin_meta:
+                jellyfin_name = jellyfin_meta.get("Name") or ""
+                if jellyfin_name and jellyfin_name != playlist.name:
+                    # Nudibranch name wins — push Nudibranch name to Jellyfin
+                    try:
+                        update_resp = client.post(
+                            f"/Playlists/{jellyfin_playlist_id}",
+                            json={"Name": playlist.name, "Ids": [], "UserId": user_id},
+                        )
+                        if update_resp.is_success:
+                            append_task_log(session, None, f"Playlist sync: renamed Jellyfin playlist '{jellyfin_name}' → '{playlist.name}'")
+                            # update in-memory lookup so the old name doesn't cause re-import
+                            if jellyfin_name in jellyfin_playlists:
+                                del jellyfin_playlists[jellyfin_name]
+                            jellyfin_playlists[playlist.name] = dict(jellyfin_meta, Name=playlist.name)
+                            jellyfin_by_id[jellyfin_playlist_id] = jellyfin_playlists[playlist.name]
+                        else:
+                            # Jellyfin rename failed — accept Jellyfin's name in Nudibranch instead
+                            append_task_log(session, None, f"Playlist sync: renamed Nudibranch playlist '{playlist.name}' → '{jellyfin_name}' (Jellyfin rename failed, accepted Jellyfin name)")
+                            playlist.name = jellyfin_name
+                    except Exception as rename_error:
+                        append_task_log(session, None, f"Playlist sync: name reconciliation error for '{playlist.name}': {rename_error}", "warning")
 
             # Build the current Nudibranch set by Jellyfin audio ID
             local_item_ids: list[str] = []
@@ -5952,7 +5980,10 @@ class JellyfinPlaylistMissing(RuntimeError):
 
 def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
     write_app_log("Playlist sync: GET /Users/{id}/Items?IncludeItemTypes=Playlist")
-    response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist"})
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+    )
     response.raise_for_status()
     playlists = {}
     for item in response.json().get("Items", []):
