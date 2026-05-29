@@ -225,6 +225,22 @@ def update_own_jellyfin_user(
     return serialize_user(user)
 
 
+@router.put("/users/{user_id}/jellyfin-user", response_model=UserOut, tags=["users"], summary="Link or unlink a Jellyfin user account for a given Nudibranch user")
+def update_user_jellyfin_user(
+    user_id: str,
+    payload: JellyfinUserLinkUpdate,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.users_manage)),
+) -> UserOut:
+    target = session.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    target.jellyfin_user_id = payload.jellyfin_user_id or None
+    session.commit()
+    session.refresh(target)
+    return serialize_user(target)
+
+
 @router.put("/me/appearance", response_model=UserOut, tags=["users"], summary="Update appearance settings")
 def update_own_appearance(
     payload: UserAppearanceUpdate,

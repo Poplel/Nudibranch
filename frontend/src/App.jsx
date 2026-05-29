@@ -110,6 +110,8 @@ function App() {
   const [wishlistApprovals, setWishlistApprovals] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [users, setUsers] = useState([]);
+  const [jellyfinUsers, setJellyfinUsers] = useState(null);
+  const [jellyfinUsersLoading, setJellyfinUsersLoading] = useState(false);
   const [userPlayback, setUserPlayback] = useState({ app: [], jellyfin: [] });
   const [permissionCatalog, setPermissionCatalog] = useState([]);
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
@@ -580,6 +582,33 @@ function App() {
       setUsers((current) => upsertUser(current, updated));
     } catch (appearanceError) {
       notify("Theme sync failed", appearanceError.message, "ui_error");
+    }
+  }
+
+  async function loadJellyfinUsers() {
+    setJellyfinUsersLoading(true);
+    try {
+      const data = await api("/settings/jellyfin-users");
+      setJellyfinUsers(data);
+    } catch {
+      setJellyfinUsers([]);
+    } finally {
+      setJellyfinUsersLoading(false);
+    }
+  }
+
+  async function updateUserJellyfinUser(userId, jellyfinUserId) {
+    try {
+      const updated = await api(`/users/${userId}/jellyfin-user`, {
+        method: "PUT",
+        body: JSON.stringify({ jellyfin_user_id: jellyfinUserId }),
+      });
+      setUsers((current) => upsertUser(current, updated));
+      if (updated.id === user?.id) setUser(updated);
+      return updated;
+    } catch (err) {
+      notify("Jellyfin link failed", err.message, "ui_error");
+      throw err;
     }
   }
 
@@ -1532,6 +1561,10 @@ function App() {
                 onUpdate={updateUserAccount}
                 onUpdatePin={updateUserPin}
                 onUpdateOwnPin={updateOwnPin}
+                jellyfinUsers={jellyfinUsers}
+                jellyfinUsersLoading={jellyfinUsersLoading}
+                onLoadJellyfinUsers={loadJellyfinUsers}
+                onUpdateJellyfinUser={updateUserJellyfinUser}
               />
             )}
             {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
@@ -4241,7 +4274,7 @@ function CheckFilesResult({ result, onFix }) {
   );
 }
 
-function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin }) {
+function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
   const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
@@ -4300,6 +4333,10 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
             canManage={canManage}
             onUpdate={onUpdate}
             onUpdatePin={canManage ? onUpdatePin : (_userId, pin) => onUpdateOwnPin(pin)}
+            jellyfinUsers={jellyfinUsers}
+            jellyfinUsersLoading={jellyfinUsersLoading}
+            onLoadJellyfinUsers={onLoadJellyfinUsers}
+            onUpdateJellyfinUser={canManage ? onUpdateJellyfinUser : null}
           />
         ))}
       </div>
@@ -4323,7 +4360,7 @@ function PlaybackRow({ row }) {
   );
 }
 
-function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onUpdatePin }) {
+function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onUpdatePin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
   const [draft, setDraft] = useState(() => ({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] }));
   const [pin, setPin] = useState("");
   const changed =
@@ -4379,6 +4416,33 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
         />
       )}
       {draft.is_admin && <p className="user-note">Admin users have every permission.</p>}
+      {onUpdateJellyfinUser && (
+        <div className="pin-reset-row">
+          <label>
+            Jellyfin account
+          </label>
+          <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+            <select
+              value={user.jellyfin_user_id || ""}
+              onChange={async (event) => {
+                try {
+                  await onUpdateJellyfinUser(user.id, event.target.value || null);
+                } catch {
+                  // error notification handled upstream
+                }
+              }}
+            >
+              <option value="">Not linked</option>
+              {(jellyfinUsers || (user.jellyfin_user_id ? [{ id: user.jellyfin_user_id, name: user.jellyfin_user_id }] : [])).map((u) => (
+                <option key={u.id} value={u.id}>{u.name}</option>
+              ))}
+            </select>
+            <button className="secondary compact" type="button" disabled={jellyfinUsersLoading} onClick={onLoadJellyfinUsers}>
+              {jellyfinUsersLoading ? "…" : "Load"}
+            </button>
+          </div>
+        </div>
+      )}
       <div className="pin-reset-row">
         <label>
           New PIN
@@ -4437,8 +4501,6 @@ function SettingsPanel({
   const [showApiKey, setShowApiKey] = useState(false);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
-  const [jellyfinUsers, setJellyfinUsers] = useState(null);
-  const [jellyfinUsersLoading, setJellyfinUsersLoading] = useState(false);
   const canViewApiKey =
     user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
 
@@ -4496,50 +4558,6 @@ function SettingsPanel({
             </button>
           </div>
         </section>
-        {canManageUsers(user) && <section className="settings-section">
-          <h2>Jellyfin account</h2>
-          <p className="settings-hint">Link your Jellyfin user account so playlists and favorites sync to you personally.</p>
-          <label className="setting-row integration-row">
-            <span>Jellyfin user</span>
-            <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-              <select
-                value={user?.jellyfin_user_id || ""}
-                onChange={async (event) => {
-                  const newId = event.target.value || null;
-                  try {
-                    const updated = await api("/me/jellyfin-user", { method: "PUT", body: JSON.stringify({ jellyfin_user_id: newId }) });
-                    setUser(updated);
-                  } catch (err) {
-                    alert(`Failed to save: ${err.message}`);
-                  }
-                }}
-              >
-                <option value="">Not linked</option>
-                {(jellyfinUsers || (user?.jellyfin_user_id ? [{ id: user.jellyfin_user_id, name: user.jellyfin_user_id }] : [])).map((u) => (
-                  <option key={u.id} value={u.id}>{u.name}</option>
-                ))}
-              </select>
-              <button
-                className="secondary compact"
-                type="button"
-                disabled={jellyfinUsersLoading}
-                onClick={async () => {
-                  setJellyfinUsersLoading(true);
-                  try {
-                    const data = await api("/settings/jellyfin-users");
-                    setJellyfinUsers(data);
-                  } catch {
-                    setJellyfinUsers([]);
-                  } finally {
-                    setJellyfinUsersLoading(false);
-                  }
-                }}
-              >
-                {jellyfinUsersLoading ? "…" : "Load users"}
-              </button>
-            </div>
-          </label>
-        </section>}
       )}
       {canManageSettings(user) && (
         <section className="settings-section">
