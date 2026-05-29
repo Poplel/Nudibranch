@@ -1342,7 +1342,7 @@ def sync_playlists(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {"notify": True}))
 
 
 @router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")

@@ -944,7 +944,18 @@ def apply_playlist_item(session: Session, item: ProposalItem) -> None:
             raise ValueError("Playlist no longer exists")
         if playlist.protected:
             raise ValueError("Favorites cannot be deleted")
+        jellyfin_id = playlist.jellyfin_playlist_id
         session.delete(playlist)
+        if jellyfin_id:
+            settings = integration_settings(session)
+            jf_url = settings.get("jellyfin_url", "").rstrip("/")
+            jf_key = settings.get("jellyfin_api_key", "")
+            if jf_url and jf_key:
+                try:
+                    with httpx.Client(base_url=jf_url, headers={"X-Emby-Token": jf_key}, timeout=10) as jf_client:
+                        jf_client.delete(f"/Items/{jellyfin_id}")
+                except Exception as del_error:
+                    write_app_log(f"Playlist sync: could not delete Jellyfin playlist {jellyfin_id}: {del_error}", level="warning")
     else:
         raise ValueError("Unsupported playlist action")
     enqueue_task(session, "sync_favorites_jellyfin", {})
@@ -4856,8 +4867,12 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                             playlist.jellyfin_playlist_id = refreshed_id
                             jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
                         else:
+                            # Stale ID and refresh found same/no ID — delete the dead playlist to avoid duplicates
+                            _delete_jellyfin_item(client, jellyfin_playlist_id)
                             jellyfin_playlist_id = None
                 if not jellyfin_playlist_id:
+                    # Clean up any other Jellyfin playlists with this name before creating fresh
+                    _delete_jellyfin_playlists_by_name(client, user_id, playlist.name)
                     created = create_jellyfin_playlist(client, user_id, playlist.name)
                     jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
                     playlist.jellyfin_playlist_id = jellyfin_playlist_id
@@ -4930,6 +4945,10 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                         pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
                     except JellyfinPlaylistMissing:
                         append_task_log(session, None, f"Jellyfin playlist {playlist.name} is not accessible; recreating it", "warning")
+                        # Delete the inaccessible playlist and all name-duplicates before creating fresh
+                        if jellyfin_playlist_id:
+                            _delete_jellyfin_item(client, jellyfin_playlist_id)
+                        _delete_jellyfin_playlists_by_name(client, user_id, playlist.name)
                         playlist.jellyfin_playlist_id = None
                         created = create_jellyfin_playlist(client, user_id, playlist.name)
                         jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
@@ -4938,14 +4957,15 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                         pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
                 synced_playlists += 1
     session.commit()
-    create_notification(
-        session,
-        title="Playlists synced",
-        body=f"{synced_playlists} playlists synced. {pushed_tracks} Jellyfin changes. {pulled_tracks} Nudibranch changes.",
-        event_type="tool_completed",
-        target_url="/playlists",
-        deliver_apns=False,
-    )
+    if _payload.get("notify"):
+        create_notification(
+            session,
+            title="Playlists synced",
+            body=f"{synced_playlists} playlists synced. {pushed_tracks} Jellyfin changes. {pulled_tracks} Nudibranch changes.",
+            event_type="tool_completed",
+            target_url="/playlists",
+            deliver_apns=False,
+        )
     return {"synced": synced_playlists, "pushed_tracks": pushed_tracks, "pulled_tracks": pulled_tracks}
 
 
@@ -5980,6 +6000,36 @@ def ensure_favorites_playlist(session: Session, user_id: str) -> Playlist:
 
 class JellyfinPlaylistMissing(RuntimeError):
     pass
+
+
+def _delete_jellyfin_item(client: httpx.Client, item_id: str) -> None:
+    try:
+        resp = client.delete(f"/Items/{item_id}")
+        if resp.is_success or resp.status_code == 404:
+            return
+        write_app_log(f"Playlist sync: DELETE /Items/{item_id} returned {resp.status_code}", level="warning")
+    except Exception as error:
+        write_app_log(f"Playlist sync: could not delete Jellyfin item {item_id}: {error}", level="warning")
+
+
+def _delete_jellyfin_playlists_by_name(client: httpx.Client, user_id: str, name: str) -> int:
+    """Delete ALL Jellyfin playlists with this name — cleans up duplicates before recreating."""
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+        )
+        resp.raise_for_status()
+    except Exception:
+        return 0
+    deleted = 0
+    for item in resp.json().get("Items", []):
+        if item.get("Name") == name and item.get("Id"):
+            _delete_jellyfin_item(client, item["Id"])
+            deleted += 1
+    if deleted:
+        write_app_log(f"Playlist sync: cleaned up {deleted} stale Jellyfin playlist(s) named '{name}'")
+    return deleted
 
 
 def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
