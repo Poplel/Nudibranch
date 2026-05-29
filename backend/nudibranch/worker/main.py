@@ -944,18 +944,24 @@ def apply_playlist_item(session: Session, item: ProposalItem) -> None:
             raise ValueError("Playlist no longer exists")
         if playlist.protected:
             raise ValueError("Favorites cannot be deleted")
+        playlist_name = playlist.name
         jellyfin_id = playlist.jellyfin_playlist_id
+        nudibranch_user = session.get(User, playlist.user_id) if playlist.user_id else None
+        jellyfin_user_id = nudibranch_user.jellyfin_user_id if nudibranch_user else None
         session.delete(playlist)
-        if jellyfin_id:
-            settings = integration_settings(session)
-            jf_url = settings.get("jellyfin_url", "").rstrip("/")
-            jf_key = settings.get("jellyfin_api_key", "")
-            if jf_url and jf_key:
-                try:
-                    with httpx.Client(base_url=jf_url, headers={"X-Emby-Token": jf_key}, timeout=10) as jf_client:
-                        jf_client.delete(f"/Items/{jellyfin_id}")
-                except Exception as del_error:
-                    write_app_log(f"Playlist sync: could not delete Jellyfin playlist {jellyfin_id}: {del_error}", level="warning")
+        settings = integration_settings(session)
+        jf_url = settings.get("jellyfin_url", "").rstrip("/")
+        jf_key = settings.get("jellyfin_api_key", "")
+        if jf_url and jf_key:
+            try:
+                with httpx.Client(base_url=jf_url, headers={"X-Emby-Token": jf_key}, timeout=10) as jf_client:
+                    if jellyfin_id:
+                        _delete_jellyfin_item(jf_client, jellyfin_id)
+                    # Also delete any stale duplicates with this name to prevent re-import on next sync
+                    if jellyfin_user_id:
+                        _delete_jellyfin_playlists_by_name(jf_client, jellyfin_user_id, playlist_name)
+            except Exception as del_error:
+                write_app_log(f"Playlist sync: could not delete Jellyfin playlist '{playlist_name}': {del_error}", level="warning")
     else:
         raise ValueError("Unsupported playlist action")
     enqueue_task(session, "sync_favorites_jellyfin", {})
