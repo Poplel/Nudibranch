@@ -7,6 +7,7 @@ from nudibranch.api.routes import router
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
 from nudibranch.db.session import SessionLocal
+from nudibranch.services.app_log import write_app_log
 
 settings = get_settings()
 
@@ -60,6 +61,7 @@ def startup() -> None:
         path.mkdir(parents=True, exist_ok=True)
     with SessionLocal() as session:
         init_db(session)
+    write_app_log(f"API started (version {__version__})")
 
 
 @app.get("/healthz", tags=["system"])

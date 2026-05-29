@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
+from nudibranch import __version__
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
 from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
@@ -21,6 +22,7 @@ from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_imp
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
+from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
@@ -5922,6 +5924,7 @@ class JellyfinPlaylistMissing(RuntimeError):
 
 
 def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
+    write_app_log("Playlist sync: GET /Users/{id}/Items?IncludeItemTypes=Playlist")
     response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist"})
     response.raise_for_status()
     playlists = {}
@@ -5929,6 +5932,7 @@ def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dic
         name = item.get("Name")
         if name:
             playlists[name] = item
+    write_app_log(f"Playlist sync: found {len(playlists)} Jellyfin playlist(s): {list(playlists.keys())}")
     return playlists
 
 
@@ -5937,6 +5941,7 @@ def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: 
 
 
 def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str) -> list[dict]:
+    write_app_log(f"Playlist sync: GET /Playlists/{playlist_id}/Items")
     try:
         response = client.get(
             f"/Playlists/{playlist_id}/Items",
@@ -5949,7 +5954,9 @@ def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str
         if error.response.status_code == 405:
             return []
         raise
-    return response.json().get("Items", [])
+    items = response.json().get("Items", [])
+    write_app_log(f"Playlist sync: playlist {playlist_id} has {len(items)} item(s)")
+    return items
 
 
 def create_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> httpx.Response:
@@ -5975,15 +5982,19 @@ def jellyfin_playlist_id_from_response(response: httpx.Response) -> str:
 def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
     if not item_ids:
         return
+    write_app_log(f"Playlist sync: POST /Playlists/{playlist_id}/Items ({len(item_ids)} items batch)")
     response = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(item_ids), "userId": user_id})
     if response.is_success:
+        write_app_log(f"Playlist sync: batch add to {playlist_id} succeeded")
         return
     if response.status_code == 404:
         raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
     if response.status_code < 500:
         response.raise_for_status()
+    write_app_log(f"Playlist sync: batch add to {playlist_id} got {response.status_code}, falling back to per-item", level="warning")
     failures = []
     for item_id in item_ids:
+        write_app_log(f"Playlist sync: POST /Playlists/{playlist_id}/Items?ids={item_id} (per-item fallback)")
         single = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": item_id, "userId": user_id})
         if single.status_code == 404:
             raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
@@ -6020,14 +6031,17 @@ def remove_jellyfin_playlist_items(client: httpx.Client, _user_id: str, playlist
 
 def replace_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, current_items: list[dict], desired_item_ids: list[str]) -> int:
     entry_ids = [entry_id for entry_id in (jellyfin_playlist_entry_id(item) for item in current_items) if entry_id]
+    write_app_log(f"Playlist sync: replacing {playlist_id}: removing {len(entry_ids)} existing entry(s), adding {len(desired_item_ids)} desired")
     removed = remove_jellyfin_playlist_entry_ids(client, playlist_id, entry_ids)
     add_jellyfin_playlist_items(client, user_id, playlist_id, desired_item_ids)
     return removed + len(desired_item_ids)
 
 
 def sync_playlist_from_jellyfin(session: Session, playlist: Playlist, jellyfin_items: list[dict]) -> int:
+    write_app_log(f"Playlist sync: pulling '{playlist.name}' from Jellyfin ({len(jellyfin_items)} Jellyfin item(s))")
     next_entries: list[tuple[Track, int]] = []
     for index, item in enumerate(jellyfin_items, start=1):
+        write_app_log(f"Playlist sync: matching Jellyfin item {index}/{len(jellyfin_items)}: {item.get('Name')!r} by {item.get('AlbumArtist') or item.get('Artists')}")
         track = find_local_track_for_jellyfin_item(session, item)
         if track:
             next_entries.append((track, index))
@@ -6247,6 +6261,7 @@ def check_mount_writability(session: Session) -> None:
 
 
 async def worker_loop() -> None:
+    write_app_log(f"Worker starting (version {__version__})")
     with SessionLocal() as session:
         init_db(session)
         check_mount_writability(session)
@@ -6370,4 +6385,11 @@ def task_target_url(task_type: str) -> str:
 
 
 if __name__ == "__main__":
-    asyncio.run(worker_loop())
+    try:
+        asyncio.run(worker_loop())
+    except (SystemExit, KeyboardInterrupt):
+        write_app_log("Worker stopped (signal)")
+        raise
+    except Exception as error:  # noqa: BLE001
+        write_app_log(f"Worker crashed: {type(error).__name__}: {error}", level="error")
+        raise
