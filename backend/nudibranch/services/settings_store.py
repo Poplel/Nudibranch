@@ -12,7 +12,6 @@ INTEGRATION_KEYS = {
     "slskd_album_match_threshold",
     "slskd_album_folder_tries",
     "slskd_concurrent_downloads",
-    "playlist_conflict_winner",
     "youtube_cookies_browser",
     "youtube_cookies_path",
 }
@@ -28,7 +27,6 @@ def integration_settings(session: Session) -> dict[str, str]:
         "slskd_album_match_threshold": "72",
         "slskd_album_folder_tries": "5",
         "slskd_concurrent_downloads": "1",
-        "playlist_conflict_winner": "nudibranch",
         "youtube_cookies_browser": "",
         "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
     }

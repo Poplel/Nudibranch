@@ -37,6 +37,7 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
+PLAYLIST_SYNC_INTERVAL_SECONDS = 300  # auto-sync every 5 minutes when idle
 REPLACEMENT_SEARCH_RETRY_SECONDS = 15
 TRANSFER_COMPLETE_PERCENT = 99.5
 DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
@@ -4765,10 +4766,6 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     if not jellyfin_url or not jellyfin_api_key:
         raise ValueError("Jellyfin URL and API key are required to sync playlists")
 
-    conflict_winner = settings.get("playlist_conflict_winner") or "nudibranch"
-    if conflict_winner not in {"nudibranch", "jellyfin"}:
-        conflict_winner = "nudibranch"
-
     headers = {"X-Emby-Token": jellyfin_api_key}
     synced_playlists = 0
     pushed_tracks = 0
@@ -4794,12 +4791,12 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         if not favorites_playlist:
             favorites_playlist = ensure_favorites_playlist(session)
         append_task_log(session, None, f"Playlist sync: syncing Favorites ({len(list(favorites_playlist.tracks))} local tracks)")
-        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, conflict_winner, audio_index)
+        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, audio_index)
         append_task_log(session, None, f"Playlist sync: Favorites done ({fav_changes} changes)")
         pulled_tracks += fav_changes
         synced_playlists += 1
 
-        # Sync regular (non-protected) playlists with Jellyfin playlists
+        # Sync regular (non-protected) playlists — always bidirectional merge
         append_task_log(session, None, "Playlist sync: fetching Jellyfin playlist list")
         jellyfin_playlists = list_jellyfin_playlists(client, user_id)
         # Import any Jellyfin playlists that don't exist locally yet
@@ -4807,7 +4804,6 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         local_by_name = {playlist.name: playlist for playlist in existing_playlists}
         # Protected playlists (e.g. Favorites) are synced separately — skip them if Jellyfin returns a playlist with the same name
         protected_names = {favorites_playlist.name} if favorites_playlist else set()
-        imported_playlist_names: set[str] = set()
         for jellyfin_playlist in jellyfin_playlists.values():
             name = jellyfin_playlist.get("Name")
             if not name or name in local_by_name or name in protected_names:
@@ -4817,7 +4813,6 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             session.flush()
             local_by_name[name] = new_playlist
             existing_playlists.append(new_playlist)
-            imported_playlist_names.add(name)
 
         regular_playlists = list(
             session.scalars(
@@ -4859,34 +4854,56 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                 session.flush()
                 jellyfin_items = []
                 created_jellyfin_playlist = True
+
+            # Build the current Nudibranch set by Jellyfin audio ID
             local_item_ids: list[str] = []
             unmapped_local_tracks: list[str] = []
-            for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at.replace(tzinfo=None) if entry.created_at else datetime.min)):
+            local_nudibranch_track_ids: set[str] = set()
+            for entry in sorted(playlist.tracks, key=lambda e: (e.position, e.created_at.replace(tzinfo=None) if e.created_at else datetime.min)):
                 item_id = _find_in_audio_index(audio_index, entry.track)
                 if item_id:
                     local_item_ids.append(item_id)
                 else:
                     unmapped_local_tracks.append(entry.track.title)
                     append_task_log(session, None, f"{playlist.name}: could not find Jellyfin audio item for {entry.track.title}", "warning")
+                local_nudibranch_track_ids.add(str(entry.track_id))
+
+            # Pull: add any Jellyfin-only tracks into Nudibranch (merge — no removals from Nudibranch)
+            if not created_jellyfin_playlist:
+                local_item_id_set = set(local_item_ids)
+                for item in jellyfin_items:
+                    item_id = item.get("Id")
+                    if item_id and item_id in local_item_id_set:
+                        continue  # already mapped in Nudibranch
+                    track = find_local_track_for_jellyfin_item(session, item)
+                    if not track:
+                        continue
+                    if str(track.id) in local_nudibranch_track_ids:
+                        continue  # already in Nudibranch by track ID (audio match just failed)
+                    new_entry = PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=len(local_item_ids) + 1)
+                    session.add(new_entry)
+                    local_nudibranch_track_ids.add(str(track.id))
+                    if item_id:
+                        local_item_ids.append(item_id)
+                        local_item_id_set.add(item_id)
+                    pulled_tracks += 1
+                    append_task_log(session, None, f"{playlist.name}: pulled '{item.get('Name') or track.title}' from Jellyfin")
+
+            # Push: replace Jellyfin playlist with the updated Nudibranch state
             jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
-            should_pull_from_jellyfin = (conflict_winner == "jellyfin" and not created_jellyfin_playlist) or playlist.name in imported_playlist_names
-            if should_pull_from_jellyfin:
-                pulled_tracks += sync_playlist_from_jellyfin(session, playlist, jellyfin_items)
-            else:
-                if unmapped_local_tracks:
-                    # Some local tracks aren't in Jellyfin yet — skip to avoid wiping the Jellyfin playlist
-                    append_task_log(session, None, f"{playlist.name}: skipped Jellyfin overwrite because {len(unmapped_local_tracks)} track(s) are not visible in Jellyfin yet", "warning")
-                elif local_item_ids and jellyfin_item_ids != local_item_ids:
-                    # Only push if we have mapped items to avoid wiping Jellyfin with an empty list
-                    try:
-                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
-                    except JellyfinPlaylistMissing:
-                        append_task_log(session, None, f"Jellyfin playlist {playlist.name} disappeared during sync; recreating it", "warning")
-                        created = create_jellyfin_playlist(client, user_id, playlist.name)
-                        jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
-                        playlist.jellyfin_playlist_id = jellyfin_playlist_id
-                        session.flush()
-                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
+            if unmapped_local_tracks:
+                append_task_log(session, None, f"{playlist.name}: skipped Jellyfin push because {len(unmapped_local_tracks)} track(s) are not visible in Jellyfin yet", "warning")
+            elif local_item_ids and local_item_ids != jellyfin_item_ids:
+                try:
+                    pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
+                except JellyfinPlaylistMissing:
+                    append_task_log(session, None, f"Jellyfin playlist {playlist.name} is not accessible; recreating it under the configured user", "warning")
+                    playlist.jellyfin_playlist_id = None
+                    created = create_jellyfin_playlist(client, user_id, playlist.name)
+                    jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
+                    playlist.jellyfin_playlist_id = jellyfin_playlist_id
+                    session.flush()
+                    pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
             synced_playlists += 1
     session.commit()
     create_notification(
@@ -4929,13 +4946,10 @@ def _find_in_audio_index(audio_index: list[dict], track: Track) -> str | None:
     return None
 
 
-def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, conflict_winner: str, audio_index: list[dict]) -> int:
-    """Sync Nudibranch Favorites against Jellyfin's native IsFavorite flag on audio items."""
+def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, audio_index: list[dict]) -> int:
+    """Bidirectional merge: pull Jellyfin IsFavorite → Nudibranch, push Nudibranch → Jellyfin IsFavorite."""
     nudibranch_tracks = list(favorites_playlist.tracks)
-    # For pull: always fetch; for push with empty playlist: no HTTP call needed
-    if conflict_winner != "jellyfin" and not nudibranch_tracks:
-        append_task_log(session, None, "Favorites sync: Nudibranch Favorites is empty, nothing to push")
-        return 0
+    nudibranch_track_ids = {str(e.track_id) for e in nudibranch_tracks}
 
     fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
     try:
@@ -4949,21 +4963,32 @@ def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: st
         append_task_log(session, None, f"Favorites sync: could not fetch Jellyfin favorites: {error}", "warning")
         return 0
 
+    append_task_log(session, None, f"Favorites sync: {len(nudibranch_tracks)} Nudibranch, {len(jellyfin_favorites)} Jellyfin")
     changes = 0
-    if conflict_winner == "jellyfin":
-        # Pull: Jellyfin IsFavorite → Nudibranch Favorites
-        changes = sync_playlist_from_jellyfin(session, favorites_playlist, jellyfin_favorites)
-    else:
-        # Push: Nudibranch Favorites → Jellyfin IsFavorite (merge only — never unmark Jellyfin favorites)
-        jellyfin_favorite_ids = {item["Id"] for item in jellyfin_favorites if item.get("Id")}
-        for entry in nudibranch_tracks:
-            item_id = _find_in_audio_index(audio_index, entry.track)
-            if item_id and item_id not in jellyfin_favorite_ids:
-                try:
-                    client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
-                    changes += 1
-                except Exception as error:
-                    append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
+    jellyfin_favorite_ids: set[str] = set()
+
+    # Pull: add Jellyfin favorites not yet in Nudibranch
+    for item in jellyfin_favorites:
+        item_id = item.get("Id")
+        if item_id:
+            jellyfin_favorite_ids.add(item_id)
+        track = find_local_track_for_jellyfin_item(session, item)
+        if track and str(track.id) not in nudibranch_track_ids:
+            session.add(PlaylistTrack(playlist_id=favorites_playlist.id, track_id=track.id, position=len(nudibranch_track_ids) + 1))
+            nudibranch_track_ids.add(str(track.id))
+            append_task_log(session, None, f"Favorites sync: pulled '{item.get('Name') or track.title}' from Jellyfin favorites")
+            changes += 1
+
+    # Push: mark any Nudibranch favorites not yet in Jellyfin's IsFavorite
+    for entry in nudibranch_tracks:
+        item_id = _find_in_audio_index(audio_index, entry.track)
+        if item_id and item_id not in jellyfin_favorite_ids:
+            try:
+                client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
+                jellyfin_favorite_ids.add(item_id)
+                changes += 1
+            except Exception as error:
+                append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
     return changes
 
 
@@ -5989,8 +6014,9 @@ def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id:
     if response.is_success:
         write_app_log(f"Playlist sync: batch add to {playlist_id} succeeded")
         return
-    if response.status_code == 404:
-        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
+    if response.status_code in (403, 404):
+        # 404 = gone; 403 = playlist is owned by a different Jellyfin user — recreate it
+        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} is not accessible (HTTP {response.status_code})")
     if response.status_code < 500:
         response.raise_for_status()
     write_app_log(f"Playlist sync: batch add to {playlist_id} got {response.status_code}, falling back to per-item", level="warning")
@@ -6271,6 +6297,7 @@ async def worker_loop() -> None:
     last_download_scan = 0.0
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
+    last_playlist_sync = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -6299,6 +6326,12 @@ async def worker_loop() -> None:
                         session.rollback()
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
+                # Periodic playlist sync — enqueue if Jellyfin is configured and no sync is already queued
+                if time.time() - last_playlist_sync > PLAYLIST_SYNC_INTERVAL_SECONDS:
+                    jf_settings = integration_settings(session)
+                    if jf_settings.get("jellyfin_url") and jf_settings.get("jellyfin_api_key"):
+                        enqueue_task(session, "sync_favorites_jellyfin", {})
+                    last_playlist_sync = time.time()
                 await deliver_apns_notifications(session)
                 time.sleep(2)
                 continue

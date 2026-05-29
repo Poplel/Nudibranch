@@ -1154,6 +1154,7 @@ def create_playlist(
     session.add(playlist)
     session.commit()
     session.refresh(playlist)
+    enqueue_task(session, "sync_favorites_jellyfin", {})
     return serialize_favorites(session, playlist)
 
 
