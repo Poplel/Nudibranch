@@ -1661,6 +1661,19 @@ function App() {
             wishlistActions={wishlistInspectorActions}
             playlistActions={playlistInspectorActions}
             mappingSyncStats={mappingSyncStats}
+            playlistImportActions={{
+              open: playlistImportOpen,
+              setOpen: setPlaylistImportOpen,
+              url: playlistImportUrl,
+              setUrl: setPlaylistImportUrl,
+              mode: playlistImportMode,
+              setMode: setPlaylistImportMode,
+              loading: playlistImportLoading,
+              tracks: playlistImportTracks,
+              error: playlistImportError,
+              onFetch: fetchPlaylistTracks,
+              onAdd: addPlaylistToImport,
+            }}
           />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
@@ -4716,6 +4729,7 @@ function Inspector({
   wishlistActions,
   playlistActions,
   mappingSyncStats,
+  playlistImportActions,
 }) {
   const stats = inspectorStats({
     page,
@@ -4762,71 +4776,71 @@ function Inspector({
           )}
         </div>
       )}
-      {page === "Import/Add" && (
+      {page === "Import/Add" && playlistImportActions && (
         <div className="inspector-section">
           <button
             className="secondary inspector-section-toggle"
-            onClick={() => setPlaylistImportOpen((o) => !o)}
+            onClick={() => playlistImportActions.setOpen((o) => !o)}
           >
             <Music size={15} />
             Import from playlist
-            {playlistImportOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            {playlistImportActions.open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
           </button>
-          {playlistImportOpen && (
+          {playlistImportActions.open && (
             <div className="inspector-section-content">
               <input
                 className="playlist-import-url"
                 placeholder="Spotify or Apple Music playlist URL"
-                value={playlistImportUrl}
-                onChange={(e) => setPlaylistImportUrl(e.target.value)}
+                value={playlistImportActions.url}
+                onChange={(e) => playlistImportActions.setUrl(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && playlistImportUrl.trim()) fetchPlaylistTracks(playlistImportUrl.trim());
+                  if (e.key === "Enter" && playlistImportActions.url.trim()) playlistImportActions.onFetch(playlistImportActions.url.trim());
                 }}
               />
               <div className="mode-toggle">
                 <button
-                  className={playlistImportMode === "songs" ? "active" : ""}
-                  onClick={() => setPlaylistImportMode("songs")}
+                  className={playlistImportActions.mode === "songs" ? "active" : ""}
+                  onClick={() => playlistImportActions.setMode("songs")}
                 >
                   Songs
                 </button>
                 <button
-                  className={playlistImportMode === "albums" ? "active" : ""}
-                  onClick={() => setPlaylistImportMode("albums")}
+                  className={playlistImportActions.mode === "albums" ? "active" : ""}
+                  onClick={() => playlistImportActions.setMode("albums")}
                 >
                   Albums
                 </button>
               </div>
               <button
                 className="secondary"
-                onClick={() => fetchPlaylistTracks(playlistImportUrl.trim())}
-                disabled={!playlistImportUrl.trim() || playlistImportLoading}
+                onClick={() => playlistImportActions.onFetch(playlistImportActions.url.trim())}
+                disabled={!playlistImportActions.url.trim() || playlistImportActions.loading}
               >
-                {playlistImportLoading && !playlistImportTracks ? "Fetching…" : "Fetch playlist"}
+                {playlistImportActions.loading && !playlistImportActions.tracks ? "Fetching…" : "Fetch playlist"}
               </button>
-              {playlistImportError && <p className="error-text">{playlistImportError}</p>}
-              {playlistImportTracks && (
+              {playlistImportActions.error && <p className="error-text">{playlistImportActions.error}</p>}
+              {playlistImportActions.tracks && (
                 <>
-                  <p className="inspector-hint">{playlistImportTracks.count} tracks from {playlistImportTracks.source}</p>
+                  <p className="inspector-hint">{playlistImportActions.tracks.count} tracks from {playlistImportActions.tracks.source}</p>
                   <ul className="playlist-import-preview">
-                    {playlistImportTracks.tracks.slice(0, 6).map((t, i) => (
+                    {playlistImportActions.tracks.tracks.slice(0, 6).map((t, i) => (
                       <li key={i}>
                         <strong>{t.title}</strong>
                         <span>{t.artist}</span>
                       </li>
                     ))}
-                    {playlistImportTracks.count > 6 && (
-                      <li className="more">+{playlistImportTracks.count - 6} more</li>
+                    {playlistImportActions.tracks.count > 6 && (
+                      <li className="more">+{playlistImportActions.tracks.count - 6} more</li>
                     )}
                   </ul>
                   <button
                     className="primary"
-                    onClick={() => addPlaylistToImport(playlistImportTracks.tracks, playlistImportMode)}
-                    disabled={playlistImportLoading}
+                    onClick={() => playlistImportActions.onAdd(playlistImportActions.tracks.tracks, playlistImportActions.mode)}
+                    disabled={playlistImportActions.loading}
                   >
-                    {playlistImportLoading
-                      ? (playlistImportMode === "albums" ? "Looking up albums…" : "Adding…")
-                      : (playlistImportMode === "albums" ? "Queue albums" : "Queue songs")}
+                    {playlistImportActions.loading
+                      ? (playlistImportActions.mode === "albums" ? "Looking up albums…" : "Adding…")
+                      : (playlistImportActions.mode === "albums" ? "Queue albums" : "Queue songs")}
                   </button>
                 </>
               )}
