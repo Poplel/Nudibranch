@@ -122,6 +122,7 @@ function App() {
   const [importDownloadRequests, setImportDownloadRequests] = useState([]);
   const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
   const [playlistInspectorActions, setPlaylistInspectorActions] = useState(null);
+  const [mappingSyncStats, setMappingSyncStats] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -273,6 +274,20 @@ function App() {
     const timeout = window.setTimeout(() => saveOwnAppearance(appearance), 250);
     return () => window.clearTimeout(timeout);
   }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, appearanceReady, dark, accentColor, backgroundTint]);
+
+  useEffect(() => {
+    if (!token || !user) return;
+    let cancelled = false;
+    async function fetchMappingStats() {
+      try {
+        const data = await fetch(`${API_BASE}/playlists/sync/stats`, { headers: { Authorization: `Bearer ${token}` } });
+        if (data.ok && !cancelled) setMappingSyncStats(await data.json());
+      } catch { /* ignore */ }
+    }
+    fetchMappingStats();
+    const id = setInterval(fetchMappingStats, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [token, user?.id]);
 
   async function api(path, options = {}) {
     const isFormData = options.body instanceof FormData;
@@ -1588,6 +1603,7 @@ function App() {
             }}
             wishlistActions={wishlistInspectorActions}
             playlistActions={playlistInspectorActions}
+            mappingSyncStats={mappingSyncStats}
           />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
@@ -4610,6 +4626,15 @@ function SettingsPanel({
   );
 }
 
+function fmtTimeAgo(isoString) {
+  if (!isoString) return "never";
+  const diff = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
 function Inspector({
   page,
   library,
@@ -4625,6 +4650,7 @@ function Inspector({
   importActions,
   wishlistActions,
   playlistActions,
+  mappingSyncStats,
 }) {
   const stats = inspectorStats({
     page,
@@ -4637,6 +4663,7 @@ function Inspector({
     queueItemCount,
     queueSelectionCount,
     tasks,
+    mappingSyncStats,
   });
   return (
     <aside className="panel inspector">
@@ -4686,8 +4713,16 @@ function Inspector({
           </button>
           <button className="secondary" onClick={playlistActions.onSync}>
             <RefreshCw size={16} />
-            Sync playlists
+            Sync track mapping
           </button>
+          {mappingSyncStats && (
+            <div className="metadata-grid inspector-stats" style={{ marginTop: 8 }}>
+              <label>Last mapped</label>
+              <strong>{fmtTimeAgo(mappingSyncStats.last_run_at)}</strong>
+              <label>Runs</label>
+              <strong>{mappingSyncStats.run_count}</strong>
+            </div>
+          )}
         </div>
       )}
       {downloadProgress && (
@@ -4729,6 +4764,7 @@ function inspectorStats({
   queueItemCount = 0,
   queueSelectionCount = 0,
   tasks = [],
+  mappingSyncStats = null,
 }) {
   if (page === "Library") {
     return { summary: "", rows: musicStatRows(countLibraryMusic(library)) };
@@ -4765,6 +4801,14 @@ function inspectorStats({
     const running = tasks.filter((task) => task.status === "running").length;
     const failed = tasks.filter((task) => task.status === "failed").length;
     return { summary: "", rows: [["Running", running], ["Queued", queued], ["Failed", failed]] };
+  }
+  if (page === "Tools") {
+    const rows = [];
+    if (mappingSyncStats) {
+      const lastRun = mappingSyncStats.last_run_at ? fmtTimeAgo(mappingSyncStats.last_run_at) : "never";
+      rows.push(["Track mapping", lastRun], ["Runs (session)", mappingSyncStats.run_count]);
+    }
+    return { summary: "", rows };
   }
   return { summary: "", rows: [] };
 }

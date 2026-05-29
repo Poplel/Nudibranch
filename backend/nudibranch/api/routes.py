@@ -1356,6 +1356,18 @@ def sync_playlists(session: Session = Depends(get_session), _: User = Depends(re
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
 
+@router.get("/playlists/sync/stats", tags=["playlists"], summary="Track mapping job stats")
+def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
+    last_run_at = session.get(AppSetting, "mapping_last_run_at")
+    run_count = session.get(AppSetting, "mapping_run_count")
+    started_at = session.get(AppSetting, "mapping_started_at")
+    return {
+        "last_run_at": last_run_at.value if last_run_at else None,
+        "run_count": int(run_count.value) if run_count else 0,
+        "started_at": started_at.value if started_at else None,
+    }
+
+
 # ── (removed) proposal-based position reorder — position is order from Jellyfin ──
 
 @router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")

@@ -38,6 +38,14 @@ QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 PLAYLIST_SYNC_INTERVAL_SECONDS = 300  # auto-sync every 5 minutes when idle
+
+
+def _upsert_setting(session: Session, key: str, value: str) -> None:
+    setting = session.get(AppSetting, key)
+    if setting:
+        setting.value = value
+    else:
+        session.add(AppSetting(key=key, value=value))
 REPLACEMENT_SEARCH_RETRY_SECONDS = 15
 TRANSFER_COMPLETE_PERCENT = 99.5
 DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
@@ -6230,6 +6238,9 @@ async def worker_loop() -> None:
     with SessionLocal() as session:
         init_db(session)
         check_mount_writability(session)
+        _upsert_setting(session, "mapping_run_count", "0")
+        _upsert_setting(session, "mapping_started_at", datetime.now(timezone.utc).isoformat())
+        session.commit()
 
     last_download_scan = 0.0
     last_download_scan_summary = ""
@@ -6263,11 +6274,20 @@ async def worker_loop() -> None:
                         session.rollback()
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
-                # Periodic playlist sync — enqueue if Jellyfin is configured and no sync is already queued
+                # Periodic track mapping — run directly (no Task record) so it's invisible in the UI
                 if time.time() - last_playlist_sync > PLAYLIST_SYNC_INTERVAL_SECONDS:
                     jf_settings = integration_settings(session)
                     if jf_settings.get("jellyfin_url") and jf_settings.get("jellyfin_api_key"):
-                        enqueue_task(session, "sync_favorites_jellyfin", {})
+                        try:
+                            run_sync_favorites_jellyfin(session, {})
+                            count_row = session.get(AppSetting, "mapping_run_count")
+                            new_count = (int(count_row.value) if count_row else 0) + 1
+                            _upsert_setting(session, "mapping_last_run_at", datetime.now(timezone.utc).isoformat())
+                            _upsert_setting(session, "mapping_run_count", str(new_count))
+                            session.commit()
+                        except Exception as _sync_err:  # noqa: BLE001
+                            session.rollback()
+                            write_app_log(f"Track mapping auto-run failed: {_sync_err}", level="warning")
                     last_playlist_sync = time.time()
                 await deliver_apns_notifications(session)
                 time.sleep(2)
