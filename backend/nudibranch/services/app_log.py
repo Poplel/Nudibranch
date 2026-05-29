@@ -16,8 +16,10 @@ def write_app_log(message: str, level: str = "info", **context: Any) -> None:
     clean_context = {key: value for key, value in context.items() if value is not None}
     if clean_context:
         entry["context"] = clean_context
+    line = json.dumps(entry, sort_keys=True)
+    print(line, flush=True)
     with settings.log_path.open("a", encoding="utf-8") as log_file:
-        log_file.write(json.dumps(entry, sort_keys=True) + "\n")
+        log_file.write(line + "\n")
 
 
 def tail_app_log(limit: int = 500) -> list[dict[str, Any]]:

@@ -4783,6 +4783,7 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         append_task_log(session, None, f"Playlist sync: fetched {len(audio_index)} Jellyfin audio items for matching")
 
         # Sync the Favorites playlist against Jellyfin's native IsFavorite flag (not a playlist)
+        append_task_log(session, None, "Playlist sync: loading Favorites playlist from DB")
         favorites_playlist = session.scalar(
             select(Playlist)
             .where(Playlist.protected.is_(True))
@@ -4790,11 +4791,14 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         )
         if not favorites_playlist:
             favorites_playlist = ensure_favorites_playlist(session)
+        append_task_log(session, None, f"Playlist sync: syncing Favorites ({len(list(favorites_playlist.tracks))} local tracks)")
         fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, conflict_winner, audio_index)
+        append_task_log(session, None, f"Playlist sync: Favorites done ({fav_changes} changes)")
         pulled_tracks += fav_changes
         synced_playlists += 1
 
         # Sync regular (non-protected) playlists with Jellyfin playlists
+        append_task_log(session, None, "Playlist sync: fetching Jellyfin playlist list")
         jellyfin_playlists = list_jellyfin_playlists(client, user_id)
         # Import any Jellyfin playlists that don't exist locally yet
         existing_playlists = list(session.scalars(select(Playlist).where(Playlist.protected.is_(False)).order_by(Playlist.name.asc())))
@@ -4820,7 +4824,9 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             )
         )
 
+        append_task_log(session, None, f"Playlist sync: syncing {len(regular_playlists)} regular playlist(s)")
         for playlist in regular_playlists:
+            append_task_log(session, None, f"Playlist sync: processing '{playlist.name}'")
             jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
             jellyfin_items: list[dict] = []
             created_jellyfin_playlist = False
@@ -6314,6 +6320,7 @@ async def worker_loop() -> None:
             except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
                 append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
                 try:
+                    session.rollback()  # clear any broken transaction so fail_task can commit
                     create_notification(
                         session,
                         title=f"{task.type} failed",
@@ -6324,7 +6331,8 @@ async def worker_loop() -> None:
                     fail_task(session, task, str(error))
                 except Exception:  # noqa: BLE001
                     pass
-                raise  # re-raise SystemExit/KeyboardInterrupt so the process exits cleanly
+                if isinstance(error, (SystemExit, KeyboardInterrupt)):
+                    raise  # only exit the process for fatal OS signals
 
 
 def task_notification_title(task_type: str) -> str:
