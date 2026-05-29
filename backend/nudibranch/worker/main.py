@@ -4805,10 +4805,12 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         # Import any Jellyfin playlists that don't exist locally yet
         existing_playlists = list(session.scalars(select(Playlist).where(Playlist.protected.is_(False)).order_by(Playlist.name.asc())))
         local_by_name = {playlist.name: playlist for playlist in existing_playlists}
+        # Protected playlists (e.g. Favorites) are synced separately — skip them if Jellyfin returns a playlist with the same name
+        protected_names = {favorites_playlist.name} if favorites_playlist else set()
         imported_playlist_names: set[str] = set()
         for jellyfin_playlist in jellyfin_playlists.values():
             name = jellyfin_playlist.get("Name")
-            if not name or name in local_by_name:
+            if not name or name in local_by_name or name in protected_names:
                 continue
             new_playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
             session.add(new_playlist)
@@ -4859,7 +4861,7 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
                 created_jellyfin_playlist = True
             local_item_ids: list[str] = []
             unmapped_local_tracks: list[str] = []
-            for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at)):
+            for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at.replace(tzinfo=None) if entry.created_at else datetime.min)):
                 item_id = _find_in_audio_index(audio_index, entry.track)
                 if item_id:
                     local_item_ids.append(item_id)
@@ -6333,9 +6335,12 @@ async def worker_loop() -> None:
                     append_task_log(session, task, f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}")
                     complete_task(session, task, result)
             except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
+                try:
+                    session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
+                except Exception:  # noqa: BLE001
+                    pass
                 append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
                 try:
-                    session.rollback()  # clear any broken transaction so fail_task can commit
                     create_notification(
                         session,
                         title=f"{task.type} failed",
