@@ -4778,9 +4778,19 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         if not user_id:
             raise ValueError("No Jellyfin user was found for playlist sync")
 
+        # Pre-fetch all Jellyfin audio items once — used for local matching instead of per-track API calls
+        audio_index = _fetch_all_jellyfin_audio(client, user_id)
+        append_task_log(session, None, f"Playlist sync: fetched {len(audio_index)} Jellyfin audio items for matching")
+
         # Sync the Favorites playlist against Jellyfin's native IsFavorite flag (not a playlist)
-        favorites_playlist = ensure_favorites_playlist(session)
-        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, conflict_winner)
+        favorites_playlist = session.scalar(
+            select(Playlist)
+            .where(Playlist.protected.is_(True))
+            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+        )
+        if not favorites_playlist:
+            favorites_playlist = ensure_favorites_playlist(session)
+        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, conflict_winner, audio_index)
         pulled_tracks += fav_changes
         synced_playlists += 1
 
@@ -4842,7 +4852,7 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
             local_item_ids: list[str] = []
             unmapped_local_tracks: list[str] = []
             for entry in sorted(playlist.tracks, key=lambda entry: (entry.position, entry.created_at)):
-                item_id = find_jellyfin_audio_item(client, user_id, entry.track)
+                item_id = _find_in_audio_index(audio_index, entry.track)
                 if item_id:
                     local_item_ids.append(item_id)
                 else:
@@ -4880,13 +4890,42 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     return {"synced": synced_playlists, "pushed_tracks": pushed_tracks, "pulled_tracks": pulled_tracks}
 
 
-def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, conflict_winner: str) -> int:
+def _fetch_all_jellyfin_audio(client: httpx.Client, user_id: str) -> list[dict]:
+    """Fetch all Jellyfin audio items in one request for local matching (no per-track API calls)."""
+    fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "10000"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("Items", [])
+    except Exception as error:
+        write_app_log("Playlist sync: failed to fetch Jellyfin audio index", level="warning", error=str(error))
+        return []
+
+
+def _find_in_audio_index(audio_index: list[dict], track: Track) -> str | None:
+    """Find a track's Jellyfin item ID from a pre-fetched audio list. No HTTP requests."""
+    best_item: dict | None = None
+    best_score = 0.0
+    for item in audio_index:
+        score = jellyfin_audio_match_score(track, item)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item and best_score >= 0.65:
+        return best_item.get("Id")
+    return None
+
+
+def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, conflict_winner: str, audio_index: list[dict]) -> int:
     """Sync Nudibranch Favorites against Jellyfin's native IsFavorite flag on audio items."""
     fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
     try:
         resp = client.get(
             f"/Users/{user_id}/Items",
-            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "500"},
+            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "2000"},
         )
         resp.raise_for_status()
         jellyfin_favorites: list[dict] = resp.json().get("Items", [])
@@ -4899,11 +4938,11 @@ def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: st
         # Pull: Jellyfin IsFavorite → Nudibranch Favorites
         changes = sync_playlist_from_jellyfin(session, favorites_playlist, jellyfin_favorites)
     else:
-        # Push: Nudibranch Favorites → Jellyfin IsFavorite
+        # Push: Nudibranch Favorites → Jellyfin IsFavorite (use pre-fetched index, no per-track API calls)
         jellyfin_favorite_ids = {item["Id"] for item in jellyfin_favorites if item.get("Id")}
         nudibranch_item_ids: set[str] = set()
         for entry in favorites_playlist.tracks:
-            item_id = find_jellyfin_audio_item(client, user_id, entry.track)
+            item_id = _find_in_audio_index(audio_index, entry.track)
             if item_id:
                 nudibranch_item_ids.add(item_id)
                 if item_id not in jellyfin_favorite_ids:
