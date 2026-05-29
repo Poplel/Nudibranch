@@ -4496,7 +4496,7 @@ function SettingsPanel({
             </button>
           </div>
         </section>
-        <section className="settings-section">
+        {canManageUsers(user) && <section className="settings-section">
           <h2>Jellyfin account</h2>
           <p className="settings-hint">Link your Jellyfin user account so playlists and favorites sync to you personally.</p>
           <label className="setting-row integration-row">
@@ -4539,7 +4539,7 @@ function SettingsPanel({
               </button>
             </div>
           </label>
-        </section>
+        </section>}
       )}
       {canManageSettings(user) && (
         <section className="settings-section">

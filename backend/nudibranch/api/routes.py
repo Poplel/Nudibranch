@@ -217,7 +217,7 @@ def update_own_pin(
 def update_own_jellyfin_user(
     payload: JellyfinUserLinkUpdate,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(Permission.users_manage)),
 ) -> UserOut:
     user.jellyfin_user_id = payload.jellyfin_user_id or None
     session.commit()
