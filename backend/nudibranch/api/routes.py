@@ -1289,13 +1289,14 @@ def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session 
         return _jf_playlist_out(session, client, jf_user_id, playlist_id, name)
 
 
-@router.delete("/playlists/{playlist_id}", status_code=204, tags=["playlists"], summary="Delete playlist")
-def delete_playlist(playlist_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> None:
+@router.delete("/playlists/{playlist_id}", tags=["playlists"], summary="Delete playlist")
+def delete_playlist(playlist_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     client, _ = _jf_client(session, user)
     if not client:
-        return
+        return {}
     with client:
         client.delete(f"/Items/{playlist_id}")
+    return {}
 
 
 @router.post("/playlists/{playlist_id}/tracks", response_model=FavoritesOut, tags=["playlists"], summary="Add tracks to playlist")
