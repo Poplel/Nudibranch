@@ -25,6 +25,7 @@ class UserOut(BaseModel):
     theme: str = "light"
     accent_color: str = "#356df3"
     background_tint: str = "#356df3"
+    jellyfin_user_id: str | None = None
 
 
 class PermissionOut(BaseModel):
@@ -54,6 +55,10 @@ class UserAppearanceUpdate(BaseModel):
     theme: str = Field(pattern="^(light|dark)$")
     accent_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     background_tint: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+
+
+class JellyfinUserLinkUpdate(BaseModel):
+    jellyfin_user_id: str | None = None
 
 
 class PlayerStateUpdate(BaseModel):
@@ -211,7 +216,6 @@ class DeviceRegistration(BaseModel):
 class IntegrationSettings(BaseModel):
     jellyfin_url: str = ""
     jellyfin_api_key: str = ""
-    jellyfin_user_id: str = ""
     slskd_url: str = ""
     slskd_api_key: str = ""
     slskd_album_match_threshold: str = "72"

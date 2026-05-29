@@ -58,7 +58,41 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "background_tint" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN background_tint VARCHAR(16) NOT NULL DEFAULT '#356df3'"))
         session.commit()
+    if "jellyfin_user_id" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN jellyfin_user_id VARCHAR(255)"))
+        session.commit()
+    _migrate_playlists_per_user(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _migrate_playlists_per_user(session: Session) -> None:
+    """Recreate playlists table with per-user ownership and updated unique constraint."""
+    playlist_columns = {row[1] for row in session.execute(text("PRAGMA table_info(playlists)"))}
+    if "user_id" in playlist_columns:
+        return
+    # Recreate with user_id column; SQLite doesn't support DROP CONSTRAINT
+    session.execute(text("""
+        CREATE TABLE playlists_new (
+            id VARCHAR NOT NULL PRIMARY KEY,
+            user_id VARCHAR REFERENCES users(id) ON DELETE CASCADE,
+            name VARCHAR(255) NOT NULL,
+            protected BOOLEAN NOT NULL DEFAULT 0,
+            jellyfin_playlist_id VARCHAR(128),
+            created_at DATETIME,
+            UNIQUE (user_id, name)
+        )
+    """))
+    # Copy existing playlists and assign all to the admin user
+    session.execute(text("""
+        INSERT INTO playlists_new (id, user_id, name, protected, jellyfin_playlist_id, created_at)
+        SELECT p.id,
+               (SELECT id FROM users WHERE is_admin = 1 ORDER BY created_at ASC LIMIT 1),
+               p.name, p.protected, p.jellyfin_playlist_id, p.created_at
+        FROM playlists p
+    """))
+    session.execute(text("DROP TABLE playlists"))
+    session.execute(text("ALTER TABLE playlists_new RENAME TO playlists"))
+    session.commit()
 
 
 def move_task_result_logs_to_app_log(session: Session) -> None:

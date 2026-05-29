@@ -4766,178 +4766,177 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     if not jellyfin_url or not jellyfin_api_key:
         raise ValueError("Jellyfin URL and API key are required to sync playlists")
 
+    linked_users = list(session.scalars(
+        select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != "")
+    ))
+    if not linked_users:
+        append_task_log(session, None, "Playlist sync: no Nudibranch users have linked a Jellyfin account — link one in Settings")
+        return {"synced": 0, "pushed_tracks": 0, "pulled_tracks": 0}
+
     headers = {"X-Emby-Token": jellyfin_api_key}
     synced_playlists = 0
     pushed_tracks = 0
     pulled_tracks = 0
     with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
-        configured_user_id = settings.get("jellyfin_user_id", "").strip()
-        if configured_user_id:
-            user_id = configured_user_id
-        else:
-            users_resp = client.get("/Users")
-            users_resp.raise_for_status()
-            user_id = (users_resp.json() or [{}])[0].get("Id")
-            if not user_id:
-                raise ValueError("No Jellyfin user was found for playlist sync")
-        append_task_log(session, None, f"Playlist sync: using Jellyfin user {user_id}")
+        user_id = linked_users[0].jellyfin_user_id  # use first linked user for audio index (shared library)
 
-        # Pre-fetch all Jellyfin audio items once — used for local matching instead of per-track API calls
+        # Pre-fetch all Jellyfin audio items once — shared across all users
         audio_index = _fetch_all_jellyfin_audio(client, user_id)
         append_task_log(session, None, f"Playlist sync: fetched {len(audio_index)} Jellyfin audio items for matching")
 
-        # Sync the Favorites playlist against Jellyfin's native IsFavorite flag (not a playlist)
-        append_task_log(session, None, "Playlist sync: loading Favorites playlist from DB")
-        favorites_playlist = session.scalar(
-            select(Playlist)
-            .where(Playlist.protected.is_(True))
-            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
-        )
-        if not favorites_playlist:
-            favorites_playlist = ensure_favorites_playlist(session)
-        append_task_log(session, None, f"Playlist sync: syncing Favorites ({len(list(favorites_playlist.tracks))} local tracks)")
-        fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, audio_index)
-        append_task_log(session, None, f"Playlist sync: Favorites done ({fav_changes} changes)")
-        pulled_tracks += fav_changes
-        synced_playlists += 1
+        for nudibranch_user in linked_users:
+            user_id = nudibranch_user.jellyfin_user_id
+            append_task_log(session, None, f"Playlist sync: syncing '{nudibranch_user.display_name}' (Jellyfin: {user_id})")
 
-        # Sync regular (non-protected) playlists — always bidirectional merge
-        append_task_log(session, None, "Playlist sync: fetching Jellyfin playlist list")
-        jellyfin_playlists = list_jellyfin_playlists(client, user_id)
-        # Import any Jellyfin playlists that don't exist locally yet
-        existing_playlists = list(session.scalars(select(Playlist).where(Playlist.protected.is_(False)).order_by(Playlist.name.asc())))
-        local_by_name = {playlist.name: playlist for playlist in existing_playlists}
-        # Protected playlists (e.g. Favorites) are synced separately — skip them if Jellyfin returns a playlist with the same name
-        protected_names = {favorites_playlist.name} if favorites_playlist else set()
-        for jellyfin_playlist in jellyfin_playlists.values():
-            name = jellyfin_playlist.get("Name")
-            if not name or name in local_by_name or name in protected_names:
-                continue
-            new_playlist = Playlist(name=name, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
-            session.add(new_playlist)
-            session.flush()
-            local_by_name[name] = new_playlist
-            existing_playlists.append(new_playlist)
-
-        regular_playlists = list(
-            session.scalars(
+            # Sync the Favorites playlist against Jellyfin's native IsFavorite flag (not a playlist)
+            append_task_log(session, None, "Playlist sync: loading Favorites playlist from DB")
+            favorites_playlist = session.scalar(
                 select(Playlist)
-                .where(Playlist.protected.is_(False))
+                .where(Playlist.protected.is_(True), Playlist.user_id == nudibranch_user.id)
                 .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
-                .order_by(Playlist.name.asc())
             )
-        )
+            if not favorites_playlist:
+                favorites_playlist = ensure_favorites_playlist(session, nudibranch_user.id)
+            append_task_log(session, None, f"Playlist sync: syncing Favorites ({len(list(favorites_playlist.tracks))} local tracks)")
+            fav_changes = _sync_jellyfin_favorites(session, client, user_id, favorites_playlist, audio_index)
+            append_task_log(session, None, f"Playlist sync: Favorites done ({fav_changes} changes)")
+            pulled_tracks += fav_changes
+            synced_playlists += 1
 
-        # Build ID-keyed lookup for name reconciliation
-        jellyfin_by_id = {v.get("Id"): v for v in jellyfin_playlists.values() if v.get("Id")}
-
-        append_task_log(session, None, f"Playlist sync: syncing {len(regular_playlists)} regular playlist(s)")
-        for playlist in regular_playlists:
-            append_task_log(session, None, f"Playlist sync: processing '{playlist.name}'")
-            jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
-            jellyfin_items: list[dict] = []
-            created_jellyfin_playlist = False
-            if jellyfin_playlist_id:
-                if playlist.jellyfin_playlist_id != jellyfin_playlist_id:
-                    playlist.jellyfin_playlist_id = jellyfin_playlist_id
-                try:
-                    jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
-                except JellyfinPlaylistMissing:
-                    append_task_log(session, None, f"Jellyfin playlist id for {playlist.name} was stale; resolving it again", "warning")
-                    if playlist.jellyfin_playlist_id == jellyfin_playlist_id:
-                        playlist.jellyfin_playlist_id = None
-                    refreshed_playlists = list_jellyfin_playlists(client, user_id)
-                    refreshed_id = (refreshed_playlists.get(playlist.name) or {}).get("Id")
-                    jellyfin_playlists.update(refreshed_playlists)
-                    if refreshed_id and refreshed_id != jellyfin_playlist_id:
-                        jellyfin_playlist_id = refreshed_id
-                        playlist.jellyfin_playlist_id = refreshed_id
-                        jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
-                    else:
-                        jellyfin_playlist_id = None
-            if not jellyfin_playlist_id:
-                created = create_jellyfin_playlist(client, user_id, playlist.name)
-                jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
-                playlist.jellyfin_playlist_id = jellyfin_playlist_id
+            # Sync regular (non-protected) playlists — always bidirectional merge
+            append_task_log(session, None, "Playlist sync: fetching Jellyfin playlist list")
+            jellyfin_playlists = list_jellyfin_playlists(client, user_id)
+            # Import any Jellyfin playlists that don't exist locally yet
+            existing_playlists = list(session.scalars(select(Playlist).where(Playlist.protected.is_(False), Playlist.user_id == nudibranch_user.id).order_by(Playlist.name.asc())))
+            local_by_name = {playlist.name: playlist for playlist in existing_playlists}
+            # Protected playlists (e.g. Favorites) are synced separately
+            protected_names = {favorites_playlist.name} if favorites_playlist else set()
+            for jellyfin_playlist in jellyfin_playlists.values():
+                name = jellyfin_playlist.get("Name")
+                if not name or name in local_by_name or name in protected_names:
+                    continue
+                new_playlist = Playlist(name=name, user_id=nudibranch_user.id, jellyfin_playlist_id=jellyfin_playlist.get("Id"))
+                session.add(new_playlist)
                 session.flush()
-                jellyfin_items = []
-                created_jellyfin_playlist = True
+                local_by_name[name] = new_playlist
+                existing_playlists.append(new_playlist)
 
-            # Name reconciliation: keep both sides in sync
-            jellyfin_meta = jellyfin_by_id.get(jellyfin_playlist_id) if not created_jellyfin_playlist else None
-            if jellyfin_meta:
-                jellyfin_name = jellyfin_meta.get("Name") or ""
-                if jellyfin_name and jellyfin_name != playlist.name:
-                    # Nudibranch name wins — push Nudibranch name to Jellyfin
+            regular_playlists = list(
+                session.scalars(
+                    select(Playlist)
+                    .where(Playlist.protected.is_(False), Playlist.user_id == nudibranch_user.id)
+                    .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+                    .order_by(Playlist.name.asc())
+                )
+            )
+
+            # Build ID-keyed lookup for name reconciliation
+            jellyfin_by_id = {v.get("Id"): v for v in jellyfin_playlists.values() if v.get("Id")}
+
+            append_task_log(session, None, f"Playlist sync: syncing {len(regular_playlists)} regular playlist(s) for '{nudibranch_user.display_name}'")
+            for playlist in regular_playlists:
+                append_task_log(session, None, f"Playlist sync: processing '{playlist.name}'")
+                jellyfin_playlist_id = playlist.jellyfin_playlist_id or (jellyfin_playlists.get(playlist.name) or {}).get("Id")
+                jellyfin_items: list[dict] = []
+                created_jellyfin_playlist = False
+                if jellyfin_playlist_id:
+                    if playlist.jellyfin_playlist_id != jellyfin_playlist_id:
+                        playlist.jellyfin_playlist_id = jellyfin_playlist_id
                     try:
-                        update_resp = client.post(
-                            f"/Playlists/{jellyfin_playlist_id}",
-                            json={"Name": playlist.name, "Ids": [], "UserId": user_id},
-                        )
-                        if update_resp.is_success:
-                            append_task_log(session, None, f"Playlist sync: renamed Jellyfin playlist '{jellyfin_name}' → '{playlist.name}'")
-                            # update in-memory lookup so the old name doesn't cause re-import
-                            if jellyfin_name in jellyfin_playlists:
-                                del jellyfin_playlists[jellyfin_name]
-                            jellyfin_playlists[playlist.name] = dict(jellyfin_meta, Name=playlist.name)
-                            jellyfin_by_id[jellyfin_playlist_id] = jellyfin_playlists[playlist.name]
+                        jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
+                    except JellyfinPlaylistMissing:
+                        append_task_log(session, None, f"Jellyfin playlist id for {playlist.name} was stale; resolving it again", "warning")
+                        if playlist.jellyfin_playlist_id == jellyfin_playlist_id:
+                            playlist.jellyfin_playlist_id = None
+                        refreshed_playlists = list_jellyfin_playlists(client, user_id)
+                        refreshed_id = (refreshed_playlists.get(playlist.name) or {}).get("Id")
+                        jellyfin_playlists.update(refreshed_playlists)
+                        if refreshed_id and refreshed_id != jellyfin_playlist_id:
+                            jellyfin_playlist_id = refreshed_id
+                            playlist.jellyfin_playlist_id = refreshed_id
+                            jellyfin_items = jellyfin_playlist_items(client, user_id, jellyfin_playlist_id)
                         else:
-                            # Jellyfin rename failed — accept Jellyfin's name in Nudibranch instead
-                            append_task_log(session, None, f"Playlist sync: renamed Nudibranch playlist '{playlist.name}' → '{jellyfin_name}' (Jellyfin rename failed, accepted Jellyfin name)")
-                            playlist.name = jellyfin_name
-                    except Exception as rename_error:
-                        append_task_log(session, None, f"Playlist sync: name reconciliation error for '{playlist.name}': {rename_error}", "warning")
-
-            # Build the current Nudibranch set by Jellyfin audio ID
-            local_item_ids: list[str] = []
-            unmapped_local_tracks: list[str] = []
-            local_nudibranch_track_ids: set[str] = set()
-            for entry in sorted(playlist.tracks, key=lambda e: (e.position, e.created_at.replace(tzinfo=None) if e.created_at else datetime.min)):
-                item_id = _find_in_audio_index(audio_index, entry.track)
-                if item_id:
-                    local_item_ids.append(item_id)
-                else:
-                    unmapped_local_tracks.append(entry.track.title)
-                    append_task_log(session, None, f"{playlist.name}: could not find Jellyfin audio item for {entry.track.title}", "warning")
-                local_nudibranch_track_ids.add(str(entry.track_id))
-
-            # Pull: add any Jellyfin-only tracks into Nudibranch (merge — no removals from Nudibranch)
-            if not created_jellyfin_playlist:
-                local_item_id_set = set(local_item_ids)
-                for item in jellyfin_items:
-                    item_id = item.get("Id")
-                    if item_id and item_id in local_item_id_set:
-                        continue  # already mapped in Nudibranch
-                    track = find_local_track_for_jellyfin_item(session, item)
-                    if not track:
-                        continue
-                    if str(track.id) in local_nudibranch_track_ids:
-                        continue  # already in Nudibranch by track ID (audio match just failed)
-                    new_entry = PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=len(local_item_ids) + 1)
-                    session.add(new_entry)
-                    local_nudibranch_track_ids.add(str(track.id))
-                    if item_id:
-                        local_item_ids.append(item_id)
-                        local_item_id_set.add(item_id)
-                    pulled_tracks += 1
-                    append_task_log(session, None, f"{playlist.name}: pulled '{item.get('Name') or track.title}' from Jellyfin")
-
-            # Push: replace Jellyfin playlist with the updated Nudibranch state
-            jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
-            if unmapped_local_tracks:
-                append_task_log(session, None, f"{playlist.name}: skipped Jellyfin push because {len(unmapped_local_tracks)} track(s) are not visible in Jellyfin yet", "warning")
-            elif local_item_ids and local_item_ids != jellyfin_item_ids:
-                try:
-                    pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
-                except JellyfinPlaylistMissing:
-                    append_task_log(session, None, f"Jellyfin playlist {playlist.name} is not accessible; recreating it under the configured user", "warning")
-                    playlist.jellyfin_playlist_id = None
+                            jellyfin_playlist_id = None
+                if not jellyfin_playlist_id:
                     created = create_jellyfin_playlist(client, user_id, playlist.name)
                     jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
                     playlist.jellyfin_playlist_id = jellyfin_playlist_id
                     session.flush()
-                    pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
-            synced_playlists += 1
+                    jellyfin_items = []
+                    created_jellyfin_playlist = True
+
+                # Name reconciliation: keep both sides in sync
+                jellyfin_meta = jellyfin_by_id.get(jellyfin_playlist_id) if not created_jellyfin_playlist else None
+                if jellyfin_meta:
+                    jellyfin_name = jellyfin_meta.get("Name") or ""
+                    if jellyfin_name and jellyfin_name != playlist.name:
+                        try:
+                            update_resp = client.post(
+                                f"/Playlists/{jellyfin_playlist_id}",
+                                json={"Name": playlist.name, "Ids": [], "UserId": user_id},
+                            )
+                            if update_resp.is_success:
+                                append_task_log(session, None, f"Playlist sync: renamed Jellyfin playlist '{jellyfin_name}' → '{playlist.name}'")
+                                if jellyfin_name in jellyfin_playlists:
+                                    del jellyfin_playlists[jellyfin_name]
+                                jellyfin_playlists[playlist.name] = dict(jellyfin_meta, Name=playlist.name)
+                                jellyfin_by_id[jellyfin_playlist_id] = jellyfin_playlists[playlist.name]
+                            else:
+                                append_task_log(session, None, f"Playlist sync: renamed Nudibranch playlist '{playlist.name}' → '{jellyfin_name}' (Jellyfin rename failed)")
+                                playlist.name = jellyfin_name
+                        except Exception as rename_error:
+                            append_task_log(session, None, f"Playlist sync: name reconciliation error for '{playlist.name}': {rename_error}", "warning")
+
+                # Build the current Nudibranch set by Jellyfin audio ID
+                local_item_ids: list[str] = []
+                unmapped_local_tracks: list[str] = []
+                local_nudibranch_track_ids: set[str] = set()
+                for entry in sorted(playlist.tracks, key=lambda e: (e.position, e.created_at.replace(tzinfo=None) if e.created_at else datetime.min)):
+                    item_id = _find_in_audio_index(audio_index, entry.track)
+                    if item_id:
+                        local_item_ids.append(item_id)
+                    else:
+                        unmapped_local_tracks.append(entry.track.title)
+                        append_task_log(session, None, f"{playlist.name}: could not find Jellyfin audio item for {entry.track.title}", "warning")
+                    local_nudibranch_track_ids.add(str(entry.track_id))
+
+                # Pull: add any Jellyfin-only tracks into Nudibranch (merge — no removals)
+                if not created_jellyfin_playlist:
+                    local_item_id_set = set(local_item_ids)
+                    for item in jellyfin_items:
+                        item_id = item.get("Id")
+                        if item_id and item_id in local_item_id_set:
+                            continue
+                        track = find_local_track_for_jellyfin_item(session, item)
+                        if not track:
+                            continue
+                        if str(track.id) in local_nudibranch_track_ids:
+                            continue
+                        new_entry = PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=len(local_item_ids) + 1)
+                        session.add(new_entry)
+                        local_nudibranch_track_ids.add(str(track.id))
+                        if item_id:
+                            local_item_ids.append(item_id)
+                            local_item_id_set.add(item_id)
+                        pulled_tracks += 1
+                        append_task_log(session, None, f"{playlist.name}: pulled '{item.get('Name') or track.title}' from Jellyfin")
+
+                # Push: replace Jellyfin playlist with the updated Nudibranch state
+                jellyfin_item_ids = [item.get("Id") for item in jellyfin_items if item.get("Id")]
+                if unmapped_local_tracks:
+                    append_task_log(session, None, f"{playlist.name}: skipped Jellyfin push because {len(unmapped_local_tracks)} track(s) are not visible in Jellyfin yet", "warning")
+                elif local_item_ids and local_item_ids != jellyfin_item_ids:
+                    try:
+                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, jellyfin_items, local_item_ids)
+                    except JellyfinPlaylistMissing:
+                        append_task_log(session, None, f"Jellyfin playlist {playlist.name} is not accessible; recreating it", "warning")
+                        playlist.jellyfin_playlist_id = None
+                        created = create_jellyfin_playlist(client, user_id, playlist.name)
+                        jellyfin_playlist_id = jellyfin_playlist_id_from_response(created)
+                        playlist.jellyfin_playlist_id = jellyfin_playlist_id
+                        session.flush()
+                        pushed_tracks += replace_jellyfin_playlist_items(client, user_id, jellyfin_playlist_id, [], local_item_ids)
+                synced_playlists += 1
     session.commit()
     create_notification(
         session,
@@ -5965,15 +5964,15 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
     return None
 
 
-def ensure_favorites_playlist(session: Session) -> Playlist:
-    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)))
+def ensure_favorites_playlist(session: Session, user_id: str) -> Playlist:
+    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True), Playlist.user_id == user_id))
     if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites", Playlist.user_id == user_id))
     if not playlist:
-        playlist = Playlist(name="Favorites", protected=True)
+        playlist = Playlist(name="Favorites", protected=True, user_id=user_id)
         session.add(playlist)
         session.flush()
-    if not playlist.protected:
+    elif not playlist.protected:
         playlist.protected = True
         session.flush()
     return playlist

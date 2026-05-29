@@ -4496,6 +4496,50 @@ function SettingsPanel({
             </button>
           </div>
         </section>
+        <section className="settings-section">
+          <h2>Jellyfin account</h2>
+          <p className="settings-hint">Link your Jellyfin user account so playlists and favorites sync to you personally.</p>
+          <label className="setting-row integration-row">
+            <span>Jellyfin user</span>
+            <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+              <select
+                value={user?.jellyfin_user_id || ""}
+                onChange={async (event) => {
+                  const newId = event.target.value || null;
+                  try {
+                    const updated = await api("/me/jellyfin-user", { method: "PUT", body: JSON.stringify({ jellyfin_user_id: newId }) });
+                    setUser(updated);
+                  } catch (err) {
+                    alert(`Failed to save: ${err.message}`);
+                  }
+                }}
+              >
+                <option value="">Not linked</option>
+                {(jellyfinUsers || (user?.jellyfin_user_id ? [{ id: user.jellyfin_user_id, name: user.jellyfin_user_id }] : [])).map((u) => (
+                  <option key={u.id} value={u.id}>{u.name}</option>
+                ))}
+              </select>
+              <button
+                className="secondary compact"
+                type="button"
+                disabled={jellyfinUsersLoading}
+                onClick={async () => {
+                  setJellyfinUsersLoading(true);
+                  try {
+                    const data = await api("/settings/jellyfin-users");
+                    setJellyfinUsers(data);
+                  } catch {
+                    setJellyfinUsers([]);
+                  } finally {
+                    setJellyfinUsersLoading(false);
+                  }
+                }}
+              >
+                {jellyfinUsersLoading ? "…" : "Load users"}
+              </button>
+            </div>
+          </label>
+        </section>
       )}
       {canManageSettings(user) && (
         <section className="settings-section">
@@ -4503,7 +4547,6 @@ function SettingsPanel({
           {[
             ["jellyfin_url", "Jellyfin URL"],
             ["jellyfin_api_key", "Jellyfin API key"],
-            ["jellyfin_user_id", "Jellyfin user"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
@@ -4514,40 +4557,7 @@ function SettingsPanel({
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
-              {key === "jellyfin_user_id" ? (
-                <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-                  <select
-                    value={integrationDraft[key] || ""}
-                    onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
-                  >
-                    <option value="">Auto (first user)</option>
-                    {(jellyfinUsers || []).map((u) => (
-                      <option key={u.id} value={u.id}>{u.name}</option>
-                    ))}
-                    {integrationDraft[key] && !(jellyfinUsers || []).some((u) => u.id === integrationDraft[key]) && (
-                      <option value={integrationDraft[key]}>{integrationDraft[key]}</option>
-                    )}
-                  </select>
-                  <button
-                    className="secondary compact"
-                    type="button"
-                    disabled={jellyfinUsersLoading}
-                    onClick={async () => {
-                      setJellyfinUsersLoading(true);
-                      try {
-                        const data = await api("/settings/jellyfin-users");
-                        setJellyfinUsers(data);
-                      } catch {
-                        setJellyfinUsers([]);
-                      } finally {
-                        setJellyfinUsersLoading(false);
-                      }
-                    }}
-                  >
-                    {jellyfinUsersLoading ? "…" : "Load users"}
-                  </button>
-                </div>
-              ) : key === "youtube_cookies_browser" ? (
+              {key === "youtube_cookies_browser" ? (
                 <select
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}

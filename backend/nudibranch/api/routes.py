@@ -47,6 +47,7 @@ from nudibranch.api.schemas import (
     TaskOut,
     UserCreate,
     UserAppearanceUpdate,
+    JellyfinUserLinkUpdate,
     UserOut,
     UserPinUpdate,
     UserUpdate,
@@ -210,6 +211,18 @@ def update_own_pin(
     user.pin_hash = hash_secret(payload.pin)
     session.commit()
     return serialize_user(load_user(session, user.id))
+
+
+@router.put("/me/jellyfin-user", response_model=UserOut, tags=["users"], summary="Link or unlink a Jellyfin user account for playlist sync")
+def update_own_jellyfin_user(
+    payload: JellyfinUserLinkUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> UserOut:
+    user.jellyfin_user_id = payload.jellyfin_user_id or None
+    session.commit()
+    session.refresh(user)
+    return serialize_user(user)
 
 
 @router.put("/me/appearance", response_model=UserOut, tags=["users"], summary="Update appearance settings")
@@ -1119,9 +1132,9 @@ def propose_wishlist_items(
 @router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"], summary="Get the Favorites playlist")
 def favorites_playlist(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
-    playlist = get_or_create_favorites(session)
+    playlist = get_or_create_favorites(session, user.id)
     session.commit()
     session.refresh(playlist)
     return serialize_favorites(session, playlist)
@@ -1130,11 +1143,11 @@ def favorites_playlist(
 @router.get("/playlists", response_model=list[FavoritesOut], tags=["playlists"], summary="List all playlists")
 def list_playlists(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> list[FavoritesOut]:
-    get_or_create_favorites(session)
+    get_or_create_favorites(session, user.id)
     session.commit()
-    playlists = list(session.scalars(select(Playlist).order_by(Playlist.name.asc())))
+    playlists = list(session.scalars(select(Playlist).where(Playlist.user_id == user.id).order_by(Playlist.name.asc())))
     return [serialize_favorites(session, playlist) for playlist in playlists]
 
 
@@ -1142,15 +1155,15 @@ def list_playlists(
 def create_playlist(
     payload: PlaylistCreate,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
-    existing = session.scalar(select(Playlist).where(Playlist.name == name))
+    existing = session.scalar(select(Playlist).where(Playlist.name == name, Playlist.user_id == user.id))
     if existing:
         return serialize_favorites(session, existing)
-    playlist = Playlist(name=name)
+    playlist = Playlist(name=name, user_id=user.id)
     session.add(playlist)
     session.commit()
     session.refresh(playlist)
@@ -1229,9 +1242,9 @@ def add_playlist_tracks(
     playlist_id: str,
     payload: PlaylistAddTracks,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
-    playlist = session.get(Playlist, playlist_id)
+    playlist = session.scalar(select(Playlist).where(Playlist.id == playlist_id, Playlist.user_id == user.id))
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     existing_track_ids = {entry.track_id for entry in playlist.tracks}
@@ -1253,9 +1266,9 @@ def remove_playlist_track(
     playlist_id: str,
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
-    playlist = session.get(Playlist, playlist_id)
+    playlist = session.scalar(select(Playlist).where(Playlist.id == playlist_id, Playlist.user_id == user.id))
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     items = list(
@@ -1275,12 +1288,12 @@ def remove_playlist_track(
 def add_favorite_track(
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
     track = session.get(Track, track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
-    playlist = get_or_create_favorites(session)
+    playlist = get_or_create_favorites(session, user.id)
     if not any(entry.track_id == track_id for entry in playlist.tracks):
         session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=len(playlist.tracks) + 1))
         session.commit()
@@ -1293,9 +1306,9 @@ def add_favorite_track(
 def remove_favorite_track(
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> FavoritesOut:
-    playlist = get_or_create_favorites(session)
+    playlist = get_or_create_favorites(session, user.id)
     items = list(
         session.scalars(
             select(PlaylistTrack).where(PlaylistTrack.playlist_id == playlist.id, PlaylistTrack.track_id == track_id)
@@ -1321,9 +1334,9 @@ def propose_favorite_position(
     entry_id: str,
     payload: PlaylistPositionProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> ProposalBatchOut:
-    playlist = get_or_create_favorites(session)
+    playlist = get_or_create_favorites(session, user.id)
     entry = session.scalar(
         select(PlaylistTrack)
         .where(PlaylistTrack.id == entry_id, PlaylistTrack.playlist_id == playlist.id)
@@ -1926,15 +1939,15 @@ def remove_action_title(action: str) -> str:
     return "Delete" if action == "delete" else "Move to import"
 
 
-def get_or_create_favorites(session: Session) -> Playlist:
-    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True)))
+def get_or_create_favorites(session: Session, user_id: str) -> Playlist:
+    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True), Playlist.user_id == user_id))
     if not playlist:
-        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites"))
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites", Playlist.user_id == user_id))
     if not playlist:
-        playlist = Playlist(name="Favorites", protected=True)
+        playlist = Playlist(name="Favorites", protected=True, user_id=user_id)
         session.add(playlist)
         session.flush()
-    if not playlist.protected:
+    elif not playlist.protected:
         playlist.protected = True
         session.flush()
     return playlist
@@ -2009,6 +2022,7 @@ def serialize_user(user: User) -> UserOut:
         theme=user.theme if user.theme in {"light", "dark"} else "light",
         accent_color=user.accent_color or "#356df3",
         background_tint=user.background_tint or "#356df3",
+        jellyfin_user_id=user.jellyfin_user_id or None,
     )
 
 

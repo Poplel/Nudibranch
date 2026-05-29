@@ -7,7 +7,6 @@ from nudibranch.db.models import AppSetting
 INTEGRATION_KEYS = {
     "jellyfin_url",
     "jellyfin_api_key",
-    "jellyfin_user_id",
     "slskd_url",
     "slskd_api_key",
     "slskd_album_match_threshold",
@@ -23,7 +22,6 @@ def integration_settings(session: Session) -> dict[str, str]:
     values = {
         "jellyfin_url": settings.jellyfin_url,
         "jellyfin_api_key": settings.jellyfin_api_key,
-        "jellyfin_user_id": "",
         "slskd_url": settings.slskd_url,
         "slskd_api_key": settings.slskd_api_key,
         "slskd_album_match_threshold": "72",

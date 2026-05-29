@@ -84,6 +84,7 @@ class User(Base):
     theme: Mapped[str] = mapped_column(String(16), default="light", nullable=False)
     accent_color: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
     background_tint: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
+    jellyfin_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     permissions: Mapped[list["UserPermission"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -189,13 +190,16 @@ class WishlistItem(Base):
 
 class Playlist(Base):
     __tablename__ = "playlists"
-    __table_args__ = (UniqueConstraint("name"),)
+    __table_args__ = (UniqueConstraint("user_id", "name"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     protected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     jellyfin_playlist_id: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    user: Mapped["User | None"] = relationship()
 
     tracks: Mapped[list["PlaylistTrack"]] = relationship(back_populates="playlist", cascade="all, delete-orphan")
 
