@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     wishlist_scan_cron: str = Field("0 */6 * * *", alias="WISHLIST_SCAN_CRON")
     trash_retention_days: int = Field(30, alias="TRASH_RETENTION_DAYS")
 
+    spotify_client_id: str = Field("", alias="SPOTIFY_CLIENT_ID")
+    spotify_client_secret: str = Field("", alias="SPOTIFY_CLIENT_SECRET")
+
     apns_enabled: bool = Field(False, alias="APNS_ENABLED")
     apns_use_sandbox: bool = Field(True, alias="APNS_USE_SANDBOX")
     apns_team_id: str = Field("", alias="APNS_TEAM_ID")

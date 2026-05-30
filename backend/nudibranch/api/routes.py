@@ -868,6 +868,72 @@ def import_playlist_url(
     return _scrape_playlist_url(payload.url)
 
 
+def _spotify_api_fetch(playlist_id: str) -> dict | None:
+    """Fetch playlist via Spotify Web API. Returns None when credentials are not configured."""
+    import base64 as _base64
+
+    settings = get_settings()
+    if not settings.spotify_client_id or not settings.spotify_client_secret:
+        return None
+
+    creds = _base64.b64encode(
+        f"{settings.spotify_client_id}:{settings.spotify_client_secret}".encode()
+    ).decode()
+    try:
+        token_resp = httpx.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {creds}"},
+            data={"grant_type": "client_credentials"},
+            timeout=10,
+        )
+        token_resp.raise_for_status()
+        access_token = token_resp.json()["access_token"]
+    except (httpx.HTTPError, KeyError) as exc:
+        write_app_log(f"Spotify token error: {exc}", level="warning")
+        return None
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        resp = httpx.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}",
+            headers=headers,
+            params={"limit": 100},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        write_app_log(f"Spotify API error: {exc}", level="warning", playlist_id=playlist_id)
+        return None
+
+    data = resp.json()
+    playlist_name: str | None = data.get("name")
+    tracks: list[dict] = []
+
+    tracks_page = data.get("tracks", {})
+    while True:
+        for item in tracks_page.get("items", []):
+            track = item.get("track") if item else None
+            if not track or track.get("type") != "track":
+                continue
+            title = track.get("name") or ""
+            artists = track.get("artists") or []
+            artist = artists[0].get("name", "") if artists else ""
+            album = (track.get("album") or {}).get("name") or None
+            if title:
+                tracks.append({"title": title, "artist": artist, "album": album})
+        next_url = tracks_page.get("next")
+        if not next_url:
+            break
+        try:
+            page_resp = httpx.get(next_url, headers=headers, timeout=15)
+            page_resp.raise_for_status()
+            tracks_page = page_resp.json()
+        except httpx.HTTPError:
+            break
+
+    return {"name": playlist_name, "tracks": tracks}
+
+
 def _scrape_playlist_url(url: str) -> dict:
     import json as _json
     import re as _re
@@ -880,13 +946,21 @@ def _scrape_playlist_url(url: str) -> dict:
     else:
         raise HTTPException(status_code=400, detail="URL must be a Spotify (open.spotify.com/playlist/…) or Apple Music (music.apple.com/…/playlist/…) playlist link.")
 
-    fetch_url = url
     if source == "Spotify":
-        # Embed URL is simpler HTML and more reliably server-rendered
-        import re as _re2
-        m = _re2.search(r"playlist/([A-Za-z0-9]+)", url)
+        m = _re.search(r"playlist/([A-Za-z0-9]+)", url)
+        if m:
+            api_result = _spotify_api_fetch(m.group(1))
+            if api_result is not None:
+                if not api_result["tracks"]:
+                    raise HTTPException(status_code=422, detail="Could not extract any tracks from this Spotify URL. Make sure the playlist is public and the link points directly to a playlist.")
+                return {"source": source, "name": api_result["name"], "tracks": api_result["tracks"], "count": len(api_result["tracks"])}
+
+        # Fall back to scraping the embed page
+        fetch_url = url
         if m:
             fetch_url = f"https://open.spotify.com/embed/playlist/{m.group(1)}"
+    else:
+        fetch_url = url
 
     try:
         resp = httpx.get(fetch_url, headers={
@@ -909,19 +983,14 @@ def _scrape_playlist_url(url: str) -> dict:
     playlist_name: str | None = None
 
     if source == "Spotify":
-        m = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, _re.DOTALL)
-        if m:
+        m2 = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, _re.DOTALL)
+        if m2:
             try:
-                data = _json.loads(m.group(1))
-                # Try new (2024+) Spotify path
+                data = _json.loads(m2.group(1))
+                # Try 2024+ path
                 content_items = (
-                    data.get("props", {})
-                    .get("pageProps", {})
-                    .get("state", {})
-                    .get("data", {})
-                    .get("playlist", {})
-                    .get("content", {})
-                    .get("items", [])
+                    data.get("props", {}).get("pageProps", {}).get("state", {})
+                    .get("data", {}).get("playlist", {}).get("content", {}).get("items", [])
                 )
                 for item in content_items:
                     entry = (item.get("itemV2") or {}).get("data") or {}
@@ -936,11 +1005,8 @@ def _scrape_playlist_url(url: str) -> dict:
                 if not tracks:
                     # Try legacy path
                     track_list = (
-                        data.get("props", {})
-                        .get("pageProps", {})
-                        .get("serverSideData", {})
-                        .get("playlist", {})
-                        .get("trackList", [])
+                        data.get("props", {}).get("pageProps", {}).get("serverSideData", {})
+                        .get("playlist", {}).get("trackList", [])
                     )
                     for item in track_list:
                         meta = item.get("trackMetadata") or {}
@@ -949,7 +1015,6 @@ def _scrape_playlist_url(url: str) -> dict:
                         album = meta.get("albumName") or None
                         if title:
                             tracks.append({"title": title, "artist": artist, "album": album})
-                # Extract playlist name
                 playlist_name = (
                     data.get("props", {}).get("pageProps", {}).get("state", {})
                     .get("data", {}).get("playlist", {}).get("name")
@@ -960,9 +1025,9 @@ def _scrape_playlist_url(url: str) -> dict:
                 write_app_log(f"Spotify playlist parse error: {exc}", level="warning", url=url)
 
     elif source == "Apple Music":
-        for m in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
+        for m2 in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
             try:
-                data = _json.loads(m.group(1))
+                data = _json.loads(m2.group(1))
                 if data.get("@type") in ("MusicPlaylist", "ItemList"):
                     playlist_name = data.get("name") or None
                     items = data.get("track") or data.get("itemListElement") or []
