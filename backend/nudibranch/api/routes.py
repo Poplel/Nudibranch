@@ -1997,10 +1997,37 @@ def register_device(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict:
+    existing = session.scalar(
+        select(MobileDevice).where(
+            MobileDevice.user_id == user.id,
+            MobileDevice.apns_token == payload.apns_token,
+        )
+    )
+    if existing:
+        existing.device_name = payload.device_name
+        existing.enabled = True
+        session.commit()
+        return {"device_id": existing.id, "enabled": existing.enabled}
     device = MobileDevice(user_id=user.id, device_name=payload.device_name, apns_token=payload.apns_token)
     session.add(device)
     session.commit()
     return {"device_id": device.id, "enabled": device.enabled}
+
+
+@router.delete("/notifications/devices/{device_id}", tags=["notifications"], summary="Deregister push notification device", response_model=dict)
+def deregister_device(
+    device_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    device = session.scalar(
+        select(MobileDevice).where(MobileDevice.id == device_id, MobileDevice.user_id == user.id)
+    )
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    session.delete(device)
+    session.commit()
+    return {"ok": True}
 
 
 @router.post("/notifications/read", tags=["notifications"], summary="Mark notifications as read", response_model=list[NotificationOut])
