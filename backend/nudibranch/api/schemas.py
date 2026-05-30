@@ -278,6 +278,25 @@ class AlbumLookupRequest(BaseModel):
     release_id: str | None = None
 
 
+class PlaylistTrackItem(BaseModel):
+    title: str
+    artist: str
+    album: str | None = None
+
+
+class PlaylistImportResponse(BaseModel):
+    source: str
+    name: str | None = None
+    tracks: list[PlaylistTrackItem]
+    count: int
+
+
+class PlaylistSyncStatsOut(BaseModel):
+    last_run_at: str | None = None
+    run_count: int = 0
+    started_at: str | None = None
+
+
 class PlaylistImportRequest(BaseModel):
     url: str
 

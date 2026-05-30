@@ -289,8 +289,8 @@ function App() {
     let cancelled = false;
     async function fetchMappingStats() {
       try {
-        const data = await fetch(`${API_BASE}/playlists/sync/stats`, { headers: { Authorization: `Bearer ${token}` } });
-        if (data.ok && !cancelled) setMappingSyncStats(await data.json());
+        const data = await api("/playlists/sync/stats");
+        if (!cancelled) setMappingSyncStats(data);
       } catch { /* ignore */ }
     }
     fetchMappingStats();

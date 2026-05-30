@@ -248,6 +248,10 @@ def add_download_candidate_review_items(
         artist = request.get("artist") or "Unknown Artist"
         album = request.get("album") or "Unknown Album"
         title = request.get("track") or request.get("title") or "Unknown Track"
+        existing = find_library_track(session, artist, album, title)
+        if existing:
+            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping", "info")
+            continue
         artist_item = artist_items.get(artist)
         if not artist_item:
             artist_item = ProposalItem(
@@ -272,10 +276,6 @@ def add_download_candidate_review_items(
             session.add(album_item)
             session.flush()
             album_items[album_key] = album_item
-        existing = find_library_track(session, artist, album, title)
-        if existing:
-            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping", "info")
-            continue
         track_item = ProposalItem(
             batch_id=batch.id,
             parent_id=album_item.id,
@@ -4834,6 +4834,9 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     return {"mapped": newly_mapped, "total": total_tracks}
 
 
+_PENDING_PLAYLIST_MAX_RETRIES = 8
+
+
 def _try_create_pending_playlists(session: Session) -> None:
     """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
     pending_settings = list(session.scalars(
@@ -4848,13 +4851,6 @@ def _try_create_pending_playlists(session: Session) -> None:
     if not jellyfin_url or not jellyfin_api_key:
         return
 
-    linked_users = list(session.scalars(
-        select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != "")
-    ))
-    if not linked_users:
-        return
-    jf_user_id = linked_users[0].jellyfin_user_id
-
     headers = {"X-Emby-Token": jellyfin_api_key}
     for setting in pending_settings:
         try:
@@ -4864,6 +4860,8 @@ def _try_create_pending_playlists(session: Session) -> None:
             continue
         playlist_name = data.get("playlist_name") or ""
         original_tracks = data.get("original_tracks") or []
+        stored_user_id = data.get("user_id")
+        retry_count = int(data.get("retry_count", 0))
         if not playlist_name or not original_tracks:
             session.delete(setting)
             continue
@@ -4890,8 +4888,31 @@ def _try_create_pending_playlists(session: Session) -> None:
                 jf_ids.append(track.jellyfin_item_id)
 
         if not jf_ids:
-            write_app_log(f"Pending playlist '{playlist_name}': no tracks mapped yet; will retry next sync", level="info")
-            continue  # leave the setting, try again on next mapping run
+            retry_count += 1
+            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
+                write_app_log(f"Pending playlist '{playlist_name}': giving up after {retry_count} retries with no tracks mapped", level="warning")
+                if stored_user_id:
+                    create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created in Jellyfin — no imported tracks were found after several sync attempts.", event_type="playlist_import_failed")
+                session.delete(setting)
+            else:
+                write_app_log(f"Pending playlist '{playlist_name}': no tracks mapped yet (attempt {retry_count}/{_PENDING_PLAYLIST_MAX_RETRIES}); will retry next sync", level="info")
+                data["retry_count"] = retry_count
+                setting.value = json.dumps(data)
+            continue
+
+        # Find the Jellyfin user ID: prefer the user who initiated the import
+        jf_user_id = None
+        if stored_user_id:
+            initiating_user = session.scalar(select(User).where(User.id == stored_user_id))
+            if initiating_user and initiating_user.jellyfin_user_id:
+                jf_user_id = initiating_user.jellyfin_user_id
+        if not jf_user_id:
+            fallback = session.scalar(select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != ""))
+            if fallback:
+                jf_user_id = fallback.jellyfin_user_id
+        if not jf_user_id:
+            write_app_log(f"Pending playlist '{playlist_name}': no linked Jellyfin user found; skipping", level="warning")
+            continue
 
         try:
             with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
@@ -4903,6 +4924,8 @@ def _try_create_pending_playlists(session: Session) -> None:
                 })
                 resp.raise_for_status()
             write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(jf_ids)} track(s)")
+            if stored_user_id:
+                create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library with {len(jf_ids)} track(s).", event_type="playlist_import_done")
         except Exception as error:  # noqa: BLE001
             write_app_log(f"Failed to create Jellyfin playlist '{playlist_name}': {error}", level="warning")
             continue

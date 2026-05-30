@@ -37,6 +37,8 @@ from nudibranch.api.schemas import (
     PlayerStateUpdate,
     PlaylistTrackOut,
     PlaylistImportRequest,
+    PlaylistImportResponse,
+    PlaylistSyncStatsOut,
     PlaylistUpdate,
     PermissionOut,
     ProposalBatchOut,
@@ -786,7 +788,7 @@ def scan_imports(
 def propose_import(
     payload: ImportScanRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.import_run)),
+    current_user: User = Depends(require_permission(Permission.import_run)),
 ) -> TaskOut:
     task = enqueue_task(
         session,
@@ -803,6 +805,8 @@ def propose_import(
         setting = AppSetting(key=pending_key, value=json.dumps({
             "playlist_name": payload.playlist_name,
             "original_tracks": payload.playlist_original_tracks,
+            "user_id": current_user.id,
+            "retry_count": 0,
         }))
         session.add(setting)
         session.commit()
@@ -855,7 +859,7 @@ def album_search(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
-@router.post("/imports/playlist-url", tags=["imports"], summary="Fetch track list from a public Spotify or Apple Music playlist URL")
+@router.post("/imports/playlist-url", response_model=PlaylistImportResponse, tags=["imports"], summary="Fetch track list from a public Spotify or Apple Music playlist URL")
 def import_playlist_url(
     payload: PlaylistImportRequest,
     user: User = Depends(get_current_user),
@@ -1497,7 +1501,7 @@ def sync_playlists(session: Session = Depends(get_session), _: User = Depends(re
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
 
-@router.get("/playlists/sync/stats", tags=["playlists"], summary="Track mapping job stats")
+@router.get("/playlists/sync/stats", response_model=PlaylistSyncStatsOut, tags=["playlists"], summary="Track mapping job stats")
 def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     last_run_at = session.get(AppSetting, "mapping_last_run_at")
     run_count = session.get(AppSetting, "mapping_run_count")
