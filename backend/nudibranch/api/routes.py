@@ -868,28 +868,55 @@ def import_playlist_url(
     return _scrape_playlist_url(payload.url)
 
 
-def _spotify_api_fetch(playlist_id: str) -> dict | None:
-    """Fetch playlist via Spotify Web API. Returns None when credentials are not configured."""
+def _spotify_get_token() -> str | None:
+    """
+    Returns a Spotify bearer token. Tries client credentials first (if configured),
+    then falls back to the anonymous token the web player uses for public content.
+    """
     import base64 as _base64
 
     settings = get_settings()
-    if not settings.spotify_client_id or not settings.spotify_client_secret:
+    if settings.spotify_client_id and settings.spotify_client_secret:
+        creds = _base64.b64encode(
+            f"{settings.spotify_client_id}:{settings.spotify_client_secret}".encode()
+        ).decode()
+        try:
+            token_resp = httpx.post(
+                "https://accounts.spotify.com/api/token",
+                headers={"Authorization": f"Basic {creds}"},
+                data={"grant_type": "client_credentials"},
+                timeout=10,
+            )
+            token_resp.raise_for_status()
+            return token_resp.json()["access_token"]
+        except (httpx.HTTPError, KeyError) as exc:
+            write_app_log(f"Spotify client-credentials token error: {exc}", level="warning")
+
+    # Anonymous token — same endpoint the Spotify web player hits for public content
+    try:
+        anon_resp = httpx.get(
+            "https://open.spotify.com/get_access_token",
+            params={"reason": "transport", "productType": "web_player"},
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://open.spotify.com/",
+            },
+            timeout=10,
+            follow_redirects=True,
+        )
+        anon_resp.raise_for_status()
+        return anon_resp.json().get("accessToken")
+    except (httpx.HTTPError, KeyError) as exc:
+        write_app_log(f"Spotify anonymous token error: {exc}", level="warning")
         return None
 
-    creds = _base64.b64encode(
-        f"{settings.spotify_client_id}:{settings.spotify_client_secret}".encode()
-    ).decode()
-    try:
-        token_resp = httpx.post(
-            "https://accounts.spotify.com/api/token",
-            headers={"Authorization": f"Basic {creds}"},
-            data={"grant_type": "client_credentials"},
-            timeout=10,
-        )
-        token_resp.raise_for_status()
-        access_token = token_resp.json()["access_token"]
-    except (httpx.HTTPError, KeyError) as exc:
-        write_app_log(f"Spotify token error: {exc}", level="warning")
+
+def _spotify_api_fetch(playlist_id: str) -> dict | None:
+    """Fetch playlist via Spotify Web API. Returns None on failure."""
+    access_token = _spotify_get_token()
+    if not access_token:
         return None
 
     headers = {"Authorization": f"Bearer {access_token}"}
