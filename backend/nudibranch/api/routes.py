@@ -797,6 +797,16 @@ def propose_import(
             "download_requests": payload.download_requests or [],
         },
     )
+    if payload.playlist_name and payload.playlist_original_tracks:
+        import uuid as _uuid
+        pending_key = f"pending_playlist:{_uuid.uuid4()}"
+        setting = AppSetting(key=pending_key, value=json.dumps({
+            "playlist_name": payload.playlist_name,
+            "original_tracks": payload.playlist_original_tracks,
+        }))
+        session.add(setting)
+        session.commit()
+        write_app_log(f"Playlist import: stored pending playlist '{payload.playlist_name}' ({len(payload.playlist_original_tracks)} original tracks)")
     return serialize_task(task)
 
 
@@ -866,48 +876,91 @@ def _scrape_playlist_url(url: str) -> dict:
     else:
         raise HTTPException(status_code=400, detail="URL must be a Spotify (open.spotify.com/playlist/…) or Apple Music (music.apple.com/…/playlist/…) playlist link.")
 
+    fetch_url = url
+    if source == "Spotify":
+        # Embed URL is simpler HTML and more reliably server-rendered
+        import re as _re2
+        m = _re2.search(r"playlist/([A-Za-z0-9]+)", url)
+        if m:
+            fetch_url = f"https://open.spotify.com/embed/playlist/{m.group(1)}"
+
     try:
-        resp = httpx.get(url, headers={
+        resp = httpx.get(fetch_url, headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }, timeout=20, follow_redirects=True)
         resp.raise_for_status()
     except httpx.HTTPStatusError as error:
-        raise HTTPException(status_code=502, detail=f"Could not fetch {source} playlist page: HTTP {error.response.status_code}") from error
+        detail = f"Could not fetch {source} playlist page: HTTP {error.response.status_code}"
+        write_app_log(detail, level="warning", url=url)
+        raise HTTPException(status_code=502, detail=detail) from error
     except httpx.RequestError as error:
-        raise HTTPException(status_code=502, detail=f"Could not reach {source}: network error") from error
+        detail = f"Could not reach {source}: network error"
+        write_app_log(detail, level="warning", url=url, error=str(error))
+        raise HTTPException(status_code=502, detail=detail) from error
 
     html = resp.text
     tracks: list[dict] = []
+    playlist_name: str | None = None
 
     if source == "Spotify":
         m = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, _re.DOTALL)
         if m:
             try:
                 data = _json.loads(m.group(1))
-                track_list = (
+                # Try new (2024+) Spotify path
+                content_items = (
                     data.get("props", {})
                     .get("pageProps", {})
-                    .get("serverSideData", {})
+                    .get("state", {})
+                    .get("data", {})
                     .get("playlist", {})
-                    .get("trackList", [])
+                    .get("content", {})
+                    .get("items", [])
                 )
-                for item in track_list:
-                    meta = item.get("trackMetadata") or {}
-                    title = meta.get("trackName") or ""
-                    artist = meta.get("artistName") or ""
-                    album = meta.get("albumName") or None
+                for item in content_items:
+                    entry = (item.get("itemV2") or {}).get("data") or {}
+                    if entry.get("__typename") != "Track":
+                        continue
+                    title = entry.get("name") or ""
+                    artist_items = (entry.get("artists") or {}).get("items") or []
+                    artist = artist_items[0].get("profile", {}).get("name", "") if artist_items else ""
+                    album = (entry.get("albumOfTrack") or {}).get("name") or None
                     if title:
                         tracks.append({"title": title, "artist": artist, "album": album})
-            except (_json.JSONDecodeError, AttributeError):
-                pass
+                if not tracks:
+                    # Try legacy path
+                    track_list = (
+                        data.get("props", {})
+                        .get("pageProps", {})
+                        .get("serverSideData", {})
+                        .get("playlist", {})
+                        .get("trackList", [])
+                    )
+                    for item in track_list:
+                        meta = item.get("trackMetadata") or {}
+                        title = meta.get("trackName") or ""
+                        artist = meta.get("artistName") or ""
+                        album = meta.get("albumName") or None
+                        if title:
+                            tracks.append({"title": title, "artist": artist, "album": album})
+                # Extract playlist name
+                playlist_name = (
+                    data.get("props", {}).get("pageProps", {}).get("state", {})
+                    .get("data", {}).get("playlist", {}).get("name")
+                    or data.get("props", {}).get("pageProps", {})
+                    .get("serverSideData", {}).get("playlist", {}).get("name")
+                )
+            except (_json.JSONDecodeError, AttributeError, IndexError) as exc:
+                write_app_log(f"Spotify playlist parse error: {exc}", level="warning", url=url)
 
     elif source == "Apple Music":
         for m in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
             try:
                 data = _json.loads(m.group(1))
                 if data.get("@type") in ("MusicPlaylist", "ItemList"):
+                    playlist_name = data.get("name") or None
                     items = data.get("track") or data.get("itemListElement") or []
                     for item in items:
                         entry = item if item.get("@type") == "MusicRecording" else item.get("item", {})
@@ -920,16 +973,16 @@ def _scrape_playlist_url(url: str) -> dict:
                             tracks.append({"title": title, "artist": artist, "album": album})
                     if tracks:
                         break
-            except (_json.JSONDecodeError, AttributeError):
+            except (_json.JSONDecodeError, AttributeError) as exc:
+                write_app_log(f"Apple Music playlist parse error: {exc}", level="warning", url=url)
                 continue
 
     if not tracks:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Could not extract any tracks from this {source} URL. Make sure the playlist is public and the link points directly to a playlist."
-        )
+        detail = f"Could not extract any tracks from this {source} URL. Make sure the playlist is public and the link points directly to a playlist."
+        write_app_log(detail, level="warning", url=url, html_length=len(html))
+        raise HTTPException(status_code=422, detail=detail)
 
-    return {"source": source, "tracks": tracks, "count": len(tracks)}
+    return {"source": source, "name": playlist_name, "tracks": tracks, "count": len(tracks)}
 
 
 @router.get("/discover/search", tags=["discover"], summary="Search music via iTunes")

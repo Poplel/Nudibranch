@@ -272,6 +272,10 @@ def add_download_candidate_review_items(
             session.add(album_item)
             session.flush()
             album_items[album_key] = album_item
+        existing = find_library_track(session, artist, album, title)
+        if existing:
+            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping", "info")
+            continue
         track_item = ProposalItem(
             batch_id=batch.id,
             parent_id=album_item.id,
@@ -4826,7 +4830,86 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         total_mapped = session.scalar(select(func.count(Track.id)).where(Track.jellyfin_item_id.isnot(None))) or 0
         total_tracks = session.scalar(select(func.count(Track.id))) or 0
         append_task_log(session, None, f"Track mapping: {newly_mapped} newly mapped; {total_mapped}/{total_tracks} total mapped to Jellyfin")
+    _try_create_pending_playlists(session)
     return {"mapped": newly_mapped, "total": total_tracks}
+
+
+def _try_create_pending_playlists(session: Session) -> None:
+    """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
+    pending_settings = list(session.scalars(
+        select(AppSetting).where(AppSetting.key.like("pending_playlist:%"))
+    ))
+    if not pending_settings:
+        return
+
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        return
+
+    linked_users = list(session.scalars(
+        select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != "")
+    ))
+    if not linked_users:
+        return
+    jf_user_id = linked_users[0].jellyfin_user_id
+
+    headers = {"X-Emby-Token": jellyfin_api_key}
+    for setting in pending_settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            session.delete(setting)
+            continue
+        playlist_name = data.get("playlist_name") or ""
+        original_tracks = data.get("original_tracks") or []
+        if not playlist_name or not original_tracks:
+            session.delete(setting)
+            continue
+
+        # Resolve original tracks → jellyfin_item_id
+        jf_ids: list[str] = []
+        for entry in original_tracks:
+            artist = entry.get("artist") or ""
+            title = entry.get("title") or ""
+            if not title:
+                continue
+            track = session.scalars(
+                select(Track)
+                .join(Album, Album.id == Track.album_id)
+                .join(Artist, Artist.id == Album.artist_id)
+                .where(
+                    func.lower(Track.title) == normalize_match_text(title),
+                    func.lower(Artist.name) == normalize_match_text(artist),
+                    Track.jellyfin_item_id.isnot(None),
+                )
+                .limit(1)
+            ).first()
+            if track and track.jellyfin_item_id:
+                jf_ids.append(track.jellyfin_item_id)
+
+        if not jf_ids:
+            write_app_log(f"Pending playlist '{playlist_name}': no tracks mapped yet; will retry next sync", level="info")
+            continue  # leave the setting, try again on next mapping run
+
+        try:
+            with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
+                resp = client.post("/Playlists", json={
+                    "Name": playlist_name,
+                    "UserId": jf_user_id,
+                    "MediaType": "Audio",
+                    "Ids": jf_ids,
+                })
+                resp.raise_for_status()
+            write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(jf_ids)} track(s)")
+        except Exception as error:  # noqa: BLE001
+            write_app_log(f"Failed to create Jellyfin playlist '{playlist_name}': {error}", level="warning")
+            continue
+
+        session.delete(setting)
+
+    session.commit()
 
 
 def _fetch_all_jellyfin_audio(client: httpx.Client, user_id: str) -> list[dict]:

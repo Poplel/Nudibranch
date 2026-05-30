@@ -15,6 +15,7 @@ import {
   HardDriveUpload,
   Heart,
   ListChecks,
+  ListMusic,
   ListPlus,
   LogOut,
   Maximize2,
@@ -129,6 +130,8 @@ function App() {
   const [playlistImportLoading, setPlaylistImportLoading] = useState(false);
   const [playlistImportTracks, setPlaylistImportTracks] = useState(null);
   const [playlistImportError, setPlaylistImportError] = useState("");
+  const [pendingPlaylistName, setPendingPlaylistName] = useState(null);
+  const [pendingPlaylistOriginalTracks, setPendingPlaylistOriginalTracks] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -909,13 +912,21 @@ function App() {
     try {
       const task = await api("/imports/propose", {
         method: "POST",
-        body: JSON.stringify({ path: null, files: importFiles, download_requests: downloadRequests }),
+        body: JSON.stringify({
+          path: null,
+          files: importFiles,
+          download_requests: downloadRequests,
+          playlist_name: pendingPlaylistName || null,
+          playlist_original_tracks: pendingPlaylistOriginalTracks || null,
+        }),
       });
       setTasks((current) => upsertTask(current, task));
       setToast({ title: "Import review queued", body: "A review item was added to the task queue." });
       setImportFiles([]);
       setImportDownloadRequests([]);
       setImportSeedDownloads([]);
+      setPendingPlaylistName(null);
+      setPendingPlaylistOriginalTracks(null);
       setPage("Task Queue");
       window.setTimeout(() => {
         refreshApprovals();
@@ -1202,11 +1213,15 @@ function App() {
   }
 
   async function addPlaylistToImport(tracks, mode) {
+    const playlistName = playlistImportTracks?.name || null;
+    const originalTracks = tracks.map((t) => ({ artist: t.artist, title: t.title }));
     setPlaylistImportLoading(true);
     try {
       if (mode === "songs") {
-        const requests = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title }));
+        const requests = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
         setImportDownloadRequests((prev) => [...prev, ...requests]);
+        setPendingPlaylistName(playlistName);
+        setPendingPlaylistOriginalTracks(originalTracks);
         setToast({ title: "Added to import", body: `${requests.length} track${requests.length === 1 ? "" : "s"} added to import queue.` });
       } else {
         // Albums mode: group by unique album, look up full tracklist from MusicBrainz for each
@@ -1226,11 +1241,14 @@ function App() {
                 track: track.title,
                 track_number: track.track_number,
                 disc_number: track.disc_number,
+                playlist_name: playlistName,
               });
             });
           } catch { /* skip albums that can't be resolved */ }
         }
         setImportDownloadRequests((prev) => [...prev, ...allRequests]);
+        setPendingPlaylistName(playlistName);
+        setPendingPlaylistOriginalTracks(originalTracks);
         setToast({ title: "Added to import", body: `${allRequests.length} track${allRequests.length === 1 ? "" : "s"} from ${seen.size} album${seen.size === 1 ? "" : "s"} added.` });
       }
     } finally {
@@ -3282,13 +3300,33 @@ function ImportTree({
           }}
         />
       )}
-      {grouped.map((artist) => {
-        const visibleAlbums = artist.albums.filter((album) =>
-          album.slots.some((slot) => slot.file || !dismissedGhosts.has(slot.id)),
-        );
-        if (visibleAlbums.length === 0) return null;
-        return (
-          <div key={artist.name}>
+      {(() => {
+        const renderedPlaylists = new Set();
+        const sortedGrouped = [
+          ...grouped.filter((a) => a.playlistName).sort((a, b) =>
+            a.playlistName !== b.playlistName
+              ? a.playlistName.localeCompare(b.playlistName)
+              : a.name.localeCompare(b.name),
+          ),
+          ...grouped.filter((a) => !a.playlistName),
+        ];
+        return sortedGrouped.flatMap((artist) => {
+          const elements = [];
+          if (artist.playlistName && !renderedPlaylists.has(artist.playlistName)) {
+            renderedPlaylists.add(artist.playlistName);
+            elements.push(
+              <div key={`playlist:${artist.playlistName}`} className="tree-playlist-header">
+                <ListMusic size={15} />
+                <span>{artist.playlistName}</span>
+              </div>,
+            );
+          }
+          const visibleAlbums = artist.albums.filter((album) =>
+            album.slots.some((slot) => slot.file || !dismissedGhosts.has(slot.id)),
+          );
+          if (visibleAlbums.length === 0) return elements;
+          elements.push(
+          <div key={`${artist.playlistName || ""}:${artist.name}`} className={artist.playlistName ? "tree-playlist-artist" : undefined}>
             <div
               onDragOver={(event) => event.preventDefault()}
               onDrop={() => {
@@ -3476,9 +3514,11 @@ function ImportTree({
                 </div>
               );
             })}
-          </div>
-        );
-      })}
+          </div>,
+          );
+          return elements;
+        });
+      })()}
     </div>
   );
 }
@@ -4069,7 +4109,7 @@ function manualAlbumsFromDownloadRequests(requests = []) {
     const album = request.album || "Singles";
     const key = albumRecordKey(artist, album);
     if (!albumMap.has(key)) {
-      albumMap.set(key, { id: `seed:${key}`, artist, name: album, tracks: [] });
+      albumMap.set(key, { id: `seed:${key}`, artist, name: album, tracks: [], playlistName: request.playlist_name || null });
     }
     const entry = albumMap.get(key);
     entry.tracks.push({
@@ -5784,6 +5824,7 @@ function groupImportFiles(files, library = [], manualAlbums = [], albumRecords =
         expectedTracks: album.tracks,
         cover_art_url: album.cover_art_url,
         manual: true,
+        playlistName: album.playlistName || null,
       });
     } else if (album.cover_art_url) {
       artist.albumMap.get(album.name).cover_art_url = album.cover_art_url;
@@ -5791,11 +5832,16 @@ function groupImportFiles(files, library = [], manualAlbums = [], albumRecords =
   });
 
   return [...artistMap.values()]
-    .map((artist) => ({
-      name: artist.name,
-      count: artist.count,
-      albums: [...artist.albumMap.values()].map((album) => buildImportAlbum(album, artist.name, library, albumRecords)),
-    }))
+    .map((artist) => {
+      const albums = [...artist.albumMap.values()].map((album) => buildImportAlbum(album, artist.name, library, albumRecords));
+      const plNames = new Set(albums.map((a) => a.playlistName).filter(Boolean));
+      return {
+        name: artist.name,
+        count: artist.count,
+        albums,
+        playlistName: plNames.size === 1 ? [...plNames][0] : null,
+      };
+    })
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 

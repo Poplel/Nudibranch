@@ -1799,6 +1799,27 @@ nav button:hover,
   padding-left: calc(14px + var(--depth, 0) * 24px);
 }
 
+.tree-playlist-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  border-top: 1px solid var(--line);
+}
+
+.tree-playlist-header:first-child {
+  border-top: none;
+}
+
+.tree-playlist-artist {
+  padding-left: 16px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  margin-left: 8px;
+}
+
 .download-tree {
   border: 1px solid var(--line);
   border-radius: 4px;

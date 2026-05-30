@@ -264,6 +264,8 @@ class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None
     download_requests: list[dict[str, Any]] | None = None
+    playlist_name: str | None = None
+    playlist_original_tracks: list[dict[str, Any]] | None = None
 
 
 class ImportMusicBrainzLookupRequest(BaseModel):
