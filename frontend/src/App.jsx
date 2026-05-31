@@ -103,6 +103,7 @@ function App() {
   const [library, setLibrary] = useState([]);
   const [importFiles, setImportFiles] = useState([]);
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
+  const addImportAlbumsRef = useRef(null);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
@@ -1214,9 +1215,19 @@ function App() {
         ));
       }
 
+      function addToTree(incoming) {
+        const albums = manualAlbumsFromDownloadRequests(incoming);
+        if (addImportAlbumsRef.current) {
+          addImportAlbumsRef.current(albums);
+        } else {
+          // Fallback: wizard not mounted yet, use seed state
+          setImportSeedDownloads((prev) => { const next = dedup(incoming, prev); return [...prev, ...next]; });
+        }
+      }
+
       if (mode === "songs") {
         const incoming = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
-        setImportSeedDownloads((prev) => { const next = dedup(incoming, prev); return [...prev, ...next]; });
+        addToTree(incoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
         setPlaylistImportUrl("");
@@ -1244,7 +1255,7 @@ function App() {
             });
           } catch { /* skip albums that can't be resolved */ }
         }
-        setImportSeedDownloads((prev) => { const next = dedup(allIncoming, prev); return [...prev, ...next]; });
+        addToTree(allIncoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
         setPlaylistImportUrl("");
@@ -1580,6 +1591,7 @@ function App() {
                 albumSearchOpen={importAlbumSearchOpen}
                 setAlbumSearchOpen={setImportAlbumSearchOpen}
                 onDownloadRequestsChange={setImportDownloadRequests}
+                addAlbumsRef={addImportAlbumsRef}
               />
             )}
             {page === "Activity" && <TasksView tasks={tasks} playback={userPlayback} onCancel={cancelTask} />}
@@ -2411,9 +2423,24 @@ function ImportWizard({
   albumSearchOpen,
   setAlbumSearchOpen,
   onDownloadRequestsChange,
+  addAlbumsRef,
 }) {
   const [manualAlbums, setManualAlbums] = useState([]);
   const [albumRecords, setAlbumRecords] = useState({});
+
+  // Expose direct add function so callers can bypass the seed mechanism
+  useEffect(() => {
+    if (!addAlbumsRef) return;
+    addAlbumsRef.current = (albums) => {
+      setManualAlbums((current) => mergeManualAlbums(current, albums));
+      setAlbumRecords((current) => ({
+        ...current,
+        ...Object.fromEntries(albums.map((album) => [albumRecordKey(album.artist, album.name), album.tracks])),
+      }));
+    };
+    return () => { if (addAlbumsRef) addAlbumsRef.current = null; };
+  });
+
   const seedKey = useMemo(() => stableDownloadRequestKey(seedDownloadRequests), [seedDownloadRequests]);
   const appliedSeedKey = useRef("");
 
