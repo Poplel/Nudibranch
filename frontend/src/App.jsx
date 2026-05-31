@@ -128,7 +128,6 @@ function App() {
   const [playlistImportUrl, setPlaylistImportUrl] = useState("");
   const [playlistImportMode, setPlaylistImportMode] = useState("songs");
   const [playlistImportLoading, setPlaylistImportLoading] = useState(false);
-  const [playlistImportTracks, setPlaylistImportTracks] = useState(null);
   const [playlistImportError, setPlaylistImportError] = useState("");
   const [pendingPlaylistName, setPendingPlaylistName] = useState(null);
   const [pendingPlaylistOriginalTracks, setPendingPlaylistOriginalTracks] = useState(null);
@@ -1198,44 +1197,43 @@ function App() {
     }
   }
 
-  async function fetchPlaylistTracks(url) {
+  async function importPlaylist(url, mode) {
     setPlaylistImportLoading(true);
     setPlaylistImportError("");
-    setPlaylistImportTracks(null);
     try {
       const data = await api("/imports/playlist-url", { method: "POST", body: JSON.stringify({ url }) });
-      setPlaylistImportTracks(data);
-    } catch (err) {
-      setPlaylistImportError(err.message || "Failed to fetch playlist.");
-    } finally {
-      setPlaylistImportLoading(false);
-    }
-  }
+      const { tracks, name: playlistName } = data;
+      const originalTracks = tracks.map((t) => ({ artist: t.artist, title: t.title }));
 
-  async function addPlaylistToImport(tracks, mode) {
-    const playlistName = playlistImportTracks?.name || null;
-    const originalTracks = tracks.map((t) => ({ artist: t.artist, title: t.title }));
-    setPlaylistImportLoading(true);
-    try {
+      function dedup(incoming, prev) {
+        const existing = new Set(
+          prev.map((r) => `${(r.artist || "").toLowerCase()}::${(r.album || "").toLowerCase()}::${(r.track || r.title || "").toLowerCase()}`)
+        );
+        return incoming.filter((r) => !existing.has(
+          `${(r.artist || "").toLowerCase()}::${(r.album || "").toLowerCase()}::${(r.track || r.title || "").toLowerCase()}`
+        ));
+      }
+
       if (mode === "songs") {
-        const requests = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
-        setImportDownloadRequests((prev) => [...prev, ...requests]);
+        const incoming = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
+        setImportDownloadRequests((prev) => { const next = dedup(incoming, prev); return [...prev, ...next]; });
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
-        setToast({ title: "Added to import", body: `${requests.length} track${requests.length === 1 ? "" : "s"} added to import queue.` });
+        setPlaylistImportUrl("");
+        setToast({ title: "Added to import", body: `${tracks.length} track${tracks.length === 1 ? "" : "s"} added to the import tree.` });
       } else {
-        // Albums mode: group by unique album, look up full tracklist from MusicBrainz for each
+        // Albums mode: group by unique artist+album, look up full tracklist from MusicBrainz for each
         const seen = new Map();
         for (const t of tracks) {
           const key = `${(t.artist || "").toLowerCase()}::${(t.album || t.title || "").toLowerCase()}`;
           if (!seen.has(key)) seen.set(key, { artist: t.artist, albumHint: t.album || t.title });
         }
-        const allRequests = [];
+        const allIncoming = [];
         for (const { artist, albumHint } of seen.values()) {
           try {
             const albumData = await lookupImportAlbum(artist, albumHint);
             (albumData.tracks || []).forEach((track) => {
-              allRequests.push({
+              allIncoming.push({
                 artist: albumData.artist || artist,
                 album: albumData.album || albumHint,
                 track: track.title,
@@ -1246,11 +1244,14 @@ function App() {
             });
           } catch { /* skip albums that can't be resolved */ }
         }
-        setImportDownloadRequests((prev) => [...prev, ...allRequests]);
+        setImportDownloadRequests((prev) => { const next = dedup(allIncoming, prev); return [...prev, ...next]; });
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
-        setToast({ title: "Added to import", body: `${allRequests.length} track${allRequests.length === 1 ? "" : "s"} from ${seen.size} album${seen.size === 1 ? "" : "s"} added.` });
+        setPlaylistImportUrl("");
+        setToast({ title: "Added to import", body: `${allIncoming.length} track${allIncoming.length === 1 ? "" : "s"} from ${seen.size} album${seen.size === 1 ? "" : "s"} added to the import tree.` });
       }
+    } catch (err) {
+      setPlaylistImportError(err.message || "Failed to fetch playlist.");
     } finally {
       setPlaylistImportLoading(false);
     }
@@ -1687,10 +1688,8 @@ function App() {
               mode: playlistImportMode,
               setMode: setPlaylistImportMode,
               loading: playlistImportLoading,
-              tracks: playlistImportTracks,
               error: playlistImportError,
-              onFetch: fetchPlaylistTracks,
-              onAdd: addPlaylistToImport,
+              onImport: importPlaylist,
             }}
           />
         </div>
@@ -4834,7 +4833,8 @@ function Inspector({
                 value={playlistImportActions.url}
                 onChange={(e) => playlistImportActions.setUrl(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter" && playlistImportActions.url.trim()) playlistImportActions.onFetch(playlistImportActions.url.trim());
+                  if (e.key === "Enter" && playlistImportActions.url.trim())
+                    playlistImportActions.onImport(playlistImportActions.url.trim(), playlistImportActions.mode);
                 }}
               />
               <div className="mode-toggle">
@@ -4852,38 +4852,15 @@ function Inspector({
                 </button>
               </div>
               <button
-                className="secondary"
-                onClick={() => playlistImportActions.onFetch(playlistImportActions.url.trim())}
+                className="primary"
+                onClick={() => playlistImportActions.onImport(playlistImportActions.url.trim(), playlistImportActions.mode)}
                 disabled={!playlistImportActions.url.trim() || playlistImportActions.loading}
               >
-                {playlistImportActions.loading && !playlistImportActions.tracks ? "Fetching…" : "Fetch playlist"}
+                {playlistImportActions.loading
+                  ? (playlistImportActions.mode === "albums" ? "Looking up albums…" : "Importing…")
+                  : "Import playlist"}
               </button>
               {playlistImportActions.error && <p className="error-text">{playlistImportActions.error}</p>}
-              {playlistImportActions.tracks && (
-                <>
-                  <p className="inspector-hint">{playlistImportActions.tracks.count} tracks from {playlistImportActions.tracks.source}</p>
-                  <ul className="playlist-import-preview">
-                    {playlistImportActions.tracks.tracks.slice(0, 6).map((t, i) => (
-                      <li key={i}>
-                        <strong>{t.title}</strong>
-                        <span>{t.artist}</span>
-                      </li>
-                    ))}
-                    {playlistImportActions.tracks.count > 6 && (
-                      <li className="more">+{playlistImportActions.tracks.count - 6} more</li>
-                    )}
-                  </ul>
-                  <button
-                    className="primary"
-                    onClick={() => playlistImportActions.onAdd(playlistImportActions.tracks.tracks, playlistImportActions.mode)}
-                    disabled={playlistImportActions.loading}
-                  >
-                    {playlistImportActions.loading
-                      ? (playlistImportActions.mode === "albums" ? "Looking up albums…" : "Adding…")
-                      : (playlistImportActions.mode === "albums" ? "Queue albums" : "Queue songs")}
-                  </button>
-                </>
-              )}
             </div>
           )}
         </div>
