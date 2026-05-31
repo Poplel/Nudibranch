@@ -1012,54 +1012,91 @@ def _scrape_playlist_url(url: str) -> dict:
             detail="Could not extract any tracks from this Spotify URL. Make sure the playlist is public and the link points directly to a playlist.",
         )
 
-    fetch_url = url
-    tracks = []
-    playlist_name = None
-
+    # Apple Music: extract bearer token from page meta tag, then call catalog API
+    _AM_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        resp = httpx.get(fetch_url, headers={
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        }, timeout=20, follow_redirects=True)
-        resp.raise_for_status()
+        page_resp = httpx.get(url, headers=_AM_HEADERS, timeout=20, follow_redirects=True)
+        page_resp.raise_for_status()
     except httpx.HTTPStatusError as error:
-        detail = f"Could not fetch {source} playlist page: HTTP {error.response.status_code}"
+        detail = f"Could not fetch Apple Music playlist page: HTTP {error.response.status_code}"
         write_app_log(detail, level="warning", url=url)
         raise HTTPException(status_code=502, detail=detail) from error
     except httpx.RequestError as error:
-        detail = f"Could not reach {source}: network error"
+        detail = "Could not reach Apple Music: network error"
         write_app_log(detail, level="warning", url=url, error=str(error))
         raise HTTPException(status_code=502, detail=detail) from error
 
-    html = resp.text
+    # Extract the bearer token embedded in the page config meta tag
+    from bs4 import BeautifulSoup as _BS
+    from urllib.parse import unquote as _unquote
+    soup = _BS(page_resp.text, "html.parser")
+    meta = soup.find("meta", attrs={"name": "desktop-music-app/config/environment"})
+    if not meta or not meta.get("content"):
+        raise HTTPException(status_code=422, detail="Could not extract any tracks from this Apple Music URL. Make sure the playlist is public and the link points directly to a playlist.")
+    try:
+        config = _json.loads(_unquote(meta["content"]))
+        bearer_token = config["MEDIA_API"]["token"]
+    except (KeyError, _json.JSONDecodeError) as exc:
+        write_app_log(f"Apple Music config parse error: {exc}", level="warning", url=url)
+        raise HTTPException(status_code=422, detail="Could not extract any tracks from this Apple Music URL. Make sure the playlist is public and the link points directly to a playlist.") from exc
 
-    if source == "Apple Music":
-        for m2 in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
+    # Parse country + playlist ID from URL: music.apple.com/{country}/playlist/{name}/{id}
+    url_parts = url.rstrip("/").split("/")
+    try:
+        country = url_parts[3]
+        playlist_id = url_parts[-1].split("?")[0]
+    except IndexError:
+        raise HTTPException(status_code=400, detail="Could not parse Apple Music playlist URL.")
+
+    api_headers = {"Authorization": f"Bearer {bearer_token}", "Origin": "https://music.apple.com"}
+    tracks: list[dict] = []
+    playlist_name: str | None = None
+    offset = 0
+    limit = 100
+
+    while True:
+        try:
+            api_resp = httpx.get(
+                f"https://api.music.apple.com/v1/catalog/{country}/playlists/{playlist_id}/tracks",
+                headers=api_headers,
+                params={"limit": limit, "offset": offset},
+                timeout=15,
+            )
+            api_resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            write_app_log(f"Apple Music catalog API error: {exc}", level="warning", url=url)
+            break
+        page_data = api_resp.json()
+        if playlist_name is None:
+            # name lives on the playlist object, fetch it once
             try:
-                data = _json.loads(m2.group(1))
-                if data.get("@type") in ("MusicPlaylist", "ItemList"):
-                    playlist_name = data.get("name") or None
-                    items = data.get("track") or data.get("itemListElement") or []
-                    for item in items:
-                        entry = item if item.get("@type") == "MusicRecording" else item.get("item", {})
-                        title = entry.get("name") or ""
-                        by_artist = entry.get("byArtist") or {}
-                        artist = (by_artist.get("name") or "") if isinstance(by_artist, dict) else ""
-                        in_album = entry.get("inAlbum") or {}
-                        album = (in_album.get("name") or None) if isinstance(in_album, dict) else None
-                        if title:
-                            tracks.append({"title": title, "artist": artist, "album": album})
-                    if tracks:
-                        break
-            except (_json.JSONDecodeError, AttributeError) as exc:
-                write_app_log(f"Apple Music playlist parse error: {exc}", level="warning", url=url)
-                continue
+                pl_resp = httpx.get(
+                    f"https://api.music.apple.com/v1/catalog/{country}/playlists/{playlist_id}",
+                    headers=api_headers,
+                    timeout=15,
+                )
+                pl_resp.raise_for_status()
+                playlist_name = pl_resp.json()["data"][0]["attributes"].get("name")
+            except Exception:
+                pass
+        for item in page_data.get("data", []):
+            attrs = item.get("attributes") or {}
+            title = attrs.get("name") or ""
+            artist = attrs.get("artistName") or ""
+            album = attrs.get("albumName") or None
+            if title:
+                tracks.append({"title": title, "artist": artist, "album": album})
+        if page_data.get("next"):
+            offset += limit
+        else:
+            break
 
     if not tracks:
-        detail = f"Could not extract any tracks from this {source} URL. Make sure the playlist is public and the link points directly to a playlist."
-        write_app_log(detail, level="warning", url=url, html_length=len(html))
-        raise HTTPException(status_code=422, detail=detail)
+        raise HTTPException(status_code=422, detail="Could not extract any tracks from this Apple Music URL. Make sure the playlist is public and the link points directly to a playlist.")
 
     return {"source": source, "name": playlist_name, "tracks": tracks, "count": len(tracks)}
 
