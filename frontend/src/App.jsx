@@ -1227,7 +1227,13 @@ function App() {
       }
 
       if (mode === "songs") {
-        const incoming = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
+        const incoming = tracks.map((t) => {
+          // When Spotify returns the track's own name as the album (single release),
+          // strip the album so it groups under "Singles" instead of creating a
+          // redundant artist → "Track Name" album → "Track Name" track hierarchy.
+          const album = t.album && normalizeName(t.album) !== normalizeName(t.title) ? t.album : "";
+          return { artist: t.artist, album, track: t.title, playlist_name: playlistName };
+        });
         addToTree(incoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
@@ -5529,7 +5535,11 @@ function groupApprovalBatches(batches) {
     batch.items.forEach((item) => {
       if (!["pending", "approved", "failed"].includes(item.status)) return;
       const groupKind = batchGroupKind || item.kind;
-      const key = `${groupKind}:${item.kind}:${item.title}:${item.old_value || ""}:${item.new_value || ""}`;
+      // Download items must not be deduped by title — two artists can share a song name
+      // and dropping one item breaks its parent's child count (missing chevron).
+      const key = item.kind === "download"
+        ? `${item.batch_id}:${item.id}`
+        : `${groupKind}:${item.kind}:${item.title}:${item.old_value || ""}:${item.new_value || ""}`;
       if (seen.has(key)) return;
       seen.add(key);
       if (!groups.has(groupKind)) {
