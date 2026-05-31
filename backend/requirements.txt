@@ -8,3 +8,4 @@ h2==4.1.0
 PyJWT[crypto]==2.10.1
 mutagen==1.47.0
 yt-dlp==2025.1.15
+spotifyscraper==2.1.5

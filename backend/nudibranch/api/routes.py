@@ -976,18 +976,45 @@ def _scrape_playlist_url(url: str) -> dict:
     if source == "Spotify":
         m = _re.search(r"playlist/([A-Za-z0-9]+)", url)
         if m:
+            # Try Spotify Web API first (when credentials configured)
             api_result = _spotify_api_fetch(m.group(1))
             if api_result is not None:
                 if not api_result["tracks"]:
                     raise HTTPException(status_code=422, detail="Could not extract any tracks from this Spotify URL. Make sure the playlist is public and the link points directly to a playlist.")
                 return {"source": source, "name": api_result["name"], "tracks": api_result["tracks"], "count": len(api_result["tracks"])}
 
-        # Fall back to scraping the embed page
-        fetch_url = url
-        if m:
-            fetch_url = f"https://open.spotify.com/embed/playlist/{m.group(1)}"
-    else:
-        fetch_url = url
+            # Fall back to spotifyscraper (embed-page scraping, no credentials needed)
+            try:
+                from spotify_scraper import SpotifyClient as _SpotifyClient  # type: ignore[import]
+                _sc = _SpotifyClient(log_level="WARNING")
+                _pl = _sc.get_playlist_info(url)
+                _raw = _pl.get("tracks") or []
+                tracks: list[dict] = []
+                playlist_name: str | None = _pl.get("name") or None
+                for item in _raw:
+                    t = item.get("track", item) if isinstance(item, dict) and "track" in item else item
+                    if not t or not isinstance(t, dict):
+                        continue
+                    title = t.get("name") or ""
+                    artists = t.get("artists") or []
+                    artist = (artists[0].get("name") or "") if artists else ""
+                    album = (t.get("album") or {}).get("name") or None
+                    if title:
+                        tracks.append({"title": title, "artist": artist, "album": album})
+                if tracks:
+                    return {"source": source, "name": playlist_name, "tracks": tracks, "count": len(tracks)}
+                write_app_log("spotifyscraper returned no tracks", level="warning", url=url)
+            except Exception as exc:
+                write_app_log(f"spotifyscraper error: {exc}", level="warning", url=url)
+
+        raise HTTPException(
+            status_code=422,
+            detail="Could not extract any tracks from this Spotify URL. Make sure the playlist is public and the link points directly to a playlist.",
+        )
+
+    fetch_url = url
+    tracks = []
+    playlist_name = None
 
     try:
         resp = httpx.get(fetch_url, headers={
@@ -1006,52 +1033,8 @@ def _scrape_playlist_url(url: str) -> dict:
         raise HTTPException(status_code=502, detail=detail) from error
 
     html = resp.text
-    tracks: list[dict] = []
-    playlist_name: str | None = None
 
-    if source == "Spotify":
-        m2 = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, _re.DOTALL)
-        if m2:
-            try:
-                data = _json.loads(m2.group(1))
-                # Try 2024+ path
-                content_items = (
-                    data.get("props", {}).get("pageProps", {}).get("state", {})
-                    .get("data", {}).get("playlist", {}).get("content", {}).get("items", [])
-                )
-                for item in content_items:
-                    entry = (item.get("itemV2") or {}).get("data") or {}
-                    if entry.get("__typename") != "Track":
-                        continue
-                    title = entry.get("name") or ""
-                    artist_items = (entry.get("artists") or {}).get("items") or []
-                    artist = artist_items[0].get("profile", {}).get("name", "") if artist_items else ""
-                    album = (entry.get("albumOfTrack") or {}).get("name") or None
-                    if title:
-                        tracks.append({"title": title, "artist": artist, "album": album})
-                if not tracks:
-                    # Try legacy path
-                    track_list = (
-                        data.get("props", {}).get("pageProps", {}).get("serverSideData", {})
-                        .get("playlist", {}).get("trackList", [])
-                    )
-                    for item in track_list:
-                        meta = item.get("trackMetadata") or {}
-                        title = meta.get("trackName") or ""
-                        artist = meta.get("artistName") or ""
-                        album = meta.get("albumName") or None
-                        if title:
-                            tracks.append({"title": title, "artist": artist, "album": album})
-                playlist_name = (
-                    data.get("props", {}).get("pageProps", {}).get("state", {})
-                    .get("data", {}).get("playlist", {}).get("name")
-                    or data.get("props", {}).get("pageProps", {})
-                    .get("serverSideData", {}).get("playlist", {}).get("name")
-                )
-            except (_json.JSONDecodeError, AttributeError, IndexError) as exc:
-                write_app_log(f"Spotify playlist parse error: {exc}", level="warning", url=url)
-
-    elif source == "Apple Music":
+    if source == "Apple Music":
         for m2 in _re.finditer(r'<script type="application/ld\+json">(.*?)</script>', html, _re.DOTALL):
             try:
                 data = _json.loads(m2.group(1))
