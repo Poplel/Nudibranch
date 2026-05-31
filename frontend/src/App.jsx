@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import {
   Bell,
   Check,
+  CheckCircle,
   ChevronDown,
   ChevronRight,
   Compass,
@@ -1233,33 +1234,53 @@ function App() {
         setPlaylistImportUrl("");
         setToast({ title: "Added to import", body: `${tracks.length} track${tracks.length === 1 ? "" : "s"} added to the import tree.` });
       } else {
-        // Albums mode: group by unique artist+album, look up full tracklist from MusicBrainz for each
+        // Albums mode: group by unique artist+album, look up full tracklist from MusicBrainz for each.
+        // Tracks with no album and fallback tracks (lookup failure or missing from album) get
+        // added with album "" so the backend uses a track-level search instead of album-folder search.
         const seen = new Map();
+        const singleTracks = []; // playlist tracks that have no album info
         for (const t of tracks) {
-          const key = `${(t.artist || "").toLowerCase()}::${(t.album || t.title || "").toLowerCase()}`;
-          if (!seen.has(key)) seen.set(key, { artist: t.artist, albumHint: t.album || t.title });
+          if (!t.album) {
+            singleTracks.push(t);
+            continue;
+          }
+          const key = `${(t.artist || "").toLowerCase()}::${t.album.toLowerCase()}`;
+          if (!seen.has(key)) seen.set(key, { artist: t.artist, albumHint: t.album, playlistTracks: [] });
+          seen.get(key).playlistTracks.push(t);
         }
         const allIncoming = [];
-        for (const { artist, albumHint } of seen.values()) {
-          try {
-            const albumData = await lookupImportAlbum(artist, albumHint);
-            (albumData.tracks || []).forEach((track) => {
-              allIncoming.push({
-                artist: albumData.artist || artist,
-                album: albumData.album || albumHint,
-                track: track.title,
-                track_number: track.track_number,
-                disc_number: track.disc_number,
-                playlist_name: playlistName,
-              });
-            });
-          } catch { /* skip albums that can't be resolved */ }
+        // No-album tracks → individual search
+        for (const t of singleTracks) {
+          allIncoming.push({ artist: t.artist, album: "", track: t.title, playlist_name: playlistName });
+        }
+        let albumsResolved = 0;
+        for (const { artist, albumHint, playlistTracks } of seen.values()) {
+          const albumData = await lookupImportAlbum(artist, albumHint);
+          if (!albumData || !(albumData.tracks || []).length) {
+            // Lookup failed → fall back to individual track searches
+            for (const t of playlistTracks) {
+              allIncoming.push({ artist: t.artist, album: "", track: t.title, playlist_name: playlistName });
+            }
+            continue;
+          }
+          albumsResolved++;
+          // Add every track from the looked-up album
+          const albumTrackTitles = new Set(albumData.tracks.map((t) => normalizeName(t.title)));
+          albumData.tracks.forEach((track) => {
+            allIncoming.push({ artist: albumData.artist || artist, album: albumData.album || albumHint, track: track.title, track_number: track.track_number, disc_number: track.disc_number, playlist_name: playlistName });
+          });
+          // Playlist tracks not found in the album → individual fallback search
+          for (const pt of playlistTracks) {
+            if (!albumTrackTitles.has(normalizeName(pt.title))) {
+              allIncoming.push({ artist: pt.artist, album: "", track: pt.title, playlist_name: playlistName });
+            }
+          }
         }
         addToTree(allIncoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
         setPlaylistImportUrl("");
-        setToast({ title: "Added to import", body: `${allIncoming.length} track${allIncoming.length === 1 ? "" : "s"} from ${seen.size} album${seen.size === 1 ? "" : "s"} added to the import tree.` });
+        setToast({ title: "Added to import", body: `${allIncoming.length} track${allIncoming.length === 1 ? "" : "s"} from ${albumsResolved} album${albumsResolved === 1 ? "" : "s"} added to the import tree.` });
       }
     } catch (err) {
       setPlaylistImportError(err.message || "Failed to fetch playlist.");
@@ -3397,7 +3418,8 @@ function ImportTree({
               visibleAlbums.map((album) => {
               const albumId = `${artist.name}/${album.name}`;
               const albumSlots = [...album.slots, ...(extraGhosts[albumId] || [])];
-              const visibleSlots = albumSlots.filter((slot) => slot.file || !dismissedGhosts.has(slot.id));
+              const visibleSlots = albumSlots.filter((slot) => slot.file || slot.in_library || !dismissedGhosts.has(slot.id));
+              const downloadableSlots = visibleSlots.filter((slot) => !slot.file && !slot.in_library);
               return (
                 <div key={albumId}>
                   <div
@@ -3429,9 +3451,9 @@ function ImportTree({
                         onToggle={() => toggleSet(setOpenAlbums, albumId)}
                         control={
                           <DownloadBranchToggle
-                            checked={visibleSlots.filter((slot) => !slot.file).length > 0 && visibleSlots.filter((slot) => !slot.file).every((slot) => downloadSelections.has(slot.id))}
-                            disabled={visibleSlots.filter((slot) => !slot.file).length === 0}
-                            onChange={(checked) => setSlotDownloadSelections(visibleSlots.filter((slot) => !slot.file), checked)}
+                            checked={downloadableSlots.length > 0 && downloadableSlots.every((slot) => downloadSelections.has(slot.id))}
+                            disabled={downloadableSlots.length === 0}
+                            onChange={(checked) => setSlotDownloadSelections(downloadableSlots, checked)}
                             title="Select downloads for this album"
                           />
                         }
@@ -3501,6 +3523,11 @@ function ImportTree({
                           onChange={(patch) => updateImportFile(files, onFilesChange, slot.file.path, patch)}
                           onRecheck={() => onRecheckTrack(slot.file)}
                           key={slot.file.path}
+                        />
+                      ) : slot.in_library ? (
+                        <LibraryTrackRow
+                          key={`lib:${albumId}:${slot.disc_number || 1}:${slot.track_number}:${slot.title}`}
+                          slot={slot}
                         />
                       ) : (
                         <GhostTrackRow
@@ -4067,6 +4094,17 @@ function normalizeEntityChanges(changes, fields) {
       if (field?.type === "boolean") return [key, Boolean(value)];
       return [key, value === "" ? null : value];
     }),
+  );
+}
+
+function LibraryTrackRow({ slot }) {
+  return (
+    <div className="library-track-row">
+      <span className="chevron" />
+      <CheckCircle size={15} className="library-track-icon" />
+      <span className="library-track-title">{slot.track_number ? `${slot.track_number}. ` : ""}{slot.title}</span>
+      <span className="library-track-badge">In library</span>
+    </div>
   );
 }
 
@@ -5862,19 +5900,22 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
     if (trackNumber && !trackMap.has(key)) trackMap.set(key, file);
   });
   const usedPaths = new Set();
+  const libraryTrackTitles = new Set((libraryAlbum?.tracks || []).map((t) => normalizeName(t.title)));
   const slots = expectedTracks.map((track, index) => {
     const trackNumber = track.track_number || index + 1;
     const discNumber = track.disc_number || 1;
     const file = trackMap.get(`${discNumber}:${trackNumber}`);
     if (file) usedPaths.add(file.path);
+    const inLibrary = libraryAlbum != null && libraryTrackTitles.has(normalizeName(track.title));
     return file
-      ? { id: file.path, track_number: trackNumber, disc_number: discNumber, title: file.metadata?.title || track.title, file }
+      ? { id: file.path, track_number: trackNumber, disc_number: discNumber, title: file.metadata?.title || track.title, file, in_library: inLibrary }
       : {
           id: `${artistName}:${album.name}:${discNumber}:${trackNumber}:${track.title}`,
           track_number: trackNumber,
           disc_number: discNumber,
           title: track.title || `Track ${trackNumber}`,
           reason: recordTracks ? "Missing from album record" : libraryAlbum ? "Missing from import" : "Album slot",
+          in_library: inLibrary,
         };
   });
   files.forEach((file, index) => {

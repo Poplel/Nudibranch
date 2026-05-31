@@ -603,6 +603,39 @@ nav button:hover,
   color: var(--text);
 }
 
+.library-track-row {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px 0 calc(10px + 2 * 22px);
+  border: 1px solid color-mix(in srgb, var(--success, #4caf50) 35%, var(--line));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--success, #4caf50) 7%, transparent);
+  opacity: 0.75;
+}
+
+.library-track-icon {
+  color: var(--success, #4caf50);
+  flex-shrink: 0;
+}
+
+.library-track-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.library-track-badge {
+  font-size: 11px;
+  color: var(--success, #4caf50);
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
 .ghost-track-row {
   display: grid;
   grid-template-columns: 18px 18px 100px minmax(0, 1fr) auto 30px;
