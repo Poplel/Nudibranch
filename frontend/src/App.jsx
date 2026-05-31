@@ -1216,7 +1216,7 @@ function App() {
 
       if (mode === "songs") {
         const incoming = tracks.map((t) => ({ artist: t.artist, album: t.album || "", track: t.title, playlist_name: playlistName }));
-        setImportDownloadRequests((prev) => { const next = dedup(incoming, prev); return [...prev, ...next]; });
+        setImportSeedDownloads((prev) => { const next = dedup(incoming, prev); return [...prev, ...next]; });
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
         setPlaylistImportUrl("");
@@ -1244,7 +1244,7 @@ function App() {
             });
           } catch { /* skip albums that can't be resolved */ }
         }
-        setImportDownloadRequests((prev) => { const next = dedup(allIncoming, prev); return [...prev, ...next]; });
+        setImportSeedDownloads((prev) => { const next = dedup(allIncoming, prev); return [...prev, ...next]; });
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
         setPlaylistImportUrl("");
