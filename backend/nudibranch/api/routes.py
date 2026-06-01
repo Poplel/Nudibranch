@@ -415,7 +415,27 @@ def propose_library_remove(
     session.flush()
     settings = get_settings()
     destination_root = settings.trash_path if payload.action == "delete" else settings.import_path
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
     for track in tracks:
+        artist_name = track.album.artist.name if track.album and track.album.artist else "Unknown Artist"
+        album_title = track.album.title if track.album else "Unknown Album"
+        album_key = (artist_name, album_title)
+        if artist_name not in artist_items:
+            artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=batch_kind)
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        if album_key not in album_items:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                title=album_title,
+                kind=batch_kind,
+                parent_id=artist_items[artist_name].id,
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
         old_path = Path(track.path)
         new_path = destination_root / old_path.name
         session.add(
@@ -426,6 +446,7 @@ def propose_library_remove(
                 old_value=str(old_path),
                 new_value=str(new_path),
                 payload_json=json.dumps({"action": payload.action, "track_id": track.id}),
+                parent_id=album_items[album_key].id,
             )
         )
     session.commit()

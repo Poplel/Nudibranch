@@ -1420,24 +1420,39 @@ function App() {
     if (previousTrack) await loadPlayerTrack(previousTrack);
   }
 
-  async function setApprovalSelection(batchId, itemIds, selected) {
-    await api(`/approvals/${batchId}/selection`, {
+  function setApprovalSelection(batchId, itemIds, selected) {
+    const selectedSet = new Set(itemIds);
+    setApprovals((current) =>
+      current.map((batch) =>
+        batch.id !== batchId
+          ? batch
+          : { ...batch, items: batch.items.map((item) => (selectedSet.has(item.id) ? { ...item, selected } : item)) }
+      )
+    );
+    api(`/approvals/${batchId}/selection`, {
       method: "POST",
       body: JSON.stringify({ item_ids: itemIds, selected }),
-    });
-    await refreshApprovals();
+    }).catch(() => refreshApprovals());
   }
 
-  async function selectOnlyApprovalItem(batchId, siblingIds, itemId) {
-    await api(`/approvals/${batchId}/selection`, {
+  function selectOnlyApprovalItem(batchId, siblingIds, itemId) {
+    const siblingSet = new Set(siblingIds);
+    setApprovals((current) =>
+      current.map((batch) =>
+        batch.id !== batchId
+          ? batch
+          : { ...batch, items: batch.items.map((item) => (siblingSet.has(item.id) ? { ...item, selected: item.id === itemId } : item)) }
+      )
+    );
+    api(`/approvals/${batchId}/selection`, {
       method: "POST",
       body: JSON.stringify({ item_ids: siblingIds, selected: false }),
-    });
-    await api(`/approvals/${batchId}/selection`, {
-      method: "POST",
-      body: JSON.stringify({ item_ids: [itemId], selected: true }),
-    });
-    await refreshApprovals();
+    }).then(() =>
+      api(`/approvals/${batchId}/selection`, {
+        method: "POST",
+        body: JSON.stringify({ item_ids: [itemId], selected: true }),
+      })
+    ).catch(() => refreshApprovals());
   }
 
   async function cancelTask(taskId) {
@@ -2149,9 +2164,22 @@ function DownloadCandidateTree({ batches, onSelection, onSelectOnly, onApprove, 
   const allSelected = leafItems.length > 0 && leafItems.every((item) => item.selected);
   const candidatesSearching = allItems.some(isCandidateSearchItem);
 
+  const batchStateKey = batches.map((batch) => `${batch.id}:${batch.items.length}:${batch.status}`).join("|");
+  const batchIdsKey = batches.map((batch) => batch.id).join("|");
+  const prevBatchIdsKey = useRef(null);
   useEffect(() => {
-    setOpenItems(new Set(batches.map((batch) => downloadBatchNodeId(batch.id))));
-  }, [batches.map((batch) => `${batch.id}:${batch.items.length}:${batch.status}`).join("|")]);
+    const newBatchNodeIds = new Set(batches.map((batch) => downloadBatchNodeId(batch.id)));
+    if (prevBatchIdsKey.current !== batchIdsKey) {
+      prevBatchIdsKey.current = batchIdsKey;
+      setOpenItems(newBatchNodeIds);
+    } else {
+      setOpenItems((prev) => {
+        const next = new Set(prev);
+        for (const id of newBatchNodeIds) next.add(id);
+        return next;
+      });
+    }
+  }, [batchStateKey]);
 
   function expandAll() {
     setOpenItems(new Set(batches.flatMap((batch) => [downloadBatchNodeId(batch.id), ...batch.items.map((item) => item.id)])));
@@ -2264,6 +2292,7 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
   const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
   const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
+  const itemById = useMemo(() => new Map(batch.items.map((item) => [item.id, item])), [batch.items]);
   const selectedItems = batch.items.filter((item) => item.selected);
   const selectedExecutableItems = selectedItems.filter(isExecutableApprovalItem);
   const allSelected = selectedItems.length === batch.items.length && batch.items.length > 0;
@@ -2271,8 +2300,19 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
   const candidatesSearching = batch.items.some(isCandidateSearchItem);
   const runDisabled = locked || candidatesSearching || selectedExecutableItems.length === 0;
 
+  const prevBatchId = useRef(null);
   useEffect(() => {
-    setOpenItems(new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
+    const rootIds = new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id));
+    if (prevBatchId.current !== batch.id) {
+      prevBatchId.current = batch.id;
+      setOpenItems(rootIds);
+    } else {
+      setOpenItems((prev) => {
+        const next = new Set(prev);
+        for (const id of rootIds) next.add(id);
+        return next;
+      });
+    }
   }, [batch.id, batch.items.length]);
 
   return (
@@ -2325,6 +2365,7 @@ function ApprovalBatch({ batch, onSelection, onSelectOnly, onApprove, onReject }
           onReject={onReject}
           openCandidatePickers={openCandidatePickers}
           setOpenCandidatePickers={setOpenCandidatePickers}
+          itemById={itemById}
           key={item.id}
         />
       ))}
@@ -2344,6 +2385,7 @@ function ApprovalNode({
   openCandidatePickers,
   setOpenCandidatePickers,
   depth = 0,
+  itemById,
 }) {
   const children = childrenById.get(item.id) || [];
   const metadataChanges = metadataChangeRows(item);
@@ -2369,6 +2411,17 @@ function ApprovalNode({
   function updateChecked(checked) {
     if (leafDownloadCandidate && checked) {
       onSelectOnly?.(item.batch_id, siblingIds, item.id);
+    } else if (itemById) {
+      // Group descendant IDs by their actual batch_id to handle items merged across batches.
+      const byBatch = new Map();
+      for (const id of descendantIds) {
+        const batchId = itemById.get(id)?.batch_id ?? item.batch_id;
+        if (!byBatch.has(batchId)) byBatch.set(batchId, []);
+        byBatch.get(batchId).push(id);
+      }
+      for (const [batchId, ids] of byBatch) {
+        onSelection(batchId, ids, checked);
+      }
     } else {
       onSelection(item.batch_id, descendantIds, checked);
     }
@@ -2431,6 +2484,7 @@ function ApprovalNode({
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
             depth={depth + 1}
+            itemById={itemById}
             key={child.id}
           />
         ))}
@@ -2805,13 +2859,15 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                             )}
                             {canQueue && (
                               <button className="row-icon-button" onClick={async () => {
-                                let allTracks = albumTracksCache.get(album.id);
-                                if (!allTracks && onFetchTracks) {
+                                // Always fetch the full track list from the API — search results may
+                                // contain only a subset of tracks, so never rely on the display cache.
+                                let freshTracks = tracks;
+                                if (onFetchTracks) {
                                   const data = await onFetchTracks(album.id);
-                                  allTracks = data.tracks || [];
-                                  setAlbumTracksCache((prev) => new Map([...prev, [album.id, allTracks]]));
+                                  freshTracks = data.tracks || [];
+                                  setAlbumTracksCache((prev) => new Map([...prev, [album.id, freshTracks]]));
                                 }
-                                onQueue(albumRequests({ ...album, tracks: allTracks || tracks }));
+                                onQueue(albumRequests({ ...album, tracks: freshTracks }));
                               }} disabled={tracksLoading} title="Queue album">
                                 <ListChecks size={15} />
                               </button>
@@ -5553,6 +5609,28 @@ function groupApprovalBatches(batches) {
       groups.get(groupKind).items.push(item);
     });
   });
+
+  // Merge root items with the same title within each group so the same artist
+  // doesn't appear twice when multiple batches exist for that artist.
+  for (const group of groups.values()) {
+    const itemIdSet = new Set(group.items.map((i) => i.id));
+    const titleToId = new Map();
+    const idRemap = new Map();
+    for (const item of group.items) {
+      if (item.parent_id && itemIdSet.has(item.parent_id)) continue; // not a root
+      if (!titleToId.has(item.title)) {
+        titleToId.set(item.title, item.id);
+      } else {
+        idRemap.set(item.id, titleToId.get(item.title));
+      }
+    }
+    if (idRemap.size > 0) {
+      group.items = group.items
+        .filter((i) => !idRemap.has(i.id))
+        .map((i) => (idRemap.has(i.parent_id) ? { ...i, parent_id: idRemap.get(i.parent_id) } : i));
+    }
+  }
+
   return [...groups.values()];
 }
 
