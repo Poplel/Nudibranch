@@ -3150,20 +3150,27 @@ def metadata_matches_request(metadata: dict, request: dict) -> bool:
     return bool((request_track and metadata_track) or (request_artist and metadata_artist))
 
 
+def _request_album(request: dict) -> str | None:
+    album = request.get("album")
+    if fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}:
+        return None
+    return album
+
+
 def verified_download_metadata(metadata: dict, request: dict) -> dict:
     artist = request.get("artist") or metadata.get("artist")
     return {
         **metadata,
         "artist": artist,
         "albumartist": artist,
-        "album": request.get("album") or metadata.get("album"),
+        "album": _request_album(request) or metadata.get("album"),
         "title": request.get("track") or request.get("title") or metadata.get("title"),
     }
 
 
 def normalize_download_metadata(metadata: dict, request: dict) -> dict:
     artist = request.get("artist") or metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
-    album = request.get("album") or metadata.get("album") or "Unknown Album"
+    album = _request_album(request) or metadata.get("album") or "Unknown Album"
     title = request.get("track") or request.get("title") or metadata.get("title") or "Unknown Title"
     normalized = {
         **metadata,
