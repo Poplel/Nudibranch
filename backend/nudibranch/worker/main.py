@@ -326,14 +326,14 @@ def add_download_candidate_review_items(
             elif pools:
                 set_item_payload_status(track_item, "no album-folder track match")
                 add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_title}: no lossless track match in {min(len(pools), folder_try_limit)} album folder(s); YouTube fallback left unselected", "warning")
+                append_task_log(session, task, f"{track_title}: no lossless match in {min(len(pools), folder_try_limit)} Soulseek folder(s) — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
             elif should_use_track_search_fallback(album, requests):
                 set_item_payload_status(track_item, "searching track candidates")
                 missing_track_jobs.append((request, track_item, query, 5))
             else:
                 set_item_payload_status(track_item, "no album folder candidates found")
                 add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_title}: no matching lossless album folders found; YouTube fallback left unselected", "warning")
+                append_task_log(session, task, f"{track_title}: no lossless Soulseek folders matched — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
             completed += 1
             if task is not None:
                 update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
@@ -416,7 +416,7 @@ def add_track_search_candidate_items(
                     append_task_log(session, task, f"{track_title}: {status}", "warning")
                 else:
                     add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                    append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
+                    append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
             session.commit()
     return added
 
@@ -791,7 +791,8 @@ def should_count_skipped_item(item: ProposalItem) -> bool:
 
 def keeps_download_batch_open(item: ProposalItem) -> bool:
     payload = json.loads(item.payload_json or "{}")
-    return item.kind == ProposalKind.download and payload.get("action") == "queue_download"
+    action = payload.get("action")
+    return item.kind == ProposalKind.download and action in {"queue_download", "queue_ytdlp_download"}
 
 
 def batch_has_open_downloads(batch: ProposalBatch) -> bool:
@@ -992,8 +993,9 @@ def apply_download_item(session: Session, item: ProposalItem, task: Task | None 
         queue_slskd_download_with_candidate_fallbacks(session, item, settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), task)
         return
     if action == "queue_ytdlp_download":
-        append_task_log(session, task, f"Queueing YouTube fallback for {item.title}", "warning")
-        queue_ytdlp_download(session, payload.get("request") or {})
+        append_task_log(session, task, f"Queuing background yt-dlp download for {item.title}")
+        set_download_item_status(item, "queued for yt-dlp download")
+        enqueue_task(session, "ytdlp_download", {"item_id": item.id})
         return
     raise ValueError("Unsupported download action")
 
@@ -1410,12 +1412,21 @@ def describe_import_error(error: Exception) -> str:
 
 
 def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
-    # Items that need manual attention (an exhausted download, a pending YouTube fallback) keep
-    # the batch from being finalized, but they no longer short-circuit the whole batch: tracks
-    # that already downloaded should still stage and import.
+    # Items that need manual attention (an exhausted slskd download) keep the batch from being
+    # finalized. Executing yt-dlp items are running in a background task and are NOT blockers.
     blocking_items = selected_download_blockers(batch)
     for blocker in blocking_items:
-        set_download_item_status(blocker, "needs attention before this batch can finish")
+        blocker_action = json.loads(blocker.payload_json or "{}").get("action")
+        if blocker_action == "queue_ytdlp_download":
+            set_download_item_status(blocker, "YouTube fallback ready — select and click Run selected to start yt-dlp download")
+        else:
+            set_download_item_status(blocker, "needs attention before this batch can finish")
+    ytdlp_executing = any(
+        json.loads(item.payload_json or "{}").get("action") == "queue_ytdlp_download"
+        and item.status == ProposalStatus.executing
+        and item.selected
+        for item in batch.items
+    )
     all_download_item_ids = selected_slskd_download_item_ids(batch)
     if not all_download_item_ids:
         return {"imported": 0, "errors": []}
@@ -1426,7 +1437,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if (existing_item := session.get(ProposalItem, item_id)) and existing_item.status not in {ProposalStatus.completed, ProposalStatus.rejected}
     }
     if not expected_item_ids:
-        if not blocking_items:
+        if not blocking_items and not ytdlp_executing:
             finalize_completed_download_batch(session, batch)
         return {"imported": 0, "errors": []}
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
@@ -1636,7 +1647,8 @@ def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
         if not item.selected or item.kind != ProposalKind.download:
             continue
         action = json.loads(item.payload_json or "{}").get("action")
-        if action == "queue_ytdlp_download" and item.status not in {ProposalStatus.completed, ProposalStatus.rejected}:
+        # Exclude executing ytdlp items — the background task is running; they are not stalled.
+        if action == "queue_ytdlp_download" and item.status not in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.executing}:
             blockers.append(item)
         elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
             blockers.append(item)
@@ -3444,7 +3456,7 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                         append_task_log(session, task, f"{track_title}: {status}", "warning")
                     else:
                         add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                        append_task_log(session, task, f"{track_title}: no slskd candidates found; YouTube fallback left unselected", "warning")
+                        append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
                 completed_tracks += 1
                 session.commit()
                 if task is not None:
@@ -3571,30 +3583,36 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
 
 
 def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> None:
-    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, tree_path="/downloads")
+    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, tree_path="/downloads", status=ProposalStatus.executing)
     session.add(batch)
     session.flush()
     track_parent = add_download_tree_parents(session, batch, request, query)
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            parent_id=track_parent.id,
-            title=f"YouTube fallback: {query}",
-            kind=ProposalKind.download,
-            old_value=query,
-            new_value="yt-dlp",
-            payload_json=json.dumps(
-                {
-                    "action": "queue_ytdlp_download",
-                    "request": request,
-                }
-            ),
-        )
+    item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=track_parent.id,
+        title=f"YouTube fallback: {query}",
+        kind=ProposalKind.download,
+        old_value=query,
+        new_value="yt-dlp",
+        status=ProposalStatus.executing,
+        payload_json=json.dumps(
+            {
+                "action": "queue_ytdlp_download",
+                "request": request,
+                "status": "queued for yt-dlp download",
+            }
+        ),
     )
+    session.add(item)
+    session.flush()
+    track_parent.status = ProposalStatus.executing
+    set_item_payload_status(track_parent, "downloading from YouTube via yt-dlp")
+    append_task_log(session, None, f"yt-dlp: slskd found no candidates for '{query}'; queuing YouTube download automatically")
+    enqueue_task(session, "ytdlp_download", {"item_id": item.id})
     create_notification(
         session,
-        title="Download fallback ready",
-        body=query,
+        title="No Soulseek results — downloading from YouTube",
+        body=f"Soulseek had no candidates for '{query}'. yt-dlp will download it automatically from YouTube.",
         event_type="approval_needed",
         target_url="/downloads",
     )
@@ -4445,41 +4463,52 @@ def slskd_diagnostic_body(query: str, diagnostics: dict) -> str:
     )
 
 
-def queue_ytdlp_download(session: Session, request: dict) -> None:
+def queue_ytdlp_download(session: Session, request: dict, task: "Task | None" = None) -> "Path | None":
+    import uuid as _uuid
     settings = get_settings()
     integration = integration_settings(session)
     query = download_query(request)
     if not query:
         raise ValueError("Download query is empty")
     settings.downloads_path.mkdir(parents=True, exist_ok=True)
+    output_id = _uuid.uuid4().hex[:16]
+    output_template = f"ytdlp-{output_id}.%(ext)s"
     command = [
         "yt-dlp",
         f"ytsearch1:{query}",
         "--no-playlist",
-        "--paths",
-        str(settings.downloads_path),
+        "--paths", str(settings.downloads_path),
+        "--output", output_template,
         "--extract-audio",
-        "--audio-format",
-        "mp3",
+        "--audio-format", "mp3",
     ]
     cookies_path = integration.get("youtube_cookies_path") or ""
     if cookies_path and Path(cookies_path).exists():
         command.extend(["--cookies", cookies_path])
+    append_task_log(session, task, f"yt-dlp: searching YouTube for '{query}' and downloading to {settings.downloads_path}")
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+        output = (result.stdout or "").strip()
+        if output:
+            append_task_log(session, task, f"yt-dlp output: {output[-1500:]}")
     except subprocess.CalledProcessError as error:
         details = (error.stderr or error.stdout or "").strip()
         if not details:
             details = f"exit code {error.returncode}"
+        append_task_log(session, task, f"yt-dlp failed for '{query}': {details[-1500:]}", "error")
         raise RuntimeError(f"yt-dlp failed for {query}: {details[-1200:]}") from error
-    create_notification(
-        session,
-        title="YouTube fallback queued",
-        body=f"{query}: {result.stdout[-600:].strip() if result.stdout else 'download command completed'}",
-        event_type="download_queued",
-        target_url="/downloads",
-        deliver_apns=False,
-    )
+    # Locate the downloaded file by the unique output_id prefix
+    downloaded: Path | None = None
+    for candidate in settings.downloads_path.glob(f"ytdlp-{output_id}.*"):
+        if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+            downloaded = candidate
+            break
+    if downloaded:
+        size_kb = downloaded.stat().st_size // 1024
+        append_task_log(session, task, f"yt-dlp: downloaded '{downloaded.name}' ({size_kb} KB)")
+    else:
+        append_task_log(session, task, f"yt-dlp: command succeeded but no audio file found (output_id={output_id})", "warning")
+    return downloaded
 
 
 def fetch_lrclib_lyrics(track: Track) -> str | None:
@@ -4748,6 +4777,92 @@ def cleanup_empty_album_artist(session: Session, album: Album | None) -> None:
         album_count = session.scalar(select(func.count()).select_from(Album).where(Album.artist_id == artist.id))
         if album_count == 0:
             session.delete(artist)
+
+
+def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Background task: run yt-dlp for one proposal item, import the result, and finalize the batch."""
+    item_id = payload.get("item_id")
+    item = session.get(ProposalItem, item_id) if item_id else None
+    if not item:
+        raise ValueError(f"yt-dlp proposal item {item_id} not found")
+
+    item_payload = json.loads(item.payload_json or "{}")
+    request = item_payload.get("request") or {}
+    query = download_query(request) or item.old_value or item.title
+
+    item.status = ProposalStatus.executing
+    set_download_item_status(item, "downloading from YouTube via yt-dlp")
+    session.commit()
+
+    downloaded_path: Path | None = None
+    try:
+        downloaded_path = queue_ytdlp_download(session, request, task=task)
+    except Exception as error:
+        item.status = ProposalStatus.failed
+        set_download_item_status(item, f"yt-dlp failed: {error}")
+        append_task_log(session, task, f"yt-dlp: download failed for '{query}': {error}", "error")
+        create_notification(
+            session,
+            title="YouTube download failed",
+            body=f"yt-dlp could not download '{query}': {error}",
+            event_type="task_failed",
+            target_url="/downloads",
+        )
+        session.commit()
+        raise
+
+    item_payload["ytdlp_file_path"] = str(downloaded_path) if downloaded_path else None
+    item_payload["status"] = "downloaded from YouTube"
+    item.payload_json = json.dumps(item_payload)
+    item.status = ProposalStatus.completed
+    session.commit()
+
+    # Import the downloaded file directly, bypassing the manifest scan's early-exit guard.
+    if downloaded_path and downloaded_path.is_file():
+        try:
+            settings = get_settings()
+            metadata = read_audio_metadata(downloaded_path)
+            target_path = Path(suggest_library_path(metadata, downloaded_path))
+            known_paths = existing_library_and_proposal_paths(session)
+            if str(target_path) not in known_paths and not target_path.exists():
+                import_file_to_library(session, downloaded_path, target_path, {
+                    "path": str(downloaded_path),
+                    "relative_path": str(downloaded_path.relative_to(settings.downloads_path)),
+                    "extension": downloaded_path.suffix.lower(),
+                    "size_bytes": downloaded_path.stat().st_size,
+                    "metadata": metadata,
+                    "suggested_library_path": str(target_path),
+                })
+                mark_matching_wishlist_completed(session, metadata)
+                append_task_log(session, task, f"yt-dlp: '{query}' added to library as '{target_path.name}'")
+                create_notification(
+                    session,
+                    title="YouTube download imported",
+                    body=f"'{query}' was downloaded from YouTube and added to the library.",
+                    event_type="tool_completed",
+                    target_url="/library",
+                )
+                session.flush()
+                enqueue_task(session, "jellyfin_scan", {})
+            else:
+                append_task_log(session, task, f"yt-dlp: '{query}' already in library, skipping import")
+        except Exception as import_error:  # noqa: BLE001
+            append_task_log(session, task, f"yt-dlp: import failed for '{query}': {import_error}", "warning")
+    else:
+        append_task_log(session, task, f"yt-dlp: no audio file found after download for '{query}' — import skipped", "warning")
+
+    # Finalize the parent batch if all items are now done
+    batch = session.get(ProposalBatch, item.batch_id)
+    if batch and batch.status == ProposalStatus.executing:
+        still_open = any(
+            i.status not in {ProposalStatus.completed, ProposalStatus.rejected}
+            for i in batch.items
+        )
+        if not still_open:
+            batch.status = ProposalStatus.completed
+            append_task_log(session, task, f"yt-dlp: batch '{batch.title}' marked complete")
+    session.commit()
+    return {"query": query, "file": str(downloaded_path) if downloaded_path else None}
 
 
 def run_process_wishlist(session: Session, _payload: dict) -> dict:
@@ -6285,6 +6400,7 @@ def jellyfin_audio_match_score(track: Track, item: dict) -> float:
 TASK_HANDLERS = {
     "propose_import": run_propose_import,
     "execute_proposal_batch": run_execute_proposal_batch,
+    "ytdlp_download": run_ytdlp_download,
     "process_wishlist": run_process_wishlist,
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
     "jellyfin_scan": run_jellyfin_scan,
