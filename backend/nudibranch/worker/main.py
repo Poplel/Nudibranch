@@ -2704,15 +2704,39 @@ def finalize_completed_download_batch(session: Session, batch: ProposalBatch) ->
 def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
     """Turn a fully-downloaded, staged batch into a manual "add to library" review task.
 
-    No MusicBrainz verification: the files are staged and an import_files proposal is created in
-    the task queue. The user approves it to move the files into the library (replacing the
-    existing file for lossless-replacement requests). The download batch itself is marked done.
+    All completed download batches accumulate into a single pending import_files review batch
+    so the user approves everything at once rather than one card per album.
     """
-    review_batch: ProposalBatch | None = None
+    # Reuse an existing pending review batch so multiple completed download batches
+    # consolidate into one "Add to library" card instead of one per album.
+    review_batch: ProposalBatch | None = session.scalar(
+        select(ProposalBatch)
+        .options(selectinload(ProposalBatch.items))
+        .where(ProposalBatch.kind == ProposalKind.import_files)
+        .where(ProposalBatch.tree_path == "/task-queue")
+        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved]))
+        .order_by(ProposalBatch.created_at.desc())
+        .limit(1)
+    )
+
+    # Rebuild artist/album node maps from whatever's already in the batch.
     artist_items: dict[str, ProposalItem] = {}
     album_items: dict[tuple[str, str], ProposalItem] = {}
-    first_artist: str | None = None
-    first_album: str | None = None
+    if review_batch is not None:
+        for existing_item in review_batch.items:
+            try:
+                payload = json.loads(existing_item.payload_json or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+            artist = payload.get("artist")
+            album = payload.get("album")
+            if not artist:
+                continue
+            if existing_item.parent_id is None:
+                artist_items[artist] = existing_item
+            elif album and existing_item.old_value is None:
+                album_items[(artist, album)] = existing_item
+
     created = 0
 
     def ensure_review_tree(artist: str, album: str) -> str:
@@ -2756,8 +2780,6 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
             artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
             album = metadata.get("album") or "Unknown Album"
-            first_artist = first_artist or artist
-            first_album = first_album or album
             album_item_id = ensure_review_tree(artist, album)
             session.add(
                 ProposalItem(
@@ -2786,17 +2808,20 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             download_item.status = ProposalStatus.completed
             set_download_item_status(download_item, "downloaded; review to add to library", stage="staging", progress=100)
     if review_batch is not None:
-        label = " – ".join(part for part in [first_artist, first_album] if part)
-        review_batch.title = f"Add to library: {label}" if label else "Add downloaded music to library"
+        # Title: list distinct artists in the batch.
+        all_artists = sorted({a for a in artist_items if a != "Unknown Artist"} or {"Unknown Artist"})
+        artist_label = ", ".join(all_artists[:3]) + (" & more" if len(all_artists) > 3 else "")
+        review_batch.title = f"Add to library: {artist_label}"
         session.flush()
-        append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
-        create_notification(
-            session,
-            title="Downloaded music ready to add",
-            body=f"{created} track(s) downloaded for {label or 'your request'}. Review and approve to add them to your library.",
-            event_type="approval_needed",
-            target_url="/task-queue",
-        )
+        if created:
+            append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
+            create_notification(
+                session,
+                title="Downloaded music ready to add",
+                body=f"{created} track(s) downloaded for {artist_label}. Review and approve to add them to your library.",
+                event_type="approval_needed",
+                target_url="/task-queue",
+            )
     if finalize:
         # Mark the download batch complete WITHOUT cleaning staging — the review task still needs
         # the staged files; they leave staging when it is approved and imported.
