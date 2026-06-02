@@ -1985,7 +1985,9 @@ async def upload_youtube_cookies(
     values = integration_settings(session)
     values["youtube_cookies_browser"] = browser.strip()
     values["youtube_cookies_path"] = str(destination)
-    return IntegrationSettings(**update_integration_settings(session, values))
+    result = update_integration_settings(session, values)
+    session.commit()
+    return IntegrationSettings(**result)
 
 
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")

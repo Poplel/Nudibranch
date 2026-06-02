@@ -1162,7 +1162,9 @@ def load_download_manifest() -> list[dict]:
 def save_download_manifest(entries: list[dict]) -> None:
     path = download_manifest_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    tmp.replace(path)
 
 
 def record_download_manifest_entry(request: dict, candidate: dict, item: ProposalItem) -> None:
@@ -2714,7 +2716,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
         .options(selectinload(ProposalBatch.items))
         .where(ProposalBatch.kind == ProposalKind.import_files)
         .where(ProposalBatch.tree_path == "/task-queue")
-        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved]))
+        .where(ProposalBatch.status == ProposalStatus.pending)
         .order_by(ProposalBatch.created_at.desc())
         .limit(1)
     )
@@ -4833,7 +4835,8 @@ def delete_stale_download_file(entry: dict) -> None:
 
 def safe_filename(path: Path, max_bytes: int = 240) -> Path:
     # Strip slskd's repeated dedup suffixes like " (1) (1) (1)" from retried downloads.
-    stem = re.sub(r"(\s*\(\d+\))+$", "", path.stem)
+    # Only matches 1–3 digit numbers so year suffixes like "(1984)" are preserved.
+    stem = re.sub(r"(\s*\(\d{1,3}\))+$", "", path.stem)
     suffix = path.suffix
     max_stem = max_bytes - len(suffix.encode())
     stem_bytes = stem.encode()
@@ -5229,6 +5232,10 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
         response = client.post("/Library/Refresh")
         response.raise_for_status()
     create_notification(session, title="Jellyfin scan queued", body="Library refresh was requested.", event_type="tool_completed", target_url="/tools")
+    # Queue a remap after the scan so newly indexed items get matched. Jellyfin scans
+    # asynchronously so this fires immediately; the 5-min periodic remap catches any
+    # items Jellyfin hasn't indexed yet by the time this task runs.
+    enqueue_task(session, "sync_favorites_jellyfin", {})
     return {"requested": True}
 
 
@@ -6576,7 +6583,7 @@ async def worker_loop() -> None:
                                 session.commit()
                                 last_download_scan = now
                                 await deliver_apns_notifications(session)
-                                time.sleep(2)
+                                await asyncio.sleep(2)
                                 continue
                             append_task_log(
                                 session,
@@ -6605,8 +6612,11 @@ async def worker_loop() -> None:
                             session.rollback()
                             write_app_log(f"Track mapping auto-run failed: {_sync_err}", level="warning")
                     last_playlist_sync = time.time()
-                await deliver_apns_notifications(session)
-                time.sleep(2)
+                try:
+                    await deliver_apns_notifications(session)
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(2)
                 continue
 
             try:

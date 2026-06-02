@@ -37,7 +37,7 @@ def _get_or_create_instance_id(session: Session) -> str:
     if row is None:
         row = AppSetting(key="proxy_instance_id", value=secrets.token_hex(16))
         session.add(row)
-        session.commit()
+        session.flush()
     return row.value
 
 
@@ -82,6 +82,7 @@ def create_notification(
                     deliver_apns=deliver_apns,
                 )
             return created
+        return None
     for attempt in range(3):
         notification = Notification(
             user_id=user_id,
@@ -133,10 +134,13 @@ async def _deliver_via_proxy(session: Session, pending, devices, proxy_url: str)
     instance_id = _get_or_create_instance_id(session)
     delivered = 0
     base = proxy_url.rstrip("/")
+    rate_limited = False
 
     async with httpx.AsyncClient(timeout=15) as client:
         for notification in pending:
-            target_devices = [d for d in devices if notification.user_id in (None, d.user_id)]
+            if rate_limited:
+                break
+            target_devices = [d for d in devices if d.enabled and notification.user_id in (None, d.user_id)]
             notification_delivered = False
             for device in target_devices:
                 timestamp = int(time.time())
@@ -173,10 +177,12 @@ async def _deliver_via_proxy(session: Session, pending, devices, proxy_url: str)
                             notification_delivered = True
                             delivered += 1
                     elif response.status_code == 429:
+                        rate_limited = True
                         break
                 except httpx.HTTPError:
                     continue
-            if notification_delivered:
+            all_devices_gone = bool(target_devices) and all(not d.enabled for d in target_devices)
+            if notification_delivered or all_devices_gone:
                 notification.apns_delivered_at = datetime.now(timezone.utc)
 
     session.commit()
@@ -196,7 +202,7 @@ async def _deliver_direct(session: Session, pending, devices) -> int:
 
     async with httpx.AsyncClient(http2=True, timeout=10) as client:
         for notification in pending:
-            target_devices = [d for d in devices if notification.user_id in (None, d.user_id)]
+            target_devices = [d for d in devices if d.enabled and notification.user_id in (None, d.user_id)]
             notification_delivered = False
             for device in target_devices:
                 try:
@@ -221,12 +227,14 @@ async def _deliver_direct(session: Session, pending, devices) -> int:
                     )
                     if response.status_code == 410:
                         device.enabled = False
+                        continue
                     response.raise_for_status()
                     notification_delivered = True
                     delivered += 1
                 except httpx.HTTPError:
                     continue
-            if notification_delivered:
+            all_devices_gone = bool(target_devices) and all(not d.enabled for d in target_devices)
+            if notification_delivered or all_devices_gone:
                 notification.apns_delivered_at = datetime.now(timezone.utc)
 
     session.commit()

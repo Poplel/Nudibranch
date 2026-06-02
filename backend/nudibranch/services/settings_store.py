@@ -45,7 +45,7 @@ def update_integration_settings(session: Session, values: dict[str, str]) -> dic
             session.add(setting)
         else:
             setting.value = str(value) if value is not None else ""
-    session.commit()
+    session.flush()
     return integration_settings(session)
 
 
