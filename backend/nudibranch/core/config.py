@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     apns_bundle_id: str = Field("", alias="APNS_BUNDLE_ID")
     apns_private_key_path: Path = Field(Path("/app/config/AuthKey.p8"), alias="APNS_PRIVATE_KEY_PATH")
 
+    # Proxy mode: point at a NudibranchProxy server instead of calling Apple directly.
+    # When set, direct APNS credentials above are not required.
+    apns_proxy_url: str = Field("", alias="APNS_PROXY_URL")
+
     import_path: Path = Path("/app/import")
     staging_path: Path = Path("/app/staging")
     library_path: Path = Path("/app/library")
