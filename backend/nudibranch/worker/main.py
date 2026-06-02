@@ -1241,10 +1241,13 @@ def remove_download_manifest_entry(target: dict) -> None:
 
 
 def same_manifest_entry(entry: dict, target: dict) -> bool:
-    target_item_id = target.get("_original_item_id") or target.get("item_id")
+    # Match on either item_id: after reconciliation the manifest holds the NEW id, but callers
+    # that carry _original_item_id still need to find that entry.
+    target_item_ids = {v for v in [target.get("item_id"), target.get("_original_item_id")] if v}
     return bool(
-        entry.get("batch_id") == target.get("batch_id")
-        and entry.get("item_id") == target_item_id
+        target_item_ids
+        and entry.get("batch_id") == target.get("batch_id")
+        and entry.get("item_id") in target_item_ids
         and entry.get("basename")
         and entry.get("basename") == target.get("basename")
     )
@@ -1261,8 +1264,22 @@ def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, f
         if staged.exists():
             return staged
     staging_root = download_staging_root(batch.id)
+    # Safety net: if the file is already inside the staging directory (e.g. the manifest status
+    # wasn't persisted but the previous move succeeded), re-save the manifest and return as-is
+    # rather than moving the file again and accumulating " (1)" suffixes.
+    try:
+        file_path.relative_to(staging_root)
+        in_staging = True
+    except ValueError:
+        in_staging = False
+    if in_staging:
+        update_download_manifest_entry(entry, "staged", path=str(file_path), staged_at=datetime.now(timezone.utc).isoformat())
+        entry.update({"status": "staged", "path": str(file_path)})
+        item = session.get(ProposalItem, entry.get("item_id"))
+        set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+        return file_path
     staging_root.mkdir(parents=True, exist_ok=True)
-    destination = unique_destination(staging_root / file_path.name)
+    destination = unique_destination(staging_root / safe_filename(file_path).name)
     append_task_log(session, None, f"{entry_download_label(entry)}: moving completed download to staging: {destination.name}")
     shutil.move(str(file_path), str(destination))
     update_download_manifest_entry(
@@ -1505,6 +1522,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 set_download_item_status(item, f"failed to move download to staging: {error}")
                 update_download_manifest_entry(entry, "failed", retry_reason=f"staging failed: {error}")
                 append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
+                delete_stale_download_file(entry)
                 continue
 
         if file_path:
@@ -2231,6 +2249,8 @@ def retry_download_entry(
         transfer = None
         if holds_slot and available_slots is not None:
             available_slots["available"] = int(available_slots.get("available") or 0) + 1
+    # Delete the old download file so slskd doesn't accumulate "(1)" dedup suffixes on retry.
+    delete_stale_download_file(entry)
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     if not download_slot_available(available_slots):
@@ -2472,14 +2492,24 @@ def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Pat
         if staged.exists():
             return staged, "staged; ready for verification"
         return None, "staged file is missing"
+    staging_root = get_settings().staging_path / "downloads"
     known_path = entry.get("path")
     candidates = []
     known_candidates: set[Path] = set()
     if known_path:
         known = Path(known_path)
         known_candidate = known if known.is_absolute() else root / known
-        known_candidates.add(known_candidate)
-        candidates.append(known_candidate)
+        # Never treat a staging-directory path as a download candidate for a non-staged entry:
+        # if the status wasn't persisted, stage_downloaded_file will re-handle it rather than
+        # moving the file again within staging.
+        try:
+            known_candidate.relative_to(staging_root)
+            in_staging = True
+        except ValueError:
+            in_staging = False
+        if not in_staging:
+            known_candidates.add(known_candidate)
+            candidates.append(known_candidate)
     candidates.extend(root.rglob("*"))
     now = time.time()
     for file_path in candidates:
@@ -4753,6 +4783,38 @@ def normalize_audio_file_volume(source_path: Path) -> None:
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(source_path), str(backup_path))
     shutil.move(str(temp_path), str(source_path))
+
+
+def delete_stale_download_file(entry: dict) -> None:
+    """Delete a download file from the downloads directory when it's being abandoned or replaced.
+
+    Only deletes files inside the configured downloads path — never touches the library or staging.
+    """
+    path_str = entry.get("path") or entry.get("download_path")
+    if not path_str:
+        return
+    file_path = Path(str(path_str))
+    downloads_root = get_settings().downloads_path
+    try:
+        file_path.relative_to(downloads_root)
+    except ValueError:
+        return  # not inside downloads — leave it alone
+    try:
+        if file_path.is_file():
+            file_path.unlink()
+    except OSError:
+        pass
+
+
+def safe_filename(path: Path, max_bytes: int = 240) -> Path:
+    # Strip slskd's repeated dedup suffixes like " (1) (1) (1)" from retried downloads.
+    stem = re.sub(r"(\s*\(\d+\))+$", "", path.stem)
+    suffix = path.suffix
+    max_stem = max_bytes - len(suffix.encode())
+    stem_bytes = stem.encode()
+    if len(stem_bytes) > max_stem:
+        stem = stem_bytes[:max_stem].decode(errors="ignore").rstrip()
+    return path.with_name(stem + suffix)
 
 
 def unique_destination(path: Path) -> Path:
