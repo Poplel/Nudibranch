@@ -22,6 +22,7 @@ from nudibranch.api.schemas import (
     ImportMusicBrainzLookupRequest,
     IntegrationSettings,
     ImportScanRequest,
+    JellyfinUserOut,
     LibraryMetadataProposalRequest,
     LibraryRemoveProposalRequest,
     LibraryTreeAlbum,
@@ -1750,6 +1751,14 @@ def tool_jellyfin_scan(
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
 
 
+@router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
+def tool_remap_tracks(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.jellyfin_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
+
+
 @router.post("/tools/clear-discover-cache", response_model=TaskOut, tags=["tools"], summary="Clear discover art cache")
 def tool_clear_discover_cache(
     session: Session = Depends(get_session),
@@ -2005,9 +2014,12 @@ def update_selection(
     payload: ProposalSelectionUpdate,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
-) -> dict:
-    count = set_selection(session, batch_id, payload.item_ids, payload.selected)
-    return {"batch_id": batch_id, "updated": count}
+) -> ProposalBatchOut:
+    set_selection(session, batch_id, payload.item_ids, payload.selected)
+    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return serialize_batch(batch)
 
 
 @router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"], summary="Approve proposal batch")
@@ -2030,9 +2042,12 @@ def reject(
     payload: ProposalRejectRequest,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
-) -> dict:
-    count = reject_items(session, batch_id, payload.item_ids, payload.suppress_for)
-    return {"batch_id": batch_id, "removed": count}
+) -> ProposalBatchOut:
+    reject_items(session, batch_id, payload.item_ids, payload.suppress_for)
+    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    return serialize_batch(batch)
 
 
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"], summary="List background tasks")
@@ -2082,11 +2097,11 @@ def get_integrations(
     return IntegrationSettings(**integration_settings(session))
 
 
-@router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key")
+@router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key", response_model=list[JellyfinUserOut])
 def list_jellyfin_users(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
-) -> list[dict]:
+) -> list[JellyfinUserOut]:
     settings = integration_settings(session)
     url = settings.get("jellyfin_url", "").rstrip("/")
     key = settings.get("jellyfin_api_key", "")
@@ -2106,7 +2121,14 @@ def update_integrations(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> IntegrationSettings:
+    old_url = integration_settings(session).get("jellyfin_url", "")
+    new_url = (payload.jellyfin_url or "").rstrip("/")
     update_integration_settings(session, payload.model_dump())
+    if new_url and new_url != old_url.rstrip("/"):
+        # Jellyfin URL changed — item IDs from the old server are invalid, clear them
+        # so the next remap job rebuilds the mapping against the new server.
+        session.query(Track).filter(Track.jellyfin_item_id.isnot(None)).update({"jellyfin_item_id": None})
+        enqueue_task(session, "sync_favorites_jellyfin", {})
     session.commit()
     return IntegrationSettings(**integration_settings(session))
 

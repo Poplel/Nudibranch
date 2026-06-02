@@ -325,3 +325,8 @@ class CheckFileFixRequest(BaseModel):
 
 class BackupRestoreRequest(BaseModel):
     backup_path: str
+
+
+class JellyfinUserOut(BaseModel):
+    id: str
+    name: str
