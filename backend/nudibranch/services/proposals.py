@@ -177,7 +177,11 @@ def remove_rejected_manifest_downloads(items: list[ProposalItem]) -> int:
         return 0
     settings = get_settings()
     downloads_root = settings.downloads_path.resolve()
-    manifest_path = settings.downloads_path / ".nudibranch-downloads.json"
+    # Use the config-volume path (current location after migration); fall back to the legacy
+    # downloads-folder path so rejections still work if the manifest hasn't been migrated yet.
+    manifest_path = settings.config_path / ".nudibranch-downloads.json"
+    if not manifest_path.exists():
+        manifest_path = settings.downloads_path / ".nudibranch-downloads.json"
     if not manifest_path.exists():
         return 0
     try:
