@@ -196,7 +196,9 @@ nav button:hover,
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 13px 18px;
+  padding: 0 18px;
+  height: 64px;
+  flex-shrink: 0;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--panel) 86%, transparent);
 }
@@ -1329,6 +1331,7 @@ nav button:hover,
   align-items: center;
   gap: 8px;
   min-width: 0;
+  height: 44px;
   overflow: hidden;
 }
 
@@ -1352,11 +1355,12 @@ nav button:hover,
 }
 
 .topbar-track-copy {
-  flex: 1;
-  min-width: 0;
-  max-width: 160px;
+  flex: 0 0 160px;
+  width: 160px;
+  height: 36px;
   display: flex;
   flex-direction: column;
+  justify-content: center;
   overflow: hidden;
 }
 
@@ -1398,8 +1402,8 @@ nav button:hover,
 
 .topbar-progress {
   flex: 1;
-  min-width: 60px;
-  max-width: 200px;
+  min-width: 80px;
+  max-width: 220px;
 }
 
 .topbar-actions {

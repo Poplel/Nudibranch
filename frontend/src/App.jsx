@@ -101,7 +101,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [accentColor, setAccentColor] = useState(initialAppearance.accentColor);
   const [backgroundTint, setBackgroundTint] = useState(initialAppearance.backgroundTint);
-  const [crossfadeDuration, setCrossfadeDuration] = useState(1.0);
+  const [crossfadeDuration, setCrossfadeDuration] = useState(0.5);
   const [library, setLibrary] = useState([]);
   const [importFiles, setImportFiles] = useState([]);
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
@@ -264,7 +264,7 @@ function App() {
     setDark(user.theme === "dark");
     setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
     setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
-    setCrossfadeDuration(user.crossfade_duration ?? 1.0);
+    setCrossfadeDuration(user.crossfade_duration ?? 0.5);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -286,7 +286,7 @@ function App() {
       (user.theme || "light") === appearance.theme &&
       (user.accent_color || DEFAULT_APPEARANCE.accentColor) === appearance.accent_color &&
       (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint &&
-      (user.crossfade_duration ?? 1.0) === appearance.crossfade_duration
+      (user.crossfade_duration ?? 0.5) === appearance.crossfade_duration
     ) {
       return;
     }
@@ -5253,7 +5253,7 @@ function AudioPlayer({
   onPlaybackState,
   onDockChange,
   onClose,
-  crossfadeDuration = 1,
+  crossfadeDuration = 0.5,
 }) {
   const audioRef = useRef(null);
   const nextAudioRef = useRef(null);
@@ -5266,6 +5266,7 @@ function AudioPlayer({
   const lastPlaybackReportSecond = useRef(-1);
   const crossfading = useRef(false);
   const crossfadeIntervalRef = useRef(null);
+  const seekOnLoad = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -5279,6 +5280,8 @@ function AudioPlayer({
   const showUpNext = Boolean(nextTrack && duration && duration - currentTime <= nearEndThreshold);
 
   useEffect(() => {
+    const wasCrossfading = crossfading.current;
+    if (!wasCrossfading) seekOnLoad.current = null;
     setPlaying(false);
     setCurrentTime(0);
     crossfading.current = false;
@@ -5363,8 +5366,8 @@ function AudioPlayer({
       if (frac >= 1) {
         clearInterval(crossfadeIntervalRef.current);
         crossfadeIntervalRef.current = null;
+        seekOnLoad.current = next.currentTime;
         next.pause();
-        next.currentTime = 0;
         onEndedRef.current?.();
       }
     }, 30);
@@ -5658,7 +5661,13 @@ function AudioPlayer({
             notifyPlaybackState(playing ? "playing" : "paused", event);
           }
         }}
-        onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
+        onLoadedMetadata={(event) => {
+          setDuration(event.currentTarget.duration || 0);
+          if (seekOnLoad.current !== null) {
+            event.currentTarget.currentTime = seekOnLoad.current;
+            seekOnLoad.current = null;
+          }
+        }}
         onEnded={() => { if (!crossfading.current) onEnded?.(); }}
       />
       {nextAudioUrl && <audio ref={nextAudioRef} preload="auto" src={nextAudioUrl} style={{ display: "none" }} />}

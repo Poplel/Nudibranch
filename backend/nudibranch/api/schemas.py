@@ -25,7 +25,7 @@ class UserOut(BaseModel):
     theme: str = "light"
     accent_color: str = "#356df3"
     background_tint: str = "#356df3"
-    crossfade_duration: float = 1.0
+    crossfade_duration: float = 0.5
     jellyfin_user_id: str | None = None
 
 
@@ -56,7 +56,7 @@ class UserAppearanceUpdate(BaseModel):
     theme: str = Field(pattern="^(light|dark)$")
     accent_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     background_tint: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
-    crossfade_duration: float = Field(default=1.0, ge=0.0, le=15.0)
+    crossfade_duration: float = Field(default=0.5, ge=0.0, le=15.0)
 
 
 class JellyfinUserLinkUpdate(BaseModel):
