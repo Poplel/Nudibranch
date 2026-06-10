@@ -1664,10 +1664,10 @@ nav button:hover,
 
 .pip-controls-sticky {
   position: sticky;
-  top: 0;
+  bottom: 0;
   z-index: 2;
-  /* Slightly frosted so text below is readable when scrolled under */
   background: color-mix(in srgb, var(--panel-strong) 0%, transparent);
+  padding-top: 8px;
   padding-bottom: 8px;
 }
 
@@ -1713,7 +1713,7 @@ nav button:hover,
 }
 
 .pip-player.has-up-next .audio-header {
-  grid-template-columns: 150px minmax(220px, 1fr) minmax(260px, 390px) 64px;
+  grid-template-columns: 150px minmax(220px, 1fr) minmax(180px, 280px) 64px;
 }
 
 .player-window-actions {
@@ -1764,16 +1764,22 @@ nav button:hover,
   white-space: nowrap;
 }
 
+.pip-player .audio-track-copy {
+  overflow: hidden;
+}
+
 .pip-player .audio-header strong {
   font-size: 56px;
   line-height: 1;
-  white-space: normal;
+  white-space: nowrap;
+  animation: topbar-marquee 18s linear infinite;
 }
 
 .pip-player .audio-header small {
   margin-top: 10px;
   font-size: 17px;
-  white-space: normal;
+  white-space: nowrap;
+  animation: topbar-marquee 18s linear infinite;
 }
 
 .playing-from {
@@ -1868,23 +1874,23 @@ nav button:hover,
 
 .fullscreen-next {
   display: grid;
-  grid-template-columns: 74px minmax(0, 1fr);
-  gap: 16px;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 10px;
   align-self: center;
   width: 100%;
-  padding: 10px 18px 10px 10px;
-  border: 1px solid var(--line);
+  padding: 7px 12px 7px 7px;
+  border: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
   border-radius: 4px;
-  background: color-mix(in srgb, var(--panel-strong) 88%, transparent);
+  background: color-mix(in srgb, var(--panel-strong) 38%, transparent);
   color: var(--text);
 }
 
 .up-next-art {
   display: grid;
-  width: 64px;
-  height: 64px;
+  width: 40px;
+  height: 40px;
   place-items: center;
-  border-radius: 4px;
+  border-radius: 3px;
   background: var(--soft);
   color: var(--muted);
   overflow: hidden;
@@ -1898,21 +1904,25 @@ nav button:hover,
 
 .fullscreen-next span {
   color: var(--muted);
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 800;
   letter-spacing: 0;
   text-transform: uppercase;
 }
 
-.fullscreen-next strong,
-.fullscreen-next small {
+.fullscreen-next strong {
+  font-size: 13px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .fullscreen-next small {
+  font-size: 11px;
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 

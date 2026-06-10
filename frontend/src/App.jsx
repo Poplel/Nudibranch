@@ -5285,6 +5285,7 @@ function AudioPlayer({
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const trackCopyRef = useRef(null);
+  const pipTrackCopyRef = useRef(null);
   const pipWindowRef = useRef(null);
   const playerContainerRef = useRef(null);
   const reopenPipAfterFullscreen = useRef(false);
@@ -5334,6 +5335,21 @@ function AudioPlayer({
     update();
     return () => ro.disconnect();
   }, [currentTrack?.id]);
+
+  useEffect(() => {
+    const container = pipTrackCopyRef.current;
+    if (!container) return;
+    const update = () => {
+      const strong = container.querySelector("strong");
+      const small = container.querySelector("small");
+      if (strong) strong.style.setProperty("--overflow-width", `${Math.max(0, strong.scrollWidth - container.clientWidth)}px`);
+      if (small) small.style.setProperty("--overflow-width", `${Math.max(0, small.scrollWidth - container.clientWidth)}px`);
+    };
+    const ro = new ResizeObserver(update);
+    ro.observe(container);
+    update();
+    return () => ro.disconnect();
+  }, [currentTrack?.id, pipContainer]);
 
   useEffect(() => {
     setLyricsData(null);
@@ -5669,7 +5685,7 @@ function AudioPlayer({
         <div className="player-core" ref={popped ? null : coreRef}>
           <div className="audio-header">
             <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
-            <div className="audio-track-copy">
+            <div className="audio-track-copy" ref={pipTrackCopyRef}>
               <span className="playing-from">Playing from library</span>
               <strong>{currentTrack?.title || "Local player"}</strong>
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
@@ -5694,6 +5710,9 @@ function AudioPlayer({
             </div>
           </div>
           <div className="pip-scroll-area">
+            <div className="local-queue pip-queue">
+              {queueList()}
+            </div>
             <div className="fullscreen-controls pip-controls-sticky">
               <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
               <div className="player-controls">
@@ -5713,9 +5732,6 @@ function AudioPlayer({
                   <Heart size={19} />
                 </button>
               </div>
-            </div>
-            <div className="local-queue pip-queue">
-              {queueList()}
             </div>
           </div>
           {lyricsOpen && (
