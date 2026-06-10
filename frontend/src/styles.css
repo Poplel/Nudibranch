@@ -187,7 +187,9 @@ nav button:hover,
 .workspace {
   min-width: 0;
   display: grid;
-  grid-template-rows: 64px 1fr;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .topbar {
@@ -319,6 +321,7 @@ nav button:hover,
   gap: 14px;
   min-height: 0;
   padding: 14px;
+  overflow: hidden;
 }
 
 .panel {
@@ -1296,18 +1299,118 @@ nav button:hover,
 }
 
 .audio-player {
-  position: fixed;
-  right: 18px;
-  bottom: 24px;
-  z-index: 30;
   display: grid;
   gap: 12px;
-  width: min(330px, calc(100vw - 36px));
-  padding: 18px;
   border: 1px solid var(--line);
   border-radius: 22px;
   background: var(--panel-strong);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
+}
+
+/* Topbar (docked) player — compact horizontal bar */
+.audio-player.topbar {
+  position: relative;
+  flex: 1;
+  max-width: 580px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  width: auto;
+  padding: 5px 10px;
+  border-radius: 8px;
+  box-shadow: none;
+}
+
+.topbar-player-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.audio-player.topbar .player-art {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: var(--soft);
+  color: var(--muted);
+  overflow: hidden;
+}
+
+.audio-player.topbar .player-art img {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.topbar-track-copy {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar-track-copy strong,
+.topbar-track-copy small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.topbar-track-copy strong {
+  font-size: 13px;
+}
+
+.topbar-track-copy small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.topbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.player-play-button.compact {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+}
+
+.topbar-progress {
+  flex: 1;
+  min-width: 60px;
+  max-width: 200px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.topbar-queue {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 50vh;
+  overflow: auto;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  padding: 6px;
 }
 
 .audio-player.popped {
@@ -1339,6 +1442,8 @@ nav button:hover,
   overflow: hidden;
   background: var(--panel-strong);
   box-shadow: none;
+  /* queue is absolute-positioned inside */
+  isolation: isolate;
 }
 
 .audio-player.popped.pip-player {
@@ -1556,15 +1661,19 @@ nav button:hover,
 }
 
 .pip-player .local-queue {
-  position: static;
-  justify-self: center;
-  width: min(520px, 100%);
-  max-height: 248px;
+  position: absolute;
+  bottom: 80px;
+  left: 72px;
+  right: 72px;
+  z-index: 10;
+  width: auto;
+  max-height: 50vh;
   padding: 8px;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--panel-strong) 86%, transparent);
+  background: color-mix(in srgb, var(--panel-strong) 92%, transparent);
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.25);
+  backdrop-filter: blur(8px);
 }
 
 .fullscreen-next {
@@ -1984,8 +2093,6 @@ nav button:hover,
 .inspector {
   padding: 14px;
   overflow: auto;
-  max-height: calc(100vh - 92px - var(--player-dock-height, 0px) - 22px);
-  margin-bottom: calc(var(--player-dock-height, 0px) + 22px);
 }
 
 .inspector-actions {
@@ -2496,6 +2603,16 @@ nav button:hover,
     height: auto;
   }
 
+  .audio-player.topbar {
+    max-width: none;
+    width: 100%;
+    order: -1;
+  }
+
+  .topbar-progress {
+    max-width: none;
+  }
+
 
   .panel-header {
     align-items: flex-start;
@@ -2585,7 +2702,8 @@ nav button:hover,
   }
 
   .pip-player .local-queue {
-    width: calc(100vw - 48px);
+    left: 24px;
+    right: 24px;
   }
 }
 

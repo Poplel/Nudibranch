@@ -181,6 +181,11 @@ function App() {
   const currentTrackIndex = playerQueue.findIndex((track) => track.id === currentTrack?.id);
   const playerDocked = playerOpen && !playerPopped;
   const appearanceVars = useMemo(() => buildAppearanceVars(dark, accentColor, backgroundTint), [dark, accentColor, backgroundTint]);
+  const nextAudioUrl = useMemo(() => {
+    const next = playerQueue[currentTrackIndex + 1];
+    if (!next?.id || !token) return null;
+    return `${API_BASE}/library/tracks/${next.id}/stream?api_key=${encodeURIComponent(token)}`;
+  }, [playerQueue, currentTrackIndex, token]);
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -1538,7 +1543,34 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <button className="icon-button" style={{marginLeft: "auto"}} onClick={refreshAll} title="Refresh">
+          {playerOpen && (
+            <AudioPlayer
+              currentTrack={currentTrack}
+              audioUrl={audioUrl}
+              nextAudioUrl={nextAudioUrl}
+              queue={playerQueue}
+              currentIndex={currentTrackIndex}
+              queueOpen={queueOpen}
+              setQueueOpen={setQueueOpen}
+              onPlayTrack={loadPlayerTrack}
+              onEnded={playNextTrack}
+              onSkipBack={playPreviousTrack}
+              onSkipForward={playNextTrack}
+              onFavorite={toggleFavoriteTrack}
+              favoriteTrackIds={favoriteTrackIds}
+              onPlaybackState={(status, details) => reportPlayerStatus(currentTrack, status, details)}
+              onDockChange={({ popped, compactHeight, fullHeight }) => {
+                setPlayerPopped(popped);
+                setPlayerDockHeight(compactHeight || 0);
+                setPlayerToastHeight(fullHeight || compactHeight || 0);
+              }}
+              onClose={() => {
+                reportPlayerStatus(currentTrack, "stopped");
+                setPlayerOpen(false);
+              }}
+            />
+          )}
+          <button className="icon-button" style={!playerOpen ? {marginLeft: "auto"} : undefined} onClick={refreshAll} title="Refresh">
             <RefreshCw size={18} />
           </button>
           {hasPermission(user, "notifications:read") && (
@@ -1736,32 +1768,6 @@ function App() {
           />
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
-        {playerOpen && (
-          <AudioPlayer
-            currentTrack={currentTrack}
-            audioUrl={audioUrl}
-            queue={playerQueue}
-            currentIndex={currentTrackIndex}
-            queueOpen={queueOpen}
-            setQueueOpen={setQueueOpen}
-            onPlayTrack={loadPlayerTrack}
-            onEnded={playNextTrack}
-            onSkipBack={playPreviousTrack}
-            onSkipForward={playNextTrack}
-            onFavorite={toggleFavoriteTrack}
-            favoriteTrackIds={favoriteTrackIds}
-            onPlaybackState={(status, details) => reportPlayerStatus(currentTrack, status, details)}
-            onDockChange={({ popped, compactHeight, fullHeight }) => {
-              setPlayerPopped(popped);
-              setPlayerDockHeight(compactHeight || 0);
-              setPlayerToastHeight(fullHeight || compactHeight || 0);
-            }}
-            onClose={() => {
-              reportPlayerStatus(currentTrack, "stopped");
-              setPlayerOpen(false);
-            }}
-          />
-        )}
       </section>
     </main>
   );
@@ -5201,6 +5207,7 @@ function Toast({ title, body, onClose }) {
 function AudioPlayer({
   currentTrack,
   audioUrl,
+  nextAudioUrl,
   queue,
   currentIndex,
   queueOpen,
@@ -5216,6 +5223,7 @@ function AudioPlayer({
   onClose,
 }) {
   const audioRef = useRef(null);
+  const nextAudioRef = useRef(null);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const pipWindowRef = useRef(null);
@@ -5340,6 +5348,12 @@ function AudioPlayer({
     container.style.minHeight = "100vh";
     container.style.overflow = "hidden";
     container.style.display = "block";
+    const mainEl = document.querySelector("main");
+    if (mainEl) {
+      for (const prop of mainEl.style) {
+        if (prop.startsWith("--")) container.style.setProperty(prop, mainEl.style.getPropertyValue(prop));
+      }
+    }
     pipWindow.document.body.appendChild(container);
     const handleFullscreenChange = () => setFullscreenPlayer(Boolean(pipWindow.document.fullscreenElement));
     const closePip = () => {
@@ -5389,23 +5403,78 @@ function AudioPlayer({
     }
   }
 
+  function queueList() {
+    return upcomingQueue.map((track, index) => (
+      <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
+        <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
+        <strong>{track.title}</strong>
+      </button>
+    ));
+  }
+
   function surface({ popped = false } = {}) {
     const pipLayout = popped || fullscreenPlayer;
+    const docked = !pipLayout;
+
+    if (docked) {
+      return (
+        <div className="audio-player topbar" ref={dockRef}>
+          <div className="topbar-player-row" ref={coreRef}>
+            <div className="player-art">
+              {currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={18} />}
+            </div>
+            <div className="topbar-track-copy">
+              <strong>{currentTrack?.title || "Local player"}</strong>
+              <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || "Ready"}</small>
+            </div>
+            <div className="topbar-controls">
+              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+                <SkipBack size={16} />
+              </button>
+              <button className="player-play-button compact" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+                {playing ? <Pause size={17} /> : <Play size={17} />}
+              </button>
+              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+                <SkipForward size={16} />
+              </button>
+            </div>
+            <input className="player-progress topbar-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+            <div className="topbar-actions">
+              <button className="player-icon-button" onClick={() => setQueueOpen((v) => !v)} title="Queue">
+                <Menu size={16} />
+              </button>
+              <button className="row-icon-button" onClick={openPictureInPicture} disabled={queue.length === 0} title={queue.length === 0 ? "Queue is empty" : "Pop out"}>
+                <PictureInPicture2 size={14} />
+              </button>
+              <button className="row-icon-button" onClick={onClose} title="Close player">
+                <X size={14} />
+              </button>
+            </div>
+          </div>
+          {queueOpen && (
+            <div className="local-queue topbar-queue">
+              {queueList()}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div
-        className={`${popped ? "audio-player popped pip-player" : fullscreenPlayer ? "audio-player pip-player main-fullscreen-player" : "audio-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${pipLayout && showUpNext ? " has-up-next" : ""}`}
+        className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${showUpNext ? " has-up-next" : ""}`}
         ref={popped ? null : dockRef}
-        style={pipLayout && currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
+        style={currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
         <div className="player-core" ref={popped ? null : coreRef}>
           <div className="audio-header">
             <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
             <div className="audio-track-copy">
-              {pipLayout && <span className="playing-from">Playing from library</span>}
+              <span className="playing-from">Playing from library</span>
               <strong>{currentTrack?.title || "Local player"}</strong>
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
             </div>
-            {pipLayout && showUpNext && (
+            {showUpNext && (
               <div className="fullscreen-next">
                 <div className="up-next-art">{nextTrack._coverUrl ? <img src={nextTrack._coverUrl} alt="" /> : <Music size={18} />}</div>
                 <div>
@@ -5416,16 +5485,10 @@ function AudioPlayer({
               </div>
             )}
             <div className="player-window-actions">
-              {popped || fullscreenPlayer ? (
-                <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
-                  {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
-                </button>
-              ) : (
-                <button className="row-icon-button" onClick={openPictureInPicture} disabled={queue.length === 0} title={queue.length === 0 ? "Queue is empty" : "Pop out"}>
-                  <PictureInPicture2 size={14} />
-                </button>
-              )}
-              <button className="row-icon-button" onClick={onClose} title="Close player">
+              <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
+                {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
+              </button>
+              <button className="row-icon-button" onClick={popped ? () => pipWindowRef.current?.close?.() : onClose} title={popped ? "Return to page" : "Close player"}>
                 <X size={14} />
               </button>
             </div>
@@ -5453,12 +5516,7 @@ function AudioPlayer({
         </div>
         {queueOpen && (
           <div className="local-queue">
-            {upcomingQueue.map((track, index) => (
-              <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
-                <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
-                <strong>{track.title}</strong>
-              </button>
-            ))}
+            {queueList()}
           </div>
         )}
       </div>
@@ -5491,6 +5549,7 @@ function AudioPlayer({
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
         onEnded={onEnded}
       />
+      {nextAudioUrl && <audio ref={nextAudioRef} preload="auto" src={nextAudioUrl} style={{ display: "none" }} />}
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
     </>
   );
