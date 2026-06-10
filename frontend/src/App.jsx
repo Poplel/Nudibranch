@@ -1417,6 +1417,11 @@ function App() {
     if (previousTrack) await loadPlayerTrack(previousTrack);
   }
 
+  function removeFromQueue(queueIndex) {
+    const absoluteIndex = currentTrackIndex + 1 + queueIndex;
+    setPlayerQueue((current) => current.filter((_, i) => i !== absoluteIndex));
+  }
+
   function setApprovalSelection(batchId, itemIds, selected) {
     const selectedSet = new Set(itemIds);
     setApprovals((current) =>
@@ -1564,13 +1569,14 @@ function App() {
                 setPlayerDockHeight(compactHeight || 0);
                 setPlayerToastHeight(fullHeight || compactHeight || 0);
               }}
+              onRemoveFromQueue={removeFromQueue}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
                 setPlayerOpen(false);
               }}
             />
           )}
-          <button className="icon-button" style={!playerOpen ? {marginLeft: "auto"} : undefined} onClick={refreshAll} title="Refresh">
+          <button className="icon-button" style={{marginLeft: "auto"}} onClick={refreshAll} title="Refresh">
             <RefreshCw size={18} />
           </button>
           {hasPermission(user, "notifications:read") && (
@@ -1586,12 +1592,12 @@ function App() {
           <button className="icon-button" onClick={logout} title="Sign out">
             <LogOut size={18} />
           </button>
+          {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
         <div className="content-grid">
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
-            {loading && <div className="loading-line">Working...</div>}
             {page === "Library" && (
               <LibraryTree
                 artists={library}
@@ -5213,6 +5219,7 @@ function AudioPlayer({
   queueOpen,
   setQueueOpen,
   onPlayTrack,
+  onRemoveFromQueue,
   onEnded,
   onSkipBack,
   onSkipForward,
@@ -5227,6 +5234,7 @@ function AudioPlayer({
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const pipWindowRef = useRef(null);
+  const playerContainerRef = useRef(null);
   const reopenPipAfterFullscreen = useRef(false);
   const lastPlaybackReportSecond = useRef(-1);
   const [playing, setPlaying] = useState(false);
@@ -5270,6 +5278,17 @@ function AudioPlayer({
     document.addEventListener("fullscreenchange", handleFullscreenChange);
     return () => document.removeEventListener("fullscreenchange", handleFullscreenChange);
   }, [queue.length]);
+
+  useEffect(() => {
+    if (!queueOpen) return;
+    const handleClickOutside = (e) => {
+      if (playerContainerRef.current && !playerContainerRef.current.contains(e.target)) {
+        setQueueOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", handleClickOutside);
+    return () => document.removeEventListener("pointerdown", handleClickOutside);
+  }, [queueOpen, setQueueOpen]);
 
   useEffect(() => {
     const measureCompactHeight = () => (coreRef.current ? coreRef.current.offsetHeight + 36 : dockRef.current?.offsetHeight || 0);
@@ -5405,10 +5424,17 @@ function AudioPlayer({
 
   function queueList() {
     return upcomingQueue.map((track, index) => (
-      <button className={track.id === currentTrack?.id ? "active" : ""} key={`${track.id}:${index}`} onClick={() => onPlayTrack(track)}>
-        <span>{track.track_number ? String(track.track_number).padStart(2, "0") : "#"}</span>
-        <strong>{track.title}</strong>
-      </button>
+      <div className="queue-entry" key={`${track.id}:${index}`}>
+        <button className={`queue-play-btn${track.id === currentTrack?.id ? " active" : ""}`} onClick={() => onPlayTrack(track)}>
+          <strong>{track.title}</strong>
+          <small>{track._artist || ""}</small>
+        </button>
+        {onRemoveFromQueue && (
+          <button className="queue-remove-btn" onClick={(e) => { e.stopPropagation(); onRemoveFromQueue(index); }} title="Remove from queue">
+            <X size={12} />
+          </button>
+        )}
+      </div>
     ));
   }
 
@@ -5418,7 +5444,7 @@ function AudioPlayer({
 
     if (docked) {
       return (
-        <div className="audio-player topbar" ref={dockRef}>
+        <div className="audio-player topbar" ref={(el) => { dockRef.current = el; playerContainerRef.current = el; }}>
           <div className="topbar-player-row" ref={coreRef}>
             <div className="player-art">
               {currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={18} />}
@@ -5460,6 +5486,9 @@ function AudioPlayer({
       );
     }
 
+    const closeAction = popped ? () => pipWindowRef.current?.close?.() : toggleFullscreenPlayer;
+    const closeTitle = popped ? "Return to page" : "Exit fullscreen";
+
     return (
       <div
         className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${showUpNext ? " has-up-next" : ""}`}
@@ -5488,37 +5517,39 @@ function AudioPlayer({
               <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
                 {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
               </button>
-              <button className="row-icon-button" onClick={popped ? () => pipWindowRef.current?.close?.() : onClose} title={popped ? "Return to page" : "Close player"}>
+              <button className="row-icon-button" onClick={closeAction} title={closeTitle}>
                 <X size={14} />
               </button>
             </div>
           </div>
-          <div className="fullscreen-controls">
-            <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
-            <div className="player-controls">
-              <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
-                <Menu size={19} />
-              </button>
-              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
-                <SkipBack size={18} />
-              </button>
-              <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
-                {playing ? <Pause size={21} /> : <Play size={21} />}
-              </button>
-              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
-                <SkipForward size={18} />
-              </button>
-              <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
-                <Heart size={19} />
-              </button>
+          <div className="pip-scroll-area">
+            <div className="fullscreen-controls pip-controls-sticky">
+              <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+              <div className="player-controls">
+                <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
+                  <Menu size={19} />
+                </button>
+                <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+                  <SkipBack size={18} />
+                </button>
+                <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+                  {playing ? <Pause size={21} /> : <Play size={21} />}
+                </button>
+                <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+                  <SkipForward size={18} />
+                </button>
+                <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
+                  <Heart size={19} />
+                </button>
+              </div>
             </div>
+            {queueOpen && (
+              <div className="local-queue pip-queue">
+                {queueList()}
+              </div>
+            )}
           </div>
         </div>
-        {queueOpen && (
-          <div className="local-queue">
-            {queueList()}
-          </div>
-        )}
       </div>
     );
   }
