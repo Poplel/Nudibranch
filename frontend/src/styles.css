@@ -1338,7 +1338,6 @@ nav button:hover,
   align-items: center;
   gap: 8px;
   min-width: 0;
-  height: 44px;
   overflow: hidden;
 }
 
@@ -1654,8 +1653,9 @@ nav button:hover,
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  flex: 1;
-  min-height: 0;
+  /* bounded so content can overflow and become scrollable */
+  max-height: calc(100vh - 290px);
+  min-height: 80px;
   overscroll-behavior: none;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
