@@ -65,6 +65,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "jellyfin_user_id" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN jellyfin_user_id VARCHAR(255)"))
         session.commit()
+    if "crossfade_duration" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN crossfade_duration FLOAT NOT NULL DEFAULT 1.0"))
+        session.commit()
     _migrate_playlists_per_user(session)
     move_task_result_logs_to_app_log(session)
 

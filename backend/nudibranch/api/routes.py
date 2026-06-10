@@ -254,6 +254,7 @@ def update_own_appearance(
     user.theme = payload.theme
     user.accent_color = payload.accent_color
     user.background_tint = payload.background_tint
+    user.crossfade_duration = payload.crossfade_duration
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -2392,6 +2393,7 @@ def serialize_user(user: User) -> UserOut:
         theme=user.theme if user.theme in {"light", "dark"} else "light",
         accent_color=user.accent_color or "#356df3",
         background_tint=user.background_tint or "#356df3",
+        crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         jellyfin_user_id=user.jellyfin_user_id or None,
     )
 

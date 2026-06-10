@@ -101,6 +101,7 @@ function App() {
   const [toast, setToast] = useState(null);
   const [accentColor, setAccentColor] = useState(initialAppearance.accentColor);
   const [backgroundTint, setBackgroundTint] = useState(initialAppearance.backgroundTint);
+  const [crossfadeDuration, setCrossfadeDuration] = useState(1.0);
   const [library, setLibrary] = useState([]);
   const [importFiles, setImportFiles] = useState([]);
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
@@ -263,6 +264,7 @@ function App() {
     setDark(user.theme === "dark");
     setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
     setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
+    setCrossfadeDuration(user.crossfade_duration ?? 1.0);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -278,17 +280,19 @@ function App() {
       theme: dark ? "dark" : "light",
       accent_color: accentColor,
       background_tint: backgroundTint,
+      crossfade_duration: crossfadeDuration,
     };
     if (
       (user.theme || "light") === appearance.theme &&
       (user.accent_color || DEFAULT_APPEARANCE.accentColor) === appearance.accent_color &&
-      (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint
+      (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint &&
+      (user.crossfade_duration ?? 1.0) === appearance.crossfade_duration
     ) {
       return;
     }
     const timeout = window.setTimeout(() => saveOwnAppearance(appearance), 250);
     return () => window.clearTimeout(timeout);
-  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, appearanceReady, dark, accentColor, backgroundTint]);
+  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration, appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration]);
 
   useEffect(() => {
     if (!token || !user) return;
@@ -1570,6 +1574,7 @@ function App() {
                 setPlayerToastHeight(fullHeight || compactHeight || 0);
               }}
               onRemoveFromQueue={removeFromQueue}
+              crossfadeDuration={crossfadeDuration}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
                 setPlayerOpen(false);
@@ -1671,6 +1676,8 @@ function App() {
                 setBackgroundTint={setBackgroundTint}
                 dark={dark}
                 setDark={setDark}
+                crossfadeDuration={crossfadeDuration}
+                setCrossfadeDuration={setCrossfadeDuration}
                 user={user}
                 apiKey={token}
                 playlists={playlists}
@@ -4733,6 +4740,8 @@ function SettingsPanel({
   setBackgroundTint,
   dark,
   setDark,
+  crossfadeDuration,
+  setCrossfadeDuration,
   user,
   apiKey,
   playlists,
@@ -4777,6 +4786,22 @@ function SettingsPanel({
             <small>Mixed into the grey interface in light and dark mode.</small>
           </span>
           <input type="color" value={backgroundTint} onChange={(event) => setBackgroundTint(event.target.value)} />
+        </label>
+        <label className="setting-row crossfade-row">
+          <span>
+            Crossfade
+            <small>Fade between tracks. {crossfadeDuration === 0 ? "Off" : `${crossfadeDuration.toFixed(1)}s`}</small>
+          </span>
+          <input
+            className="crossfade-slider"
+            type="range"
+            min="0"
+            max="15"
+            step="0.5"
+            value={crossfadeDuration}
+            style={{ "--progress": `${(crossfadeDuration / 15) * 100}%` }}
+            onChange={(event) => setCrossfadeDuration(Number(event.target.value))}
+          />
         </label>
       </section>
       <section className="settings-section">
@@ -5228,15 +5253,19 @@ function AudioPlayer({
   onPlaybackState,
   onDockChange,
   onClose,
+  crossfadeDuration = 1,
 }) {
   const audioRef = useRef(null);
   const nextAudioRef = useRef(null);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
+  const trackCopyRef = useRef(null);
   const pipWindowRef = useRef(null);
   const playerContainerRef = useRef(null);
   const reopenPipAfterFullscreen = useRef(false);
   const lastPlaybackReportSecond = useRef(-1);
+  const crossfading = useRef(false);
+  const crossfadeIntervalRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -5252,7 +5281,28 @@ function AudioPlayer({
   useEffect(() => {
     setPlaying(false);
     setCurrentTime(0);
+    crossfading.current = false;
+    if (crossfadeIntervalRef.current) {
+      clearInterval(crossfadeIntervalRef.current);
+      crossfadeIntervalRef.current = null;
+    }
+    if (audioRef.current) audioRef.current.volume = 1;
   }, [audioUrl]);
+
+  useEffect(() => {
+    const container = trackCopyRef.current;
+    if (!container) return;
+    const update = () => {
+      const strong = container.querySelector("strong");
+      const small = container.querySelector("small");
+      if (strong) strong.style.setProperty("--overflow-width", `${Math.max(0, strong.scrollWidth - container.clientWidth)}px`);
+      if (small) small.style.setProperty("--overflow-width", `${Math.max(0, small.scrollWidth - container.clientWidth)}px`);
+    };
+    const ro = new ResizeObserver(update);
+    ro.observe(container);
+    update();
+    return () => ro.disconnect();
+  }, [currentTrack?.id]);
 
   useEffect(() => () => {
     pipWindowRef.current?.close?.();
@@ -5289,6 +5339,37 @@ function AudioPlayer({
     document.addEventListener("pointerdown", handleClickOutside);
     return () => document.removeEventListener("pointerdown", handleClickOutside);
   }, [queueOpen, setQueueOpen]);
+
+  const onEndedRef = useRef(onEnded);
+  onEndedRef.current = onEnded;
+
+  useEffect(() => {
+    const fadeSec = crossfadeDuration > 0 ? crossfadeDuration : 0;
+    if (!fadeSec || !duration || !nextAudioUrl || crossfading.current) return;
+    const remaining = duration - currentTime;
+    if (remaining > fadeSec || remaining <= 0) return;
+    crossfading.current = true;
+    const next = nextAudioRef.current;
+    if (!next?.src) return;
+    next.currentTime = 0;
+    next.volume = 0;
+    next.play().catch(() => {});
+    const startTime = performance.now();
+    crossfadeIntervalRef.current = setInterval(() => {
+      const elapsed = (performance.now() - startTime) / 1000;
+      const frac = Math.min(elapsed / fadeSec, 1);
+      if (audioRef.current) audioRef.current.volume = Math.max(0, 1 - frac);
+      if (next) next.volume = Math.min(1, frac);
+      if (frac >= 1) {
+        clearInterval(crossfadeIntervalRef.current);
+        crossfadeIntervalRef.current = null;
+        next.pause();
+        next.currentTime = 0;
+        onEndedRef.current?.();
+      }
+    }, 30);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTime]);
 
   useEffect(() => {
     const measureCompactHeight = () => (coreRef.current ? coreRef.current.offsetHeight + 36 : dockRef.current?.offsetHeight || 0);
@@ -5449,7 +5530,7 @@ function AudioPlayer({
             <div className="player-art">
               {currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={18} />}
             </div>
-            <div className="topbar-track-copy">
+            <div className="topbar-track-copy" ref={trackCopyRef}>
               <strong>{currentTrack?.title || "Local player"}</strong>
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || "Ready"}</small>
             </div>
@@ -5578,7 +5659,7 @@ function AudioPlayer({
           }
         }}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration || 0)}
-        onEnded={onEnded}
+        onEnded={() => { if (!crossfading.current) onEnded?.(); }}
       />
       {nextAudioUrl && <audio ref={nextAudioRef} preload="auto" src={nextAudioUrl} style={{ display: "none" }} />}
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
