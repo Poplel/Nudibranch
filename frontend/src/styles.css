@@ -1600,7 +1600,7 @@ nav button:hover,
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: auto 1fr;
-  min-height: calc(100vh - 80px);
+  height: 100%;
   gap: 42px;
 }
 
@@ -1646,9 +1646,9 @@ nav button:hover,
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  /* bounded so content can overflow and become scrollable */
-  max-height: calc(100vh - 290px);
-  min-height: 80px;
+  /* min-height: 0 lets the grid 1fr track bound this box so it scrolls
+     instead of growing the page; it fills down to the bottom of the page */
+  min-height: 0;
   overscroll-behavior: none;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
@@ -1658,6 +1658,11 @@ nav button:hover,
   position: sticky;
   top: 0;
   z-index: 2;
+  /* margin-top:auto drops the controls+queue block to the bottom of the page
+     when the queue is short; once the queue overflows, the auto margin
+     collapses and sticky top:0 clamps the controls just under the album art
+     while the queue scrolls up behind them */
+  margin-top: auto;
   background: color-mix(in srgb, var(--panel-strong) 0%, transparent);
   padding-top: 8px;
   padding-bottom: 8px;
@@ -1669,6 +1674,9 @@ nav button:hover,
   flex-direction: column;
   gap: 4px;
   padding: 0;
+  /* match the media controls' width and centering */
+  width: min(100%, 840px);
+  margin: 0 auto;
   background: transparent;
   border: 0;
   box-shadow: none;
@@ -2897,7 +2905,7 @@ nav button:hover,
   }
 
   .pip-player .player-core {
-    min-height: calc(100vh - 48px);
+    height: 100%;
   }
 
   .pip-player .audio-header {
