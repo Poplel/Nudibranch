@@ -3097,12 +3097,11 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [draftPositions, setDraftPositions] = useState({});
 
-  const positionKey = playlists.map((playlist) => `${playlist.id}:${playlist.track_count}`).join("|");
+  const positionKey = useMemo(() => playlists.map((playlist) => `${playlist.id}:${playlist.track_count}`).join("|"), [playlists]);
   useEffect(() => {
     setDraftPositions(
       Object.fromEntries(playlists.flatMap((playlist) => playlist.tracks.map((track) => [track.id, String(track.position || "")]))),
     );
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [positionKey]);
 
   function updateDraft(entryId, value) {

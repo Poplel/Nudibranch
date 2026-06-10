@@ -37,6 +37,7 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
+MAX_TASK_ATTEMPTS = 4
 
 
 
@@ -525,6 +526,14 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         else:
             session.commit()
 
+    def skip_unchanged(item: ProposalItem) -> bool:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            nonlocal skipped
+            skipped += 1
+            return True
+        return False
+
     note_progress(f"Preparing {len(progress_items)} selected changes")
 
     if not progress_items:
@@ -537,9 +546,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     # not added to the library one at a time.
     executable_albums: dict[str, list[ProposalItem]] = {}
     for item in executable_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         executable_albums.setdefault(str(Path(item.new_value).parent), []).append(item)
     for album_path, album_items in executable_albums.items():
@@ -563,9 +570,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     metadata_updated = 0
     for item in metadata_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         try:
             note_progress(f"Applying metadata for {item.title}", item)
@@ -580,9 +585,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     file_actions = 0
     for item in file_action_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         try:
             note_progress(f"Handling file action for {item.title}", item)
@@ -597,9 +600,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     playlist_changes = 0
     for item in playlist_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         try:
             note_progress(f"Updating playlist item {item.title}", item)
@@ -630,9 +631,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     for item in direct_download_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         try:
             is_slskd_download = keeps_download_batch_open(item)
@@ -681,9 +680,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     lyric_changes = 0
     for item in lyrics_items:
-        session.refresh(item)
-        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
-            skipped += 1
+        if skip_unchanged(item):
             continue
         try:
             note_progress(f"Downloading lyrics for {item.title}", item)
@@ -3593,14 +3590,6 @@ def create_album_download_candidate_batch(
                     update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
     session.flush()
     append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing fallback or attention")
-    if existing_batch is None:
-        create_notification(
-            session,
-            title="Download candidates ready",
-            body=f"{album}: {slskd_tracks} tracks with slskd candidates. {retry_tracks} tracks need fallback or attention. {' '.join(diagnostic_lines[:3])}",
-            event_type="approval_needed",
-            target_url="/task-queue" if tree_path != "/downloads" else "/downloads",
-        )
     return batch
 
 
@@ -6683,9 +6672,9 @@ async def worker_loop() -> None:
                 await asyncio.sleep(2)
                 continue
 
-            if task.attempts > 3:
-                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({task.attempts}); marking failed", "error")
-                fail_task(session, task, f"exceeded maximum retry attempts ({task.attempts})")
+            if task.attempts >= MAX_TASK_ATTEMPTS:
+                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
+                fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
                 continue
 
             try:
