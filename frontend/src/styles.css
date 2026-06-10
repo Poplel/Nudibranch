@@ -195,7 +195,6 @@ nav button:hover,
 .topbar {
   display: flex;
   align-items: center;
-  justify-content: center;
   gap: 14px;
   padding: 0 18px;
   height: 64px;
@@ -204,14 +203,10 @@ nav button:hover,
   background: color-mix(in srgb, var(--panel) 86%, transparent);
 }
 
-.topbar-side {
-  flex: 1;
+.topbar-side-right {
+  margin-left: auto;
   display: flex;
   align-items: center;
-}
-
-.topbar-side-right {
-  justify-content: flex-end;
   gap: 14px;
 }
 
@@ -1324,8 +1319,9 @@ nav button:hover,
 /* Topbar (docked) player — inline, no bubble */
 .audio-player.topbar {
   position: relative;
-  flex: 0 1 560px;
-  min-width: 200px;
+  flex: 1;
+  min-width: 0;
+  max-width: 580px;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -1550,13 +1546,12 @@ nav button:hover,
   width: auto;
   height: auto;
   min-height: 0;
-  padding: 56px 72px 24px;
+  padding: 56px 48px 24px 32px;
   border: 0;
   border-radius: 0;
   overflow: hidden;
   background: var(--panel-strong);
   box-shadow: none;
-  /* queue is absolute-positioned inside */
   isolation: isolate;
 }
 
@@ -1602,34 +1597,27 @@ nav button:hover,
 }
 
 .pip-player .player-core {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr;
   min-height: calc(100vh - 80px);
   gap: 42px;
 }
 
-/* Two-column layout when lyrics panel is open */
-.pip-player.has-lyrics {
-  display: flex;
-  flex-direction: row;
-  align-items: stretch;
-  gap: 40px;
-}
-
+/* Lyrics open: add a second column for the lyrics panel */
 .pip-player.has-lyrics .player-core {
-  flex: 0 0 340px;
-  min-height: 0;
-  height: 100%;
+  grid-template-columns: minmax(280px, 40%) 1fr;
+  gap: 32px 40px;
 }
 
 .pip-lyrics-panel {
-  flex: 1;
-  min-width: 0;
+  grid-column: 2;
+  grid-row: 1 / 3;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 16px 8px 24px;
+  padding: 8px 0 24px;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
 }
@@ -1717,10 +1705,10 @@ nav button:hover,
 }
 
 .pip-player .audio-header {
-  align-self: center;
   grid-template-columns: 150px minmax(0, 1fr) 64px;
   gap: 12px;
   max-width: none;
+  align-self: start;
 }
 
 .pip-player.has-up-next .audio-header {

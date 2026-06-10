@@ -1559,7 +1559,6 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="topbar-side" />
           {playerOpen && (
             <AudioPlayer
               currentTrack={currentTrack}
@@ -5719,12 +5718,12 @@ function AudioPlayer({
               {queueList()}
             </div>
           </div>
+          {lyricsOpen && (
+            <div className="pip-lyrics-panel" ref={lyricsPanelRef}>
+              {lyricsContent}
+            </div>
+          )}
         </div>
-        {lyricsOpen && (
-          <div className="pip-lyrics-panel" ref={lyricsPanelRef}>
-            {lyricsContent}
-          </div>
-        )}
       </div>
     );
   }
