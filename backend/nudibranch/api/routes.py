@@ -772,6 +772,27 @@ def stream_track(
     return FileResponse(path)
 
 
+@router.get("/library/tracks/{track_id}/lyrics", tags=["library"], summary="Get track lyrics")
+def get_track_lyrics(
+    track_id: str,
+    api_key: str = Query(""),
+    session: Session = Depends(get_session),
+) -> dict:
+    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    permissions = {permission.permission for permission in user.permissions} if user else set()
+    if not user or (not user.is_admin and Permission.library_read not in permissions):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    track = session.get(Track, track_id)
+    if not track or not track.path:
+        raise HTTPException(status_code=404, detail="Track not found")
+    audio_path = Path(track.path)
+    for ext in [".lrc", ".txt", ".lyrics"]:
+        candidate = audio_path.with_suffix(ext)
+        if candidate.exists():
+            return {"lyrics": candidate.read_text(encoding="utf-8", errors="replace"), "format": ext.lstrip(".")}
+    return {"lyrics": None, "format": None}
+
+
 @router.get("/library/albums/{album_id}/cover", tags=["library"], summary="Get album cover art", response_class=FileResponse)
 def album_cover(
     album_id: str,

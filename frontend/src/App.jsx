@@ -21,6 +21,7 @@ import {
   LogOut,
   Maximize2,
   Menu,
+  Mic2,
   Minimize2,
   Moon,
   Music,
@@ -186,6 +187,12 @@ function App() {
     const next = playerQueue[currentTrackIndex + 1];
     if (!next?.id || !token) return null;
     return `${API_BASE}/library/tracks/${next.id}/stream?api_key=${encodeURIComponent(token)}`;
+  }, [playerQueue, currentTrackIndex, token]);
+
+  const lyricsUrl = useMemo(() => {
+    const track = playerQueue[currentTrackIndex];
+    if (!track?.id || !token) return null;
+    return `${API_BASE}/library/tracks/${track.id}/lyrics?api_key=${encodeURIComponent(token)}`;
   }, [playerQueue, currentTrackIndex, token]);
 
   useEffect(() => {
@@ -1552,11 +1559,13 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
+          <div className="topbar-side" />
           {playerOpen && (
             <AudioPlayer
               currentTrack={currentTrack}
               audioUrl={audioUrl}
               nextAudioUrl={nextAudioUrl}
+              lyricsUrl={lyricsUrl}
               queue={playerQueue}
               currentIndex={currentTrackIndex}
               queueOpen={queueOpen}
@@ -1581,22 +1590,24 @@ function App() {
               }}
             />
           )}
-          <button className="icon-button" style={{marginLeft: "auto"}} onClick={refreshAll} title="Refresh">
-            <RefreshCw size={18} />
-          </button>
-          {hasPermission(user, "notifications:read") && (
-            <div className="notification-anchor" ref={trayRef}>
-              <button className="icon-button" onClick={openNotificationTray} title="Notifications">
-                <Bell size={18} />
-                {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
-                {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
-              </button>
-              {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
-            </div>
-          )}
-          <button className="icon-button" onClick={logout} title="Sign out">
-            <LogOut size={18} />
-          </button>
+          <div className="topbar-side topbar-side-right">
+            <button className="icon-button" onClick={refreshAll} title="Refresh">
+              <RefreshCw size={18} />
+            </button>
+            {hasPermission(user, "notifications:read") && (
+              <div className="notification-anchor" ref={trayRef}>
+                <button className="icon-button" onClick={openNotificationTray} title="Notifications">
+                  <Bell size={18} />
+                  {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
+                  {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
+                </button>
+                {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
+              </div>
+            )}
+            <button className="icon-button" onClick={logout} title="Sign out">
+              <LogOut size={18} />
+            </button>
+          </div>
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
@@ -5235,10 +5246,25 @@ function Toast({ title, body, onClose }) {
   );
 }
 
+function parseLrc(text) {
+  if (!text) return [];
+  const lines = [];
+  for (const raw of text.split("\n")) {
+    const m = raw.match(/^\[(\d+):(\d+(?:\.\d+)?)\](.*)/);
+    if (m) {
+      const time = parseInt(m[1]) * 60 + parseFloat(m[2]);
+      const lineText = m[3].trim();
+      if (lineText) lines.push({ time, text: lineText });
+    }
+  }
+  return lines.sort((a, b) => a.time - b.time);
+}
+
 function AudioPlayer({
   currentTrack,
   audioUrl,
   nextAudioUrl,
+  lyricsUrl,
   queue,
   currentIndex,
   queueOpen,
@@ -5267,6 +5293,9 @@ function AudioPlayer({
   const crossfading = useRef(false);
   const crossfadeIntervalRef = useRef(null);
   const seekOnLoad = useRef(null);
+  const [lyricsOpen, setLyricsOpen] = useState(false);
+  const [lyricsData, setLyricsData] = useState(null);
+  const lyricsPanelRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -5306,6 +5335,38 @@ function AudioPlayer({
     update();
     return () => ro.disconnect();
   }, [currentTrack?.id]);
+
+  useEffect(() => {
+    setLyricsData(null);
+    if (!lyricsUrl) return;
+    let cancelled = false;
+    fetch(lyricsUrl)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled) return;
+        const parsed = data.format === "lrc" ? parseLrc(data.lyrics) : [];
+        setLyricsData({ raw: data.lyrics, format: data.format, parsed });
+      })
+      .catch(() => { if (!cancelled) setLyricsData({ raw: null, format: null, parsed: [] }); });
+    return () => { cancelled = true; };
+  }, [lyricsUrl]);
+
+  const currentLyricIndex = useMemo(() => {
+    const parsed = lyricsData?.parsed;
+    if (!parsed?.length) return -1;
+    let idx = -1;
+    for (let i = 0; i < parsed.length; i++) {
+      if (parsed[i].time <= currentTime) idx = i;
+      else break;
+    }
+    return idx;
+  }, [lyricsData?.parsed, currentTime]);
+
+  useEffect(() => {
+    if (!lyricsOpen || !lyricsPanelRef.current || currentLyricIndex < 0) return;
+    const el = lyricsPanelRef.current.children[currentLyricIndex];
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [currentLyricIndex, lyricsOpen]);
 
   useEffect(() => () => {
     pipWindowRef.current?.close?.();
@@ -5573,9 +5634,36 @@ function AudioPlayer({
     const closeAction = popped ? () => pipWindowRef.current?.close?.() : toggleFullscreenPlayer;
     const closeTitle = popped ? "Return to page" : "Exit fullscreen";
 
+    const lyricsContent = (() => {
+      if (!lyricsData) return <div className="lyrics-loading">Loading…</div>;
+      const parsed = lyricsData.parsed;
+      if (parsed?.length) {
+        return parsed.map((line, i) => {
+          const dist = i - currentLyricIndex;
+          const isCurrent = dist === 0;
+          const opacity = isCurrent ? 1 : Math.max(0.12, 1 - Math.abs(dist) * 0.14);
+          return (
+            <div
+              key={i}
+              className={`lyric-line${isCurrent ? " current" : ""}`}
+              style={{ opacity }}
+            >
+              {line.text}
+            </div>
+          );
+        });
+      }
+      if (lyricsData.raw) {
+        return lyricsData.raw.split("\n").filter(Boolean).map((line, i) => (
+          <div key={i} className="lyric-line plain">{line}</div>
+        ));
+      }
+      return <div className="lyrics-empty">No lyrics available</div>;
+    })();
+
     return (
       <div
-        className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${showUpNext ? " has-up-next" : ""}`}
+        className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${showUpNext ? " has-up-next" : ""}${lyricsOpen ? " has-lyrics" : ""}`}
         ref={popped ? null : dockRef}
         style={currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
@@ -5610,8 +5698,8 @@ function AudioPlayer({
             <div className="fullscreen-controls pip-controls-sticky">
               <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
               <div className="player-controls">
-                <button className="player-icon-button" onClick={() => setQueueOpen((value) => !value)} title="Queue">
-                  <Menu size={19} />
+                <button className={`player-icon-button${lyricsOpen ? " active" : ""}`} onClick={() => setLyricsOpen((v) => !v)} title="Lyrics">
+                  <Mic2 size={19} />
                 </button>
                 <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
                   <SkipBack size={18} />
@@ -5627,13 +5715,16 @@ function AudioPlayer({
                 </button>
               </div>
             </div>
-            {queueOpen && (
-              <div className="local-queue pip-queue">
-                {queueList()}
-              </div>
-            )}
+            <div className="local-queue pip-queue">
+              {queueList()}
+            </div>
           </div>
         </div>
+        {lyricsOpen && (
+          <div className="pip-lyrics-panel" ref={lyricsPanelRef}>
+            {lyricsContent}
+          </div>
+        )}
       </div>
     );
   }

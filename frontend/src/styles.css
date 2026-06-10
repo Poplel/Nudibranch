@@ -195,12 +195,24 @@ nav button:hover,
 .topbar {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 14px;
   padding: 0 18px;
   height: 64px;
   flex-shrink: 0;
   border-bottom: 1px solid var(--line);
   background: color-mix(in srgb, var(--panel) 86%, transparent);
+}
+
+.topbar-side {
+  flex: 1;
+  display: flex;
+  align-items: center;
+}
+
+.topbar-side-right {
+  justify-content: flex-end;
+  gap: 14px;
 }
 
 .notification-anchor {
@@ -1312,9 +1324,8 @@ nav button:hover,
 /* Topbar (docked) player — inline, no bubble */
 .audio-player.topbar {
   position: relative;
-  flex: 1;
-  min-width: 0;
-  max-width: 580px;
+  flex: 0 1 560px;
+  min-width: 200px;
   display: flex;
   flex-direction: column;
   gap: 0;
@@ -1421,6 +1432,7 @@ nav button:hover,
   z-index: 50;
   max-height: 50vh;
   overflow: auto;
+  overscroll-behavior: none;
   background: var(--panel-strong);
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -1590,9 +1602,63 @@ nav button:hover,
 }
 
 .pip-player .player-core {
+  display: flex;
+  flex-direction: column;
   min-height: calc(100vh - 80px);
-  grid-template-rows: 1fr auto;
   gap: 42px;
+}
+
+/* Two-column layout when lyrics panel is open */
+.pip-player.has-lyrics {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 40px;
+}
+
+.pip-player.has-lyrics .player-core {
+  flex: 0 0 340px;
+  min-height: 0;
+  height: 100%;
+}
+
+.pip-lyrics-panel {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px 8px 24px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
+}
+
+.lyric-line {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+  cursor: default;
+  user-select: none;
+}
+
+.lyric-line.current {
+  font-size: 26px;
+  transform: translateX(4px);
+}
+
+.lyric-line.plain {
+  font-size: 16px;
+  font-weight: 400;
+}
+
+.lyrics-loading,
+.lyrics-empty {
+  font-size: 15px;
+  color: var(--muted);
+  padding: 16px 0;
 }
 
 /* Scroll area containing sticky controls + queue in PiP/fullscreen */
@@ -1600,7 +1666,9 @@ nav button:hover,
   display: flex;
   flex-direction: column;
   overflow-y: auto;
-  max-height: 50vh;
+  flex: 1;
+  min-height: 0;
+  overscroll-behavior: none;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
 }
