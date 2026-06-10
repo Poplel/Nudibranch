@@ -1324,6 +1324,7 @@ nav button:hover,
   max-width: 580px;
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: 0;
   width: auto;
   padding: 0;
