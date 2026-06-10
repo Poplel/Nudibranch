@@ -101,6 +101,7 @@ def update_task_progress(session: Session, task: Task, current: int, total: int,
     }
     payload["progress"] = progress
     task.result_json = json.dumps(payload)
+    task.lease_until = Task.lease_expiry(300)
     session.commit()
 
 

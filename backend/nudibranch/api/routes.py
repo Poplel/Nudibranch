@@ -1630,12 +1630,12 @@ def remove_playlist_track(playlist_id: str, track_id: str, session: Session = De
         return _jf_playlist_out(session, client, jf_user_id, playlist_id, "")
 
 
-@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Sync Jellyfin track mapping")
+@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Remap Nudibranch tracks to Jellyfin item IDs", description="Queues the track-mapping job, which is also triggered automatically after a Jellyfin library scan or track import. Only tracks not yet mapped are processed.")
 def sync_playlists(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> TaskOut:
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
 
-@router.get("/playlists/sync/stats", response_model=PlaylistSyncStatsOut, tags=["playlists"], summary="Track mapping job stats")
+@router.get("/playlists/sync/stats", response_model=PlaylistSyncStatsOut, tags=["playlists"], summary="Track remap job stats")
 def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     last_run_at = session.get(AppSetting, "mapping_last_run_at")
     run_count = session.get(AppSetting, "mapping_run_count")

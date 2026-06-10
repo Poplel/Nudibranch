@@ -288,15 +288,23 @@ function App() {
   useEffect(() => {
     if (!token || !user) return;
     let cancelled = false;
+    let consecutiveErrors = 0;
+    let intervalId = null;
     async function fetchMappingStats() {
       try {
         const data = await api("/playlists/sync/stats");
-        if (!cancelled) setMappingSyncStats(data);
-      } catch { /* ignore */ }
+        if (!cancelled) { setMappingSyncStats(data); consecutiveErrors = 0; }
+      } catch {
+        consecutiveErrors++;
+        if (consecutiveErrors >= 3 && intervalId !== null && !cancelled) {
+          clearInterval(intervalId);
+          intervalId = null;
+        }
+      }
     }
     fetchMappingStats();
-    const id = setInterval(fetchMappingStats, 30000);
-    return () => { cancelled = true; clearInterval(id); };
+    intervalId = setInterval(fetchMappingStats, 30000);
+    return () => { cancelled = true; if (intervalId !== null) clearInterval(intervalId); };
   }, [token, user?.id]);
 
   async function api(path, options = {}) {
@@ -1182,22 +1190,6 @@ function App() {
     }
   }
 
-  async function syncPlaylists() {
-    setLoading(true);
-    setError("");
-    try {
-      const task = await api("/playlists/sync", { method: "POST" });
-      setTasks((current) => upsertTask(current, task));
-      setToast({ title: "Playlist sync queued", body: "Jellyfin playlist sync was added to activity." });
-      return task;
-    } catch (syncError) {
-      setError(syncError.message);
-      notify("Sync failed", syncError.message, "ui_error");
-      throw syncError;
-    } finally {
-      setLoading(false);
-    }
-  }
 
   async function importPlaylist(url, mode) {
     setPlaylistImportLoading(true);
@@ -1546,11 +1538,7 @@ function App() {
 
       <section className="workspace">
         <header className="topbar">
-          <div className="search">
-            <Search size={16} />
-            <input placeholder="Search library, queue, activity" />
-          </div>
-          <button className="icon-button" onClick={refreshAll} title="Refresh">
+          <button className="icon-button" style={{marginLeft: "auto"}} onClick={refreshAll} title="Refresh">
             <RefreshCw size={18} />
           </button>
           {hasPermission(user, "notifications:read") && (
@@ -1687,7 +1675,7 @@ function App() {
                 onDelete={deletePlaylist}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
-                onSync={syncPlaylists}
+                onQueuePosition={proposePlaylistPosition}
                 onInspectorActionsChange={setPlaylistInspectorActions}
               />
             )}
@@ -3100,7 +3088,7 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onQueue, onSync, onInspectorActionsChange }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onQueue, onQueuePosition, onInspectorActionsChange }) {
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set());
   const [addOpen, setAddOpen] = useState(null);
   const [editOpen, setEditOpen] = useState(null);
@@ -3109,11 +3097,13 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
   const [playlistSearch, setPlaylistSearch] = useState("");
   const [draftPositions, setDraftPositions] = useState({});
 
+  const positionKey = playlists.map((playlist) => `${playlist.id}:${playlist.track_count}`).join("|");
   useEffect(() => {
     setDraftPositions(
       Object.fromEntries(playlists.flatMap((playlist) => playlist.tracks.map((track) => [track.id, String(track.position || "")]))),
     );
-  }, [playlists.map((playlist) => `${playlist.id}:${playlist.track_count}`).join("|")]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [positionKey]);
 
   function updateDraft(entryId, value) {
     setDraftPositions((current) => ({ ...current, [entryId]: value }));
@@ -3138,12 +3128,13 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
       onPlaylistNameChange: setPlaylistName,
       onCreate: () => {
         if (!playlistName.trim()) return;
-        onCreatePlaylist(playlistName.trim()).then(() => setPlaylistName(""));
+        onCreatePlaylist(playlistName.trim()).then(() => setPlaylistName("")).catch(() => {});
       },
-      onSync,
     });
     return () => onInspectorActionsChange?.(null);
-  }, [playlistName]);
+  // onInspectorActionsChange is a stable state setter; onCreatePlaylist is a stable App function
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [playlistName, onInspectorActionsChange]);
 
   return (
     <div className="playlist-view">
@@ -3189,8 +3180,8 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                 playlist={playlist}
                 draftName={playlistDraftName}
                 setDraftName={setPlaylistDraftName}
-                onRename={() => onRename(playlist.id, playlistDraftName.trim()).then(() => setEditOpen(null))}
-                onDelete={() => onDelete(playlist.id).then(() => setEditOpen(null))}
+                onRename={() => onRename(playlist.id, playlistDraftName.trim()).then(() => setEditOpen(null)).catch(() => {})}
+                onDelete={() => onDelete(playlist.id).then(() => setEditOpen(null)).catch(() => {})}
               />
             )}
             {addOpen === playlist.id && (
@@ -4396,6 +4387,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
+    ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs so playlist add/remove operations can resolve correctly.", "remap-tracks", "jellyfin:manage"],
     ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "downloads:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
     ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash on approval.", "check-duplicates", "library:manage"],
@@ -5006,18 +4998,6 @@ function Inspector({
             <Plus size={16} />
             Create playlist
           </button>
-          <button className="secondary" onClick={playlistActions.onSync}>
-            <RefreshCw size={16} />
-            Sync playlists
-          </button>
-          {mappingSyncStats && (
-            <div className="metadata-grid inspector-stats" style={{ marginTop: 8 }}>
-              <label>Last synced</label>
-              <strong>{fmtTimeAgo(mappingSyncStats.last_run_at)}</strong>
-              <label>Runs</label>
-              <strong>{mappingSyncStats.run_count}</strong>
-            </div>
-          )}
         </div>
       )}
       {downloadProgress && (
@@ -5101,7 +5081,7 @@ function inspectorStats({
     const rows = [];
     if (mappingSyncStats) {
       const lastRun = mappingSyncStats.last_run_at ? fmtTimeAgo(mappingSyncStats.last_run_at) : "never";
-      rows.push(["Playlist sync", lastRun], ["Runs (session)", mappingSyncStats.run_count]);
+      rows.push(["Track remap", lastRun], ["Remap runs", mappingSyncStats.run_count]);
     }
     return { summary: "", rows };
   }

@@ -37,7 +37,7 @@ COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
-PLAYLIST_SYNC_INTERVAL_SECONDS = 300  # auto-sync every 5 minutes when idle
+
 
 
 def _upsert_setting(session: Session, key: str, value: str) -> None:
@@ -537,6 +537,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     # not added to the library one at a time.
     executable_albums: dict[str, list[ProposalItem]] = {}
     for item in executable_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         executable_albums.setdefault(str(Path(item.new_value).parent), []).append(item)
     for album_path, album_items in executable_albums.items():
         album_label = Path(album_path).name or "album"
@@ -559,6 +563,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     metadata_updated = 0
     for item in metadata_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         try:
             note_progress(f"Applying metadata for {item.title}", item)
             apply_metadata_item(session, item)
@@ -572,6 +580,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     file_actions = 0
     for item in file_action_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         try:
             note_progress(f"Handling file action for {item.title}", item)
             apply_file_action_item(session, item)
@@ -585,6 +597,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     playlist_changes = 0
     for item in playlist_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         try:
             note_progress(f"Updating playlist item {item.title}", item)
             apply_playlist_item(session, item)
@@ -614,6 +630,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
     for item in direct_download_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         try:
             is_slskd_download = keeps_download_batch_open(item)
             if is_slskd_download and not download_slot_available(download_slot_tracker):
@@ -661,6 +681,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
     lyric_changes = 0
     for item in lyrics_items:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            skipped += 1
+            continue
         try:
             note_progress(f"Downloading lyrics for {item.title}", item)
             apply_lyrics_item(session, item)
@@ -3317,9 +3341,32 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem], 
         if payload.get("wishlist_item_id"):
             wishlist_item_ids.append(payload["wishlist_item_id"])
         grouped.setdefault((workflow, artist, album), []).append(payload)
-    append_task_log(session, task, f"Preparing download candidate searches for {len(items)} tracks across {len(grouped)} album batch(es)")
-    for (workflow, artist, album), requests in grouped.items():
-        create_album_download_candidate_batch(session, artist, album, requests, task, workflow=workflow)
+    append_task_log(session, task, f"Preparing download candidates for {len(items)} tracks across {len(grouped)} album(s)")
+    # All albums share one batch so candidates can be reviewed and approved in a single pass.
+    workflows = {wf for wf, _, _ in grouped.keys()}
+    workflow = next(iter(workflows), "wishlist")
+    title_prefix = {
+        "lossless_replacement": "Lossless replacement candidates",
+        "missing_tracks": "Missing track candidates",
+    }.get(workflow, "Download candidates")
+    shared_batch: ProposalBatch | None = None
+    shared_artist_items: dict[str, ProposalItem] = {}
+    shared_album_items: dict[tuple[str, str], ProposalItem] = {}
+    for (album_workflow, artist, album), requests in grouped.items():
+        shared_batch = create_album_download_candidate_batch(
+            session, artist, album, requests, task, workflow=album_workflow, existing_batch=shared_batch,
+            batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
+        )
+    if shared_batch is not None:
+        album_count = len(grouped)
+        track_count = len(items)
+        create_notification(
+            session,
+            title="Download candidates ready",
+            body=f"{track_count} track(s) across {album_count} album(s) are ready for review.",
+            event_type="approval_needed",
+            target_url="/task-queue",
+        )
     if wishlist_item_ids:
         for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
             wishlist_item.status = "approved"
@@ -3347,32 +3394,58 @@ def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
     lrc_path.write_text(lyric_text, encoding="utf-8")
 
 
-def create_album_download_candidate_batch(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, tree_path: str = "/task-queue", workflow: str = "wishlist") -> None:
-    title_prefix = {
-        "lossless_replacement": "Lossless replacement candidates",
-        "missing_tracks": "Missing track candidates",
-    }.get(workflow, "Download candidates")
-    batch = ProposalBatch(title=f"{title_prefix}: {artist} / {album}", kind=ProposalKind.download, tree_path=tree_path)
-    session.add(batch)
-    session.flush()
-    append_task_log(session, task, f"Created download candidate batch for {artist} / {album} with {len(requests)} requested track(s)")
-    artist_item = ProposalItem(
-        batch_id=batch.id,
-        title=artist,
-        kind=ProposalKind.download,
-        payload_json=json.dumps({"artist": artist}),
-    )
-    session.add(artist_item)
-    session.flush()
-    album_item = ProposalItem(
-        batch_id=batch.id,
-        parent_id=artist_item.id,
-        title=album,
-        kind=ProposalKind.download,
-        payload_json=json.dumps({"artist": artist, "album": album}),
-    )
-    session.add(album_item)
-    session.flush()
+def create_album_download_candidate_batch(
+    session: Session,
+    artist: str,
+    album: str,
+    requests: list[dict],
+    task: Task | None = None,
+    tree_path: str = "/task-queue",
+    workflow: str = "wishlist",
+    existing_batch: ProposalBatch | None = None,
+    batch_title: str | None = None,
+    artist_items: dict[str, ProposalItem] | None = None,
+    album_items: dict[tuple[str, str], ProposalItem] | None = None,
+) -> ProposalBatch:
+    if existing_batch is None:
+        title_prefix = batch_title or {
+            "lossless_replacement": "Lossless replacement candidates",
+            "missing_tracks": "Missing track candidates",
+        }.get(workflow, "Download candidates")
+        batch = ProposalBatch(title=f"{title_prefix}: {artist} / {album}", kind=ProposalKind.download, tree_path=tree_path)
+        session.add(batch)
+        session.flush()
+    else:
+        batch = existing_batch
+    if artist_items is None:
+        artist_items = {}
+    if album_items is None:
+        album_items = {}
+    append_task_log(session, task, f"Preparing download candidates for {artist} / {album} with {len(requests)} requested track(s)")
+    artist_item = artist_items.get(artist)
+    if not artist_item:
+        artist_item = ProposalItem(
+            batch_id=batch.id,
+            title=artist,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist}),
+        )
+        session.add(artist_item)
+        session.flush()
+        artist_items[artist] = artist_item
+    album_key = (artist, album)
+    album_item = album_items.get(album_key)
+    if not album_item:
+        album_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=artist_item.id,
+            title=album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album}),
+        )
+        session.add(album_item)
+        session.flush()
+        album_items[album_key] = album_item
     track_items: list[tuple[dict, str, str]] = []
     for request in requests:
         query = download_query(request)
@@ -3520,13 +3593,15 @@ def create_album_download_candidate_batch(session: Session, artist: str, album: 
                     update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
     session.flush()
     append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing fallback or attention")
-    create_notification(
-        session,
-        title="Download candidates ready",
-        body=f"{album}: {slskd_tracks} tracks with slskd candidates. {retry_tracks} tracks need fallback or attention. {' '.join(diagnostic_lines[:3])}",
-        event_type="approval_needed",
-        target_url="/task-queue" if tree_path != "/downloads" else "/downloads",
-    )
+    if existing_batch is None:
+        create_notification(
+            session,
+            title="Download candidates ready",
+            body=f"{album}: {slskd_tracks} tracks with slskd candidates. {retry_tracks} tracks need fallback or attention. {' '.join(diagnostic_lines[:3])}",
+            event_type="approval_needed",
+            target_url="/task-queue" if tree_path != "/downloads" else "/downloads",
+        )
+    return batch
 
 
 def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
@@ -5042,6 +5117,11 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         total_mapped = session.scalar(select(func.count(Track.id)).where(Track.jellyfin_item_id.isnot(None))) or 0
         total_tracks = session.scalar(select(func.count(Track.id))) or 0
         append_task_log(session, None, f"Track mapping: {newly_mapped} newly mapped; {total_mapped}/{total_tracks} total mapped to Jellyfin")
+    count_row = session.get(AppSetting, "mapping_run_count")
+    new_count = (int(count_row.value) if count_row else 0) + 1
+    _upsert_setting(session, "mapping_last_run_at", datetime.now(timezone.utc).isoformat())
+    _upsert_setting(session, "mapping_run_count", str(new_count))
+    session.commit()
     _try_create_pending_playlists(session)
     return {"mapped": newly_mapped, "total": total_tracks}
 
@@ -6568,7 +6648,6 @@ async def worker_loop() -> None:
     last_download_scan = 0.0
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
-    last_playlist_sync = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -6597,26 +6676,16 @@ async def worker_loop() -> None:
                         session.rollback()
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
-                # Periodic track mapping — run directly (no Task record) so it's invisible in the UI
-                if time.time() - last_playlist_sync > PLAYLIST_SYNC_INTERVAL_SECONDS:
-                    jf_settings = integration_settings(session)
-                    if jf_settings.get("jellyfin_url") and jf_settings.get("jellyfin_api_key"):
-                        try:
-                            run_sync_favorites_jellyfin(session, {})
-                            count_row = session.get(AppSetting, "mapping_run_count")
-                            new_count = (int(count_row.value) if count_row else 0) + 1
-                            _upsert_setting(session, "mapping_last_run_at", datetime.now(timezone.utc).isoformat())
-                            _upsert_setting(session, "mapping_run_count", str(new_count))
-                            session.commit()
-                        except Exception as _sync_err:  # noqa: BLE001
-                            session.rollback()
-                            write_app_log(f"Track mapping auto-run failed: {_sync_err}", level="warning")
-                    last_playlist_sync = time.time()
                 try:
                     await deliver_apns_notifications(session)
                 except Exception:  # noqa: BLE001
                     pass
                 await asyncio.sleep(2)
+                continue
+
+            if task.attempts > 3:
+                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({task.attempts}); marking failed", "error")
+                fail_task(session, task, f"exceeded maximum retry attempts ({task.attempts})")
                 continue
 
             try:
@@ -6676,7 +6745,7 @@ def task_notification_title(task_type: str) -> str:
         "propose_import": "Import review",
         "execute_proposal_batch": "Task queue item",
         "process_wishlist": "Wishlist scan",
-        "sync_favorites_jellyfin": "Playlist sync",
+        "sync_favorites_jellyfin": "Track remap",
         "jellyfin_scan": "Jellyfin scan",
         "check_files": "File check",
         "check_duplicates": "Duplicate check",
@@ -6698,9 +6767,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"sync_favorites_jellyfin"}:
-        return "/playlists"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
         return "/tools"
     return "/activity"
 
