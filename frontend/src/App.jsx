@@ -5700,6 +5700,11 @@ function AudioPlayer({
                 </div>
               </div>
             )}
+            {lyricsOpen && (
+              <div className="pip-header-lyrics" ref={lyricsPanelRef}>
+                {lyricsContent}
+              </div>
+            )}
             <div className="player-window-actions">
               <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
                 {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
@@ -5710,9 +5715,6 @@ function AudioPlayer({
             </div>
           </div>
           <div className="pip-scroll-area">
-            <div className="local-queue pip-queue">
-              {queueList()}
-            </div>
             <div className="fullscreen-controls pip-controls-sticky">
               <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
               <div className="player-controls">
@@ -5733,12 +5735,10 @@ function AudioPlayer({
                 </button>
               </div>
             </div>
-          </div>
-          {lyricsOpen && (
-            <div className="pip-lyrics-panel" ref={lyricsPanelRef}>
-              {lyricsContent}
+            <div className="local-queue pip-queue">
+              {queueList()}
             </div>
-          )}
+          </div>
         </div>
       </div>
     );

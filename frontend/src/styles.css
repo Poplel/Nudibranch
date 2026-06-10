@@ -1604,15 +1604,7 @@ nav button:hover,
   gap: 42px;
 }
 
-/* Lyrics open: add a second column for the lyrics panel */
-.pip-player.has-lyrics .player-core {
-  grid-template-columns: minmax(280px, 40%) 1fr;
-  gap: 32px 40px;
-}
-
 .pip-lyrics-panel {
-  grid-column: 2;
-  grid-row: 1 / 3;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -1664,7 +1656,7 @@ nav button:hover,
 
 .pip-controls-sticky {
   position: sticky;
-  bottom: 0;
+  top: 0;
   z-index: 2;
   background: color-mix(in srgb, var(--panel-strong) 0%, transparent);
   padding-top: 8px;
@@ -1710,10 +1702,32 @@ nav button:hover,
   gap: 12px;
   max-width: none;
   align-self: start;
+  align-items: start;
+}
+
+.pip-player.has-lyrics .audio-header {
+  grid-template-columns: 150px minmax(0, 1fr) 1fr 64px;
 }
 
 .pip-player.has-up-next .audio-header {
   grid-template-columns: 150px minmax(220px, 1fr) minmax(180px, 280px) 64px;
+}
+
+.pip-player.has-up-next.has-lyrics .audio-header {
+  grid-template-columns: 150px minmax(0, 1fr) minmax(180px, 1fr) minmax(180px, 280px) 64px;
+}
+
+/* Lyrics panel embedded in the header row */
+.pip-header-lyrics {
+  height: 150px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 8px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
+  min-width: 0;
 }
 
 .player-window-actions {
@@ -2891,12 +2905,24 @@ nav button:hover,
     max-width: none;
   }
 
+  .pip-player.has-lyrics .audio-header {
+    grid-template-columns: 112px minmax(0, 1fr) 1fr 54px;
+  }
+
   .pip-player.has-up-next .audio-header {
     grid-template-columns: 112px minmax(0, 1fr) minmax(140px, 1fr);
   }
 
+  .pip-player.has-up-next.has-lyrics .audio-header {
+    grid-template-columns: 112px minmax(0, 1fr) minmax(140px, 1fr) minmax(140px, 1fr);
+  }
+
   .pip-player .player-art {
     width: 112px;
+    height: 112px;
+  }
+
+  .pip-header-lyrics {
     height: 112px;
   }
 
