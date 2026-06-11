@@ -1461,21 +1461,50 @@ def propose_wishlist_items(
             session.add(album_item)
             session.flush()
             album_items[album_key] = album_item
-        session.add(
-            ProposalItem(
-                batch_id=batch.id,
-                parent_id=album_items[album_key].id,
-                title=wishlist_item.track or wishlist_item.album or wishlist_item.artist,
-                kind=ProposalKind.download,
-                payload_json=json.dumps(
-                    wishlist_download_payload(wishlist_item, album_lookup_cache)
-                    | {
-                        "user_id": wishlist_item.user_id,
-                        "wishlist_item_id": wishlist_item.id,
+        # Expand an album-level wishlist entry into one download request per track so the
+        # Soulseek per-track folder matcher can match each track against the found album
+        # folder. Fall back to the single album-level request if MusicBrainz has no tracklist.
+        track_payloads: list[dict] = []
+        if wishlist_item.kind == "album" and not wishlist_item.track and wishlist_item.album:
+            cache_key = (wishlist_item.artist, wishlist_item.album)
+            if cache_key not in album_lookup_cache:
+                try:
+                    album_lookup_cache[cache_key] = lookup_album_tracks(wishlist_item.artist, wishlist_item.album)
+                except Exception:
+                    album_lookup_cache[cache_key] = None
+            record = album_lookup_cache.get(cache_key)
+            for track in (record or {}).get("tracks", []) or []:
+                title = track.get("title")
+                if not title:
+                    continue
+                track_payloads.append(
+                    {
+                        "action": "wishlist_request",
+                        "kind": "track",
+                        "artist": wishlist_item.artist,
+                        "album": wishlist_item.album,
+                        "track": title,
+                        "track_number": track.get("track_number"),
+                        "disc_number": track.get("disc_number"),
+                        "duration_ms": track.get("length"),
+                        "musicbrainz_album_id": track.get("musicbrainz_album_id") or (record or {}).get("musicbrainz_album_id"),
+                        "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
                     }
-                ),
+                )
+        if not track_payloads:
+            track_payloads = [wishlist_download_payload(wishlist_item, album_lookup_cache)]
+        for track_payload in track_payloads:
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=album_items[album_key].id,
+                    title=track_payload.get("track") or wishlist_item.album or wishlist_item.artist,
+                    kind=ProposalKind.download,
+                    payload_json=json.dumps(
+                        track_payload | {"user_id": wishlist_item.user_id, "wishlist_item_id": wishlist_item.id}
+                    ),
+                )
             )
-        )
         wishlist_item.status = "review"
         wishlist_item.status_changed_at = datetime.now(timezone.utc)
     notify_wishlist_decisions(session, items, "Wishlist request approved", "added to the task queue", "wishlist_approved", "/downloads")
