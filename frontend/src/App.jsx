@@ -5302,7 +5302,7 @@ function AudioPlayer({
     ro.observe(container);
     update();
     return () => ro.disconnect();
-  }, [currentTrack?.id, pipContainer]);
+  }, [currentTrack?.id, pipContainer, lyricsOpen]);
 
   useEffect(() => {
     const container = upNextRef.current?.querySelector('.up-next-text');
@@ -5368,7 +5368,9 @@ function AudioPlayer({
       const coreRect = core.getBoundingClientRect();
       const controlsH = controls.offsetHeight || 90;
       const sTop = scroll ? scroll.offsetTop : 0; // scroll area top, relative to core
-      const minY = ART_BASE + CLAMP_GAP; // controls top, clamped under the art
+      // In has-lyrics layout sTop is large (3fr row); keep controls within one
+      // controls-height of the scroll area so they don't visually detach from the queue
+      const minY = scroll ? Math.max(ART_BASE + CLAMP_GAP, sTop - controlsH) : ART_BASE + CLAMP_GAP;
       const maxY = Math.max(minY, coreRect.height - controlsH - BOTTOM_PAD); // at the bottom
       const scrollTop = scroll ? scroll.scrollTop : 0;
       const controlsY = Math.max(minY, Math.min(maxY, maxY - scrollTop));

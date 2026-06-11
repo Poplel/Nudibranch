@@ -3318,6 +3318,7 @@ nav button:hover,
 }
 
 .audio-player.pip-player.is-micro .audio-track-copy {
+  flex: 0 0 auto; /* base rule is flex:1 1 0; in a height:auto column that gives zero height */
   overflow: hidden;
   max-width: 100%;
 }
@@ -3386,6 +3387,10 @@ nav button:hover,
     overflow: hidden;
     align-self: auto;
     height: auto;
+  }
+
+  .audio-player.pip-player .audio-track-copy {
+    flex: 0 0 auto;
   }
 
   .audio-player.pip-player .player-art,
