@@ -23,7 +23,8 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
-from nudibranch.services.settings_store import integration_settings
+from nudibranch.services.settings_store import integration_settings, integration_value
+from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
 
@@ -5735,7 +5736,7 @@ def file_info_for_existing_library_file(file_path: Path) -> dict:
     }
 
 
-def run_check_lyrics(session: Session, _payload: dict) -> dict:
+def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None) -> dict:
     tracks = list(
         session.scalars(
             select(Track)
@@ -5746,7 +5747,9 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
     )
     missing = []
     existing = 0
-    for track in tracks:
+    for index, track in enumerate(tracks):
+        if task is not None and index % 25 == 0:
+            update_task_progress(session, task, index, max(1, len(tracks)), f"Checking lyrics for {track.title}")
         if not track.path:
             continue
         audio_path = Path(track.path)
@@ -5828,7 +5831,7 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
     return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
 
 
-def run_check_musicbrainz_ids(session: Session, _payload: dict) -> dict:
+def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | None = None) -> dict:
     artists = list(
         session.scalars(
             select(Artist)
@@ -5855,6 +5858,8 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict) -> dict:
     def flagged(name: str, uncertain: bool) -> str:
         return ("⚠ " + name) if uncertain else name
 
+    total_albums = max(1, sum(len(a.albums) for a in artists))
+    album_index = 0
     n_albums_scanned = 0
     proposed = 0
 
@@ -5865,6 +5870,9 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict) -> dict:
         artist_uncertain = False
 
         for album in artist.albums:
+            album_index += 1
+            if task is not None:
+                update_task_progress(session, task, album_index, total_albums, f"Checking MusicBrainz IDs: {artist.name} – {album.title}")
             album_needs_release = not album.musicbrainz_release_id
             album_needs_rg = not album.musicbrainz_release_group_id
             tracks_needing = [t for t in album.tracks if not t.musicbrainz_recording_id]
@@ -6237,6 +6245,151 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
     return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
 
 
+def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist), selectinload(Album.tracks))
+            .where(Album.musicbrainz_release_id.is_not(None))
+            .order_by(Album.title.asc())
+        )
+    )
+    api_key = integration_value(session, "acoustid_api_key")
+    batch = ProposalBatch(title="Replace incorrect audio files", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    tracks_checked = 0
+    suspicious = 0
+    albums_scanned = 0
+    total_albums = max(1, len(albums))
+
+    for album in albums:
+        albums_scanned += 1
+        if task is not None:
+            update_task_progress(session, task, albums_scanned, total_albums, f"Verifying audio: {album.artist.name if album.artist else '?'} – {album.title}")
+        artist_name = album.artist.name if album.artist else "Unknown Artist"
+        try:
+            record = lookup_album_tracks(artist_name, album.title, album.musicbrainz_release_id)
+        except Exception as e:
+            append_task_log(session, task, f"Could not fetch tracklist for {album.title}: {e}", "warning")
+            continue
+        time.sleep(1)
+        expected_tracks = record.get("tracks") or []
+        if not expected_tracks:
+            continue
+
+        # Build slot lookup: (disc_number, track_number) -> expected dict (normalise missing disc to 1)
+        slot_map: dict[tuple[int, int], dict] = {}
+        for exp in expected_tracks:
+            disc = exp.get("disc_number") or 1
+            tn = exp.get("track_number")
+            if tn is not None:
+                slot_map[(disc, tn)] = exp
+
+        for track in album.tracks:
+            tracks_checked += 1
+
+            # Find expected slot
+            expected = None
+            if track.track_number is not None:
+                disc = track.disc_number or 1
+                expected = slot_map.get((disc, track.track_number))
+            if expected is None:
+                # Fallback: text similarity match
+                best_score = 0.0
+                best_exp = None
+                for exp in expected_tracks:
+                    score = text_similarity(normalize(track.title), normalize(exp.get("title") or ""))
+                    if score > best_score:
+                        best_score = score
+                        best_exp = exp
+                if best_score >= 0.5:
+                    expected = best_exp
+                else:
+                    continue  # can't establish expectation
+
+            expected_length = expected.get("length")
+            actual_duration = track.duration_ms
+            if actual_duration is None and track.path and Path(track.path).exists():
+                try:
+                    actual_duration = read_audio_metadata(Path(track.path)).get("duration_ms")
+                except Exception:
+                    pass
+            if not expected_length or not actual_duration:
+                continue
+
+            tolerance = max(5000, int(expected_length * 0.08))
+            if abs(actual_duration - expected_length) <= tolerance:
+                continue  # duration matches — assume correct
+
+            # SUSPICIOUS (duration mismatch)
+            suspicious += 1
+            expected_title = expected.get("title") or track.title
+            expected_recording_id = expected.get("musicbrainz_recording_id")
+
+            if api_key:
+                if track.path and Path(track.path).exists():
+                    verdict = audio_matches_claim(Path(track.path), expected_title, artist_name, expected_recording_id, api_key)
+                else:
+                    verdict = {"matched": None, "message": "file missing"}
+                time.sleep(0.4)
+                if verdict.get("matched") is True:
+                    append_task_log(session, task, f"{album.title} / {track.title}: duration off but AcoustID confirms correct audio; skipping", "info")
+                    continue
+                confirmed = verdict.get("matched") is False
+                display = expected_title if confirmed else f"⚠ {expected_title}"
+                reason = "AcoustID confirms wrong audio" if confirmed else f"unconfirmed ({verdict.get('message')})"
+            else:
+                display = f"⚠ {expected_title}"
+                reason = "duration mismatch only (no AcoustID key configured)"
+
+            add_download_request_item(
+                session,
+                batch,
+                artist_items,
+                album_items,
+                artist_name,
+                album.title,
+                expected_title,
+                track_number=expected.get("track_number") or track.track_number,
+                disc_number=expected.get("disc_number") or track.disc_number,
+                duration_ms=expected_length,
+                musicbrainz_album_id=album.musicbrainz_release_id,
+                musicbrainz_recording_id=expected_recording_id,
+                replace_track_id=track.id,
+                replace_path=track.path,
+                require_lossless=True if track.is_lossless else None,
+                workflow="content_replacement",
+                display_title=display,
+            )
+            created += 1
+            append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for slot '{track.title}' -> '{expected_title}' ({reason})")
+
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Audio content check complete",
+            body=f"{tracks_checked} tracks checked across {albums_scanned} album(s) with MusicBrainz data. No incorrect audio found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Audio replacement review ready",
+        body=f"{created} incorrect audio file(s) queued for replacement.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": created, "batch_id": batch.id}
+
+
 def run_normalize_volume(session: Session, _payload: dict) -> dict:
     tracks = list(session.scalars(select(Track).where(Track.path.is_not(None)).order_by(Track.title.asc())))
     batch = ProposalBatch(title="Normalize library volume", kind=ProposalKind.file_move, tree_path="/library")
@@ -6288,6 +6441,7 @@ def add_download_request_item(
     replace_path: str | None = None,
     require_lossless: bool | None = None,
     workflow: str | None = None,
+    display_title: str | None = None,
 ) -> None:
     if artist not in artist_items:
         artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
@@ -6310,7 +6464,7 @@ def add_download_request_item(
         ProposalItem(
             batch_id=batch.id,
             parent_id=album_items[album_key].id,
-            title=track or album,
+            title=display_title or track or album,
             kind=ProposalKind.download,
             payload_json=json.dumps(
                 {
@@ -6808,6 +6962,7 @@ TASK_HANDLERS = {
     "check_album_covers": run_check_album_covers,
     "check_missing_tracks": run_check_missing_tracks,
     "check_non_lossless": run_check_non_lossless,
+    "check_audio_content": run_check_audio_content,
     "normalize_volume": run_normalize_volume,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
@@ -6924,7 +7079,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -6976,6 +7131,8 @@ def task_notification_title(task_type: str) -> str:
         "check_album_covers": "Album cover check",
         "check_missing_tracks": "Missing tracks check",
         "check_non_lossless": "Lossless check",
+        "check_musicbrainz_ids": "MusicBrainz ID check",
+        "check_audio_content": "Audio content check",
         "normalize_volume": "Volume normalization",
         "backup_now": "Backup",
         "restore_default": "Restore",
@@ -6990,7 +7147,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
         return "/tools"
     return "/activity"
 

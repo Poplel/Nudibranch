@@ -14,6 +14,7 @@ INTEGRATION_KEYS = {
     "slskd_concurrent_downloads",
     "youtube_cookies_browser",
     "youtube_cookies_path",
+    "acoustid_api_key",
 }
 
 
@@ -29,6 +30,7 @@ def integration_settings(session: Session) -> dict[str, str]:
         "slskd_concurrent_downloads": "1",
         "youtube_cookies_browser": "",
         "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
+        "acoustid_api_key": settings.acoustid_api_key,
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value

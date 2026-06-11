@@ -332,3 +332,19 @@ class BackupRestoreRequest(BaseModel):
 class JellyfinUserOut(BaseModel):
     id: str
     name: str
+
+
+class AudioVerifyDetected(BaseModel):
+    recording_id: str | None = None
+    title: str | None = None
+    artist: str | None = None
+    score: float = 0.0
+
+
+class AudioVerifyResult(BaseModel):
+    matched: bool | None
+    confidence: float
+    message: str
+    claimed: dict[str, Any]
+    detected: list[AudioVerifyDetected]
+    duration_seconds: int | None = None

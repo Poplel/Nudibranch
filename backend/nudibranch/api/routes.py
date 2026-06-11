@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session, selectinload
 from nudibranch.api.deps import get_current_user, require_permission
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
+    AudioVerifyDetected,
+    AudioVerifyResult,
     BackupRestoreRequest,
     CheckFileFixRequest,
     DeviceRegistration,
@@ -90,7 +92,8 @@ from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
-from nudibranch.services.settings_store import integration_settings, update_integration_settings
+from nudibranch.services.acoustid import audio_matches_claim
+from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 
 router = APIRouter(prefix="/api/v1")
@@ -506,6 +509,46 @@ def musicbrainz_match_library_track(
     result["queued_replacements"] = 1 if result.get("replacement_request") else 0
     result["batch_id"] = metadata_batch.id if metadata_batch else replacement_batch.id if replacement_batch else None
     return result
+
+
+@router.post("/library/tracks/{track_id}/verify-audio", tags=["library"], summary="Verify track audio via AcoustID", response_model=AudioVerifyResult)
+def verify_track_audio(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> AudioVerifyResult:
+    track = session.scalar(
+        select(Track)
+        .where(Track.id == track_id)
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    )
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    if not track.path or not Path(track.path).exists():
+        raise HTTPException(status_code=404, detail="Track file is missing")
+    api_key = integration_value(session, "acoustid_api_key")
+    claimed_title = track.title
+    claimed_artist = track.album.artist.name if track.album and track.album.artist else None
+    claimed_recording_id = track.musicbrainz_recording_id
+    result = audio_matches_claim(
+        Path(track.path),
+        claimed_title=claimed_title,
+        claimed_artist=claimed_artist,
+        claimed_recording_id=claimed_recording_id,
+        api_key=api_key,
+    )
+    return AudioVerifyResult(
+        matched=result["matched"],
+        confidence=result["confidence"],
+        message=result["message"],
+        claimed={
+            "title": claimed_title,
+            "artist": claimed_artist,
+            "recording_id": claimed_recording_id,
+        },
+        detected=[AudioVerifyDetected(**d) for d in result["detected"]],
+        duration_seconds=result["duration"],
+    )
 
 
 def musicbrainz_match_track_result(session: Session, track: Track, force: bool = False, album_record: dict | None = None) -> dict:
@@ -1819,6 +1862,14 @@ def tool_check_musicbrainz_ids(
     _: User = Depends(require_permission(Permission.library_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {}))
+
+
+@router.post("/tools/check-audio-content", response_model=TaskOut, tags=["tools"], summary="Verify audio matches metadata")
+def tool_check_audio_content(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_audio_content", {}))
 
 
 @router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")

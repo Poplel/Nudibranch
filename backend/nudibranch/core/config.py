@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     jellyfin_api_key: str = Field("", alias="JELLYFIN_API_KEY")
     slskd_url: str = Field("http://slskd:5030", alias="SLSKD_URL")
     slskd_api_key: str = Field("", alias="SLSKD_API_KEY")
+    acoustid_api_key: str = Field("", alias="ACOUSTID_API_KEY")
 
     wishlist_scan_cron: str = Field("0 */6 * * *", alias="WISHLIST_SCAN_CRON")
     trash_retention_days: int = Field(30, alias="TRASH_RETENTION_DAYS")

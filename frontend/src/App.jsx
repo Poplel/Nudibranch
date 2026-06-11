@@ -1049,6 +1049,15 @@ function App() {
     }
   }
 
+  async function checkLibraryTrackAudio(track) {
+    try {
+      return await api(`/library/tracks/${track.id}/verify-audio`, { method: "POST" });
+    } catch (verifyError) {
+      notify("Audio verification failed", verifyError.message, "ui_error");
+      return null;
+    }
+  }
+
   async function lookupImportAlbum(artist, album, releaseId = null) {
     setLoading(true);
     try {
@@ -1568,6 +1577,7 @@ function App() {
                 onCheckAlbum={lookupImportAlbum}
                 onCheckAlbumMusicBrainz={checkLibraryAlbumMusicBrainz}
                 onCheckTrackMusicBrainz={checkLibraryTrackMusicBrainz}
+                onCheckTrackAudio={checkLibraryTrackAudio}
                 albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={proposeLibraryMetadata}
@@ -1822,7 +1832,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -2006,6 +2016,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTr
                             targetTrackIds={[track.id]}
                             onAddToPlaylist={onAddToPlaylist}
                             onMusicBrainzCheck={canEditMetadata ? () => onCheckTrackMusicBrainz(track, album) : null}
+                            onVerifyAudio={canEditMetadata ? () => onCheckTrackAudio(track) : null}
                             onQueue={onQueueMetadata}
                             onClose={() => toggleSet(setOpenTrackDetails, track.id)}
                           />
@@ -3753,6 +3764,7 @@ function LibraryMetadataEditor({
   targetTrackIds = [],
   onAddToPlaylist,
   onMusicBrainzCheck,
+  onVerifyAudio,
   onRemove,
   onQueue,
   onClose,
@@ -3761,6 +3773,8 @@ function LibraryMetadataEditor({
   const [draft, setDraft] = useState(() => initialFieldValues(fields));
   const [lookupOpen, setLookupOpen] = useState(false);
   const [artFailed, setArtFailed] = useState(false);
+  const [audioCheckResult, setAudioCheckResult] = useState(null);
+  const [audioCheckLoading, setAudioCheckLoading] = useState(false);
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
   );
@@ -3768,6 +3782,7 @@ function LibraryMetadataEditor({
 
   useEffect(() => {
     setDraft(initialValues);
+    setAudioCheckResult(null);
   }, [targetId]);
 
   async function autoLookup(field) {
@@ -3792,6 +3807,15 @@ function LibraryMetadataEditor({
       ...metadataPatchFromAlbum(targetType, current, album),
     }));
     setLookupOpen(false);
+  }
+
+  async function runAudioCheck() {
+    if (!onVerifyAudio) return;
+    setAudioCheckLoading(true);
+    setAudioCheckResult(null);
+    const result = await onVerifyAudio();
+    setAudioCheckLoading(false);
+    if (result) setAudioCheckResult(result);
   }
 
   return (
@@ -3843,12 +3867,18 @@ function LibraryMetadataEditor({
             onSearch={onSearchAlbums}
           />
         )}
-        {(onMusicBrainzCheck || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
+        {(onMusicBrainzCheck || onVerifyAudio || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
           <div className="metadata-menu-actions">
             {onMusicBrainzCheck && (
               <button className="secondary compact" onClick={onMusicBrainzCheck}>
                 <Sparkles size={15} />
                 Check MusicBrainz
+              </button>
+            )}
+            {onVerifyAudio && (
+              <button className="secondary compact" onClick={runAudioCheck} disabled={audioCheckLoading}>
+                <FileAudio size={15} />
+                {audioCheckLoading ? "Checking…" : "Check audio"}
               </button>
             )}
             {playlists.length > 0 && targetTrackIds.length > 0 && (
@@ -3874,6 +3904,17 @@ function LibraryMetadataEditor({
                 Remove
               </button>
             )}
+          </div>
+        )}
+        {audioCheckResult && (
+          <div
+            className="musicbrainz-change-list"
+            style={audioCheckResult.matched === true ? { color: "var(--accent)" } : audioCheckResult.matched === false ? { color: "var(--danger)" } : undefined}
+          >
+            <span>{audioCheckResult.message}</span>
+            {(audioCheckResult.detected || []).slice(0, 3).map((rec) => (
+              <span key={rec.recording_id}>{rec.title} — {rec.artist} ({Math.round(rec.score * 100)}%)</span>
+            ))}
           </div>
         )}
       </div>
@@ -4338,7 +4379,22 @@ function TaskProgress({ task }) {
 function taskDisplayName(task) {
   if (task.type === "execute_proposal_batch") return "Processing task queue";
   if (task.type === "sync_favorites_jellyfin") return "Syncing playlists";
-  return task.type;
+  const names = {
+    check_files: "Checking files",
+    check_duplicates: "Checking duplicates",
+    check_lyrics: "Checking lyrics",
+    check_album_covers: "Checking album covers",
+    check_musicbrainz_ids: "Filling MusicBrainz IDs",
+    check_missing_tracks: "Checking missing tracks",
+    check_non_lossless: "Checking audio quality",
+    check_audio_content: "Verifying audio content",
+    normalize_volume: "Normalizing volume",
+    propose_import: "Preparing import",
+    ytdlp_download: "Downloading",
+    process_wishlist: "Scanning wishlist",
+    jellyfin_scan: "Scanning Jellyfin",
+  };
+  return names[task.type] || task.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function InlineProgress({ value = 0, label = "", indeterminate = false, compact = false }) {
@@ -4370,6 +4426,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
     ["Check MusicBrainz IDs", "Scan the library for missing MusicBrainz IDs and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
+    ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
     ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
     ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
@@ -4793,6 +4850,7 @@ function SettingsPanel({
             ["jellyfin_api_key", "Jellyfin API key"],
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
+            ["acoustid_api_key", "AcoustID API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
             ["slskd_album_folder_tries", "Album folder tries"],
             ["slskd_concurrent_downloads", "Concurrent slskd downloads"],
