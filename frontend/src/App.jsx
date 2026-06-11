@@ -132,8 +132,7 @@ function App() {
   const [playlistImportUrl, setPlaylistImportUrl] = useState("");
   const [playlistImportMode, setPlaylistImportMode] = useState("songs");
   const [playlistImportLoading, setPlaylistImportLoading] = useState(false);
-  const [playlistImportError, setPlaylistImportError] = useState("");
-  const [pendingPlaylistName, setPendingPlaylistName] = useState(null);
+    const [pendingPlaylistName, setPendingPlaylistName] = useState(null);
   const [pendingPlaylistOriginalTracks, setPendingPlaylistOriginalTracks] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
@@ -373,7 +372,6 @@ function App() {
 
   async function refreshAll() {
     setLoading(true);
-    setError("");
     try {
       const me = await api("/me");
       setUser(me);
@@ -408,10 +406,9 @@ function App() {
       if (hasPermission(me, "activity:read")) refreshUserPlayback();
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
-        setError("");
         logout();
       } else {
-        setError(refreshError.message);
+        notify("Refresh failed", refreshError.message, "ui_error");
       }
     } finally {
       setLoading(false);
@@ -544,7 +541,6 @@ function App() {
 
   async function createUserAccount(payload) {
     setLoading(true);
-    setError("");
     try {
       const created = await api("/users", {
         method: "POST",
@@ -563,7 +559,6 @@ function App() {
 
   async function updateUserAccount(userId, payload) {
     setLoading(true);
-    setError("");
     try {
       const updated = await api(`/users/${userId}`, {
         method: "PATCH",
@@ -582,7 +577,6 @@ function App() {
 
   async function updateUserPin(userId, pin) {
     setLoading(true);
-    setError("");
     try {
       const updated = await api(`/users/${userId}/pin`, {
         method: "POST",
@@ -601,7 +595,6 @@ function App() {
 
   async function updateOwnPin(pin) {
     setLoading(true);
-    setError("");
     try {
       const updated = await api("/me/pin", {
         method: "POST",
@@ -663,7 +656,6 @@ function App() {
 
   async function saveIntegrationSettings(settings) {
     setLoading(true);
-    setError("");
     try {
       const saved = await api("/settings/integrations", {
         method: "PUT",
@@ -673,7 +665,6 @@ function App() {
       refreshPlaylists();
       setToast({ title: "Settings saved", body: "Integration settings were updated." });
     } catch (settingsError) {
-      setError(settingsError.message);
       notify("Settings failed", settingsError.message, "ui_error");
     } finally {
       setLoading(false);
@@ -692,7 +683,6 @@ function App() {
 
   async function createPlaylist(name) {
     setLoading(true);
-    setError("");
     try {
       const playlist = await api("/playlists", {
         method: "POST",
@@ -715,7 +705,6 @@ function App() {
   async function addTracksToPlaylist(playlistId, trackIds) {
     if (!playlistId || trackIds.length === 0) return null;
     setLoading(true);
-    setError("");
     try {
       const playlist = await api(`/playlists/${playlistId}/tracks`, {
         method: "POST",
@@ -759,7 +748,6 @@ function App() {
         body: track._artist ? `${track.title} by ${track._artist}` : track.title,
       });
     } catch (favoriteError) {
-      setError(favoriteError.message);
       notify("Favorite failed", favoriteError.message, "ui_error");
     }
   }
@@ -782,7 +770,6 @@ function App() {
     try {
       await api("/notifications", { method: "DELETE" });
     } catch (clearError) {
-      setError(clearError.message);
       notify("Notifications failed", clearError.message, "ui_error");
     }
   }
@@ -813,7 +800,6 @@ function App() {
 
   async function createWishlistItem(item) {
     setLoading(true);
-    setError("");
     try {
       const created = await api("/wishlist", {
         method: "POST",
@@ -823,7 +809,6 @@ function App() {
       setToast({ title: "Wishlist updated", body: "The item was added to the wishlist." });
       return created;
     } catch (wishlistError) {
-      setError(wishlistError.message);
       notify("Wishlist failed", wishlistError.message, "ui_error");
       throw wishlistError;
     } finally {
@@ -837,7 +822,6 @@ function App() {
 
   async function removeWishlistItems(itemIds) {
     setLoading(true);
-    setError("");
     try {
       const updatedItems = [];
       for (const itemId of itemIds) {
@@ -848,7 +832,6 @@ function App() {
       setToast({ title: "Wishlist updated", body: `${updatedItems.length} item${updatedItems.length === 1 ? "" : "s"} removed.` });
       return updatedItems;
     } catch (wishlistError) {
-      setError(wishlistError.message);
       notify("Wishlist failed", wishlistError.message, "ui_error");
       throw wishlistError;
     } finally {
@@ -858,7 +841,6 @@ function App() {
 
   async function submitWishlistApprovals(itemIds = null, options = {}) {
     setLoading(true);
-    setError("");
     try {
       const wantedItems = itemIds?.length ? wishlist.filter((item) => itemIds.includes(item.id)) : wishlist.filter((item) => item.status === "wanted");
       const batch = await api("/wishlist/approvals", {
@@ -889,7 +871,6 @@ function App() {
 
   async function queueDiscoverDownloads(downloadRequests) {
     setLoading(true);
-    setError("");
     try {
       const task = await api("/discover/task-queue", {
         method: "POST",
@@ -903,7 +884,6 @@ function App() {
       }, 2500);
       return task;
     } catch (discoverError) {
-      setError(discoverError.message);
       notify("Discover failed", discoverError.message, "ui_error");
       throw discoverError;
     } finally {
@@ -913,7 +893,6 @@ function App() {
 
   async function scanImportFolder() {
     setLoading(true);
-    setError("");
     try {
       setImportDownloadRequests([]);
       setImportSeedDownloads([]);
@@ -924,7 +903,6 @@ function App() {
       setImportFiles(data.files);
       setToast({ title: "Import scan complete", body: `${data.count} audio files found.` });
     } catch (scanError) {
-      setError(scanError.message);
       notify("Import scan failed", scanError.message, "ui_error");
     } finally {
       setLoading(false);
@@ -933,7 +911,6 @@ function App() {
 
   async function proposeImport(downloadRequests = []) {
     setLoading(true);
-    setError("");
     try {
       const task = await api("/imports/propose", {
         method: "POST",
@@ -958,7 +935,6 @@ function App() {
         refreshTasks();
       }, 2500);
     } catch (proposeError) {
-      setError(proposeError.message);
       notify("Import review failed", proposeError.message, "ui_error");
     } finally {
       setLoading(false);
@@ -967,7 +943,6 @@ function App() {
 
   async function recheckImportTrack(file) {
     setLoading(true);
-    setError("");
     try {
       const data = await api("/imports/musicbrainz-match", {
         method: "POST",
@@ -992,7 +967,6 @@ function App() {
     const albumFiles = album.files || [];
     if (albumFiles.length === 0) return;
     setLoading(true);
-    setError("");
     let nextFiles = importFiles;
     let matched = 0;
     let changed = 0;
@@ -1038,7 +1012,6 @@ function App() {
 
   async function checkLibraryAlbumMusicBrainz(album) {
     setLoading(true);
-    setError("");
     try {
       const data = await api(`/library/albums/${album.id}/musicbrainz-match`, { method: "POST" });
       setLibraryAlbumChecks((current) => ({ ...current, [album.id]: data }));
@@ -1057,7 +1030,6 @@ function App() {
 
   async function checkLibraryTrackMusicBrainz(track, album = null) {
     setLoading(true);
-    setError("");
     try {
       const result = await api(`/library/tracks/${track.id}/musicbrainz-match`, { method: "POST" });
       const label = musicBrainzResultMeta(result);
@@ -1078,7 +1050,6 @@ function App() {
 
   async function lookupImportAlbum(artist, album, releaseId = null) {
     setLoading(true);
-    setError("");
     try {
       const data = await api("/imports/album-lookup", {
         method: "POST",
@@ -1087,7 +1058,6 @@ function App() {
       setToast({ title: "Album checked", body: `${data.tracks?.length || 0} tracks found.` });
       return data;
     } catch (lookupError) {
-      setError(lookupError.message);
       notify("Album lookup failed", lookupError.message, "ui_error");
       return null;
     } finally {
@@ -1097,7 +1067,6 @@ function App() {
 
   async function searchImportAlbums(artist, album) {
     setLoading(true);
-    setError("");
     try {
       const data = await api("/imports/album-search", {
         method: "POST",
@@ -1105,7 +1074,6 @@ function App() {
       });
       return data.results || [];
     } catch (lookupError) {
-      setError(lookupError.message);
       notify("Album search failed", lookupError.message, "ui_error");
       return [];
     } finally {
@@ -1115,7 +1083,6 @@ function App() {
 
   async function proposeLibraryMetadata(targetType, targetId, changes) {
     setLoading(true);
-    setError("");
     try {
       const batch = await api("/library/metadata", {
         method: "POST",
@@ -1125,7 +1092,6 @@ function App() {
       setToast({ title: "Metadata queued", body: "The change was added to the task queue." });
       return batch;
     } catch (metadataError) {
-      setError(metadataError.message);
       notify("Metadata queue failed", metadataError.message, "ui_error");
       throw metadataError;
     } finally {
@@ -1135,7 +1101,6 @@ function App() {
 
   async function proposeLibraryRemove(targetType, targetId, action) {
     setLoading(true);
-    setError("");
     try {
       const batch = await api("/library/remove", {
         method: "POST",
@@ -1145,7 +1110,6 @@ function App() {
       setToast({ title: "Library change queued", body: "The removal request was added to the task queue." });
       return batch;
     } catch (removeError) {
-      setError(removeError.message);
       notify("Queue request failed", removeError.message, "ui_error");
       throw removeError;
     } finally {
@@ -1155,7 +1119,6 @@ function App() {
 
   async function proposePlaylistPosition(entryId, position) {
     setLoading(true);
-    setError("");
     try {
       const batch = await api(`/playlists/entries/${entryId}/position`, {
         method: "POST",
@@ -1165,7 +1128,6 @@ function App() {
       setToast({ title: "Playlist change queued", body: "The order change was added to the task queue." });
       return batch;
     } catch (playlistError) {
-      setError(playlistError.message);
       notify("Playlist queue failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
@@ -1175,14 +1137,12 @@ function App() {
 
   async function renamePlaylist(playlistId, name) {
     setLoading(true);
-    setError("");
     try {
       const playlist = await api(`/playlists/${playlistId}`, { method: "PATCH", body: JSON.stringify({ name }) });
       await refreshPlaylists();
       setToast({ title: "Playlist renamed", body: playlist.name });
       return playlist;
     } catch (playlistError) {
-      setError(playlistError.message);
       notify("Rename failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
@@ -1192,13 +1152,11 @@ function App() {
 
   async function deletePlaylist(playlistId) {
     setLoading(true);
-    setError("");
     try {
       await api(`/playlists/${playlistId}`, { method: "DELETE" });
       await refreshPlaylists();
       setToast({ title: "Playlist deleted" });
     } catch (playlistError) {
-      setError(playlistError.message);
       notify("Delete failed", playlistError.message, "ui_error");
       throw playlistError;
     } finally {
@@ -1209,7 +1167,6 @@ function App() {
 
   async function importPlaylist(url, mode) {
     setPlaylistImportLoading(true);
-    setPlaylistImportError("");
     try {
       const data = await api("/imports/playlist-url", { method: "POST", body: JSON.stringify({ url }) });
       const { tracks, name: playlistName } = data;
@@ -1297,7 +1254,7 @@ function App() {
         setToast({ title: "Added to import", body: `${allIncoming.length} track${allIncoming.length === 1 ? "" : "s"} from ${albumsResolved} album${albumsResolved === 1 ? "" : "s"} added to the import tree.` });
       }
     } catch (err) {
-      setPlaylistImportError(err.message || "Failed to fetch playlist.");
+      notify("Playlist import failed", err.message || "Failed to fetch playlist.", "ui_error");
     } finally {
       setPlaylistImportLoading(false);
     }
@@ -1305,7 +1262,6 @@ function App() {
 
   async function runTool(action, payload = null) {
     setLoading(true);
-    setError("");
     try {
       const task = await api(`/tools/${action}`, {
         method: "POST",
@@ -1327,7 +1283,6 @@ function App() {
 
   async function proposeCheckFileFix(fix) {
     setLoading(true);
-    setError("");
     try {
       const batch = await api("/tools/check-files/fix", {
         method: "POST",
@@ -1337,7 +1292,6 @@ function App() {
       setToast({ title: "File fix queued", body: "The fix was added to the task queue." });
       return batch;
     } catch (fixError) {
-      setError(fixError.message);
       notify("File fix failed", fixError.message, "ui_error");
       throw fixError;
     } finally {
@@ -1348,7 +1302,6 @@ function App() {
   async function uploadYoutubeCookies(browser, file) {
     if (!file) return null;
     setLoading(true);
-    setError("");
     const body = new FormData();
     body.append("file", file);
     try {
@@ -1360,7 +1313,6 @@ function App() {
       setToast({ title: "Cookies uploaded", body: file.name });
       return saved;
     } catch (uploadError) {
-      setError(uploadError.message);
       notify("Cookie upload failed", uploadError.message, "ui_error");
       throw uploadError;
     } finally {
@@ -1392,7 +1344,6 @@ function App() {
       setCurrentTrack(track);
       reportPlayerStatus(track, "playing", { queue_length: playerQueue.length || 1, current_index: Math.max(0, playerQueue.findIndex((queuedTrack) => queuedTrack.id === track.id)) });
     } catch (playError) {
-      setError(`Playback failed: ${playError.message}`);
       notify("Playback failed", playError.message, "ui_error");
     }
   }
@@ -1476,7 +1427,6 @@ function App() {
       await refreshTasks();
       await refreshApprovals();
     } catch (cancelError) {
-      setError(cancelError.message);
       notify("Cancel failed", cancelError.message, "ui_error");
     }
   }
@@ -1500,7 +1450,6 @@ function App() {
       await refreshApprovals();
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
-      setError(approvalError.message);
       notify("Task queue failed", approvalError.message, "ui_error");
     } finally {
       setLoading(false);
@@ -1520,7 +1469,6 @@ function App() {
       setToast({ title: "Changes rejected", body: "Selected items were removed from the queue." });
       await refreshApprovals();
     } catch (rejectError) {
-      setError(rejectError.message);
       notify("Reject failed", rejectError.message, "ui_error");
     } finally {
       setLoading(false);
@@ -1785,7 +1733,6 @@ function App() {
               mode: playlistImportMode,
               setMode: setPlaylistImportMode,
               loading: playlistImportLoading,
-              error: playlistImportError,
               onImport: importPlaylist,
             }}
           />
@@ -5025,7 +4972,6 @@ function Inspector({
                   ? (playlistImportActions.mode === "albums" ? "Looking up albums…" : "Importing…")
                   : "Import playlist"}
               </button>
-              {playlistImportActions.error && <p className="error-text">{playlistImportActions.error}</p>}
             </div>
           )}
         </div>
@@ -5300,6 +5246,8 @@ function AudioPlayer({
   const fsArtRef = useRef(null);
   const fsControlsRef = useRef(null);
   const fsScrollRef = useRef(null);
+  const fsPlayerRef = useRef(null);
+  const upNextRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -5356,6 +5304,21 @@ function AudioPlayer({
   }, [currentTrack?.id, pipContainer]);
 
   useEffect(() => {
+    const container = upNextRef.current?.querySelector('.up-next-text');
+    if (!container || !nextTrack) return;
+    const update = () => {
+      const strong = container.querySelector("strong");
+      const small = container.querySelector("small");
+      if (strong) strong.style.setProperty("--overflow-width", `${Math.max(0, strong.scrollWidth - container.clientWidth)}px`);
+      if (small) small.style.setProperty("--overflow-width", `${Math.max(0, small.scrollWidth - container.clientWidth)}px`);
+    };
+    const ro = new ResizeObserver(update);
+    ro.observe(container);
+    update();
+    return () => ro.disconnect();
+  }, [nextTrack?.id, lyricsOpen]);
+
+  useEffect(() => {
     setLyricsData(null);
     if (!lyricsUrl) return;
     let cancelled = false;
@@ -5395,6 +5358,7 @@ function AudioPlayer({
     const art = fsArtRef.current;
     const controls = fsControlsRef.current;
     const scroll = fsScrollRef.current;
+    const pip = fsPlayerRef.current;
     if (!core || !art || !controls) return undefined;
     const ART_BASE = 150;
     const CLAMP_GAP = 16; // gap between the art bottom and the controls when clamped
@@ -5421,6 +5385,16 @@ function AudioPlayer({
       const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.6, 460, maxByWidth));
       const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
       core.style.setProperty("--art-size", `${artSize}px`);
+      // Compact mode: triggered when height is too short for full layout or scrolled
+      // with no room for 1 queue entry (art + controls + 1 entry + padding ≈ 370px)
+      if (pip) {
+        const pipH = pip.offsetHeight;
+        const pipW = pip.offsetWidth;
+        const compact = pipH < 350 && (scrollTop > 0 || pipH < 290);
+        const micro = pipH < 200 && pipW < 260;
+        pip.classList.toggle("is-compact", compact);
+        pip.classList.toggle("is-micro", micro && !compact);
+      }
     };
     update();
     const onScrollOrResize = () => window.requestAnimationFrame(update);
@@ -5430,10 +5404,21 @@ function AudioPlayer({
     ro?.observe(core);
     ro?.observe(controls);
     if (scroll) ro?.observe(scroll);
+    if (pip) ro?.observe(pip);
+    // Forward wheel events on the header area (outside lyrics) to the queue scroller
+    const headerEl = core.querySelector(".audio-header");
+    const handleWheel = (e) => {
+      if (!scroll) return;
+      if (e.target.closest && e.target.closest(".pip-header-lyrics")) return;
+      e.preventDefault();
+      scroll.scrollTop += e.deltaY;
+    };
+    headerEl?.addEventListener("wheel", handleWheel, { passive: false });
     return () => {
       scroll?.removeEventListener("scroll", onScrollOrResize);
       window.removeEventListener("resize", onScrollOrResize);
       ro?.disconnect();
+      headerEl?.removeEventListener("wheel", handleWheel);
     };
   }, [currentTrack, queue, lyricsOpen, fullscreenPlayer, pipContainer, showUpNext]);
 
@@ -5730,10 +5715,21 @@ function AudioPlayer({
       return <div className="lyrics-empty">No lyrics available</div>;
     })();
 
+    const upNextWidget = nextTrack ? (
+      <div className={`fullscreen-next${showUpNext ? " is-visible" : ""}`} ref={upNextRef}>
+        <div className="up-next-art">{nextTrack._coverUrl ? <img src={nextTrack._coverUrl} alt="" /> : <Music size={18} />}</div>
+        <div className="up-next-text">
+          <span>Up next</span>
+          <strong>{nextTrack.title}</strong>
+          <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+        </div>
+      </div>
+    ) : null;
+
     return (
       <div
-        className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${showUpNext ? " has-up-next" : ""}${lyricsOpen ? " has-lyrics" : ""}`}
-        ref={popped ? null : dockRef}
+        className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${nextTrack ? " has-up-next" : ""}${lyricsOpen ? " has-lyrics" : ""}`}
+        ref={(el) => { fsPlayerRef.current = el; if (!popped) dockRef.current = el; }}
         style={currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
         <div className="player-core" ref={(el) => { fsCoreRef.current = el; if (!popped) coreRef.current = el; }}>
@@ -5744,21 +5740,14 @@ function AudioPlayer({
               <strong>{currentTrack?.title || "Local player"}</strong>
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || currentTrack?.path || "Ready"}</small>
             </div>
-            {showUpNext && (
-              <div className="fullscreen-next">
-                <div className="up-next-art">{nextTrack._coverUrl ? <img src={nextTrack._coverUrl} alt="" /> : <Music size={18} />}</div>
-                <div>
-                  <span>Up next</span>
-                  <strong>{nextTrack.title}</strong>
-                  <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
+            {lyricsOpen ? (
+              <div className="lyrics-next-stack">
+                {upNextWidget}
+                <div className="pip-header-lyrics" ref={lyricsPanelRef}>
+                  {lyricsContent}
                 </div>
               </div>
-            )}
-            {lyricsOpen && (
-              <div className="pip-header-lyrics" ref={lyricsPanelRef}>
-                {lyricsContent}
-              </div>
-            )}
+            ) : upNextWidget}
             <div className="player-window-actions">
               <button className="row-icon-button" onClick={toggleFullscreenPlayer} title={fullscreenPlayer ? "Exit fullscreen" : "Fullscreen"}>
                 {fullscreenPlayer ? <Minimize2 size={14} /> : <Maximize2 size={14} />}
