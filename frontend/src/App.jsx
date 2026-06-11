@@ -5296,6 +5296,10 @@ function AudioPlayer({
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [lyricsData, setLyricsData] = useState(null);
   const lyricsPanelRef = useRef(null);
+  const fsCoreRef = useRef(null);
+  const fsArtRef = useRef(null);
+  const fsControlsRef = useRef(null);
+  const fsScrollRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -5382,6 +5386,38 @@ function AudioPlayer({
     const el = lyricsPanelRef.current.children[currentLyricIndex];
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [currentLyricIndex, lyricsOpen]);
+
+  // Grow the album art to fill the empty space down to the media controls when
+  // they slide toward the bottom of the page, shrinking back to the base size
+  // when the queue is long enough that the controls clamp under the art.
+  useEffect(() => {
+    const core = fsCoreRef.current;
+    const art = fsArtRef.current;
+    const controls = fsControlsRef.current;
+    const scroll = fsScrollRef.current;
+    if (!core || !art || !controls) return undefined;
+    const GAP = 42;
+    const update = () => {
+      const artTop = art.getBoundingClientRect().top;
+      const controlsTop = controls.getBoundingClientRect().top;
+      const max = Math.min(window.innerHeight * 0.62, 540);
+      const size = Math.max(150, Math.min(max, Math.round(controlsTop - artTop - GAP)));
+      core.style.setProperty("--art-size", `${size}px`);
+    };
+    update();
+    const onScrollOrResize = () => window.requestAnimationFrame(update);
+    scroll?.addEventListener("scroll", onScrollOrResize, { passive: true });
+    window.addEventListener("resize", onScrollOrResize);
+    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onScrollOrResize) : null;
+    ro?.observe(core);
+    ro?.observe(controls);
+    if (scroll) ro?.observe(scroll);
+    return () => {
+      scroll?.removeEventListener("scroll", onScrollOrResize);
+      window.removeEventListener("resize", onScrollOrResize);
+      ro?.disconnect();
+    };
+  }, [currentTrack, queue, lyricsOpen, fullscreenPlayer, pipContainer, showUpNext]);
 
   useEffect(() => () => {
     pipWindowRef.current?.close?.();
@@ -5682,9 +5718,9 @@ function AudioPlayer({
         ref={popped ? null : dockRef}
         style={currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
       >
-        <div className="player-core" ref={popped ? null : coreRef}>
+        <div className="player-core" ref={(el) => { fsCoreRef.current = el; if (!popped) coreRef.current = el; }}>
           <div className="audio-header">
-            <div className="player-art">{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
+            <div className="player-art" ref={fsArtRef}>{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
             <div className="audio-track-copy" ref={pipTrackCopyRef}>
               <span className="playing-from">Playing from library</span>
               <strong>{currentTrack?.title || "Local player"}</strong>
@@ -5714,8 +5750,8 @@ function AudioPlayer({
               </button>
             </div>
           </div>
-          <div className="pip-scroll-area">
-            <div className="fullscreen-controls pip-controls-sticky">
+          <div className="pip-scroll-area" ref={fsScrollRef}>
+            <div className="fullscreen-controls pip-controls-sticky" ref={fsControlsRef}>
               <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
               <div className="player-controls">
                 <button className={`player-icon-button${lyricsOpen ? " active" : ""}`} onClick={() => setLyricsOpen((v) => !v)} title="Lyrics">

@@ -1597,6 +1597,7 @@ nav button:hover,
 }
 
 .pip-player .player-core {
+  position: relative;
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: auto 1fr;
@@ -1677,6 +1678,10 @@ nav button:hover,
   /* match the media controls' width and centering */
   width: min(100%, 840px);
   margin: 0 auto;
+  /* not its own scroll box — .pip-scroll-area is the single scroller so the
+     controls can slide with the queue and clamp under the album art */
+  max-height: none;
+  overflow: visible;
   background: transparent;
   border: 0;
   box-shadow: none;
@@ -1706,23 +1711,25 @@ nav button:hover,
 }
 
 .pip-player .audio-header {
-  grid-template-columns: 150px minmax(0, 1fr) 64px;
+  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) 64px;
   gap: 12px;
   max-width: none;
   align-self: start;
   align-items: start;
+  /* reserve the base art height so the controls clamp below the art */
+  min-height: 150px;
 }
 
 .pip-player.has-lyrics .audio-header {
-  grid-template-columns: 150px minmax(0, 1fr) 1fr 64px;
+  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) 1fr 64px;
 }
 
 .pip-player.has-up-next .audio-header {
-  grid-template-columns: 150px minmax(220px, 1fr) minmax(180px, 280px) 64px;
+  grid-template-columns: var(--art-size, 150px) minmax(220px, 1fr) minmax(180px, 280px) 64px;
 }
 
 .pip-player.has-up-next.has-lyrics .audio-header {
-  grid-template-columns: 150px minmax(0, 1fr) minmax(180px, 1fr) minmax(180px, 280px) 64px;
+  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) minmax(180px, 1fr) minmax(180px, 280px) 64px;
 }
 
 /* Lyrics panel embedded in the header row */
@@ -1763,9 +1770,18 @@ nav button:hover,
 }
 
 .pip-player .player-art {
-  width: 150px;
-  height: 150px;
+  /* anchored top-left; size driven by JS (--art-size) so it grows to fill the
+     empty space down to the controls when they slide toward the bottom, and
+     shrinks back to its base size when they clamp under it. Absolute so its
+     size never feeds back into the layout. */
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  width: var(--art-size, 150px);
+  height: var(--art-size, 150px);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.26);
+  transition: width 0.18s ease, height 0.18s ease;
 }
 
 .player-art img {
@@ -2911,6 +2927,7 @@ nav button:hover,
   .pip-player .audio-header {
     grid-template-columns: 112px minmax(0, 1fr) 54px;
     max-width: none;
+    min-height: 112px;
   }
 
   .pip-player.has-lyrics .audio-header {
