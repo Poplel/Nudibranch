@@ -141,3 +141,43 @@ def cancel_task(session: Session, task_id: str) -> Task:
     session.commit()
     session.refresh(task)
     return task
+
+
+def recover_orphaned_tasks(session: Session) -> int:
+    """On worker startup, any task still marked running was orphaned by a crash/reboot
+    (single-worker deployment). Requeue them so they resume. Attempts are preserved so the
+    MAX_TASK_ATTEMPTS poison guard still trips for tasks that repeatedly crash the worker."""
+    orphaned = list(session.scalars(select(Task).where(Task.status == TaskStatus.running)))
+    for task in orphaned:
+        task.status = TaskStatus.queued
+        task.locked_by = None
+        task.lease_until = None
+        write_app_log(
+            f"Recovered interrupted task {task.type} after restart; requeued to resume",
+            level="warning",
+            task_id=task.id,
+            task_type=task.type,
+        )
+    if orphaned:
+        session.commit()
+    return len(orphaned)
+
+
+def discard_pending_batches(session: Session, title: str, kind) -> int:
+    """Delete prior proposal batches with the same title+kind that are still fully pending
+    (not approved/executing/completed). Lets a re-run of a check/scan tool replace its previous
+    un-acted proposal instead of piling up duplicates — important when a crashed scan resumes."""
+    stale = list(
+        session.scalars(
+            select(ProposalBatch).where(
+                ProposalBatch.title == title,
+                ProposalBatch.kind == kind,
+                ProposalBatch.status == ProposalStatus.pending,
+            )
+        )
+    )
+    for batch in stale:
+        session.delete(batch)  # items cascade
+    if stale:
+        session.flush()
+    return len(stale)

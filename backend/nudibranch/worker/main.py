@@ -26,7 +26,7 @@ from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings, integration_value
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
-from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, enqueue_task, fail_task, task_to_payload, update_task_progress
+from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
 MAX_DOWNLOAD_AUTO_RETRIES = 5
@@ -5316,6 +5316,7 @@ def run_clear_discover_cache(session: Session, _payload: dict) -> dict:
 
 
 def run_check_files(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
     settings = get_settings()
     library_root = settings.library_path.resolve()
     audio_suffixes = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac"}
@@ -5562,6 +5563,7 @@ def queue_missing_file_downloads(session: Session, missing_files: list[dict]) ->
 def run_check_duplicates(session: Session, _payload: dict, task: Task | None = None) -> dict:
     """Find tracks with the same artist + album + title appearing in multiple files and queue a
     review batch to move the duplicate copies to trash (keeping the best copy of each song)."""
+    discard_pending_batches(session, "Remove duplicate library files", ProposalKind.delete)
     tracks = list(
         session.scalars(
             select(Track).options(selectinload(Track.album).selectinload(Album.artist))
@@ -5737,6 +5739,7 @@ def file_info_for_existing_library_file(file_path: Path) -> dict:
 
 
 def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Download missing lyrics", ProposalKind.lyrics)
     tracks = list(
         session.scalars(
             select(Track)
@@ -5832,6 +5835,7 @@ def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None)
 
 
 def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Fill MusicBrainz IDs", ProposalKind.metadata)
     artists = list(
         session.scalars(
             select(Artist)
@@ -6041,6 +6045,7 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
 
 
 def run_check_album_covers(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Download missing album covers", ProposalKind.artwork)
     albums = list(
         session.scalars(
             select(Album)
@@ -6100,6 +6105,7 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
 
 
 def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Missing album tracks", ProposalKind.download)
     albums = list(
         session.scalars(
             select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
@@ -6180,6 +6186,7 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
 
 
 def run_check_non_lossless(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Lossless replacement downloads", ProposalKind.download)
     tracks = list(session.scalars(select(Track).options(selectinload(Track.album).selectinload(Album.artist)).order_by(Track.title.asc())))
     batch = ProposalBatch(title="Lossless replacement downloads", kind=ProposalKind.download, tree_path="/task-queue")
     session.add(batch)
@@ -6246,6 +6253,7 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
 
 
 def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Replace incorrect audio files", ProposalKind.download)
     from nudibranch.services.metadata_lookup import normalize, text_similarity
 
     albums = list(
@@ -6391,6 +6399,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
 
 
 def run_normalize_volume(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Normalize library volume", ProposalKind.file_move)
     tracks = list(session.scalars(select(Track).where(Track.path.is_not(None)).order_by(Track.title.asc())))
     batch = ProposalBatch(title="Normalize library volume", kind=ProposalKind.file_move, tree_path="/library")
     session.add(batch)
@@ -7022,6 +7031,16 @@ async def worker_loop() -> None:
         _upsert_setting(session, "mapping_run_count", "0")
         _upsert_setting(session, "mapping_started_at", datetime.now(timezone.utc).isoformat())
         session.commit()
+        recovered = recover_orphaned_tasks(session)
+        if recovered:
+            create_notification(
+                session,
+                title="Resumed interrupted work",
+                body=f"{recovered} task(s) interrupted by a restart were requeued to continue.",
+                event_type="task_started",
+                target_url="/activity",
+            )
+            session.commit()
 
     last_download_scan = 0.0
     last_download_scan_summary = ""
