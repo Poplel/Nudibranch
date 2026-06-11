@@ -393,6 +393,54 @@ def dedupe_tracks(tracks: list[dict]) -> list[dict]:
     return deduped
 
 
+def lookup_musicbrainz_ids(artist: str, album: str) -> dict | None:
+    releases = find_releases(artist, album, limit=5)
+    if not releases:
+        return None
+    normalized_album = normalize(album)
+    best = sorted(
+        releases,
+        key=lambda release: (
+            normalize(release.get("title")) != normalized_album,
+            -(release.get("score") or 0),
+        ),
+    )[0]
+    release_id = best.get("id")
+    if not release_id:
+        return None
+    match_score = best.get("score") or 0
+    response = musicbrainz_get(
+        f"https://musicbrainz.org/ws/2/release/{release_id}",
+        params={"fmt": "json", "inc": "recordings+media+artist-credits+release-groups"},
+    )
+    response.raise_for_status()
+    detail = response.json()
+    tracks = []
+    for medium in detail.get("media", []):
+        disc_number = medium.get("position")
+        for track in medium.get("tracks", []):
+            recording = track.get("recording") or {}
+            tracks.append(
+                {
+                    "track_number": parse_track_number(track.get("number") or track.get("position")),
+                    "disc_number": disc_number,
+                    "title": track.get("title") or recording.get("title") or "Unknown Title",
+                    "musicbrainz_recording_id": recording.get("id"),
+                    "length": track.get("length") or recording.get("length"),
+                }
+            )
+    artist_credit_list = detail.get("artist-credit") or []
+    return {
+        "match_score": match_score,
+        "artist_mbid": (artist_credit_list[0].get("artist", {}).get("id") if artist_credit_list and isinstance(artist_credit_list[0], dict) else None),
+        "artist_name": artist_credit(artist_credit_list) or artist,
+        "release_id": release_id,
+        "release_group_id": (detail.get("release-group") or {}).get("id") or None,
+        "album_title": detail.get("title") or album,
+        "tracks": tracks,
+    }
+
+
 def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) -> dict:
     release = {"id": release_id} if release_id else find_release(artist, album)
     if not release:

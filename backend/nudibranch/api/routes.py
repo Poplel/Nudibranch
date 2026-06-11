@@ -1813,6 +1813,14 @@ def tool_check_lyrics(
     return serialize_task(enqueue_task(session, "check_lyrics", {}))
 
 
+@router.post("/tools/check-musicbrainz-ids", response_model=TaskOut, tags=["tools"], summary="Fill missing MusicBrainz IDs")
+def tool_check_musicbrainz_ids(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {}))
+
+
 @router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")
 def tool_check_album_covers(
     session: Session = Depends(get_session),

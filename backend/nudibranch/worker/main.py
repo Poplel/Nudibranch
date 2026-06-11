@@ -20,7 +20,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings
@@ -5770,10 +5770,39 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
     batch = ProposalBatch(title="Download missing lyrics", kind=ProposalKind.lyrics, tree_path="/library")
     session.add(batch)
     session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
     for track in missing:
+        artist_name = track.album.artist.name
+        album_title = track.album.title
+        artist_item = artist_items.get(artist_name)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist_name,
+                kind=ProposalKind.lyrics,
+                payload_json=json.dumps({"artist": artist_name}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        album_key = (artist_name, album_title)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album_title,
+                kind=ProposalKind.lyrics,
+                payload_json=json.dumps({"artist": artist_name, "album": album_title}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
         session.add(
             ProposalItem(
                 batch_id=batch.id,
+                parent_id=album_item.id,
                 title=track.title,
                 kind=ProposalKind.lyrics,
                 old_value=str(Path(track.path).with_suffix(".lrc")),
@@ -5782,8 +5811,8 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
                     {
                         "action": "download_lyrics",
                         "track_id": track.id,
-                        "artist": track.album.artist.name,
-                        "album": track.album.title,
+                        "artist": artist_name,
+                        "album": album_title,
                         "track": track.title,
                     }
                 ),
@@ -5797,6 +5826,210 @@ def run_check_lyrics(session: Session, _payload: dict) -> dict:
         target_url="/task-queue",
     )
     return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
+
+
+def run_check_musicbrainz_ids(session: Session, _payload: dict) -> dict:
+    artists = list(
+        session.scalars(
+            select(Artist)
+            .options(selectinload(Artist.albums).selectinload(Album.tracks))
+            .order_by(Artist.name.asc())
+        )
+    )
+    batch = ProposalBatch(title="Fill MusicBrainz IDs", kind=ProposalKind.metadata, tree_path="/library")
+    session.add(batch)
+    session.flush()
+
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    def is_high_confidence_album(result: dict, artist_name: str, album_title: str) -> bool:
+        return (
+            (result.get("match_score") or 0) >= 90
+            and text_similarity(normalize(album_title), normalize(result.get("album_title") or "")) >= 0.85
+            and text_similarity(normalize(artist_name), normalize(result.get("artist_name") or "")) >= 0.85
+        )
+
+    def is_high_confidence_track(track_title: str, mb_track: dict) -> bool:
+        return text_similarity(normalize(track_title), normalize(mb_track.get("title") or "")) >= 0.85
+
+    def flagged(name: str, uncertain: bool) -> str:
+        return ("⚠ " + name) if uncertain else name
+
+    n_albums_scanned = 0
+    proposed = 0
+
+    for artist in artists:
+        artist_needs = not artist.musicbrainz_id
+        artist_item = None
+        artist_mbid = None
+        artist_uncertain = False
+
+        for album in artist.albums:
+            album_needs_release = not album.musicbrainz_release_id
+            album_needs_rg = not album.musicbrainz_release_group_id
+            tracks_needing = [t for t in album.tracks if not t.musicbrainz_recording_id]
+
+            if not artist_needs and not album_needs_release and not album_needs_rg and not tracks_needing:
+                continue
+
+            n_albums_scanned += 1
+            try:
+                result = lookup_musicbrainz_ids(artist.name, album.title)
+            except Exception as error:  # noqa: BLE001 - keep checking other albums
+                write_app_log(
+                    f"MusicBrainz ID check: lookup failed for {artist.name} / {album.title}: {error}",
+                    level="warning",
+                )
+                time.sleep(1)
+                continue
+            time.sleep(1)
+
+            if result is None:
+                continue
+
+            album_uncertain = not is_high_confidence_album(result, artist.name, album.title)
+
+            if artist_mbid is None and result.get("artist_mbid"):
+                artist_mbid = result["artist_mbid"]
+                artist_uncertain = album_uncertain
+
+            album_changes: dict = {}
+            if album_needs_release and result.get("release_id"):
+                album_changes["musicbrainz_release_id"] = result["release_id"]
+            if album_needs_rg and result.get("release_group_id"):
+                album_changes["musicbrainz_release_group_id"] = result["release_group_id"]
+
+            # Match needing tracks to result tracks
+            mb_tracks = result.get("tracks") or []
+            track_proposals: list[tuple] = []  # (track, mb_track, track_changes, track_uncertain)
+            for track in tracks_needing:
+                chosen = None
+                used_track_number_match = False
+                best_sim = 0.0
+                for mb_track in mb_tracks:
+                    # Prefer track_number match (considering disc_number when both present)
+                    tn_match = (
+                        track.track_number is not None
+                        and mb_track.get("track_number") is not None
+                        and track.track_number == mb_track["track_number"]
+                        and (
+                            not track.disc_number
+                            or not mb_track.get("disc_number")
+                            or track.disc_number == mb_track["disc_number"]
+                        )
+                    )
+                    if tn_match:
+                        chosen = mb_track
+                        used_track_number_match = True
+                        break
+                    sim = text_similarity(normalize(track.title), normalize(mb_track.get("title") or ""))
+                    if sim > best_sim:
+                        best_sim = sim
+                        chosen = mb_track
+
+                if chosen is None:
+                    continue
+                if not used_track_number_match:
+                    # Fell back to title similarity — apply a minimum threshold
+                    title_sim = text_similarity(normalize(track.title), normalize(chosen.get("title") or ""))
+                    if title_sim < 0.5:
+                        continue
+                mb_recording_id = chosen.get("musicbrainz_recording_id")
+                if not mb_recording_id:
+                    continue
+                track_uncertain = not is_high_confidence_track(track.title, chosen)
+                track_changes: dict = {"musicbrainz_recording_id": mb_recording_id}
+                if not track_uncertain and not album_uncertain:
+                    track_changes["musicbrainz_verified"] = True
+                track_proposals.append((track, chosen, track_changes, track_uncertain))
+
+            if not album_changes and not track_proposals:
+                continue
+
+            # Lazily create artist_item
+            if artist_item is None:
+                artist_item = ProposalItem(
+                    batch_id=batch.id,
+                    title=artist.name,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name}),
+                )
+                session.add(artist_item)
+                session.flush()
+
+            # Create album node
+            if album_changes:
+                album_item = ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=artist_item.id,
+                    title=flagged(album.title, album_uncertain),
+                    kind=ProposalKind.metadata,
+                    old_value=json.dumps({k: getattr(album, k) for k in album_changes}),
+                    new_value=json.dumps(album_changes),
+                    payload_json=json.dumps({"target_type": "album", "target_id": album.id, "changes": album_changes}),
+                )
+                proposed += 1
+            else:
+                album_item = ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=artist_item.id,
+                    title=album.title,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name, "album": album.title}),
+                )
+            session.add(album_item)
+            session.flush()
+
+            for track, _mb_track, track_changes, track_uncertain in track_proposals:
+                session.add(
+                    ProposalItem(
+                        batch_id=batch.id,
+                        parent_id=album_item.id,
+                        title=flagged(track.title, track_uncertain),
+                        kind=ProposalKind.metadata,
+                        old_value=json.dumps({k: getattr(track, k) for k in track_changes}),
+                        new_value=json.dumps(track_changes),
+                        payload_json=json.dumps({"target_type": "track", "target_id": track.id, "changes": track_changes}),
+                    )
+                )
+                proposed += 1
+
+        # After all albums: upgrade artist_item if we can fill artist mbid
+        if artist_needs and artist_mbid:
+            if artist_item is None:
+                artist_item = ProposalItem(
+                    batch_id=batch.id,
+                    title=artist.name,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name}),
+                )
+                session.add(artist_item)
+                session.flush()
+            artist_item.title = flagged(artist.name, artist_uncertain)
+            artist_item.old_value = json.dumps({"musicbrainz_id": artist.musicbrainz_id})
+            artist_item.new_value = json.dumps({"musicbrainz_id": artist_mbid})
+            artist_item.payload_json = json.dumps({"target_type": "artist", "target_id": artist.id, "changes": {"musicbrainz_id": artist_mbid}})
+            proposed += 1
+
+    if proposed == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="MusicBrainz check complete",
+            body="All MusicBrainz IDs are already filled in or no matches were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"checked": n_albums_scanned, "proposed": 0, "batch_id": None}
+
+    create_notification(
+        session,
+        title="MusicBrainz IDs review ready",
+        body=f"{proposed} MusicBrainz ID updates were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"checked": n_albums_scanned, "proposed": proposed, "batch_id": batch.id}
 
 
 def run_check_album_covers(session: Session, _payload: dict) -> dict:
@@ -6571,6 +6804,7 @@ TASK_HANDLERS = {
     "check_files": run_check_files,
     "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
+    "check_musicbrainz_ids": run_check_musicbrainz_ids,
     "check_album_covers": run_check_album_covers,
     "check_missing_tracks": run_check_missing_tracks,
     "check_non_lossless": run_check_non_lossless,

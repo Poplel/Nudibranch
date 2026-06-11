@@ -4369,6 +4369,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash on approval.", "check-duplicates", "library:manage"],
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
+    ["Check MusicBrainz IDs", "Scan the library for missing MusicBrainz IDs and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
     ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
     ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
