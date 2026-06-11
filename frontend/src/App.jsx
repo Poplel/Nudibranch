@@ -5387,25 +5387,32 @@ function AudioPlayer({
     if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [currentLyricIndex, lyricsOpen]);
 
-  // Grow the album art to fill the empty space down to the media controls when
-  // they slide toward the bottom of the page, shrinking back to the base size
-  // when the queue is long enough that the controls clamp under the art.
+  // Slide the media controls up with the queue (between the bottom of the page
+  // and just under the album art), and grow the album art to fill the space
+  // above the controls — both driven by the queue's scroll position.
   useEffect(() => {
     const core = fsCoreRef.current;
     const art = fsArtRef.current;
     const controls = fsControlsRef.current;
     const scroll = fsScrollRef.current;
     if (!core || !art || !controls) return undefined;
-    const GAP = 42;
+    const ART_BASE = 150;
+    const CLAMP_GAP = 16; // gap between the art bottom and the controls when clamped
+    const BOTTOM_PAD = 10;
     const update = () => {
-      const coreWidth = core.getBoundingClientRect().width;
-      const artTop = art.getBoundingClientRect().top;
-      const controlsTop = controls.getBoundingClientRect().top;
-      // never grow so wide that the track info / actions get squeezed out
-      const maxByWidth = coreWidth - 64 - 24 - 240;
-      const max = Math.max(150, Math.min(window.innerHeight * 0.62, 540, maxByWidth));
-      const size = Math.max(150, Math.min(max, Math.round(controlsTop - artTop - GAP)));
-      core.style.setProperty("--art-size", `${size}px`);
+      const coreRect = core.getBoundingClientRect();
+      const controlsH = controls.offsetHeight || 90;
+      const minY = ART_BASE + CLAMP_GAP; // controls top, clamped under the art
+      const maxY = Math.max(minY, coreRect.height - controlsH - BOTTOM_PAD); // at the bottom
+      const scrollTop = scroll ? scroll.scrollTop : 0;
+      const controlsY = Math.max(minY, Math.min(maxY, maxY - scrollTop));
+      core.style.setProperty("--controls-y", `${controlsY}px`);
+      // art fills from its top down to just above the controls; never so wide
+      // that the track info / actions get squeezed out
+      const maxByWidth = coreRect.width - 64 - 24 - 240;
+      const maxArt = Math.max(ART_BASE, Math.min(window.innerHeight * 0.62, 540, maxByWidth));
+      const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
+      core.style.setProperty("--art-size", `${artSize}px`);
     };
     update();
     const onScrollOrResize = () => window.requestAnimationFrame(update);
@@ -5754,28 +5761,28 @@ function AudioPlayer({
             </div>
           </div>
           <div className="pip-scroll-area" ref={fsScrollRef}>
-            <div className="fullscreen-controls pip-controls-sticky" ref={fsControlsRef}>
-              <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
-              <div className="player-controls">
-                <button className={`player-icon-button${lyricsOpen ? " active" : ""}`} onClick={() => setLyricsOpen((v) => !v)} title="Lyrics">
-                  <Mic2 size={19} />
-                </button>
-                <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
-                  <SkipBack size={18} />
-                </button>
-                <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
-                  {playing ? <Pause size={21} /> : <Play size={21} />}
-                </button>
-                <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
-                  <SkipForward size={18} />
-                </button>
-                <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
-                  <Heart size={19} />
-                </button>
-              </div>
-            </div>
             <div className="local-queue pip-queue">
               {queueList()}
+            </div>
+          </div>
+          <div className="fullscreen-controls pip-controls-sticky" ref={fsControlsRef}>
+            <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
+            <div className="player-controls">
+              <button className={`player-icon-button${lyricsOpen ? " active" : ""}`} onClick={() => setLyricsOpen((v) => !v)} title="Lyrics">
+                <Mic2 size={19} />
+              </button>
+              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+                <SkipBack size={18} />
+              </button>
+              <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
+                {playing ? <Pause size={21} /> : <Play size={21} />}
+              </button>
+              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+                <SkipForward size={18} />
+              </button>
+              <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
+                <Heart size={19} />
+              </button>
             </div>
           </div>
         </div>

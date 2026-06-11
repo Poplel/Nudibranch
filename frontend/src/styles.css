@@ -1661,17 +1661,20 @@ nav button:hover,
 }
 
 .pip-controls-sticky {
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  /* margin-top:auto drops the controls+queue block to the bottom of the page
-     when the queue is short; once the queue overflows, the auto margin
-     collapses and sticky top:0 clamps the controls just under the album art
-     while the queue scrolls up behind them */
-  margin-top: auto;
-  background: color-mix(in srgb, var(--panel-strong) 0%, transparent);
-  padding-top: 8px;
-  padding-bottom: 8px;
+  /* absolutely positioned and driven by --controls-y (set in JS from scroll):
+     slides between the bottom of the page and just under the album art,
+     moving up with the queue and clamping under the art */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: var(--controls-y, 0px);
+  z-index: 4;
+  padding: 12px 0;
+  /* mask the queue scrolling behind the controls */
+  background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 12px;
 }
 
 /* PiP queue — no box background, semi-transparent bubbles */
@@ -1687,6 +1690,8 @@ nav button:hover,
      controls can slide with the queue and clamp under the album art */
   max-height: none;
   overflow: visible;
+  /* room so the last items can scroll clear of the controls overlay */
+  padding-bottom: 96px;
   background: transparent;
   border: 0;
   box-shadow: none;
@@ -1716,25 +1721,32 @@ nav button:hover,
 }
 
 .pip-player .audio-header {
-  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) 64px;
-  gap: 12px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
   max-width: none;
   align-self: start;
-  align-items: start;
   /* reserve the base art height so the controls clamp below the art */
   min-height: 150px;
+  /* leave room for the absolutely-positioned album art on the left */
+  padding-left: calc(var(--art-size, 150px) + 16px);
 }
 
-.pip-player.has-lyrics .audio-header {
-  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) 1fr 64px;
+.pip-player .audio-track-copy {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
-.pip-player.has-up-next .audio-header {
-  grid-template-columns: var(--art-size, 150px) minmax(220px, 1fr) minmax(180px, 280px) 64px;
+.pip-player .fullscreen-next {
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 240px;
+  margin-left: auto;
 }
 
-.pip-player.has-up-next.has-lyrics .audio-header {
-  grid-template-columns: var(--art-size, 150px) minmax(0, 1fr) minmax(180px, 1fr) minmax(180px, 280px) 64px;
+.pip-player .pip-header-lyrics {
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 /* Lyrics panel embedded in the header row */
@@ -1783,10 +1795,10 @@ nav button:hover,
   top: 0;
   left: 0;
   z-index: 1;
+  pointer-events: none;
   width: var(--art-size, 150px);
   height: var(--art-size, 150px);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.26);
-  transition: width 0.18s ease, height 0.18s ease;
 }
 
 .player-art img {
@@ -2931,9 +2943,10 @@ nav button:hover,
   }
 
   .pip-player .audio-header {
-    grid-template-columns: 112px minmax(0, 1fr) 54px;
     max-width: none;
     min-height: 112px;
+    /* art is a fixed 112px on mobile, so don't track --art-size here */
+    padding-left: calc(112px + 16px);
   }
 
   .pip-player.has-lyrics .audio-header {
