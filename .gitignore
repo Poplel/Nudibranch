@@ -11,4 +11,5 @@ __pycache__/
 *.sqlite-shm
 *.sqlite-wal
 AuthKey_*.p8
+CLAUDE.md
 
