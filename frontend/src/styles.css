@@ -1546,7 +1546,7 @@ nav button:hover,
   width: auto;
   height: auto;
   min-height: 0;
-  padding: 56px 48px 24px 32px;
+  padding: 56px 48px 24px 48px;
   border: 0;
   border-radius: 0;
   overflow: hidden;
@@ -1658,6 +1658,10 @@ nav button:hover,
   overscroll-behavior: none;
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
+  /* hide the queue above the bottom edge of the controls box so it only
+     shows below the controls (--mask-cut set in JS) */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--mask-cut, 0px), #000 var(--mask-cut, 0px));
+  mask-image: linear-gradient(to bottom, transparent var(--mask-cut, 0px), #000 var(--mask-cut, 0px));
 }
 
 .pip-controls-sticky {
@@ -1690,7 +1694,9 @@ nav button:hover,
      controls can slide with the queue and clamp under the album art */
   max-height: none;
   overflow: visible;
-  /* room so the last items can scroll clear of the controls overlay */
+  /* start just below the controls' resting (bottom) position so the queue
+     travels up together with them; room at the bottom to clear the overlay */
+  padding-top: var(--queue-pad-top, 0px);
   padding-bottom: 96px;
   background: transparent;
   border: 0;
@@ -1729,7 +1735,9 @@ nav button:hover,
   /* reserve the base art height so the controls clamp below the art */
   min-height: 150px;
   /* leave room for the absolutely-positioned album art on the left */
-  padding-left: calc(var(--art-size, 150px) + 16px);
+  padding-left: calc(var(--art-size, 150px) + 28px);
+  /* keep the info/lyrics from spilling past the right edge */
+  overflow: hidden;
 }
 
 .pip-player .audio-track-copy {
@@ -1753,6 +1761,7 @@ nav button:hover,
 .pip-header-lyrics {
   height: 150px;
   overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -1760,6 +1769,12 @@ nav button:hover,
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
   min-width: 0;
+  max-width: 460px;
+}
+
+.pip-header-lyrics .lyric-line {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .player-window-actions {
@@ -1827,6 +1842,12 @@ nav button:hover,
   font-size: 56px;
   line-height: 1;
   white-space: nowrap;
+  /* full text overflows the clipped track-copy box and the marquee reveals it,
+     instead of being ellipsis-truncated first */
+  overflow: visible;
+  text-overflow: clip;
+  width: max-content;
+  max-width: none;
   animation: topbar-marquee 18s linear infinite;
 }
 
@@ -1834,6 +1855,10 @@ nav button:hover,
   margin-top: 10px;
   font-size: 17px;
   white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  width: max-content;
+  max-width: none;
   animation: topbar-marquee 18s linear infinite;
 }
 

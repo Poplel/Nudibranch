@@ -5402,15 +5402,23 @@ function AudioPlayer({
     const update = () => {
       const coreRect = core.getBoundingClientRect();
       const controlsH = controls.offsetHeight || 90;
+      const sTop = scroll ? scroll.offsetTop : 0; // scroll area top, relative to core
       const minY = ART_BASE + CLAMP_GAP; // controls top, clamped under the art
       const maxY = Math.max(minY, coreRect.height - controlsH - BOTTOM_PAD); // at the bottom
       const scrollTop = scroll ? scroll.scrollTop : 0;
       const controlsY = Math.max(minY, Math.min(maxY, maxY - scrollTop));
       core.style.setProperty("--controls-y", `${controlsY}px`);
+      // queue starts just below the controls' resting (bottom) position so it
+      // travels up together with the controls
+      const padTop = Math.max(0, Math.round(maxY + controlsH + 8 - sTop));
+      core.style.setProperty("--queue-pad-top", `${padTop}px`);
+      // mask the queue above the bottom edge of the controls box
+      const maskCut = Math.max(0, Math.round(controlsY + controlsH - sTop + 6));
+      core.style.setProperty("--mask-cut", `${maskCut}px`);
       // art fills from its top down to just above the controls; never so wide
       // that the track info / actions get squeezed out
       const maxByWidth = coreRect.width - 64 - 24 - 240;
-      const maxArt = Math.max(ART_BASE, Math.min(window.innerHeight * 0.62, 540, maxByWidth));
+      const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.6, 460, maxByWidth));
       const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
       core.style.setProperty("--art-size", `${artSize}px`);
     };
