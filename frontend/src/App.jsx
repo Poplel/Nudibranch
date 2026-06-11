@@ -5398,9 +5398,12 @@ function AudioPlayer({
     if (!core || !art || !controls) return undefined;
     const GAP = 42;
     const update = () => {
+      const coreWidth = core.getBoundingClientRect().width;
       const artTop = art.getBoundingClientRect().top;
       const controlsTop = controls.getBoundingClientRect().top;
-      const max = Math.min(window.innerHeight * 0.62, 540);
+      // never grow so wide that the track info / actions get squeezed out
+      const maxByWidth = coreWidth - 64 - 24 - 240;
+      const max = Math.max(150, Math.min(window.innerHeight * 0.62, 540, maxByWidth));
       const size = Math.max(150, Math.min(max, Math.round(controlsTop - artTop - GAP)));
       core.style.setProperty("--art-size", `${size}px`);
     };

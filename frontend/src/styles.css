@@ -1553,6 +1553,10 @@ nav button:hover,
   background: var(--panel-strong);
   box-shadow: none;
   isolation: isolate;
+  /* flex column so player-core gets a definite height and the scroll area
+     inside it can actually overflow-scroll */
+  display: flex;
+  flex-direction: column;
 }
 
 .audio-player.popped.pip-player {
@@ -1601,7 +1605,8 @@ nav button:hover,
   display: grid;
   grid-template-columns: 1fr;
   grid-template-rows: auto 1fr;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
   gap: 42px;
 }
 
@@ -2921,7 +2926,8 @@ nav button:hover,
   }
 
   .pip-player .player-core {
-    height: 100%;
+    flex: 1;
+    min-height: 0;
   }
 
   .pip-player .audio-header {
