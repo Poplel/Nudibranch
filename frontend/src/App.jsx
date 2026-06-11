@@ -21,6 +21,7 @@ import {
   LogOut,
   Maximize2,
   Menu,
+  Ban,
   Mic2,
   Minimize2,
   Moon,
@@ -5385,20 +5386,21 @@ function AudioPlayer({
       const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.6, 460, maxByWidth));
       const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
       core.style.setProperty("--art-size", `${artSize}px`);
-      // Compact/micro modes: hysteresis prevents rapid toggling
+      // Compact/micro modes: hysteresis prevents rapid toggling.
+      // Thresholds are in CSS pixels — on 2x Retina a 300px CSS window is 600 physical px.
       if (pip) {
         const pipH = pip.offsetHeight;
         const pipW = pip.offsetWidth;
         const wasCompact = pip.classList.contains("is-compact");
         const wasMicro = pip.classList.contains("is-micro");
-        // Enter compact at 460px (scrolled) / 390px (any); exit at 500px / 430px
+        // Enter compact at 150px (scrolled) / 120px (any); exit at 180px / 150px
         const compact = wasCompact
-          ? pipH < 500 && (scrollTop > 0 || pipH < 430)
-          : pipH < 460 && (scrollTop > 0 || pipH < 390);
-        // Enter micro at 270px tall & 340px wide; exit at 310px / 380px
+          ? pipH < 180 && (scrollTop > 0 || pipH < 150)
+          : pipH < 150 && (scrollTop > 0 || pipH < 120);
+        // Micro: 20% larger than original 270×340 → 324×408; exit at 370×470
         const micro = !compact && (wasMicro
-          ? pipH < 310 && pipW < 380
-          : pipH < 270 && pipW < 340);
+          ? pipH < 370 && pipW < 470
+          : pipH < 324 && pipW < 408);
         pip.classList.toggle("is-compact", compact);
         pip.classList.toggle("is-micro", micro);
       }
@@ -5562,6 +5564,7 @@ function AudioPlayer({
     pipWindow.document.body.style.width = "100vw";
     pipWindow.document.body.style.height = "100vh";
     pipWindow.document.body.style.minHeight = "100vh";
+    pipWindow.document.body.style.minWidth = "250px";
     pipWindow.document.body.style.overflow = "hidden";
     pipWindow.document.body.style.background = "transparent";
     pipWindow.document.documentElement.style.margin = "0";
@@ -5569,6 +5572,7 @@ function AudioPlayer({
     pipWindow.document.documentElement.style.width = "100vw";
     pipWindow.document.documentElement.style.height = "100vh";
     pipWindow.document.documentElement.style.minHeight = "100vh";
+    pipWindow.document.documentElement.style.minWidth = "250px";
     pipWindow.document.documentElement.style.overflow = "hidden";
     pipWindow.document.documentElement.style.background = "transparent";
     copyStylesToWindow(pipWindow);
@@ -5577,6 +5581,7 @@ function AudioPlayer({
     container.style.width = "100vw";
     container.style.height = "100vh";
     container.style.minHeight = "100vh";
+    container.style.minWidth = "250px";
     container.style.overflow = "hidden";
     container.style.display = "block";
     const mainEl = document.querySelector("main");
@@ -5598,14 +5603,6 @@ function AudioPlayer({
     pipWindow.document.addEventListener("fullscreenchange", handleFullscreenChange);
     pipWindow.addEventListener("pagehide", closePip, { once: true });
     pipWindow.addEventListener("beforeunload", closePip, { once: true });
-    // Enforce 250×250 minimum — resizeTo is allowed on popup/PiP windows
-    const enforcePipMinSize = () => {
-      const minW = 250, minH = 250;
-      if (pipWindow.innerWidth < minW || pipWindow.innerHeight < minH) {
-        pipWindow.resizeTo(Math.max(pipWindow.innerWidth, minW), Math.max(pipWindow.innerHeight, minH));
-      }
-    };
-    pipWindow.addEventListener("resize", enforcePipMinSize);
     setPipContainer(container);
   }
 
@@ -5787,7 +5784,8 @@ function AudioPlayer({
             <input className="player-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
             <div className="player-controls">
               <button className={`player-icon-button${lyricsOpen ? " active" : ""}`} onClick={() => setLyricsOpen((v) => !v)} title="Lyrics">
-                <Mic2 size={19} />
+                <Mic2 size={19} className="lyric-icon-on" />
+                <Ban size={19} className="lyric-icon-off" />
               </button>
               <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
                 <SkipBack size={18} />

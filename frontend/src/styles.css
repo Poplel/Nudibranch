@@ -3143,13 +3143,20 @@ nav button:hover,
   display: none;
 }
 
-/* hide the lyrics toggle in compact — lyrics aren't visible */
-.audio-player.pip-player.is-compact .player-controls > button:first-child {
+/* lyrics button in compact: swap to blocked icon, disable interaction */
+.lyric-icon-off { display: none; }
+
+.audio-player.pip-player.is-compact .player-controls > button:first-child .lyric-icon-on,
+.audio-player.pip-player.is-micro .player-controls > button:first-child .lyric-icon-on {
   display: none;
 }
-
-.audio-player.pip-player.is-compact .player-controls {
-  grid-template-columns: repeat(4, 1fr);
+.audio-player.pip-player.is-compact .player-controls > button:first-child .lyric-icon-off,
+.audio-player.pip-player.is-micro .player-controls > button:first-child .lyric-icon-off {
+  display: block;
+}
+.audio-player.pip-player.is-compact .player-controls > button:first-child {
+  pointer-events: none;
+  opacity: 0.35;
 }
 
 .audio-player.pip-player.is-compact .audio-header strong {
@@ -3182,7 +3189,7 @@ nav button:hover,
 }
 
 /* CSS-only compact fallback (absolute height limit regardless of scroll) */
-@media (max-height: 280px) {
+@media (max-height: 150px) {
   .audio-player.pip-player {
     padding: 10px 16px;
   }
@@ -3226,12 +3233,15 @@ nav button:hover,
     display: none;
   }
 
-  .audio-player.pip-player .player-controls > button:first-child {
+  .audio-player.pip-player .player-controls > button:first-child .lyric-icon-on {
     display: none;
   }
-
-  .audio-player.pip-player .player-controls {
-    grid-template-columns: repeat(4, 1fr);
+  .audio-player.pip-player .player-controls > button:first-child .lyric-icon-off {
+    display: block;
+  }
+  .audio-player.pip-player .player-controls > button:first-child {
+    pointer-events: none;
+    opacity: 0.35;
   }
 
   .audio-player.pip-player .audio-header strong {
@@ -3338,6 +3348,7 @@ nav button:hover,
 
 .audio-player.pip-player.is-micro .player-controls {
   grid-template-columns: 1fr 1fr 1fr;
+  justify-items: center;
 }
 
 .audio-player.pip-player.is-micro .player-controls button:first-child,
@@ -3345,7 +3356,7 @@ nav button:hover,
   display: none;
 }
 
-@media (max-height: 195px) and (max-width: 245px) {
+@media (max-height: 320px) and (max-width: 400px) {
   .audio-player.pip-player {
     padding: 8px 10px;
   }
@@ -3412,6 +3423,7 @@ nav button:hover,
 
   .audio-player.pip-player .player-controls {
     grid-template-columns: 1fr 1fr 1fr;
+    justify-items: center;
   }
 
   .audio-player.pip-player .player-controls button:first-child,
