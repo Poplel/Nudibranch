@@ -4490,7 +4490,6 @@ function taskDisplayName(task) {
     normalize_volume: "Normalizing volume",
     propose_import: "Preparing import",
     ytdlp_download: "Downloading",
-    process_wishlist: "Scanning wishlist",
     jellyfin_scan: "Scanning Jellyfin",
   };
   return names[task.type] || task.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());

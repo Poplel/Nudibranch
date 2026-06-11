@@ -5049,51 +5049,6 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
     return {"query": query, "file": str(downloaded_path) if downloaded_path else None}
 
 
-def run_process_wishlist(session: Session, _payload: dict) -> dict:
-    items = list(session.scalars(select(WishlistItem).where(WishlistItem.status == "wanted").order_by(WishlistItem.artist, WishlistItem.album, WishlistItem.track)))
-    if not items:
-        return {"items": 0, "batch_id": None}
-
-    batch = ProposalBatch(title="Wishlist download review", kind=ProposalKind.download, tree_path="/wishlist")
-    session.add(batch)
-    session.flush()
-    for wishlist_item in items:
-        session.add(
-            ProposalItem(
-                batch_id=batch.id,
-                title=download_query(
-                    {
-                        "artist": wishlist_item.artist,
-                        "album": wishlist_item.album,
-                        "track": wishlist_item.track,
-                    }
-                ),
-                kind=ProposalKind.download,
-                payload_json=json.dumps(
-                    {
-                        "action": "wishlist_request",
-                        "user_id": wishlist_item.user_id,
-                        "wishlist_item_id": wishlist_item.id,
-                        "kind": wishlist_item.kind,
-                        "artist": wishlist_item.artist,
-                        "album": wishlist_item.album,
-                        "track": wishlist_item.track,
-                    }
-                ),
-            )
-        )
-        wishlist_item.status = "review"
-        wishlist_item.status_changed_at = datetime.now(timezone.utc)
-    create_notification(
-        session,
-        title="Wishlist review ready",
-        body=f"{len(items)} wishlist items are ready for approval.",
-        event_type="approval_needed",
-        target_url="/task-queue",
-    )
-    return {"items": len(items), "batch_id": batch.id}
-
-
 def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
     """Map Nudibranch tracks to Jellyfin audio items (populates jellyfin_item_id on tracks).
 
@@ -6989,7 +6944,6 @@ TASK_HANDLERS = {
     "propose_import": run_propose_import,
     "execute_proposal_batch": run_execute_proposal_batch,
     "ytdlp_download": run_ytdlp_download,
-    "process_wishlist": run_process_wishlist,
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
     "jellyfin_scan": run_jellyfin_scan,
     "clear_discover_cache": run_clear_discover_cache,
@@ -7170,7 +7124,6 @@ def task_notification_title(task_type: str) -> str:
     return {
         "propose_import": "Import review",
         "execute_proposal_batch": "Task queue item",
-        "process_wishlist": "Wishlist scan",
         "sync_favorites_jellyfin": "Track remap",
         "jellyfin_scan": "Jellyfin scan",
         "check_files": "File check",

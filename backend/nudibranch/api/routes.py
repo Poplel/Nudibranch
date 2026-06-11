@@ -1828,15 +1828,6 @@ def propose_playlist_position(
     return serialize_batch(batch)
 
 
-@router.post("/wishlist/process", response_model=TaskOut, tags=["wishlist"], summary="Process wishlist into download tasks")
-def process_wishlist(
-    session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.downloads_manage)),
-) -> TaskOut:
-    task = enqueue_task(session, "process_wishlist", {})
-    return serialize_task(task)
-
-
 @router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"], summary="Trigger Jellyfin library scan")
 def tool_jellyfin_scan(
     session: Session = Depends(get_session),
