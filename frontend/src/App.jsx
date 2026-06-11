@@ -5361,7 +5361,7 @@ function AudioPlayer({
     const scroll = fsScrollRef.current;
     const pip = fsPlayerRef.current;
     if (!core || !art || !controls) return undefined;
-    const ART_BASE = 150;
+    const ART_BASE = 100;  // smaller base keeps art squished so the queue is reachable sooner
     const CLAMP_GAP = 16; // gap between the art bottom and the controls when clamped
     const BOTTOM_PAD = 10;
     const update = () => {
@@ -5383,7 +5383,7 @@ function AudioPlayer({
       // art fills from its top down to just above the controls; never so wide
       // that the track info / actions get squeezed out
       const maxByWidth = coreRect.width - 64 - 24 - 240;
-      const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.6, 460, maxByWidth));
+      const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.5, 420, maxByWidth));
       const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
       core.style.setProperty("--art-size", `${artSize}px`);
       // Compact/micro modes: hysteresis prevents rapid toggling.
@@ -5393,10 +5393,10 @@ function AudioPlayer({
         const pipW = pip.offsetWidth;
         const wasCompact = pip.classList.contains("is-compact");
         const wasMicro = pip.classList.contains("is-micro");
-        // Enter compact at 150px (scrolled) / 120px (any); exit at 180px / 150px
+        // Enter compact at 250px (scrolled) / 200px (any); exit at 290px / 235px
         const compact = wasCompact
-          ? pipH < 180 && (scrollTop > 0 || pipH < 150)
-          : pipH < 150 && (scrollTop > 0 || pipH < 120);
+          ? pipH < 290 && (scrollTop > 0 || pipH < 235)
+          : pipH < 250 && (scrollTop > 0 || pipH < 200);
         // Micro: 20% larger than original 270×340 → 324×408; exit at 370×470
         const micro = !compact && (wasMicro
           ? pipH < 370 && pipW < 470

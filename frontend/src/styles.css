@@ -1733,9 +1733,9 @@ nav button:hover,
   max-width: none;
   align-self: start;
   /* reserve the base art height so the controls clamp below the art */
-  min-height: 150px;
+  min-height: 100px;
   /* leave room for the absolutely-positioned album art on the left */
-  padding-left: calc(var(--art-size, 150px) + 28px);
+  padding-left: calc(var(--art-size, 100px) + 28px);
   /* keep the info/lyrics from spilling past the right edge */
   overflow: hidden;
 }
@@ -3189,7 +3189,7 @@ nav button:hover,
 }
 
 /* CSS-only compact fallback (absolute height limit regardless of scroll) */
-@media (max-height: 150px) {
+@media (max-height: 220px) {
   .audio-player.pip-player {
     padding: 10px 16px;
   }
@@ -3299,7 +3299,7 @@ nav button:hover,
 .audio-player.pip-player.is-micro .audio-header {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: stretch;
   min-height: 0;
   padding-left: 0;
   gap: 0;
@@ -3379,7 +3379,7 @@ nav button:hover,
   .audio-player.pip-player .audio-header {
     display: flex;
     flex-direction: column;
-    align-items: flex-start;
+    align-items: stretch;
     min-height: 0;
     padding-left: 0;
     gap: 0;
