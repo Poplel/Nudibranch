@@ -1782,22 +1782,20 @@ nav button:hover,
   gap: 6px;
 }
 
-/* In the stack the up-next always occupies its full height; opacity fades it */
+/* In the stack the up-next is only rendered when visible — always shown, no transition */
 .lyrics-next-stack .fullscreen-next {
   flex: 0 0 auto;
   max-width: none;
   overflow: hidden;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.35s ease;
-  min-height: 54px;
+  opacity: 1;
+  pointer-events: auto;
+  transition: none;
   padding: 5px 8px 5px 5px;
   border-width: 1px;
 }
 
 .lyrics-next-stack .fullscreen-next.is-visible {
   opacity: 1;
-  pointer-events: auto;
   max-width: none;
 }
 
@@ -1831,7 +1829,14 @@ nav button:hover,
 
 .pip-player.has-lyrics .audio-header {
   align-self: stretch;
+  align-items: stretch;
+  height: 100%;
   overflow: hidden;
+}
+
+.pip-player.has-lyrics .audio-track-copy,
+.pip-player.has-lyrics .player-window-actions {
+  align-self: flex-start;
 }
 
 .pip-header-lyrics .lyric-line {
@@ -1900,12 +1905,10 @@ nav button:hover,
   overflow: hidden;
 }
 
-.pip-player .audio-header strong {
+.pip-player .audio-track-copy strong {
   font-size: 56px;
   line-height: 1;
   white-space: nowrap;
-  /* full text overflows the clipped track-copy box and the marquee reveals it,
-     instead of being ellipsis-truncated first */
   overflow: visible;
   text-overflow: clip;
   width: max-content;
@@ -1913,7 +1916,7 @@ nav button:hover,
   animation: topbar-marquee 18s linear infinite;
 }
 
-.pip-player .audio-header small {
+.pip-player .audio-track-copy small {
   margin-top: 10px;
   font-size: 17px;
   white-space: nowrap;
@@ -3070,7 +3073,7 @@ nav button:hover,
     height: auto;
   }
 
-  .pip-player .audio-header strong {
+  .pip-player .audio-track-copy strong {
     font-size: 30px;
   }
 
@@ -3140,20 +3143,22 @@ nav button:hover,
   display: none;
 }
 
+/* hide the lyrics toggle in compact — lyrics aren't visible */
+.audio-player.pip-player.is-compact .player-controls > button:first-child {
+  display: none;
+}
+
+.audio-player.pip-player.is-compact .player-controls {
+  grid-template-columns: repeat(4, 1fr);
+}
+
 .audio-player.pip-player.is-compact .audio-header strong {
   font-size: 15px;
-  animation: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  width: auto;
 }
 
 .audio-player.pip-player.is-compact .audio-header small {
   font-size: 11px;
-  animation: none;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  width: auto;
+  margin-top: 3px;
 }
 
 .audio-player.pip-player.is-compact .pip-controls-sticky {
@@ -3221,20 +3226,21 @@ nav button:hover,
     display: none;
   }
 
+  .audio-player.pip-player .player-controls > button:first-child {
+    display: none;
+  }
+
+  .audio-player.pip-player .player-controls {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
   .audio-player.pip-player .audio-header strong {
     font-size: 15px;
-    animation: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    width: auto;
   }
 
   .audio-player.pip-player .audio-header small {
     font-size: 11px;
-    animation: none;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    width: auto;
+    margin-top: 3px;
   }
 
   .audio-player.pip-player .pip-controls-sticky {
@@ -3258,41 +3264,76 @@ nav button:hover,
   }
 }
 
-/* ─── Micro player: tiny square — album art fills the window ─── */
+/* ─── Micro player: tiny/square — album art fills the window, text + controls overlay ─── */
 
 .audio-player.pip-player.is-micro {
-  padding: 0;
+  padding: 8px 10px;
 }
 
 .audio-player.pip-player.is-micro::before {
-  filter: blur(0) saturate(1.1);
+  filter: blur(0) saturate(1.15);
   opacity: 0.88;
 }
 
 .audio-player.pip-player.is-micro .player-core {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: stretch;
   height: 100%;
+  gap: 4px;
   grid-template-rows: none;
 }
 
-.audio-player.pip-player.is-micro .audio-header,
-.audio-player.pip-player.is-micro .pip-scroll-area,
-.audio-player.pip-player.is-micro .player-progress,
-.audio-player.pip-player.is-micro .player-window-actions {
+/* Show audio-header but as a simple text block (no art, no actions) */
+.audio-player.pip-player.is-micro .audio-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-height: 0;
+  padding-left: 0;
+  gap: 0;
+  overflow: hidden;
+  align-self: auto;
+  height: auto;
+}
+
+.audio-player.pip-player.is-micro .player-art,
+.audio-player.pip-player.is-micro .playing-from,
+.audio-player.pip-player.is-micro .player-window-actions,
+.audio-player.pip-player.is-micro .fullscreen-next,
+.audio-player.pip-player.is-micro .lyrics-next-stack,
+.audio-player.pip-player.is-micro .pip-scroll-area {
   display: none;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy {
+  overflow: hidden;
+  max-width: 100%;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy strong {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy small {
+  font-size: 12px;
+  margin-top: 2px;
 }
 
 .audio-player.pip-player.is-micro .pip-controls-sticky {
   position: relative;
   top: auto;
-  padding: 4px;
-  background: color-mix(in srgb, var(--panel-strong) 40%, transparent);
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
-  border-radius: 50px;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-radius: 12px;
+}
+
+.audio-player.pip-player.is-micro .player-progress {
+  height: 3px;
 }
 
 .audio-player.pip-player.is-micro .player-controls {
@@ -3306,38 +3347,67 @@ nav button:hover,
 
 @media (max-height: 195px) and (max-width: 245px) {
   .audio-player.pip-player {
-    padding: 0;
+    padding: 8px 10px;
   }
 
   .audio-player.pip-player::before {
-    filter: blur(0) saturate(1.1);
+    filter: blur(0) saturate(1.15);
     opacity: 0.88;
   }
 
   .audio-player.pip-player .player-core {
     display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 0;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: stretch;
     height: 100%;
+    gap: 4px;
     grid-template-rows: none;
   }
 
-  .audio-player.pip-player .audio-header,
-  .audio-player.pip-player .pip-scroll-area,
-  .audio-player.pip-player .player-progress,
-  .audio-player.pip-player .player-window-actions {
+  .audio-player.pip-player .audio-header {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-height: 0;
+    padding-left: 0;
+    gap: 0;
+    overflow: hidden;
+    align-self: auto;
+    height: auto;
+  }
+
+  .audio-player.pip-player .player-art,
+  .audio-player.pip-player .playing-from,
+  .audio-player.pip-player .player-window-actions,
+  .audio-player.pip-player .fullscreen-next,
+  .audio-player.pip-player .lyrics-next-stack,
+  .audio-player.pip-player .pip-scroll-area {
     display: none;
+  }
+
+  .audio-player.pip-player .audio-track-copy strong {
+    font-size: 18px;
+  }
+
+  .audio-player.pip-player .audio-track-copy small {
+    font-size: 12px;
+    margin-top: 2px;
   }
 
   .audio-player.pip-player .pip-controls-sticky {
     position: relative;
     top: auto;
-    padding: 4px;
-    background: color-mix(in srgb, var(--panel-strong) 40%, transparent);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
-    border-radius: 50px;
+    padding: 4px 8px;
+    background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-radius: 12px;
+  }
+
+  .audio-player.pip-player .player-progress {
+    height: 3px;
+    display: block;
   }
 
   .audio-player.pip-player .player-controls {

@@ -5385,28 +5385,39 @@ function AudioPlayer({
       const maxArt = Math.max(ART_BASE, Math.min(coreRect.height * 0.6, 460, maxByWidth));
       const artSize = Math.max(ART_BASE, Math.min(maxArt, Math.round(controlsY - CLAMP_GAP)));
       core.style.setProperty("--art-size", `${artSize}px`);
-      // Compact mode: triggered when height is too short for full layout or scrolled
-      // with no room for 1 queue entry (art + controls + 1 entry + padding ≈ 370px)
+      // Compact/micro modes: hysteresis prevents rapid toggling
       if (pip) {
         const pipH = pip.offsetHeight;
         const pipW = pip.offsetWidth;
-        const compact = pipH < 350 && (scrollTop > 0 || pipH < 290);
-        const micro = pipH < 200 && pipW < 260;
+        const wasCompact = pip.classList.contains("is-compact");
+        const wasMicro = pip.classList.contains("is-micro");
+        // Enter compact at 460px (scrolled) / 390px (any); exit at 500px / 430px
+        const compact = wasCompact
+          ? pipH < 500 && (scrollTop > 0 || pipH < 430)
+          : pipH < 460 && (scrollTop > 0 || pipH < 390);
+        // Enter micro at 270px tall & 340px wide; exit at 310px / 380px
+        const micro = !compact && (wasMicro
+          ? pipH < 310 && pipW < 380
+          : pipH < 270 && pipW < 340);
         pip.classList.toggle("is-compact", compact);
-        pip.classList.toggle("is-micro", micro && !compact);
+        pip.classList.toggle("is-micro", micro);
       }
     };
     update();
-    const onScrollOrResize = () => window.requestAnimationFrame(update);
+    // Use the element's own window for observer/resize so PiP cross-window works
+    const observerWin = core.ownerDocument?.defaultView ?? window;
+    const onScrollOrResize = () => observerWin.requestAnimationFrame(update);
     scroll?.addEventListener("scroll", onScrollOrResize, { passive: true });
-    window.addEventListener("resize", onScrollOrResize);
-    const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onScrollOrResize) : null;
+    observerWin.addEventListener("resize", onScrollOrResize);
+    const RO = observerWin.ResizeObserver ?? (typeof ResizeObserver !== "undefined" ? ResizeObserver : null);
+    const ro = RO ? new RO(onScrollOrResize) : null;
     ro?.observe(core);
     ro?.observe(controls);
     if (scroll) ro?.observe(scroll);
     if (pip) ro?.observe(pip);
-    // Forward wheel events on the header area (outside lyrics) to the queue scroller
+    // Forward wheel events on header and controls areas to the queue scroller
     const headerEl = core.querySelector(".audio-header");
+    const controlsEl = core.querySelector(".pip-controls-sticky");
     const handleWheel = (e) => {
       if (!scroll) return;
       if (e.target.closest && e.target.closest(".pip-header-lyrics")) return;
@@ -5414,11 +5425,13 @@ function AudioPlayer({
       scroll.scrollTop += e.deltaY;
     };
     headerEl?.addEventListener("wheel", handleWheel, { passive: false });
+    controlsEl?.addEventListener("wheel", handleWheel, { passive: false });
     return () => {
       scroll?.removeEventListener("scroll", onScrollOrResize);
-      window.removeEventListener("resize", onScrollOrResize);
+      observerWin.removeEventListener("resize", onScrollOrResize);
       ro?.disconnect();
       headerEl?.removeEventListener("wheel", handleWheel);
+      controlsEl?.removeEventListener("wheel", handleWheel);
     };
   }, [currentTrack, queue, lyricsOpen, fullscreenPlayer, pipContainer, showUpNext]);
 
@@ -5585,6 +5598,14 @@ function AudioPlayer({
     pipWindow.document.addEventListener("fullscreenchange", handleFullscreenChange);
     pipWindow.addEventListener("pagehide", closePip, { once: true });
     pipWindow.addEventListener("beforeunload", closePip, { once: true });
+    // Enforce 250×250 minimum — resizeTo is allowed on popup/PiP windows
+    const enforcePipMinSize = () => {
+      const minW = 250, minH = 250;
+      if (pipWindow.innerWidth < minW || pipWindow.innerHeight < minH) {
+        pipWindow.resizeTo(Math.max(pipWindow.innerWidth, minW), Math.max(pipWindow.innerHeight, minH));
+      }
+    };
+    pipWindow.addEventListener("resize", enforcePipMinSize);
     setPipContainer(container);
   }
 
@@ -5742,7 +5763,7 @@ function AudioPlayer({
             </div>
             {lyricsOpen ? (
               <div className="lyrics-next-stack">
-                {upNextWidget}
+                {showUpNext ? upNextWidget : null}
                 <div className="pip-header-lyrics" ref={lyricsPanelRef}>
                   {lyricsContent}
                 </div>
