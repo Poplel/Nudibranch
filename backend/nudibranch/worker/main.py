@@ -21,7 +21,7 @@ from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
-from nudibranch.services.proposals import item_ids_with_descendants
+from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings, integration_value
 from nudibranch.services.acoustid import audio_matches_claim
@@ -3356,15 +3356,44 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem], 
             batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
         )
     if shared_batch is not None:
-        album_count = len(grouped)
-        track_count = len(items)
-        create_notification(
-            session,
-            title="Download candidates ready",
-            body=f"{track_count} track(s) across {album_count} album(s) are ready for review.",
-            event_type="approval_needed",
-            target_url="/task-queue",
-        )
+        session.flush()
+        session.refresh(shared_batch)
+        batch_items = list(shared_batch.items)
+        runnable = [
+            it for it in batch_items
+            if json.loads(it.payload_json or "{}").get("action") == "queue_download"
+            and it.selected
+            and it.status == ProposalStatus.pending
+        ]
+        needs_review = [
+            it for it in batch_items
+            if json.loads(it.payload_json or "{}").get("action") == "queue_ytdlp_download"
+        ]
+        if runnable:
+            approve_batch(session, shared_batch.id)
+            create_notification(
+                session,
+                title="Downloads started",
+                body=f"{len(runnable)} track(s) started downloading from Soulseek.",
+                event_type="task_started",
+                target_url="/downloads",
+            )
+            if needs_review:
+                create_notification(
+                    session,
+                    title="Some tracks need your approval",
+                    body=f"{len(needs_review)} track(s) had no Soulseek match — approve a YouTube fallback in the Task Queue.",
+                    event_type="approval_needed",
+                    target_url="/task-queue",
+                )
+        else:
+            create_notification(
+                session,
+                title="Approval needed",
+                body="No Soulseek matches were found — review and approve downloads in the Task Queue.",
+                event_type="approval_needed",
+                target_url="/task-queue",
+            )
     if wishlist_item_ids:
         for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
             wishlist_item.status = "approved"

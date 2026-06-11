@@ -97,7 +97,7 @@ function App() {
   const initialAppearance = readInitialAppearance();
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
-  const [page, setPage] = useState("Import/Add");
+  const [page, setPage] = useState("Library");
   const [dark, setDark] = useState(initialAppearance.dark);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -1612,12 +1612,6 @@ function App() {
             {page === "Downloads" && (
               <DownloadsView
                 approvals={approvals}
-                tasks={tasks}
-                onSelection={setApprovalSelection}
-                onSelectOnly={selectOnlyApprovalItem}
-                onApprove={approveItems}
-                onReject={rejectItems}
-                onCancelTask={cancelTask}
               />
             )}
             {page === "Import/Add" && (
@@ -2105,23 +2099,128 @@ function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }
   );
 }
 
-function DownloadsView({ approvals, tasks, onSelection, onSelectOnly, onApprove, onReject, onCancelTask }) {
-  const downloadBatches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  if (downloadBatches.length === 0) {
-    return <EmptyState title="No active downloads" body="Chosen candidates will move here after they are started from the task queue." />;
+function DownloadsView({ approvals }) {
+  const activeBatches = approvals.filter((batch) => batch.kind === "download" || batch.kind === "lyrics");
+
+  // Build per-batch item lists: download batches use visibleDownloadItems to collapse
+  // alternate candidates down to the single selected one; lyrics batches use raw items.
+  const batchItems = useMemo(() => {
+    return activeBatches.map((batch) => {
+      const items = batch.kind === "download" ? visibleDownloadItems([batch]) : batch.items;
+      return { batch, items };
+    });
+  }, [activeBatches]);
+
+  // Collect the set of all executing item ids, then walk parent_id to include ancestors.
+  const activeIds = useMemo(() => {
+    const allItems = batchItems.flatMap(({ items }) => items);
+    const byId = new Map(allItems.map((item) => [item.id, item]));
+    const ids = new Set();
+    for (const item of allItems) {
+      if (item.status !== "executing") continue;
+      ids.add(item.id);
+      let cur = item;
+      while (cur.parent_id) {
+        ids.add(cur.parent_id);
+        cur = byId.get(cur.parent_id) || {};
+        if (!cur.id) break;
+      }
+    }
+    return ids;
+  }, [batchItems]);
+
+  // Count executing leaf items across all batches.
+  const executingLeafCount = useMemo(() => {
+    return batchItems.reduce((count, { batch, items }) => {
+      const tree = buildItemTree(items);
+      const leaves = items.filter((item) => {
+        const children = tree.childrenById.get(item.id) || [];
+        return children.length === 0 && item.status === "executing";
+      });
+      return count + leaves.length;
+    }, 0);
+  }, [batchItems]);
+
+  if (activeIds.size === 0) {
+    return <EmptyState title="No active downloads" body="Approved downloads and lyric fetches show their progress here while they run." />;
   }
+
   return (
     <div className="approval-tree">
-      {downloadBatches.length > 0 && (
-        <DownloadCandidateTree
-          batches={downloadBatches}
-          onSelection={onSelection}
-          onSelectOnly={onSelectOnly}
-          onApprove={onApprove}
-          onReject={onReject}
-        />
-      )}
+      <section className="batch download-tree">
+        <div className="batch-header">
+          <div>
+            <h2>Downloading</h2>
+            <p>{executingLeafCount} item{executingLeafCount === 1 ? "" : "s"} in progress</p>
+          </div>
+        </div>
+        {batchItems.map(({ batch, items }) => {
+          const tree = buildItemTree(items);
+          const activeRoots = tree.roots.filter((item) => activeIds.has(item.id));
+          if (activeRoots.length === 0) return null;
+          return activeRoots.map((root) => (
+            <ActiveDownloadNode
+              key={root.id}
+              item={root}
+              childrenById={tree.childrenById}
+              activeIds={activeIds}
+              batchKind={batch.kind}
+              depth={0}
+            />
+          ));
+        })}
+      </section>
     </div>
+  );
+}
+
+function ActiveDownloadNode({ item, childrenById, activeIds, batchKind, depth }) {
+  const children = (childrenById.get(item.id) || []).filter((child) => activeIds.has(child.id));
+  const isLeaf = children.length === 0;
+
+  if (isLeaf) {
+    // Render progress for the executing leaf.
+    const p = batchKind === "lyrics"
+      ? { indeterminate: true, label: "Downloading lyrics", value: 0 }
+      : downloadStatusProgressForItem(item);
+    return (
+      <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
+        <span />
+        <span />
+        <span className="proposal-title-cell">
+          <span className="proposal-title">{item.title}</span>
+          <InlineProgress
+            value={p ? (p.value || 0) : 0}
+            label={p ? (p.label || itemStatusMeta(item)) : itemStatusMeta(item)}
+            indeterminate={p ? Boolean(p.indeterminate) : false}
+            compact
+          />
+        </span>
+      </div>
+    );
+  }
+
+  // Non-leaf grouping row — always expanded, no checkboxes or buttons.
+  return (
+    <>
+      <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
+        <span />
+        <button className="row-toggle" disabled>
+          <ChevronDown size={15} />
+        </button>
+        <span className="proposal-title">{item.title}</span>
+      </div>
+      {children.map((child) => (
+        <ActiveDownloadNode
+          key={child.id}
+          item={child}
+          childrenById={childrenById}
+          activeIds={activeIds}
+          batchKind={batchKind}
+          depth={depth + 1}
+        />
+      ))}
+    </>
   );
 }
 
@@ -5973,11 +6072,12 @@ function groupApprovalBatches(batches) {
   const groups = new Map();
   const seen = new Set();
   batches.forEach((batch) => {
-    if (batch.tree_path === "/downloads") return;
-    if (batch.status === "executing") return;
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
       if (!["pending", "approved", "failed"].includes(item.status)) return;
+      const itemAction = parseJsonObject(item.payload_json).action;
+      // Soulseek candidate rows are auto-run now; hide them from the queue unless they failed.
+      if (item.kind === "download" && itemAction === "queue_download" && item.status !== "failed") return;
       const groupKind = batchGroupKind || item.kind;
       // Download items must not be deduped by title — two artists can share a song name
       // and dropping one item breaks its parent's child count (missing chevron).
@@ -6016,6 +6116,30 @@ function groupApprovalBatches(batches) {
       group.items = group.items
         .filter((i) => !idRemap.has(i.id))
         .map((i) => (idRemap.has(i.parent_id) ? { ...i, parent_id: idRemap.get(i.parent_id) } : i));
+    }
+
+    // Prune empty grouping branches for the DOWNLOAD group only: when an album's
+    // candidates are all running (shown in Downloads) its grouping rows would otherwise
+    // linger here empty. Keep only download items that are actionable themselves (have a
+    // payload action or are failed) or are ancestors of such items. Other kinds (metadata,
+    // import_files, lyrics, artwork) carry no "action" and must NOT be pruned.
+    if (group.id === "type:download") {
+      const byId = new Map(group.items.map((i) => [i.id, i]));
+      const actionableIds = new Set(
+        group.items
+          .filter((i) => Boolean(parseJsonObject(i.payload_json).action) || i.status === "failed")
+          .map((i) => i.id)
+      );
+      const keepIds = new Set();
+      for (const id of actionableIds) {
+        keepIds.add(id);
+        let cur = byId.get(id);
+        while (cur && cur.parent_id) {
+          keepIds.add(cur.parent_id);
+          cur = byId.get(cur.parent_id);
+        }
+      }
+      group.items = group.items.filter((i) => keepIds.has(i.id));
     }
   }
 
