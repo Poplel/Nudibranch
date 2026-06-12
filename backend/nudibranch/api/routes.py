@@ -408,6 +408,30 @@ def propose_library_remove(
     tracks = library_target_tracks(target)
     tracks = [track for track in tracks if track.path]
     if not tracks:
+        # An album row with no track files is an orphan/duplicate; offer a record-only
+        # removal (never deletes files — an empty duplicate may share its folder/cover
+        # with the real album).
+        if payload.target_type == "album" and not library_target_tracks(target):
+            artist_name = target.artist.name if target.artist else "Unknown Artist"
+            batch = ProposalBatch(title="Remove empty album", kind=ProposalKind.delete, tree_path="/library")
+            session.add(batch)
+            session.flush()
+            artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.delete)
+            session.add(artist_item)
+            session.flush()
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    title=f"{target.title} (empty record — no tracks)",
+                    kind=ProposalKind.delete,
+                    old_value=target.title,
+                    payload_json=json.dumps({"action": "remove_empty_album", "album_id": target.id}),
+                    parent_id=artist_item.id,
+                )
+            )
+            session.commit()
+            session.refresh(batch)
+            return serialize_batch(batch)
         raise HTTPException(status_code=400, detail="No files were found for this library item")
 
     batch_kind = ProposalKind.delete if payload.action == "delete" else ProposalKind.file_move

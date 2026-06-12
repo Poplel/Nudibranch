@@ -4894,6 +4894,15 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
     if payload.get("action") == "normalize_volume":
         normalize_audio_file_volume(source_path)
         return
+    if payload.get("action") == "remove_empty_album":
+        # Record-only deletion of an orphan 0-track album row. Never touches files —
+        # an empty duplicate often shares its folder/cover.jpg with the real album.
+        album = session.get(Album, payload.get("album_id"))
+        if album and album.tracks:
+            raise ValueError("Album is no longer empty")
+        if album:
+            cleanup_empty_album_artist(session, album)
+        return
     if payload.get("action") == "remove_record":
         if not track:
             raise ValueError("Track record no longer exists")
