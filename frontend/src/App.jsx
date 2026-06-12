@@ -6080,9 +6080,6 @@ function groupApprovalBatches(batches) {
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
       if (!["pending", "approved", "failed"].includes(item.status)) return;
-      const itemAction = parseJsonObject(item.payload_json).action;
-      // Soulseek candidate rows are auto-run now; hide them from the queue unless they failed.
-      if (item.kind === "download" && itemAction === "queue_download" && item.status !== "failed") return;
       const groupKind = batchGroupKind || item.kind;
       // Download items must not be deduped by title — two artists can share a song name
       // and dropping one item breaks its parent's child count (missing chevron).
