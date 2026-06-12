@@ -4788,11 +4788,14 @@ def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> Non
     old_name = artist.name
     apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id"})
     name_changed = artist.name != old_name
+    if not name_changed:
+        # sort_name / musicbrainz_id-only edits must not merge into a same-name artist
+        # (that deletes this artist and discards the edit). Merge only on a name change.
+        return
     matching_artist = session.scalar(select(Artist).where(Artist.name == artist.name, Artist.id != artist.id))
     if not matching_artist:
-        if name_changed:
-            for album in list(artist.albums):
-                sync_album_folder(session, album)
+        for album in list(artist.albums):
+            sync_album_folder(session, album)
         return
     for album in list(artist.albums):
         matching_album = session.scalar(
@@ -4835,12 +4838,17 @@ def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
         {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
     )
     title_changed = album.title != old_title
+    if not title_changed:
+        # Cover-art / mbid / path-only edits must not trigger a merge: the merge below
+        # deletes this album and keeps matching_album, which would silently discard the
+        # change we just applied (e.g. the new cover_path). Only an actual title change
+        # can create a collision worth merging.
+        return
     matching_album = session.scalar(
         select(Album).where(Album.artist_id == album.artist_id, Album.title == album.title, Album.id != album.id)
     )
     if not matching_album:
-        if title_changed:
-            sync_album_folder(session, album)
+        sync_album_folder(session, album)
         return
     for track in list(album.tracks):
         # Reassign through the relationship (not the FK column) so album.tracks is
