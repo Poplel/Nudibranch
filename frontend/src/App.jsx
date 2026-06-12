@@ -4527,6 +4527,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
     ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
     ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
+    ["Consolidate album folders", "Find albums whose tracks are split across folders and move them into one folder per album.", "consolidate-folders", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
     ["Clear discover art cache", "Remove cached artist and album artwork used by Discover.", "clear-discover-cache", "settings:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],

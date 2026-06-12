@@ -4841,6 +4841,24 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
             session.flush()
             cleanup_empty_album_artist(session, album)
         return
+    if payload.get("action") == "relocate_track":
+        if not track:
+            raise ValueError("Track record no longer exists")
+        if not source_path.exists():
+            raise FileNotFoundError(f"{source_path} no longer exists")
+        target_path = Path(item.new_value or "")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.resolve() != source_path.resolve():
+            target_path = unique_destination(target_path)
+            shutil.move(str(source_path), str(target_path))
+            # move a matching .lrc lyrics sidecar alongside, if present
+            lrc = source_path.with_suffix(".lrc")
+            if lrc.exists():
+                shutil.move(str(lrc), str(target_path.with_suffix(".lrc")))
+        track.path = str(target_path)
+        if track.album is not None:
+            track.album.path = str(target_path.parent)
+        return
     target_path = unique_destination(Path(item.new_value or ""))
     if not source_path.exists():
         raise FileNotFoundError(f"{source_path} no longer exists")
@@ -6908,6 +6926,61 @@ def run_search_candidates(session: Session, payload: dict, task: Task | None = N
     return {"searched": len(items)}
 
 
+def run_consolidate_folders(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    albums = list(
+        session.scalars(
+            select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Consolidate album folders", kind=ProposalKind.file_move, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    library_root = get_settings().library_path
+    for index, album in enumerate(albums):
+        if task is not None and index % 25 == 0:
+            update_task_progress(session, task, index, max(1, len(albums)), f"Checking {album.title}")
+        artist_name = album.artist.name if album.artist else "Unknown Artist"
+        canonical = (library_root / safe_path_part(artist_name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")).resolve()
+        misplaced = [t for t in album.tracks if t.path and Path(t.path).parent.resolve() != canonical]
+        if not misplaced:
+            continue
+        # Build artist>album grouping nodes (no action) lazily, then a relocate leaf per misplaced track.
+        a_item = artist_items.get(artist_name)
+        if not a_item:
+            a_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.file_move, payload_json=json.dumps({"artist": artist_name}))
+            session.add(a_item)
+            session.flush()
+            artist_items[artist_name] = a_item
+        al_key = (artist_name, album.title)
+        al_item = album_items.get(al_key)
+        if not al_item:
+            al_item = ProposalItem(batch_id=batch.id, parent_id=a_item.id, title=album.title, kind=ProposalKind.file_move, payload_json=json.dumps({"artist": artist_name, "album": album.title}))
+            session.add(al_item)
+            session.flush()
+            album_items[al_key] = al_item
+        for t in misplaced:
+            target = canonical / Path(t.path).name
+            session.add(ProposalItem(
+                batch_id=batch.id,
+                parent_id=al_item.id,
+                title=Path(t.path).name,
+                kind=ProposalKind.file_move,
+                old_value=t.path,
+                new_value=str(target),
+                payload_json=json.dumps({"action": "relocate_track", "track_id": t.id}),
+            ))
+            created += 1
+    if created == 0:
+        session.delete(batch)
+        create_notification(session, title="Folder consolidation complete", body="All album tracks are already in one folder per album.", event_type="tool_completed", target_url="/tools")
+        return {"albums_checked": len(albums), "moves": 0, "batch_id": None}
+    create_notification(session, title="Folder consolidation ready", body=f"{created} track file(s) can be moved into one folder per album — review in the Task Queue.", event_type="approval_needed", target_url="/task-queue")
+    return {"albums_checked": len(albums), "moves": created, "batch_id": batch.id}
+
+
 TASK_HANDLERS = {
     "propose_import": run_propose_import,
     "execute_proposal_batch": run_execute_proposal_batch,
@@ -6929,6 +7002,7 @@ TASK_HANDLERS = {
     "restore_backup": run_restore_backup,
     "clear_downloads": run_clear_downloads,
     "search_candidates": run_search_candidates,
+    "consolidate_folders": run_consolidate_folders,
 }
 
 
@@ -7050,7 +7124,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -7110,6 +7184,7 @@ def task_notification_title(task_type: str) -> str:
         "clear_downloads": "Clear downloads",
         "clear_discover_cache": "Clear discover cache",
         "search_candidates": "Searching downloads",
+        "consolidate_folders": "Folder consolidation",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
@@ -7118,7 +7193,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache", "consolidate_folders"}:
         return "/tools"
     return "/activity"
 

@@ -2024,6 +2024,14 @@ def tool_normalize_volume(
     return serialize_task(enqueue_task(session, "normalize_volume", {}))
 
 
+@router.post("/tools/consolidate-folders", response_model=TaskOut, tags=["tools"], summary="Consolidate album folders")
+def tool_consolidate_folders(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "consolidate_folders", {}))
+
+
 @router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"], summary="Clear completed downloads")
 def tool_clear_downloads(
     session: Session = Depends(get_session),
