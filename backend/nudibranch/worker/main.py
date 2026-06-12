@@ -4815,13 +4815,16 @@ def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> Non
         )
         if matching_album:
             for track in list(album.tracks):
-                track.album_id = matching_album.id
+                # Reassign via the relationship so album.tracks empties in-session;
+                # a direct FK set leaves the stale collection and deleting the album
+                # in cleanup_empty_album_artist would null album_id (NOT NULL fail).
+                track.album = matching_album
             session.flush()
             session.refresh(matching_album)
             sync_album_folder(session, matching_album)
             cleanup_empty_album_artist(session, album)
         else:
-            album.artist_id = matching_artist.id
+            album.artist = matching_artist
             session.flush()
             session.refresh(album)
             sync_album_folder(session, album)
@@ -4843,7 +4846,11 @@ def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
             sync_album_folder(session, album)
         return
     for track in list(album.tracks):
-        track.album_id = matching_album.id
+        # Reassign through the relationship (not the FK column) so album.tracks is
+        # emptied in-session; otherwise deleting the now-empty album in
+        # cleanup_empty_album_artist cascades album_id=NULL onto these tracks and
+        # trips the NOT NULL constraint.
+        track.album = matching_album
     session.flush()
     session.refresh(matching_album)
     sync_album_folder(session, matching_album)
