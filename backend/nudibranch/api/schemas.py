@@ -225,6 +225,7 @@ class IntegrationSettings(BaseModel):
     slskd_concurrent_downloads: str = "1"
     youtube_cookies_browser: str = ""
     youtube_cookies_path: str = ""
+    acoustid_api_key: str = ""
 
 
 class PlaylistTrackOut(BaseModel):
