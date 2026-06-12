@@ -6100,6 +6100,10 @@ function buildItemTree(items) {
 function groupApprovalBatches(batches) {
   const groups = new Map();
   const seen = new Set();
+  // All items across every batch, by id — used to recover structural ancestors whose own
+  // status no longer passes the pending/approved/failed filter below.
+  const allById = new Map();
+  batches.forEach((batch) => batch.items.forEach((item) => allById.set(item.id, item)));
   batches.forEach((batch) => {
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
@@ -6123,6 +6127,24 @@ function groupApprovalBatches(batches) {
       groups.get(groupKind).items.push(item);
     });
   });
+
+  // Pull structural ancestor nodes (artist/album/track) back into the download group even
+  // when their own status has advanced to executing/completed. Otherwise, once a batch is
+  // approved and downloading, the still-pending alternate candidates lose their parents and
+  // dump flat at the top of the Task Queue instead of nesting under Artist>Album>Track.
+  const downloadGroup = groups.get("download");
+  if (downloadGroup) {
+    const present = new Set(downloadGroup.items.map((item) => item.id));
+    for (const item of [...downloadGroup.items]) {
+      let parentId = item.parent_id;
+      while (parentId && allById.has(parentId) && !present.has(parentId)) {
+        const ancestor = allById.get(parentId);
+        present.add(parentId);
+        downloadGroup.items.push(ancestor);
+        parentId = ancestor.parent_id;
+      }
+    }
+  }
 
   // Merge root items with the same title within each group so the same artist
   // doesn't appear twice when multiple batches exist for that artist.
