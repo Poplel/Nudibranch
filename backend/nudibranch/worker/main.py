@@ -4747,35 +4747,101 @@ def unique_nonempty(values: list[str]) -> list[str]:
     return result
 
 
+def relocate_track_to_dir(track: Track, target_dir: Path) -> None:
+    """Move a track's audio file (and .lrc sidecar) into target_dir and update track.path. No-op if already there."""
+    if not track.path:
+        return
+    source = Path(track.path)
+    target = target_dir / source.name
+    if source.resolve() == target.resolve():
+        return
+    if not source.exists():
+        # File already gone/moved; just record the intended new location.
+        track.path = str(target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = unique_destination(target)
+    shutil.move(str(source), str(target))
+    lrc = source.with_suffix(".lrc")
+    if lrc.exists():
+        shutil.move(str(lrc), str(target.with_suffix(".lrc")))
+    track.path = str(target)
+
+
+def sync_album_folder(session: Session, album: Album) -> None:
+    """Move all of an album's track files into the canonical library/<artist>/<album>/ folder,
+    update album.path, and remove now-empty source folders."""
+    if album is None:
+        return
+    artist_name = album.artist.name if album.artist else "Unknown Artist"
+    canonical = (
+        get_settings().library_path
+        / safe_path_part(artist_name, "Unknown Artist")
+        / safe_path_part(album.title, "Unknown Album")
+    )
+    old_dirs: set[Path] = set()
+    for track in list(album.tracks):
+        if track.path:
+            old_dirs.add(Path(track.path).parent)
+        relocate_track_to_dir(track, canonical)
+    album.path = str(canonical)
+    for d in old_dirs:
+        try:
+            if d.resolve() != canonical.resolve() and d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
+    old_name = artist.name
     apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id"})
+    name_changed = artist.name != old_name
     matching_artist = session.scalar(select(Artist).where(Artist.name == artist.name, Artist.id != artist.id))
     if not matching_artist:
+        if name_changed:
+            for album in list(artist.albums):
+                sync_album_folder(session, album)
         return
     for album in list(artist.albums):
         matching_album = session.scalar(
             select(Album).where(Album.artist_id == matching_artist.id, Album.title == album.title, Album.id != album.id)
         )
         if matching_album:
-            for track in album.tracks:
+            for track in list(album.tracks):
                 track.album_id = matching_album.id
+            session.flush()
+            session.refresh(matching_album)
+            sync_album_folder(session, matching_album)
+            cleanup_empty_album_artist(session, album)
         else:
             album.artist_id = matching_artist.id
+            session.flush()
+            session.refresh(album)
+            sync_album_folder(session, album)
 
 
 def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
+    old_title = album.title
     apply_scalar_changes(
         album,
         changes,
         {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
     )
+    title_changed = album.title != old_title
     matching_album = session.scalar(
         select(Album).where(Album.artist_id == album.artist_id, Album.title == album.title, Album.id != album.id)
     )
     if not matching_album:
+        if title_changed:
+            sync_album_folder(session, album)
         return
-    for track in album.tracks:
+    for track in list(album.tracks):
         track.album_id = matching_album.id
+    session.flush()
+    session.refresh(matching_album)
+    sync_album_folder(session, matching_album)
+    cleanup_empty_album_artist(session, album)
 
 
 def apply_scalar_changes(target, changes: dict, allowed_fields: set[str]) -> None:
