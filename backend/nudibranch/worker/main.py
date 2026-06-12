@@ -6366,27 +6366,46 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
             if abs(actual_duration - expected_length) <= tolerance:
                 continue  # duration matches — assume correct
 
-            # SUSPICIOUS (duration mismatch)
+            # SUSPICIOUS: the file's length doesn't match the album-slot's expected track.
+            # A mismatch alone is NOT proof the audio is wrong — the library's track numbering
+            # may simply not line up with MusicBrainz (commentary editions, duplicated/garbled
+            # disc/track numbers), which makes the "expected" slot itself wrong while the file is
+            # fine. Only propose a replacement when AcoustID positively identifies the file's
+            # audio AND that audio is NOT any track on this album (genuinely foreign, not just
+            # mis-numbered). This prevents overwriting correctly-ripped files on odd-numbered albums.
             suspicious += 1
             expected_title = expected.get("title") or track.title
             expected_recording_id = expected.get("musicbrainz_recording_id")
 
-            if api_key:
-                if track.path and Path(track.path).exists():
-                    verdict = audio_matches_claim(Path(track.path), expected_title, artist_name, expected_recording_id, api_key)
-                else:
-                    verdict = {"matched": None, "message": "file missing"}
-                time.sleep(0.4)
-                if verdict.get("matched") is True:
-                    append_task_log(session, task, f"{album.title} / {track.title}: duration off but AcoustID confirms correct audio; skipping", "info")
-                    continue
-                confirmed = verdict.get("matched") is False
-                display = expected_title if confirmed else f"⚠ {expected_title}"
-                reason = "AcoustID confirms wrong audio" if confirmed else f"unconfirmed ({verdict.get('message')})"
-            else:
-                display = f"⚠ {expected_title}"
-                reason = "duration mismatch only (no AcoustID key configured)"
+            if not api_key:
+                append_task_log(session, task, f"{album.title} / {track.title}: length off but no AcoustID key — skipping (cannot confirm wrong audio)", "warning")
+                continue
+            if not (track.path and Path(track.path).exists()):
+                continue
+            verdict = audio_matches_claim(Path(track.path), expected_title, artist_name, expected_recording_id, api_key)
+            time.sleep(0.4)
+            if verdict.get("matched") is True:
+                append_task_log(session, task, f"{album.title} / {track.title}: length off but AcoustID confirms correct audio; skipping", "info")
+                continue
+            detected = verdict.get("detected") or []
+            if not detected:
+                append_task_log(session, task, f"{album.title} / {track.title}: AcoustID couldn't identify the audio ({verdict.get('message')}); skipping (no confident replacement)", "info")
+                continue
+            # Is the file's actual audio just another track of THIS album (mis-numbered, not wrong)?
+            album_recording_ids = {e.get("musicbrainz_recording_id") for e in expected_tracks if e.get("musicbrainz_recording_id")}
+            detected_recording_ids = {d.get("recording_id") for d in detected if d.get("recording_id")}
+            belongs_to_album = bool(album_recording_ids & detected_recording_ids)
+            if not belongs_to_album:
+                for d in detected:
+                    d_title = normalize(d.get("title") or "")
+                    if d_title and any(text_similarity(d_title, normalize(e.get("title") or "")) >= 0.85 for e in expected_tracks):
+                        belongs_to_album = True
+                        break
+            if belongs_to_album:
+                append_task_log(session, task, f"{album.title} / {track.title}: audio is another track from this album (likely mis-numbered, not wrong audio); skipping replacement", "info")
+                continue
 
+            actual_title = detected[0].get("title") or "unknown"
             add_download_request_item(
                 session,
                 batch,
@@ -6404,10 +6423,10 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
                 replace_path=track.path,
                 require_lossless=True if track.is_lossless else None,
                 workflow="content_replacement",
-                display_title=display,
+                display_title=expected_title,
             )
             created += 1
-            append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for slot '{track.title}' -> '{expected_title}' ({reason})")
+            append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for '{track.title}' -> '{expected_title}' (AcoustID found foreign audio: '{actual_title}')")
 
     if created == 0:
         session.delete(batch)
