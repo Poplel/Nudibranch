@@ -3356,44 +3356,13 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem], 
             batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
         )
     if shared_batch is not None:
-        session.flush()
-        session.refresh(shared_batch)
-        batch_items = list(shared_batch.items)
-        runnable = [
-            it for it in batch_items
-            if json.loads(it.payload_json or "{}").get("action") == "queue_download"
-            and it.selected
-            and it.status == ProposalStatus.pending
-        ]
-        needs_review = [
-            it for it in batch_items
-            if json.loads(it.payload_json or "{}").get("action") == "queue_ytdlp_download"
-        ]
-        if runnable:
-            approve_batch(session, shared_batch.id)
-            create_notification(
-                session,
-                title="Downloads started",
-                body=f"{len(runnable)} track(s) started downloading from Soulseek.",
-                event_type="task_started",
-                target_url="/downloads",
-            )
-            if needs_review:
-                create_notification(
-                    session,
-                    title="Some tracks need your approval",
-                    body=f"{len(needs_review)} track(s) had no Soulseek match — approve a YouTube fallback in the Task Queue.",
-                    event_type="approval_needed",
-                    target_url="/task-queue",
-                )
-        else:
-            create_notification(
-                session,
-                title="Approval needed",
-                body="No Soulseek matches were found — review and approve downloads in the Task Queue.",
-                event_type="approval_needed",
-                target_url="/task-queue",
-            )
+        create_notification(
+            session,
+            title="Download candidates ready",
+            body="Soulseek candidates are ready — review and approve them in the Task Queue.",
+            event_type="approval_needed",
+            target_url="/task-queue",
+        )
     if wishlist_item_ids:
         for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
             wishlist_item.status = "approved"
@@ -6940,6 +6909,23 @@ def jellyfin_audio_match_score(track: Track, item: dict) -> float:
     return score
 
 
+def run_search_candidates(session: Session, payload: dict, task: Task | None = None) -> dict:
+    batch_id = payload.get("batch_id")
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise ValueError("Batch not found for candidate search")
+    items = [i for i in batch.items if json.loads(i.payload_json or "{}").get("action") == "wishlist_request"]
+    if items:
+        process_wishlist_request_items(session, items, task)
+    # The intent batch is consumed once its requests have been turned into a candidate batch.
+    for item in batch.items:
+        if item.status in {ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing}:
+            item.status = ProposalStatus.completed
+    batch.status = ProposalStatus.completed
+    session.commit()
+    return {"searched": len(items)}
+
+
 TASK_HANDLERS = {
     "propose_import": run_propose_import,
     "execute_proposal_batch": run_execute_proposal_batch,
@@ -6960,6 +6946,7 @@ TASK_HANDLERS = {
     "restore_default": run_restore_default,
     "restore_backup": run_restore_backup,
     "clear_downloads": run_clear_downloads,
+    "search_candidates": run_search_candidates,
 }
 
 
@@ -7081,7 +7068,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -7140,11 +7127,12 @@ def task_notification_title(task_type: str) -> str:
         "restore_backup": "Restore",
         "clear_downloads": "Clear downloads",
         "clear_discover_cache": "Clear discover cache",
+        "search_candidates": "Searching downloads",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
 def task_target_url(task_type: str) -> str:
-    if task_type in {"execute_proposal_batch"}:
+    if task_type in {"execute_proposal_batch", "search_candidates"}:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"

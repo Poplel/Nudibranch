@@ -1515,6 +1515,7 @@ def propose_wishlist_items(
         notify_wishlist_decisions(session, denied_items, "Wishlist request denied", "not selected for download", "wishlist_denied", "/wishlist")
     session.commit()
     session.refresh(batch)
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
     return serialize_batch(batch)
 
 
