@@ -20,7 +20,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import clear_discover_art_cache, itunes_album_artwork, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, clear_discover_art_cache, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -2947,21 +2947,6 @@ def album_folder_path(album: Album) -> Path:
     return get_settings().library_path / safe_path_part(album.artist.name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")
 
 
-def album_cover_candidate_urls(artist: str, album: str, results: list[dict]) -> list[str]:
-    urls = [str(result.get("cover_art_url")) for result in results if result.get("cover_art_url")]
-    itunes_url = itunes_album_artwork(artist, album)
-    if itunes_url:
-        urls.append(itunes_url)
-    seen = set()
-    unique_urls = []
-    for url in urls:
-        if url in seen:
-            continue
-        seen.add(url)
-        unique_urls.append(url)
-    return unique_urls
-
-
 def cover_extension(content_type: str, url: str) -> str:
     content_type = content_type.split(";", 1)[0].strip().casefold()
     if content_type == "image/png":
@@ -4831,6 +4816,18 @@ def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> Non
 
 
 def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
+    # When the cover_path is a remote URL (e.g. the library "Auto lookup" button or
+    # an album-search pick hands us a Cover Art Archive / iTunes URL), download it
+    # into the album folder so it serves like the Check Album Covers tool's output.
+    # Storing the URL verbatim would make GET /library/albums/{id}/cover 404.
+    cover_value = changes.get("cover_path")
+    if isinstance(cover_value, str) and cover_value.lower().startswith(("http://", "https://")):
+        changes = dict(changes)
+        local_cover = download_album_cover_to_library(session, album, [cover_value])
+        if local_cover:
+            changes["cover_path"] = local_cover
+        else:
+            changes.pop("cover_path", None)
     old_title = album.title
     apply_scalar_changes(
         album,

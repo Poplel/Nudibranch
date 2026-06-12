@@ -89,7 +89,7 @@ from nudibranch.services.imports import discover_import_files, read_audio_metada
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
-from nudibranch.services.metadata_lookup import cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
@@ -857,6 +857,24 @@ def album_cover(
     if library_root not in [resolved, *resolved.parents]:
         raise HTTPException(status_code=403, detail="Album cover is outside the library")
     return FileResponse(resolved)
+
+
+@router.get("/library/albums/{album_id}/cover-candidates", tags=["library"], summary="Search album cover art sources", response_model=dict)
+def album_cover_candidates(
+    album_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    artist_name = album.artist.name if album.artist else ""
+    try:
+        results = search_album_releases(artist_name, album.title)
+    except (RuntimeError, httpx.HTTPError):
+        results = []
+    urls = album_cover_candidate_urls(artist_name, album.title, results)
+    return {"album_id": album.id, "urls": urls, "cover_path": urls[0] if urls else None}
 
 
 @router.post("/imports/scan", tags=["imports"], summary="Scan staging directory for audio files", response_model=dict)

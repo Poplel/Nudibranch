@@ -703,5 +703,25 @@ def itunes_album_artwork(artist: str, album: str) -> str | None:
     return None
 
 
+def album_cover_candidate_urls(artist: str, album: str, results: list[dict]) -> list[str]:
+    """Ordered, de-duplicated cover-art URLs from MusicBrainz release results + iTunes.
+
+    Shared by the Check Album Covers tool and the library album cover lookup so both
+    discover artwork the same way.
+    """
+    urls = [str(result.get("cover_art_url")) for result in results if result.get("cover_art_url")]
+    itunes_url = itunes_album_artwork(artist, album)
+    if itunes_url:
+        urls.append(itunes_url)
+    seen = set()
+    unique_urls = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique_urls.append(url)
+    return unique_urls
+
+
 def normalize(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()

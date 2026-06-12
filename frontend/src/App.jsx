@@ -1091,6 +1091,22 @@ function App() {
     }
   }
 
+  async function searchAlbumCover(albumId) {
+    setLoading(true);
+    try {
+      const data = await api(`/library/albums/${albumId}/cover-candidates`);
+      if (!data.cover_path) {
+        notify("No cover art found", "No album art source matched this album.", "ui_error");
+      }
+      return data;
+    } catch (coverError) {
+      notify("Cover search failed", coverError.message, "ui_error");
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function proposeLibraryMetadata(targetType, targetId, changes) {
     setLoading(true);
     try {
@@ -1575,6 +1591,7 @@ function App() {
               <LibraryTree
                 artists={library}
                 onCheckAlbum={lookupImportAlbum}
+                onCoverSearch={searchAlbumCover}
                 onCheckAlbumMusicBrainz={checkLibraryAlbumMusicBrainz}
                 onCheckTrackMusicBrainz={checkLibraryTrackMusicBrainz}
                 onCheckTrackAudio={checkLibraryTrackAudio}
@@ -1826,7 +1843,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1952,7 +1969,7 @@ function LibraryTree({ artists, onCheckAlbum, onCheckAlbumMusicBrainz, onCheckTr
                       coverUrl={album._coverUrl}
                       fields={albumFields(album)}
                       details={{ artist: artist.name, tracks: album.tracks.length }}
-                      onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum)}
+                      onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum, album.id, onCoverSearch)}
                       onSearchAlbums={onSearchAlbums}
                       playlists={canUsePlaylists ? playlists : []}
                       targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
@@ -4069,10 +4086,17 @@ function trackFields(track) {
   ];
 }
 
-async function albumAutoLookup(field, draft, artistName, onCheckAlbum) {
+async function albumAutoLookup(field, draft, artistName, onCheckAlbum, albumId, onCoverSearch) {
   const releaseId = draft.musicbrainz_release_id || null;
-  if (field === "cover_path" && releaseId) {
-    return { cover_path: `https://coverartarchive.org/release/${releaseId}/front-250` };
+  if (field === "cover_path") {
+    // Search MusicBrainz + iTunes the same way the Check Album Covers tool does
+    // (works even without a stored release id); apply downloads it to the library.
+    if (onCoverSearch && albumId) {
+      const found = await onCoverSearch(albumId);
+      if (found?.cover_path) return { cover_path: found.cover_path };
+    }
+    if (releaseId) return { cover_path: `https://coverartarchive.org/release/${releaseId}/front-250` };
+    return null;
   }
   if (!releaseId) return null;
   const lookup = await onCheckAlbum(artistName, draft.title || draft.release_title || "", releaseId);
