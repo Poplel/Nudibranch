@@ -1312,7 +1312,8 @@ def list_wishlist(
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
     expire_old_terminal_wishlist_items(session, items)
     items = [item for item in items if item.status != "removed" and not terminal_wishlist_expired(item)]
-    return [serialize_wishlist_item(item) for item in items]
+    downloading_ids = downloading_wishlist_ids(session)
+    return [serialize_wishlist_item(item, downloading_ids) for item in items]
 
 
 @router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"], summary="Add to wishlist")
@@ -2563,7 +2564,10 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
     return sessions
 
 
-def serialize_wishlist_item(item: WishlistItem) -> WishlistOut:
+def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
+    status = item.status
+    if status == "approved" and downloading_ids and item.id in downloading_ids:
+        status = "downloading"
     return WishlistOut(
         id=item.id,
         user_id=item.user_id,
@@ -2572,7 +2576,7 @@ def serialize_wishlist_item(item: WishlistItem) -> WishlistOut:
         artist=item.artist,
         album=item.album,
         track=item.track,
-        status=item.status,
+        status=status,
         created_at=item.created_at,
         status_changed_at=item.status_changed_at or item.created_at,
     )
@@ -2638,6 +2642,29 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
             if wishlist_item_id:
                 active_ids.add(wishlist_item_id)
     return active_ids
+
+
+def downloading_wishlist_ids(session: Session) -> set[str]:
+    """Wishlist items whose linked Soulseek download is actively executing right now."""
+    ids: set[str] = set()
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.kind == ProposalKind.download)
+            .where(ProposalBatch.status.in_([ProposalStatus.approved, ProposalStatus.executing]))
+        )
+    )
+    for batch in batches:
+        for item in batch.items:
+            if item.kind != ProposalKind.download or item.status != ProposalStatus.executing:
+                continue
+            payload = json.loads(item.payload_json or "{}")
+            request = payload.get("request") or {}
+            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
+            if wishlist_item_id:
+                ids.add(wishlist_item_id)
+    return ids
 
 
 def notify_wishlist_decisions(

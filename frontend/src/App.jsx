@@ -2904,7 +2904,9 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                 )}
               </div>
               {openArtists.has(artist.id) && (() => {
-                const allAlbums = artist.albums || [];
+                const allAlbums = [...(artist.albums || [])].sort(
+                  (a, b) => (b.track_count || 0) - (a.track_count || 0),
+                );
                 const showAll = expandedAllAlbums.has(artist.id);
                 const visibleAlbums = showAll ? allAlbums : allAlbums.slice(0, DISCOVER_ALBUMS_INITIAL);
                 return (
@@ -5840,6 +5842,9 @@ function AudioPlayer({
               <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
                 <SkipForward size={16} />
               </button>
+              <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} disabled={!currentTrack} title="Favorite">
+                <Heart size={16} />
+              </button>
             </div>
             <input className="player-progress topbar-progress" type="range" min="0" max={duration || 0} value={currentTime} onChange={seek} style={{ "--progress": `${progress}%` }} />
             <div className="topbar-actions">
@@ -6891,6 +6896,7 @@ function buildWishlistOwnerTree(items) {
 }
 
 function wishlistStatusLabel(status) {
+  if (status === "downloading") return "Downloading…";
   if (status === "approved") return "Awaiting Download";
   if (status === "completed") return "Completed";
   if (status === "rejected") return "Rejected";

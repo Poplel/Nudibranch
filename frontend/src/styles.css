@@ -1962,6 +1962,12 @@ nav button:hover,
   margin: 0 auto;
 }
 
+/* Inset the pip/fullscreen seek bar slightly so it sits inside its frame */
+.pip-player .fullscreen-controls .player-progress {
+  width: calc(100% - 20px);
+  margin-inline: auto;
+}
+
 .player-controls {
   display: grid;
   grid-template-columns: repeat(5, 1fr);

@@ -3299,7 +3299,13 @@ def mark_matching_wishlist_completed(session: Session, metadata: dict) -> None:
     for item in candidates:
         same_artist = normalize_match_text(item.artist) == artist
         same_album = not item.album or not album or normalize_match_text(item.album) == album
-        same_track = normalize_match_text(item.track or item.album or item.artist) == title
+        # Album-/artist-level wishlist entries have no specific track to match against
+        # (an album request is expanded into per-track downloads), so an artist+album
+        # match is enough; only require a track-title match when the item names a track.
+        if item.track:
+            same_track = normalize_match_text(item.track) == title
+        else:
+            same_track = True
         if same_artist and same_album and same_track:
             item.status = "completed"
             item.status_changed_at = datetime.now(timezone.utc)
