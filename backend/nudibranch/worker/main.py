@@ -1482,6 +1482,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             finalize_completed_download_batch(session, batch)
         return {"imported": 0, "errors": []}
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
+    # Entries whose item is no longer approved (rejected/deselected/never-approved) get their
+    # slskd transfer cancelled and manifest entry/partial file removed, instead of silently
+    # downloading in the background.
+    cancel_unapproved_download_entries(session, [entry for entry in entries if entry.get("item_id") not in expected_item_ids])
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     entries = defer_excess_download_slot_entries(session, batch, entries)
     download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
@@ -1645,6 +1649,26 @@ def reconcile_manifest_entries_to_selected_items(session: Session, batch: Propos
     return reconciled
 
 
+def cancel_unapproved_download_entries(session: Session, dropped_entries: list[dict]) -> None:
+    """Cancel the slskd transfer and drop the manifest entry/partial file for downloads that are no
+    longer approved (item rejected, deselected, or never approved). Without this, rejecting a
+    download — or the monitor dropping an unapproved one — leaves the transfer running and the file
+    orphaned in /app/downloads. Completed downloads are left untouched."""
+    if not dropped_entries:
+        return
+    transfer_lookup, transfer_error = slskd_transfer_lookup(session, dropped_entries)
+    for entry in dropped_entries:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        if item is not None and item.status == ProposalStatus.completed:
+            continue
+        if not transfer_error and item is not None:
+            transfer = transfer_lookup.get(manifest_entry_key(entry))
+            if transfer is not None:
+                cancel_existing_slskd_transfer(session, transfer, item, "download no longer approved")
+        delete_stale_download_file(entry)
+        remove_download_manifest_entry(entry)
+
+
 def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, entries: list[dict]) -> list[dict]:
     limit = slskd_concurrent_download_limit(session)
     transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
@@ -1717,6 +1741,13 @@ def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
     ids = set()
     for item in batch.items:
         if not item.selected or item.kind != ProposalKind.download:
+            continue
+        # Only items that have actually been approved for download (approved → executing, or a
+        # failed attempt awaiting retry). A still-"pending" candidate has NOT been approved, even
+        # if it is selected by default. Without this gate the download monitor auto-queues every
+        # selected candidate in a partially-approved batch (queue_missing_manifest_download),
+        # downloading whole artists/albums the user never approved.
+        if item.status not in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed}:
             continue
         if json.loads(item.payload_json or "{}").get("action") == "queue_download":
             ids.add(item.id)
