@@ -6128,13 +6128,7 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
             target_url="/tools",
         )
         return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
-    create_notification(
-        session,
-        title="Missing track review ready",
-        body=f"{created} missing tracks were added to the task queue.",
-        event_type="approval_needed",
-        target_url="/task-queue",
-    )
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
     return {"albums_checked": checked, "download_items_created": created, "batch_id": batch.id}
 
 
@@ -6195,13 +6189,7 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
             target_url="/tools",
         )
         return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
-    create_notification(
-        session,
-        title="Lossless replacement review ready",
-        body=f"{created} replacement downloads were added to the task queue.",
-        event_type="approval_needed",
-        target_url="/task-queue",
-    )
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
     return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
 
 
@@ -6341,13 +6329,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
             target_url="/tools",
         )
         return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": 0, "batch_id": None}
-    create_notification(
-        session,
-        title="Audio replacement review ready",
-        body=f"{created} incorrect audio file(s) queued for replacement.",
-        event_type="approval_needed",
-        target_url="/task-queue",
-    )
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
     return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": created, "batch_id": batch.id}
 
 
