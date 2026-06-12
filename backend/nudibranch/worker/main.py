@@ -6382,6 +6382,16 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
                 continue
             if not (track.path and Path(track.path).exists()):
                 continue
+            # First: does the audio match what the FILE ITSELF claims to be? If so it is the right
+            # song — just mis-slotted, or AcoustID is conflating it with a higher-scoring lookalike
+            # that crowds the real recording out of the (top-5) slot-based detected window below.
+            # Checking the file's own recording-id scans ALL AcoustID candidates, so it is the most
+            # reliable "this file is fine" signal. Never replace a file that matches its own tags.
+            own_verdict = audio_matches_claim(Path(track.path), track.title, artist_name, track.musicbrainz_recording_id, api_key)
+            time.sleep(0.4)
+            if own_verdict.get("matched") is True:
+                append_task_log(session, task, f"{album.title} / {track.title}: audio matches the file's own tags ({own_verdict.get('confidence')} confidence) — not wrong audio, skipping", "info")
+                continue
             verdict = audio_matches_claim(Path(track.path), expected_title, artist_name, expected_recording_id, api_key)
             time.sleep(0.4)
             if verdict.get("matched") is True:
