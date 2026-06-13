@@ -1664,6 +1664,8 @@ function App() {
                 integrationSettings={integrationSettings}
                 onSaveIntegrations={saveIntegrationSettings}
                 onUploadYoutubeCookies={uploadYoutubeCookies}
+                api={api}
+                notify={notify}
               />
             )}
             {page === "Tools" && (
@@ -4889,6 +4891,210 @@ function Placeholder({ page }) {
   );
 }
 
+function SecuritySettings({ api, notify }) {
+  const [sessions, setSessions] = useState(null);
+  const [apiKeys, setApiKeys] = useState(null);
+  const [newKeyName, setNewKeyName] = useState("");
+  const [createdSecret, setCreatedSecret] = useState(null); // { id, name, api_key }
+  const [loadingRevoke, setLoadingRevoke] = useState({});
+  const [creatingKey, setCreatingKey] = useState(false);
+
+  async function loadSessions() {
+    try {
+      setSessions(await api("/me/sessions"));
+    } catch (err) {
+      notify("Sessions error", err.message, "ui_error");
+    }
+  }
+
+  async function loadApiKeys() {
+    try {
+      setApiKeys(await api("/me/api-keys"));
+    } catch (err) {
+      notify("API keys error", err.message, "ui_error");
+    }
+  }
+
+  useEffect(() => {
+    loadSessions();
+    loadApiKeys();
+  }, []);
+
+  async function revokeSession(id) {
+    setLoadingRevoke((prev) => ({ ...prev, [`session-${id}`]: true }));
+    try {
+      await api(`/me/sessions/${id}`, { method: "DELETE" });
+      notify("Session revoked", "The session has been signed out.", "ui_notice");
+      loadSessions();
+    } catch (err) {
+      notify("Revoke failed", err.message, "ui_error");
+    } finally {
+      setLoadingRevoke((prev) => ({ ...prev, [`session-${id}`]: false }));
+    }
+  }
+
+  async function createApiKey() {
+    if (!newKeyName.trim()) return;
+    setCreatingKey(true);
+    try {
+      const created = await api("/me/api-keys", {
+        method: "POST",
+        body: JSON.stringify({ name: newKeyName.trim() }),
+      });
+      setCreatedSecret(created);
+      setNewKeyName("");
+      loadApiKeys();
+    } catch (err) {
+      notify("Create key failed", err.message, "ui_error");
+    } finally {
+      setCreatingKey(false);
+    }
+  }
+
+  async function revokeApiKey(id) {
+    setLoadingRevoke((prev) => ({ ...prev, [`key-${id}`]: true }));
+    try {
+      await api(`/me/api-keys/${id}`, { method: "DELETE" });
+      notify("API key revoked", "The key can no longer be used.", "ui_notice");
+      if (createdSecret?.id === id) setCreatedSecret(null);
+      loadApiKeys();
+    } catch (err) {
+      notify("Revoke failed", err.message, "ui_error");
+    } finally {
+      setLoadingRevoke((prev) => ({ ...prev, [`key-${id}`]: false }));
+    }
+  }
+
+  return (
+    <>
+      <section className="settings-section">
+        <h2>Active sessions</h2>
+        {sessions === null ? (
+          <p className="muted-label">Loading…</p>
+        ) : sessions.length === 0 ? (
+          <p className="muted-label">No active sessions found.</p>
+        ) : (
+          <div className="security-list">
+            {sessions.map((session) => (
+              <div key={session.id} className="security-row">
+                <div className="security-row-info">
+                  <span className="security-row-label">
+                    {session.device_label || "Unknown device"}
+                    {session.current && (
+                      <span className="security-badge current-badge">This device</span>
+                    )}
+                  </span>
+                  <small className="muted-label">
+                    Last used: {session.last_used_at ? new Date(session.last_used_at).toLocaleString() : "never"}
+                    {" · "}
+                    Expires: {session.expires_at ? new Date(session.expires_at).toLocaleString() : "never"}
+                  </small>
+                </div>
+                {!session.current && (
+                  <button
+                    className="secondary compact"
+                    disabled={loadingRevoke[`session-${session.id}`]}
+                    onClick={() => revokeSession(session.id)}
+                  >
+                    <LogOut size={14} />
+                    Revoke
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+
+      <section className="settings-section">
+        <h2>API keys</h2>
+        <div className="security-create-row">
+          <input
+            type="text"
+            placeholder="Key name (e.g. Home server)"
+            value={newKeyName}
+            onChange={(e) => setNewKeyName(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && createApiKey()}
+          />
+          <button
+            className="primary compact-button"
+            disabled={creatingKey || !newKeyName.trim()}
+            onClick={createApiKey}
+          >
+            <Plus size={14} />
+            Create key
+          </button>
+        </div>
+
+        {createdSecret && (
+          <div className="security-new-key-reveal">
+            <div className="security-new-key-warning">
+              <Shield size={15} />
+              Copy this now — it won&apos;t be shown again.
+            </div>
+            <div className="security-new-key-row">
+              <input
+                readOnly
+                type="text"
+                className="security-secret-input"
+                value={createdSecret.api_key}
+                onFocus={(e) => e.target.select()}
+              />
+              <button
+                className="secondary compact"
+                onClick={() => {
+                  navigator.clipboard.writeText(createdSecret.api_key).catch(() => {});
+                  notify("Copied", "API key copied to clipboard.", "ui_notice");
+                }}
+              >
+                <Check size={14} />
+                Copy
+              </button>
+            </div>
+            <small className="muted-label">Key name: {createdSecret.name}</small>
+          </div>
+        )}
+
+        {apiKeys === null ? (
+          <p className="muted-label">Loading…</p>
+        ) : apiKeys.length === 0 ? (
+          <p className="muted-label">No API keys yet.</p>
+        ) : (
+          <div className="security-list">
+            {apiKeys.map((key) => (
+              <div key={key.id} className={`security-row${key.revoked ? " security-row-revoked" : ""}`}>
+                <div className="security-row-info">
+                  <span className="security-row-label">
+                    {key.name}
+                    {key.revoked && <span className="security-badge revoked-badge">Revoked</span>}
+                  </span>
+                  <small className="muted-label">
+                    Prefix: {key.prefix}
+                    {" · "}
+                    Created: {new Date(key.created_at).toLocaleString()}
+                    {" · "}
+                    Last used: {key.last_used_at ? new Date(key.last_used_at).toLocaleString() : "never"}
+                  </small>
+                </div>
+                {!key.revoked && (
+                  <button
+                    className="secondary compact"
+                    disabled={loadingRevoke[`key-${key.id}`]}
+                    onClick={() => revokeApiKey(key.id)}
+                  >
+                    <Trash2 size={14} />
+                    Revoke
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
+    </>
+  );
+}
+
 function SettingsPanel({
   accentColor,
   setAccentColor,
@@ -4904,6 +5110,8 @@ function SettingsPanel({
   integrationSettings,
   onSaveIntegrations,
   onUploadYoutubeCookies,
+  api,
+  notify,
 }) {
   const [showApiKey, setShowApiKey] = useState(false);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
@@ -5048,6 +5256,7 @@ function SettingsPanel({
           </button>
         </section>
       )}
+      <SecuritySettings api={api} notify={notify} />
       <footer className="settings-footer">
         Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
       </footer>
