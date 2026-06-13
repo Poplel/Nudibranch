@@ -12,8 +12,8 @@ from nudibranch.services.app_log import write_app_log
 settings = get_settings()
 
 _TAGS_METADATA = [
-    {"name": "auth", "description": "PIN-based authentication. Returns an API key used as a Bearer token or `api_key` query parameter on all other endpoints."},
-    {"name": "users", "description": "User accounts, permissions, appearance preferences, and real-time player state."},
+    {"name": "auth", "description": "Username + password authentication issuing sliding-expiry session tokens, plus session and named static API-key management. A session token or static API key is sent as a Bearer token (or `api_key` query parameter on media endpoints)."},
+    {"name": "users", "description": "User accounts, permissions, appearance and search preferences, real-time player state, and remote playback commands (play/pause/next with loop and shuffle)."},
     {"name": "library", "description": "Browse the music library tree, update metadata, propose removals, and stream audio files or album art."},
     {"name": "imports", "description": "Scan the staging directory for new audio files, look up album/track metadata from MusicBrainz, and enqueue import proposals."},
     {"name": "discover", "description": "Search for music via iTunes, retrieve album tracks, fetch cached album art, and add downloads to the task queue."},
@@ -24,6 +24,7 @@ _TAGS_METADATA = [
     {"name": "tools", "description": "Administrative one-shot tools: library/file health checks, volume normalisation, duplicate detection, backups and restore."},
     {"name": "settings", "description": "Read and update integration settings (Jellyfin, slskd, YouTube cookies)."},
     {"name": "notifications", "description": "In-app and APNS push notifications. Register devices, mark notifications read, dismiss all."},
+    {"name": "automations", "description": "Trigger → Action → Notify automations: run a maintenance tool or play music on a schedule (cron/interval), an inbound webhook (IFTTT-style; the token is the credential), or an in-app event."},
     {"name": "system", "description": "Health-check endpoint."},
 ]
 
