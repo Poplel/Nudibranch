@@ -51,7 +51,9 @@ ACTION_TYPES = {"tool", "play", "media_control"}
 NOTIFY_MODES = {"log", "notification", "both"}
 NOTIFY_PRIORITIES = {"low", "normal", "high"}
 EVENT_TYPES = {"download_complete", "wishlist_match", "scan_complete"}
-COMMAND_MATCH_FLOOR = 0.5
+# WRatio can score unrelated titles ~0.56 (substring overlap); real matches land 0.72+,
+# so require a confident 0.65 to resolve a play target from a free-text query.
+COMMAND_MATCH_FLOOR = 0.65
 
 
 # --- scheduling ----------------------------------------------------------

@@ -453,9 +453,9 @@ def create_player_command(
                 raise HTTPException(status_code=404, detail="No playlist matches that name")
             target_id, target_label = playlist.id, playlist.name
         else:
-            # Commands must resolve confidently (floor at 0.5, or stricter per the user's
-            # own threshold) so a nonsense query 404s instead of playing a garbage match.
-            floor = max(0.5, user.search_min_confidence if user.search_min_confidence is not None else 0.0)
+            # Commands must resolve confidently (WRatio scores junk ~0.56; floor at 0.65,
+            # or stricter per the user's threshold) so a nonsense query 404s.
+            floor = max(0.65, user.search_min_confidence if user.search_min_confidence is not None else 0.0)
             matches = search_library(session, q, kinds=[target_type] if target_type else None, min_confidence=floor, limit=1)
             if not matches:
                 raise HTTPException(status_code=404, detail="No library match for that query")
