@@ -111,9 +111,32 @@ def ensure_populated(session: Session) -> None:
         rebuild_search_index(session)
 
 
-def _fts_phrase(query_lower: str) -> str:
-    """Quote the query as an FTS5 phrase so punctuation isn't parsed as query syntax."""
-    return '"' + query_lower.replace('"', '""') + '"'
+def _trigrams(value: str) -> list[str]:
+    value = value.strip()
+    if len(value) < 3:
+        return []
+    grams: list[str] = []
+    for i in range(len(value) - 2):
+        gram = value[i : i + 3]
+        if gram not in grams:
+            grams.append(gram)
+    return grams
+
+
+def _fts_query(query_lower: str) -> str | None:
+    """Build an OR-of-trigrams FTS5 query.
+
+    A quoted *phrase* would only match substrings, so a typo that breaks the substring
+    (e.g. "coldploy") would retrieve nothing and RapidFuzz would never get to rank it.
+    OR-ing the query's individual trigrams retrieves any name that *shares trigrams*
+    (so "coldploy" still pulls in "coldplay"); RapidFuzz then scores/filters. Each
+    trigram is a quoted phrase so punctuation isn't parsed as FTS5 query syntax.
+    Returns None for queries shorter than a trigram.
+    """
+    grams = _trigrams(query_lower)
+    if not grams:
+        return None
+    return " OR ".join('"' + g.replace('"', '""') + '"' for g in grams)
 
 
 def search_library(
@@ -131,11 +154,12 @@ def search_library(
     q_lower = query.lower()
 
     rows = []
-    if len(q_lower) >= 3:
+    fts_q = _fts_query(q_lower)
+    if fts_q:
         try:
             rows = session.execute(
                 text("SELECT kind, ref_id, artist_id, album_id, display FROM library_fts WHERE name MATCH :q LIMIT 4000"),
-                {"q": _fts_phrase(q_lower)},
+                {"q": fts_q},
             ).all()
         except Exception:
             rows = []
