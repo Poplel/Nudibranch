@@ -5,13 +5,13 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
-from nudibranch.api.deps import get_current_user, require_permission
+from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
     AudioVerifyDetected,
@@ -49,6 +49,10 @@ from nudibranch.api.schemas import (
     ProposalItemOut,
     ProposalRejectRequest,
     ProposalSelectionUpdate,
+    SessionOut,
+    StaticKeyCreate,
+    StaticKeyOut,
+    StaticKeyCreated,
     TaskCreate,
     TaskOut,
     UserCreate,
@@ -66,6 +70,7 @@ from nudibranch.db.models import (
     Album,
     AppSetting,
     Artist,
+    AuthSession,
     MobileDevice,
     Notification,
     NotificationStatus,
@@ -77,6 +82,7 @@ from nudibranch.db.models import (
     ProposalItem,
     ProposalKind,
     ProposalStatus,
+    StaticApiKey,
     Task,
     Track,
     User,
@@ -85,6 +91,7 @@ from nudibranch.db.models import (
 )
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
+from nudibranch.services.auth import generate_token, hash_password, hash_token, token_prefix, verify_password
 from nudibranch.services.imports import discover_import_files, read_audio_metadata
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
@@ -119,17 +126,126 @@ PERMISSION_SECTIONS = {
 }
 
 
-@router.post("/auth/login", response_model=LoginResponse, tags=["auth"], summary="Log in with PIN")
+@router.post("/auth/login", response_model=LoginResponse, tags=["auth"], summary="Log in with username and password")
 def login(payload: LoginRequest, session: Session = Depends(get_session)) -> LoginResponse:
-    pin_hash = hash_secret(payload.pin)
-    user = session.scalar(select(User).where(User.pin_hash == pin_hash))
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid PIN")
-
-    api_key = secrets.token_urlsafe(32)
-    user.api_key_hash = hash_secret(api_key)
+    user = session.scalar(select(User).where(func.lower(User.username) == payload.username.strip().lower()))
+    if not user or not verify_password(payload.password, user.pin_hash):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    token = generate_token()
+    now = datetime.now(timezone.utc)
+    expires = now + SESSION_TTL
+    session.add(AuthSession(
+        user_id=user.id,
+        token_hash=hash_token(token),
+        device_label=(payload.device_label or None),
+        created_at=now,
+        last_used_at=now,
+        expires_at=expires,
+    ))
     session.commit()
-    return LoginResponse(user_id=user.id, display_name=user.display_name, api_key=api_key, is_admin=user.is_admin)
+    return LoginResponse(
+        user_id=user.id,
+        display_name=user.display_name,
+        username=user.username,
+        api_key=token,
+        is_admin=user.is_admin,
+        expires_at=expires,
+    )
+
+
+@router.post("/auth/logout", tags=["auth"], summary="Log out the current session")
+def logout(
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    if authorization and authorization.lower().startswith("bearer "):
+        token_h = hash_token(authorization.split(" ", 1)[1].strip())
+        existing = session.scalar(select(AuthSession).where(AuthSession.token_hash == token_h, AuthSession.user_id == user.id))
+        if existing:
+            session.delete(existing)
+            session.commit()
+    return {"ok": True}
+
+
+@router.get("/me/sessions", response_model=list[SessionOut], tags=["auth"], summary="List my active sessions")
+def list_sessions(
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[SessionOut]:
+    current_hash = None
+    if authorization and authorization.lower().startswith("bearer "):
+        current_hash = hash_token(authorization.split(" ", 1)[1].strip())
+    rows = session.scalars(
+        select(AuthSession).where(AuthSession.user_id == user.id).order_by(AuthSession.last_used_at.desc())
+    )
+    return [
+        SessionOut(
+            id=s.id,
+            device_label=s.device_label,
+            created_at=s.created_at,
+            last_used_at=s.last_used_at,
+            expires_at=s.expires_at,
+            current=(s.token_hash == current_hash),
+        )
+        for s in rows
+    ]
+
+
+@router.delete("/me/sessions/{session_id}", tags=["auth"], summary="Revoke one of my sessions")
+def revoke_session(
+    session_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    existing = session.scalar(select(AuthSession).where(AuthSession.id == session_id, AuthSession.user_id == user.id))
+    if existing:
+        session.delete(existing)
+        session.commit()
+    return {"ok": True}
+
+
+@router.get("/me/api-keys", response_model=list[StaticKeyOut], tags=["auth"], summary="List my static API keys")
+def list_api_keys(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[StaticKeyOut]:
+    rows = session.scalars(
+        select(StaticApiKey).where(StaticApiKey.user_id == user.id).order_by(StaticApiKey.created_at.desc())
+    )
+    return [
+        StaticKeyOut(id=k.id, name=k.name, prefix=k.prefix, created_at=k.created_at, last_used_at=k.last_used_at, revoked=k.revoked)
+        for k in rows
+    ]
+
+
+@router.post("/me/api-keys", response_model=StaticKeyCreated, tags=["auth"], summary="Create a static API key (shown once)")
+def create_api_key(
+    payload: StaticKeyCreate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> StaticKeyCreated:
+    token = generate_token()
+    key = StaticApiKey(user_id=user.id, name=payload.name.strip(), key_hash=hash_token(token), prefix=token_prefix(token))
+    session.add(key)
+    session.commit()
+    return StaticKeyCreated(
+        id=key.id, name=key.name, prefix=key.prefix, created_at=key.created_at, last_used_at=None, revoked=False, api_key=token
+    )
+
+
+@router.delete("/me/api-keys/{key_id}", tags=["auth"], summary="Revoke a static API key")
+def revoke_api_key(
+    key_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    key = session.scalar(select(StaticApiKey).where(StaticApiKey.id == key_id, StaticApiKey.user_id == user.id))
+    if key:
+        key.revoked = True
+        session.commit()
+    return {"ok": True}
 
 
 @router.get("/me", response_model=UserOut, tags=["users"], summary="Get current user")
@@ -160,9 +276,13 @@ def create_user(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.users_manage)),
 ) -> UserOut:
+    username = payload.username.strip().lower()
+    if session.scalar(select(User).where(func.lower(User.username) == username)):
+        raise HTTPException(status_code=409, detail="Username already taken")
     user = User(
         display_name=payload.display_name.strip(),
-        pin_hash=hash_secret(payload.pin),
+        username=username,
+        pin_hash=hash_password(payload.password),
         is_admin=payload.is_admin,
     )
     session.add(user)
@@ -184,6 +304,11 @@ def update_user(
         raise HTTPException(status_code=404, detail="User not found")
     if payload.display_name is not None:
         user.display_name = payload.display_name.strip()
+    if payload.username is not None:
+        new_username = payload.username.strip().lower()
+        if session.scalar(select(User).where(func.lower(User.username) == new_username, User.id != user_id)):
+            raise HTTPException(status_code=409, detail="Username already taken")
+        user.username = new_username
     if payload.is_admin is not None:
         if user.is_admin and not payload.is_admin and count_admins(session) <= 1:
             raise HTTPException(status_code=400, detail="At least one admin user is required")
@@ -204,7 +329,7 @@ def update_user_pin(
     user = session.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-    user.pin_hash = hash_secret(payload.pin)
+    user.pin_hash = hash_password(payload.password)
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -215,7 +340,7 @@ def update_own_pin(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> UserOut:
-    user.pin_hash = hash_secret(payload.pin)
+    user.pin_hash = hash_password(payload.password)
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -2540,6 +2665,7 @@ def serialize_user(user: User) -> UserOut:
     return UserOut(
         id=user.id,
         display_name=user.display_name,
+        username=user.username,
         is_admin=user.is_admin,
         permissions=effective_permission_values(user),
         theme=user.theme if user.theme in {"light", "dark"} else "light",

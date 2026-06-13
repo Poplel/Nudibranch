@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.models import Base, Permission, Task, User, UserPermission
+from nudibranch.services.auth import hash_password, is_bcrypt_hash, slugify_username, wrap_legacy_hash
 from nudibranch.db.session import engine
 from nudibranch.services.app_log import write_app_log
 
@@ -25,7 +26,8 @@ def init_db(session: Session) -> None:
     settings = get_settings()
     admin = User(
         display_name="Admin",
-        pin_hash=hash_secret(settings.first_admin_pin),
+        username="admin",
+        pin_hash=hash_password(settings.first_admin_pin),
         api_key_hash=hash_secret(settings.full_access_api_key),
         is_admin=True,
     )
@@ -68,8 +70,39 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "crossfade_duration" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN crossfade_duration FLOAT NOT NULL DEFAULT 1.0"))
         session.commit()
+    user_cols = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
+    if "username" not in user_cols:
+        session.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(120)"))
+        session.commit()
+    _backfill_usernames(session)
+    _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _backfill_usernames(session: Session) -> None:
+    rows = list(session.execute(text("SELECT id, display_name, is_admin, username FROM users")))
+    taken = {str(r[3]).lower() for r in rows if r[3]}
+    for user_id, display_name, is_admin, username in rows:
+        if username:
+            continue
+        base = "admin" if is_admin else slugify_username(display_name or "user")
+        candidate = base
+        n = 1
+        while candidate.lower() in taken:
+            n += 1
+            candidate = f"{base}{n}"
+        taken.add(candidate.lower())
+        session.execute(text("UPDATE users SET username = :u WHERE id = :id"), {"u": candidate, "id": user_id})
+    session.commit()
+
+
+def _migrate_password_hashes(session: Session) -> None:
+    rows = list(session.execute(text("SELECT id, pin_hash FROM users")))
+    for user_id, pin_hash in rows:
+        if pin_hash and not is_bcrypt_hash(pin_hash):
+            session.execute(text("UPDATE users SET pin_hash = :h WHERE id = :id"), {"h": wrap_legacy_hash(pin_hash), "id": user_id})
+    session.commit()
 
 
 def _migrate_playlists_per_user(session: Session) -> None:

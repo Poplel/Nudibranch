@@ -78,6 +78,7 @@ class User(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    username: Mapped[str | None] = mapped_column(String(120), unique=True, index=True)
     pin_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     api_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
@@ -91,6 +92,8 @@ class User(Base):
     permissions: Mapped[list["UserPermission"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     wishlists: Mapped[list["WishlistItem"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     player_state: Mapped["PlayerState | None"] = relationship(back_populates="user", cascade="all, delete-orphan", uselist=False)
+    auth_sessions: Mapped[list["AuthSession"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    api_keys: Mapped[list["StaticApiKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
 
 
 class UserPermission(Base):
@@ -102,6 +105,35 @@ class UserPermission(Base):
     permission: Mapped[Permission] = mapped_column(Enum(Permission), nullable=False)
 
     user: Mapped[User] = relationship(back_populates="permissions")
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    device_label: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_used_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="auth_sessions")
+
+
+class StaticApiKey(Base):
+    __tablename__ = "static_api_keys"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(255), nullable=False, unique=True, index=True)
+    prefix: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    user: Mapped["User"] = relationship(back_populates="api_keys")
 
 
 class PlayerState(Base):

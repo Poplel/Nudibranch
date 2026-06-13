@@ -340,18 +340,18 @@ function App() {
     return response.json();
   }
 
-  async function login(pin) {
+  async function login(username, password) {
     setLoading(true);
     setError("");
     try {
       const response = await fetch(`${API_BASE}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ username, password, device_label: "Web" }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
-        throw new Error(body.detail || "Invalid PIN");
+        throw new Error(body.detail || "Invalid username or password");
       }
       const data = await response.json();
       localStorage.setItem(TOKEN_KEY, data.api_key);
@@ -576,37 +576,37 @@ function App() {
     }
   }
 
-  async function updateUserPin(userId, pin) {
+  async function updateUserPin(userId, password) {
     setLoading(true);
     try {
       const updated = await api(`/users/${userId}/pin`, {
         method: "POST",
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ password }),
       });
       setUsers((current) => upsertUser(current, updated));
-      setToast({ title: "PIN updated", body: updated.display_name });
+      setToast({ title: "Password updated", body: updated.display_name });
       return updated;
     } catch (userError) {
-      notify("PIN update failed", userError.message, "ui_error");
+      notify("Password update failed", userError.message, "ui_error");
       throw userError;
     } finally {
       setLoading(false);
     }
   }
 
-  async function updateOwnPin(pin) {
+  async function updateOwnPin(password) {
     setLoading(true);
     try {
       const updated = await api("/me/pin", {
         method: "POST",
-        body: JSON.stringify({ pin }),
+        body: JSON.stringify({ password }),
       });
       setUser(updated);
       setUsers((current) => upsertUser(current, updated));
-      setToast({ title: "PIN updated", body: updated.display_name });
+      setToast({ title: "Password updated", body: updated.display_name });
       return updated;
     } catch (userError) {
-      notify("PIN update failed", userError.message, "ui_error");
+      notify("Password update failed", userError.message, "ui_error");
       throw userError;
     } finally {
       setLoading(false);
@@ -1766,7 +1766,8 @@ function App() {
 }
 
 function LoginScreen({ loading, error, onLogin }) {
-  const [pin, setPin] = useState("");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
 
   return (
     <main className="login-page">
@@ -1774,7 +1775,7 @@ function LoginScreen({ loading, error, onLogin }) {
         className="login-panel"
         onSubmit={(event) => {
           event.preventDefault();
-          onLogin(pin);
+          onLogin(username, password);
         }}
       >
         <div className="brand login-brand">
@@ -1782,11 +1783,15 @@ function LoginScreen({ loading, error, onLogin }) {
           <strong>Nudibranch</strong>
         </div>
         <label>
-          PIN
-          <input autoFocus value={pin} onChange={(event) => setPin(event.target.value)} type="password" />
+          Username
+          <input autoFocus value={username} onChange={(event) => setUsername(event.target.value)} />
+        </label>
+        <label>
+          Password
+          <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" />
         </label>
         {error && <div className="error-banner">{error}</div>}
-        <button className="primary" disabled={loading || pin.length < 4}>
+        <button className="primary" disabled={loading || !username.trim() || !password}>
           {loading ? "Signing in" : "Sign in"}
         </button>
       </form>
@@ -4665,7 +4670,7 @@ function CheckFilesResult({ result, onFix }) {
 }
 
 function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
-  const [newUser, setNewUser] = useState({ display_name: "", pin: "", is_admin: false, permissions: [] });
+  const [newUser, setNewUser] = useState({ display_name: "", username: "", password: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
 
@@ -4678,9 +4683,9 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
 
   async function submitNewUser(event) {
     event.preventDefault();
-    if (!newUser.display_name.trim() || newUser.pin.length < 4) return;
+    if (!newUser.display_name.trim() || !newUser.username.trim() || !newUser.password) return;
     await onCreate(newUser);
-    setNewUser({ display_name: "", pin: "", is_admin: false, permissions: [] });
+    setNewUser({ display_name: "", username: "", password: "", is_admin: false, permissions: [] });
   }
 
   return (
@@ -4693,8 +4698,12 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
             <input value={newUser.display_name} onChange={(event) => setNewUser((current) => ({ ...current, display_name: event.target.value }))} />
           </label>
           <label>
-            PIN
-            <input type="password" value={newUser.pin} onChange={(event) => setNewUser((current) => ({ ...current, pin: event.target.value }))} />
+            Username
+            <input value={newUser.username} onChange={(event) => setNewUser((current) => ({ ...current, username: event.target.value }))} />
+          </label>
+          <label>
+            Password
+            <input type="password" value={newUser.password} onChange={(event) => setNewUser((current) => ({ ...current, password: event.target.value }))} />
           </label>
           <label className="inline-check">
             <input type="checkbox" checked={newUser.is_admin} onChange={(event) => setNewUser((current) => ({ ...current, is_admin: event.target.checked }))} />
@@ -4707,7 +4716,7 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
               onToggle={toggleNewPermission}
             />
           )}
-          <button className="primary compact-button" disabled={!newUser.display_name.trim() || newUser.pin.length < 4}>
+          <button className="primary compact-button" disabled={!newUser.display_name.trim() || !newUser.username.trim() || !newUser.password}>
             <Plus size={15} />
             Create user
           </button>
@@ -4722,7 +4731,7 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
             permissionGroups={permissionGroups}
             canManage={canManage}
             onUpdate={onUpdate}
-            onUpdatePin={canManage ? onUpdatePin : (_userId, pin) => onUpdateOwnPin(pin)}
+            onUpdatePin={canManage ? onUpdatePin : (_userId, password) => onUpdateOwnPin(password)}
             jellyfinUsers={jellyfinUsers}
             jellyfinUsersLoading={jellyfinUsersLoading}
             onLoadJellyfinUsers={onLoadJellyfinUsers}
@@ -4752,7 +4761,7 @@ function PlaybackRow({ row }) {
 
 function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onUpdatePin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
   const [draft, setDraft] = useState(() => ({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] }));
-  const [pin, setPin] = useState("");
+  const [password, setPassword] = useState("");
   const changed =
     draft.display_name !== user.display_name ||
     draft.is_admin !== user.is_admin ||
@@ -4760,7 +4769,7 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
 
   useEffect(() => {
     setDraft({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] });
-    setPin("");
+    setPassword("");
   }, [user.id, user.display_name, user.is_admin, stablePermissionKey(user.permissions || [])]);
 
   function togglePermission(value) {
@@ -4777,6 +4786,12 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
           Name
           <input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} disabled={!canManage} />
         </label>
+        {user.username && (
+          <label>
+            Username
+            <input value={user.username} disabled />
+          </label>
+        )}
         {canManage && (
           <label className="inline-check">
             <input
@@ -4835,11 +4850,11 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
       )}
       <div className="pin-reset-row">
         <label>
-          New PIN
-          <input type="password" value={pin} onChange={(event) => setPin(event.target.value)} />
+          New Password
+          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
         </label>
-        <button className="secondary compact" disabled={pin.length < 4} onClick={() => onUpdatePin(user.id, pin).then(() => setPin(""))}>
-          Reset PIN
+        <button className="secondary compact" disabled={!password} onClick={() => onUpdatePin(user.id, password).then(() => setPassword(""))}>
+          Reset Password
         </button>
       </div>
     </section>

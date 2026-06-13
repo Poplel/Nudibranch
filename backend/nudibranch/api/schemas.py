@@ -7,7 +7,9 @@ from nudibranch.db.models import NotificationStatus, ProposalKind, ProposalStatu
 
 
 class LoginRequest(BaseModel):
-    pin: str = Field(min_length=4, max_length=32)
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=4, max_length=128)
+    device_label: str | None = None
 
 
 class LoginResponse(BaseModel):
@@ -15,11 +17,14 @@ class LoginResponse(BaseModel):
     display_name: str
     api_key: str
     is_admin: bool
+    username: str | None = None
+    expires_at: datetime
 
 
 class UserOut(BaseModel):
     id: str
     display_name: str
+    username: str | None = None
     is_admin: bool
     permissions: list[str]
     theme: str = "light"
@@ -37,19 +42,21 @@ class PermissionOut(BaseModel):
 
 class UserCreate(BaseModel):
     display_name: str = Field(min_length=1, max_length=120)
-    pin: str = Field(min_length=4, max_length=32)
+    username: str = Field(min_length=1, max_length=120)
+    password: str = Field(min_length=4, max_length=128)
     is_admin: bool = False
     permissions: list[str] = Field(default_factory=list)
 
 
 class UserUpdate(BaseModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    username: str | None = None
     is_admin: bool | None = None
     permissions: list[str] | None = None
 
 
 class UserPinUpdate(BaseModel):
-    pin: str = Field(min_length=4, max_length=32)
+    password: str = Field(min_length=4, max_length=128)
 
 
 class UserAppearanceUpdate(BaseModel):
@@ -349,3 +356,29 @@ class AudioVerifyResult(BaseModel):
     claimed: dict[str, Any]
     detected: list[AudioVerifyDetected]
     duration_seconds: int | None = None
+
+
+class SessionOut(BaseModel):
+    id: str
+    device_label: str | None = None
+    created_at: datetime
+    last_used_at: datetime
+    expires_at: datetime
+    current: bool = False
+
+
+class StaticKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
+class StaticKeyOut(BaseModel):
+    id: str
+    name: str
+    prefix: str
+    created_at: datetime
+    last_used_at: datetime | None = None
+    revoked: bool = False
+
+
+class StaticKeyCreated(StaticKeyOut):
+    api_key: str
