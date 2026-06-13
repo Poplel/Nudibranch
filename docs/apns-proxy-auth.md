@@ -81,12 +81,14 @@ Important for not over-engineering:
 - To reach a specific device, the attacker needs that device's **APNS token**, which is
   registered to a Nudibranch instance via `POST /notifications/devices`. Tokens are not
   public.
-- So realistic abuse is narrow: (a) free push infrastructure on the project's APNS
-  credentials, (b) spam/phishing to Nudibranch users **whose tokens leaked**, (c) cost /
-  reputation load on the project-run proxy.
+- With the §4 per-pairing grant, **even knowing the token is not enough** — a server can
+  only push to devices that authorized *it* (granted to its `instance_id`). So realistic
+  abuse collapses to: a server the user *did* pair sends unwanted pushes (already in the
+  user's trust boundary; revoke = unpair), plus generic cost/reputation load on the proxy.
 
-The worst case is **not** "push to anyone." It is "spam users whose device tokens you
-already have." The design should be proportionate to that.
+The worst case is **not** "push to anyone," and not even "push to anyone whose token you
+know" — it is "a server you deliberately added behaves badly." The design should be
+proportionate to that.
 
 ---
 
@@ -103,18 +105,36 @@ Adopt the OpenClaw model, adapted to Nudibranch's topology
   mints and verifies send-grants.
 
 ### Flow
+
+> **The grant is scoped to a `(device, server)` pairing — not just a device token.** App
+> Attest only proves the *app* is genuine; it does not say *which server* may push to a
+> device. If a grant were device-only, any server that learned the token could push. The
+> per-pairing scope is what makes "only servers I added can notify me" actually true.
+
 1. **Attested registration (app → proxy).** On a real device, the app performs App Attest
    with the proxy and includes its StoreKit app-transaction JWS. The proxy validates
    bundle ID + App Attest + production-distribution proof, then stores the raw APNS token
-   and returns an opaque **send-grant**: proxy-signed, **scoped to that one device token**,
-   short-lived/renewable, revocable.
-2. **Pairing (app → server).** The app hands the opaque grant to whichever Nudibranch
-   server the user logs into, over the existing authenticated channel
-   (`POST /notifications/devices`, extended to carry the grant instead of a raw token).
-3. **Push (server → proxy).** To notify, the server presents the grant. The proxy
-   validates **its own signature** on the grant and delivers only to the token bound
-   inside it. The self-hosted server never needs a shared secret and (optionally) never
-   handles the raw token.
+   bound to this attested device identity. No server is involved yet.
+2. **Pairing (app authorizes a server, per server).** When the user adds a server in the
+   app (URL + login), the server hands the app its **stable server identity** —
+   Nudibranch already mints one: `instance_id` via `_get_or_create_instance_id`
+   (`notifications.py`). The app tells the **proxy** "authorize `instance_id=X` to push to
+   *my* device," and the proxy records a **send-grant scoped to `(this device token, X)`**,
+   short-lived/renewable, revocable, and returns it for the app to hand to server X (over
+   the existing authenticated `POST /notifications/devices`, extended to carry the grant).
+3. **Push (server → proxy).** Server X presents its grant. The proxy verifies the grant is
+   valid for *(that exact device, X)* and not revoked, then delivers — and **tags the push
+   with X's `instance_id` and the friendly label the user saved at pairing**, so the app
+   knows the source. The app keeps its own paired-server list and ignores pushes from a
+   server not on it (defense in depth).
+
+**Stolen-grant resistance (recommended, OpenClaw-style):** give each server a keypair tied
+to its `instance_id`, registered with the proxy at pairing; the server **signs** every push
+and the proxy verifies against that key. A leaked grant is then useless without the server's
+private key.
+
+**Multi-server falls out for free:** one grant per pairing, each notification attributed by
+server, and unpairing a server just revokes that one grant — no effect on the others.
 
 ### Why this meets all three goals genuinely
 - **Out of the box** — no Apple Developer account, no manual secret provisioning. Install
