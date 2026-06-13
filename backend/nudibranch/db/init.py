@@ -70,6 +70,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "crossfade_duration" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN crossfade_duration FLOAT NOT NULL DEFAULT 1.0"))
         session.commit()
+    user_cols2 = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
+    if "search_min_confidence" not in user_cols2:
+        session.execute(text("ALTER TABLE users ADD COLUMN search_min_confidence FLOAT NOT NULL DEFAULT 0.4"))
+        session.commit()
     user_cols = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
     if "username" not in user_cols:
         session.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(120)"))

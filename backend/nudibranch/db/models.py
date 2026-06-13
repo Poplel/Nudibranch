@@ -86,6 +86,7 @@ class User(Base):
     accent_color: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
     background_tint: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
     crossfade_duration: Mapped[float] = mapped_column(default=0.5, nullable=False)
+    search_min_confidence: Mapped[float] = mapped_column(default=0.4, nullable=False)
     jellyfin_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 

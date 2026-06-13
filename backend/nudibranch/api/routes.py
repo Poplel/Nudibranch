@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import case, func, literal, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission
@@ -17,6 +17,7 @@ from nudibranch.api.schemas import (
     AudioVerifyDetected,
     AudioVerifyResult,
     BackupRestoreRequest,
+    BucketCount,
     CheckFileFixRequest,
     DeviceRegistration,
     DiscoverTaskQueueRequest,
@@ -25,8 +26,11 @@ from nudibranch.api.schemas import (
     IntegrationSettings,
     ImportScanRequest,
     JellyfinUserOut,
+    LibraryArtistRow,
+    LibraryAlbumRow,
     LibraryMetadataProposalRequest,
     LibraryRemoveProposalRequest,
+    LibraryTrackRow,
     LibraryTreeAlbum,
     LibraryTreeArtist,
     LibraryTreeTrack,
@@ -34,6 +38,9 @@ from nudibranch.api.schemas import (
     LoginRequest,
     LoginResponse,
     NotificationOut,
+    PaginatedAlbums,
+    PaginatedArtists,
+    PaginatedTracks,
     PlaylistAddTracks,
     PlaylistCreate,
     PlaylistPositionProposalRequest,
@@ -60,6 +67,7 @@ from nudibranch.api.schemas import (
     JellyfinUserLinkUpdate,
     UserOut,
     UserPinUpdate,
+    UserSearchSettingsUpdate,
     UserUpdate,
     WishlistApprovalRequest,
     WishlistCreate,
@@ -424,6 +432,43 @@ def users_playback(
     }
 
 
+def _bucket_first_char(sort_expr):
+    return func.substr(func.trim(sort_expr), 1, 1)
+
+
+def _bucket_condition(sort_expr, bucket: str):
+    """SQL filter for a first-character bucket; None means no filter (all)."""
+    if not bucket or bucket == "all":
+        return None
+    first = _bucket_first_char(sort_expr)
+    if bucket == "0-9":
+        return first.op("GLOB")("[0-9]")
+    if bucket == "symbol":
+        return first.op("NOT GLOB")("[A-Za-z0-9]")
+    return func.upper(first) == bucket[:1].upper()
+
+
+def _bucket_label(sort_expr):
+    first = _bucket_first_char(sort_expr)
+    return case(
+        (first.op("GLOB")("[0-9]"), literal("0-9")),
+        (func.upper(first).op("GLOB")("[A-Z]"), func.upper(first)),
+        else_=literal("symbol"),
+    )
+
+
+def _bucket_sort_key(bucket: str):
+    if bucket == "symbol":
+        return (0, "")
+    if bucket == "0-9":
+        return (1, "")
+    return (2, bucket)
+
+
+def _artist_sort_expr():
+    return func.coalesce(func.nullif(func.trim(Artist.sort_name), ""), Artist.name)
+
+
 @router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"], summary="Get library tree")
 def library_tree(
     session: Session = Depends(get_session),
@@ -475,6 +520,141 @@ def library_tree(
         )
         for artist in artists
     ]
+
+
+@router.get("/library/artists", response_model=PaginatedArtists, tags=["library"], summary="Paginated artists by bucket")
+def library_artists(
+    bucket: str = Query("all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    q: str | None = Query(None),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> PaginatedArtists:
+    sort_expr = _artist_sort_expr()
+    stmt = select(Artist)
+    cond = _bucket_condition(sort_expr, bucket)
+    if cond is not None:
+        stmt = stmt.where(cond)
+    if q:
+        stmt = stmt.where(Artist.name.ilike(f"%{q.strip()}%"))
+    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = session.scalars(
+        stmt.order_by(sort_expr, Artist.name).offset((page - 1) * page_size).limit(page_size).options(selectinload(Artist.albums))
+    )
+    items = [LibraryArtistRow(id=a.id, name=a.name, sort_name=a.sort_name, album_count=len(a.albums)) for a in rows]
+    return PaginatedArtists(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/library/albums", response_model=PaginatedAlbums, tags=["library"], summary="Paginated albums by bucket")
+def library_albums(
+    bucket: str = Query("all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    artist_id: str | None = Query(None),
+    q: str | None = Query(None),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> PaginatedAlbums:
+    stmt = select(Album)
+    if artist_id:
+        stmt = stmt.where(Album.artist_id == artist_id)
+    cond = _bucket_condition(Album.title, bucket)
+    if cond is not None:
+        stmt = stmt.where(cond)
+    if q:
+        stmt = stmt.where(Album.title.ilike(f"%{q.strip()}%"))
+    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = session.scalars(
+        stmt.order_by(func.lower(Album.title)).offset((page - 1) * page_size).limit(page_size)
+        .options(selectinload(Album.artist), selectinload(Album.tracks))
+    )
+    items = [
+        LibraryAlbumRow(
+            id=al.id, title=al.title, artist_id=al.artist_id,
+            artist_name=(al.artist.name if al.artist else ""),
+            cover_path=al.cover_path, track_count=len(al.tracks),
+        )
+        for al in rows
+    ]
+    return PaginatedAlbums(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/library/tracks", response_model=PaginatedTracks, tags=["library"], summary="Paginated tracks by bucket")
+def library_tracks(
+    bucket: str = Query("all"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+    album_id: str | None = Query(None),
+    q: str | None = Query(None),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> PaginatedTracks:
+    stmt = select(Track)
+    if album_id:
+        stmt = stmt.where(Track.album_id == album_id)
+    cond = _bucket_condition(Track.title, bucket)
+    if cond is not None:
+        stmt = stmt.where(cond)
+    if q:
+        stmt = stmt.where(Track.title.ilike(f"%{q.strip()}%"))
+    total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    stmt = stmt.options(selectinload(Track.album).selectinload(Album.artist))
+    if album_id:
+        ordered = stmt.order_by(Track.disc_number, Track.track_number)
+    else:
+        ordered = stmt.order_by(func.lower(Track.title))
+    rows = session.scalars(ordered.offset((page - 1) * page_size).limit(page_size))
+    items = [
+        LibraryTrackRow(
+            id=t.id, title=t.title, album_id=t.album_id,
+            album_title=(t.album.title if t.album else ""),
+            artist_id=(t.album.artist_id if t.album else ""),
+            artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
+            track_number=t.track_number, disc_number=t.disc_number,
+            duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
+        )
+        for t in rows
+    ]
+    return PaginatedTracks(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get("/library/buckets", response_model=list[BucketCount], tags=["library"], summary="Non-empty buckets + counts")
+def library_buckets(
+    type: str = Query("artists"),
+    artist_id: str | None = Query(None),
+    album_id: str | None = Query(None),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> list[BucketCount]:
+    if type == "albums":
+        sort_expr = Album.title
+        base = select(_bucket_label(sort_expr).label("bucket"), func.count().label("n")).select_from(Album)
+        if artist_id:
+            base = base.where(Album.artist_id == artist_id)
+    elif type == "tracks":
+        sort_expr = Track.title
+        base = select(_bucket_label(sort_expr).label("bucket"), func.count().label("n")).select_from(Track)
+        if album_id:
+            base = base.where(Track.album_id == album_id)
+    else:
+        sort_expr = _artist_sort_expr()
+        base = select(_bucket_label(sort_expr).label("bucket"), func.count().label("n")).select_from(Artist)
+    rows = session.execute(base.group_by("bucket")).all()
+    counts = [BucketCount(bucket=r[0], count=r[1]) for r in rows]
+    counts.sort(key=lambda c: _bucket_sort_key(c.bucket))
+    return counts
+
+
+@router.put("/me/search-settings", response_model=UserOut, tags=["users"], summary="Update my search confidence threshold")
+def update_search_settings(
+    payload: UserSearchSettingsUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> UserOut:
+    user.search_min_confidence = payload.min_confidence
+    session.commit()
+    return serialize_user(load_user(session, user.id))
 
 
 @router.post("/library/metadata", response_model=ProposalBatchOut, tags=["library"], summary="Propose metadata edit")
@@ -2672,6 +2852,7 @@ def serialize_user(user: User) -> UserOut:
         accent_color=user.accent_color or "#356df3",
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
+        search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         jellyfin_user_id=user.jellyfin_user_id or None,
     )
 

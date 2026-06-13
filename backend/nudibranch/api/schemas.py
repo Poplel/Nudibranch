@@ -31,6 +31,7 @@ class UserOut(BaseModel):
     accent_color: str = "#356df3"
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
+    search_min_confidence: float = 0.4
     jellyfin_user_id: str | None = None
 
 
@@ -356,6 +357,66 @@ class AudioVerifyResult(BaseModel):
     claimed: dict[str, Any]
     detected: list[AudioVerifyDetected]
     duration_seconds: int | None = None
+
+
+class LibraryArtistRow(BaseModel):
+    id: str
+    name: str
+    sort_name: str | None = None
+    album_count: int = 0
+
+
+class LibraryAlbumRow(BaseModel):
+    id: str
+    title: str
+    artist_id: str
+    artist_name: str
+    cover_path: str | None = None
+    track_count: int = 0
+
+
+class LibraryTrackRow(BaseModel):
+    id: str
+    title: str
+    album_id: str
+    album_title: str
+    artist_id: str
+    artist_name: str
+    track_number: int | None = None
+    disc_number: int | None = None
+    duration_ms: int | None = None
+    format: str | None = None
+    is_lossless: bool = False
+
+
+class PaginatedArtists(BaseModel):
+    items: list[LibraryArtistRow] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 100
+
+
+class PaginatedAlbums(BaseModel):
+    items: list[LibraryAlbumRow] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 100
+
+
+class PaginatedTracks(BaseModel):
+    items: list[LibraryTrackRow] = Field(default_factory=list)
+    total: int = 0
+    page: int = 1
+    page_size: int = 100
+
+
+class BucketCount(BaseModel):
+    bucket: str
+    count: int
+
+
+class UserSearchSettingsUpdate(BaseModel):
+    min_confidence: float = Field(ge=0.0, le=1.0)
 
 
 class SessionOut(BaseModel):
