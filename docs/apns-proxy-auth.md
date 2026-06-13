@@ -6,6 +6,15 @@ iOS app (see `docs/ios-app.md`; iOS app itself is deferred/user-built per the pr
 **Goal (user's words):** "fully prevent this from being exploitable and ensure it can
 only be used by Nudibranch and works out of the box for any new users."
 
+**Confirmed deployment model:** the project owner has an Apple Developer account and will
+**host the central APNS proxy** and publish the single iOS app. Self-hosters do **not** need
+their own Apple account — their Nudibranch servers relay notifications through the hosted
+proxy. This is decisive: the proxy is exposed to **arbitrary, untrusted self-hosted servers**,
+so the server cannot be the trust anchor and App Attest (§4) is load-bearing, not optional.
+One published app means App Attest validates the *app* (not each server), so every
+self-hoster's notifications work out of the box. "Self-hosters use direct mode with their own
+`.p8`" is **not** the intended path.
+
 ---
 
 ## 1. The current design and why it is not enough
@@ -129,10 +138,11 @@ If proxy mode must go live before App Attest exists, stop treating the secret as
 and harden the proxy's *actual* boundary instead. None of this is a substitute for §4 —
 it just lowers the floor.
 
-- **Get the secret out of the public repo.** Inject it into the official proxy + official
-  deployment image only (env var / build-time). Self-hosters default to **direct mode**
-  (their own `.p8`, the `_deliver_direct` path) or run their own proxy. Removes the
-  published-secret footgun.
+- **Get the secret out of the public repo.** Inject it into the hosted proxy + official
+  deployment image only (env var / build-time). Removes the published-secret footgun. (Direct
+  mode / `_deliver_direct` remains as a fallback for anyone who wants to run their own proxy,
+  but per the confirmed model the default self-hoster path is relaying through the hosted
+  proxy — not bringing their own Apple account.)
 - **Real replay protection.** The proxy must **persist `nonce`** and reject reuse, and
   reject `timestamp` outside a tight window (a few minutes). Today the nonce is decorative
   unless the proxy stores it.
