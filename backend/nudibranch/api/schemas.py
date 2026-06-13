@@ -81,6 +81,8 @@ class PlayerStateUpdate(BaseModel):
     current_index: int = 0
     position_seconds: int | None = None
     duration_seconds: int | None = None
+    shuffle: bool = False
+    repeat: str = "off"
 
 
 class LibraryTreeTrack(BaseModel):
@@ -458,3 +460,26 @@ class SearchResponse(BaseModel):
     query: str
     min_confidence: float
     results: list[SearchResultItem] = Field(default_factory=list)
+
+
+class PlayerCommandCreate(BaseModel):
+    action: str = "play"
+    target_type: str | None = None
+    target_id: str | None = None
+    target_query: str | None = None
+    loop: str = "off"
+    shuffle: bool = False
+    device_id: str | None = None
+
+
+class PlayerCommandOut(BaseModel):
+    id: str
+    action: str
+    target_type: str | None = None
+    target_id: str | None = None
+    target_label: str | None = None
+    loop: str = "off"
+    shuffle: bool = False
+    status: str
+    device_id: str | None = None
+    created_at: datetime

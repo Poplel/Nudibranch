@@ -8,7 +8,7 @@ from pathlib import Path
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 import httpx
-from sqlalchemy import case, func, literal, select
+from sqlalchemy import case, func, literal, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission
@@ -44,6 +44,8 @@ from nudibranch.api.schemas import (
     PlaylistAddTracks,
     PlaylistCreate,
     PlaylistPositionProposalRequest,
+    PlayerCommandCreate,
+    PlayerCommandOut,
     PlayerStateUpdate,
     PlaylistTrackOut,
     PlaylistImportRequest,
@@ -83,6 +85,7 @@ from nudibranch.db.models import (
     AuthSession,
     MobileDevice,
     Notification,
+    PlaybackCommand,
     NotificationStatus,
     Permission,
     Playlist,
@@ -418,8 +421,97 @@ def update_player_status(
     state.current_index = max(0, payload.current_index)
     state.position_seconds = payload.position_seconds
     state.duration_seconds = payload.duration_seconds
+    state.shuffle = bool(payload.shuffle)
+    state.repeat = payload.repeat if payload.repeat in {"off", "one", "all"} else "off"
     state.updated_at = datetime.now(timezone.utc)
     session.commit()
+    return {"ok": True}
+
+
+@router.post("/player/commands", response_model=PlayerCommandOut, tags=["users"], summary="Queue a remote playback command")
+def create_player_command(
+    payload: PlayerCommandCreate,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> PlayerCommandOut:
+    action = (payload.action or "play").strip().lower()
+    target_type = payload.target_type
+    target_id = payload.target_id
+    target_label = None
+    if action == "play" and not target_id and payload.target_query:
+        q = payload.target_query.strip()
+        if target_type == "playlist":
+            playlist = session.scalar(
+                select(Playlist).where(Playlist.name.ilike(q), or_(Playlist.user_id == user.id, Playlist.user_id.is_(None)))
+            )
+            if not playlist:
+                raise HTTPException(status_code=404, detail="No playlist matches that name")
+            target_id, target_label = playlist.id, playlist.name
+        else:
+            matches = search_library(session, q, kinds=[target_type] if target_type else None, min_confidence=0.0, limit=1)
+            if not matches:
+                raise HTTPException(status_code=404, detail="No library match for that query")
+            top = matches[0]
+            target_type, target_id, target_label = top["kind"], top["id"], top["name"]
+    if target_id and not target_label:
+        target_label = _resolve_target_label(session, target_type, target_id)
+    command = PlaybackCommand(
+        user_id=user.id,
+        device_id=payload.device_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        target_label=target_label,
+        loop=payload.loop if payload.loop in {"off", "one", "all"} else "off",
+        shuffle=bool(payload.shuffle),
+        status="pending",
+    )
+    session.add(command)
+    session.commit()
+    session.refresh(command)
+    try:
+        body = f"Play {target_label}" if action == "play" and target_label else action.capitalize()
+        create_notification(
+            session,
+            title="Remote playback",
+            body=body,
+            event_type="remote_playback_command",
+            target_url="/player",
+            user_id=user.id,
+            deliver_apns=True,
+        )
+    except Exception:
+        pass
+    return _serialize_command(command)
+
+
+@router.get("/player/commands", response_model=list[PlayerCommandOut], tags=["users"], summary="Fetch my pending playback commands")
+def list_player_commands(
+    device_id: str | None = Query(None),
+    include_consumed: bool = Query(False),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[PlayerCommandOut]:
+    stmt = select(PlaybackCommand).where(PlaybackCommand.user_id == user.id)
+    if not include_consumed:
+        stmt = stmt.where(PlaybackCommand.status == "pending")
+    if device_id:
+        stmt = stmt.where(or_(PlaybackCommand.device_id.is_(None), PlaybackCommand.device_id == device_id))
+    rows = session.scalars(stmt.order_by(PlaybackCommand.created_at.asc()))
+    return [_serialize_command(c) for c in rows]
+
+
+@router.post("/player/commands/{command_id}/ack", tags=["users"], summary="Mark a playback command consumed")
+def ack_player_command(
+    command_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    command = session.scalar(select(PlaybackCommand).where(PlaybackCommand.id == command_id, PlaybackCommand.user_id == user.id))
+    if command:
+        command.status = "consumed"
+        command.consumed_at = datetime.now(timezone.utc)
+        session.commit()
     return {"ok": True}
 
 
@@ -2906,8 +2998,36 @@ def serialize_player_state(user: User) -> dict:
         "current_index": state.current_index,
         "position_seconds": state.position_seconds,
         "duration_seconds": state.duration_seconds,
+        "shuffle": state.shuffle,
+        "repeat": state.repeat,
         "updated_at": updated_at.isoformat() if updated_at else None,
     }
+
+
+def _resolve_target_label(session: Session, target_type: str | None, target_id: str | None) -> str | None:
+    if not target_id:
+        return None
+    if target_type == "track":
+        obj = session.get(Track, target_id)
+        return obj.title if obj else None
+    if target_type == "album":
+        obj = session.get(Album, target_id)
+        return obj.title if obj else None
+    if target_type == "artist":
+        obj = session.get(Artist, target_id)
+        return obj.name if obj else None
+    if target_type == "playlist":
+        obj = session.get(Playlist, target_id)
+        return obj.name if obj else None
+    return None
+
+
+def _serialize_command(cmd: PlaybackCommand) -> PlayerCommandOut:
+    return PlayerCommandOut(
+        id=cmd.id, action=cmd.action, target_type=cmd.target_type, target_id=cmd.target_id,
+        target_label=cmd.target_label, loop=cmd.loop, shuffle=cmd.shuffle, status=cmd.status,
+        device_id=cmd.device_id, created_at=cmd.created_at,
+    )
 
 
 def jellyfin_now_playing(session: Session) -> list[dict]:

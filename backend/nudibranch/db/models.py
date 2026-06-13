@@ -150,6 +150,8 @@ class PlayerState(Base):
     current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     position_seconds: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     user: Mapped[User] = relationship(back_populates="player_state")
@@ -340,3 +342,20 @@ class MobileDevice(Base):
     apns_token: Mapped[str] = mapped_column(Text, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class PlaybackCommand(Base):
+    __tablename__ = "playback_commands"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    device_id: Mapped[str | None] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16), nullable=False, default="play")
+    target_type: Mapped[str | None] = mapped_column(String(16))
+    target_id: Mapped[str | None] = mapped_column(String(64))
+    target_label: Mapped[str | None] = mapped_column(String(255))
+    loop: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
+    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

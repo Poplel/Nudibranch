@@ -88,6 +88,13 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "username" not in user_cols:
         session.execute(text("ALTER TABLE users ADD COLUMN username VARCHAR(120)"))
         session.commit()
+    pstate_cols = {row[1] for row in session.execute(text("PRAGMA table_info(player_states)"))}
+    if "shuffle" not in pstate_cols:
+        session.execute(text("ALTER TABLE player_states ADD COLUMN shuffle BOOLEAN NOT NULL DEFAULT 0"))
+        session.commit()
+    if "repeat" not in pstate_cols:
+        session.execute(text("ALTER TABLE player_states ADD COLUMN repeat VARCHAR(8) NOT NULL DEFAULT 'off'"))
+        session.commit()
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
