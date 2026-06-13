@@ -39,6 +39,7 @@ QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 MAX_TASK_ATTEMPTS = 4
+AUTOMATION_TICK_SECONDS = 30
 
 
 
@@ -7224,6 +7225,7 @@ async def worker_loop() -> None:
     last_download_scan = 0.0
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
+    last_automation_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -7252,6 +7254,14 @@ async def worker_loop() -> None:
                         session.rollback()
                         create_notification(session, title="Download scan failed", body=str(error), event_type="task_failed", target_url="/activity")
                     last_download_scan = time.time()
+                if time.time() - last_automation_tick > AUTOMATION_TICK_SECONDS:
+                    try:
+                        from nudibranch.services.automations import run_due_automations
+
+                        run_due_automations(session)
+                    except Exception:  # noqa: BLE001 - scheduler must never stop the worker.
+                        session.rollback()
+                    last_automation_tick = time.time()
                 try:
                     await deliver_apns_notifications(session)
                 except Exception:  # noqa: BLE001

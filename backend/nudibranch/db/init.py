@@ -26,7 +26,7 @@ def init_db(session: Session) -> None:
     except Exception as exc:  # search index is non-critical; never block startup
         session.rollback()
         try:
-            write_app_log(session, "warning", f"Search index init failed: {exc}")
+            write_app_log(f"Search index init failed: {exc}", "warning")
         except Exception:
             pass
     existing_admin = session.scalar(select(User).where(User.is_admin.is_(True)))

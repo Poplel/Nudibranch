@@ -14,6 +14,9 @@ from sqlalchemy.orm import Session, selectinload
 from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
+    AutomationCreate,
+    AutomationOut,
+    AutomationUpdate,
     AudioVerifyDetected,
     AudioVerifyResult,
     BackupRestoreRequest,
@@ -82,6 +85,7 @@ from nudibranch.db.models import (
     Album,
     AppSetting,
     Artist,
+    Automation,
     AuthSession,
     MobileDevice,
     Notification,
@@ -116,6 +120,7 @@ from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
+from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
 
 router = APIRouter(prefix="/api/v1")
 
@@ -516,6 +521,156 @@ def ack_player_command(
         command.consumed_at = datetime.now(timezone.utc)
         session.commit()
     return {"ok": True}
+
+
+def _serialize_automation(automation: Automation) -> AutomationOut:
+    def _loads(value: str | None) -> dict:
+        try:
+            return json.loads(value or "{}")
+        except json.JSONDecodeError:
+            return {}
+    return AutomationOut(
+        id=automation.id,
+        name=automation.name,
+        enabled=automation.enabled,
+        trigger_type=automation.trigger_type,
+        trigger_config=_loads(automation.trigger_config),
+        action_type=automation.action_type,
+        action_config=_loads(automation.action_config),
+        notify_mode=automation.notify_mode,
+        notify_priority=automation.notify_priority,
+        webhook_token=automation.webhook_token,
+        webhook_url=f"/api/v1/automations/hooks/{automation.webhook_token}" if automation.webhook_token else None,
+        last_run_at=automation.last_run_at,
+        last_status=automation.last_status,
+        last_error=automation.last_error,
+        next_run_at=automation.next_run_at,
+        created_at=automation.created_at,
+    )
+
+
+@router.get("/automations", response_model=list[AutomationOut], tags=["automations"], summary="List my automations")
+def list_automations(
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> list[AutomationOut]:
+    rows = session.scalars(select(Automation).where(Automation.owner_id == user.id).order_by(Automation.created_at.desc()))
+    return [_serialize_automation(a) for a in rows]
+
+
+@router.post("/automations", response_model=AutomationOut, tags=["automations"], summary="Create an automation")
+def create_automation(
+    payload: AutomationCreate,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> AutomationOut:
+    if payload.trigger_type not in TRIGGER_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid trigger_type")
+    if payload.action_type not in ACTION_TYPES:
+        raise HTTPException(status_code=400, detail="Invalid action_type")
+    automation = Automation(
+        owner_id=user.id,
+        name=payload.name.strip(),
+        enabled=payload.enabled,
+        trigger_type=payload.trigger_type,
+        trigger_config=json.dumps(payload.trigger_config or {}),
+        action_type=payload.action_type,
+        action_config=json.dumps(payload.action_config or {}),
+        notify_mode=payload.notify_mode if payload.notify_mode in NOTIFY_MODES else "log",
+        notify_priority=payload.notify_priority if payload.notify_priority in NOTIFY_PRIORITIES else "normal",
+        webhook_token=secrets.token_urlsafe(24),
+    )
+    automation.next_run_at = compute_next_run(automation.trigger_type, payload.trigger_config or {})
+    session.add(automation)
+    session.commit()
+    session.refresh(automation)
+    return _serialize_automation(automation)
+
+
+@router.get("/automations/{automation_id}", response_model=AutomationOut, tags=["automations"], summary="Get an automation")
+def get_automation(
+    automation_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> AutomationOut:
+    automation = session.scalar(select(Automation).where(Automation.id == automation_id, Automation.owner_id == user.id))
+    if not automation:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    return _serialize_automation(automation)
+
+
+@router.patch("/automations/{automation_id}", response_model=AutomationOut, tags=["automations"], summary="Update an automation")
+def update_automation(
+    automation_id: str,
+    payload: AutomationUpdate,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> AutomationOut:
+    automation = session.scalar(select(Automation).where(Automation.id == automation_id, Automation.owner_id == user.id))
+    if not automation:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    if payload.name is not None:
+        automation.name = payload.name.strip()
+    if payload.enabled is not None:
+        automation.enabled = payload.enabled
+    if payload.trigger_type is not None:
+        if payload.trigger_type not in TRIGGER_TYPES:
+            raise HTTPException(status_code=400, detail="Invalid trigger_type")
+        automation.trigger_type = payload.trigger_type
+    if payload.trigger_config is not None:
+        automation.trigger_config = json.dumps(payload.trigger_config)
+    if payload.action_type is not None:
+        if payload.action_type not in ACTION_TYPES:
+            raise HTTPException(status_code=400, detail="Invalid action_type")
+        automation.action_type = payload.action_type
+    if payload.action_config is not None:
+        automation.action_config = json.dumps(payload.action_config)
+    if payload.notify_mode is not None and payload.notify_mode in NOTIFY_MODES:
+        automation.notify_mode = payload.notify_mode
+    if payload.notify_priority is not None and payload.notify_priority in NOTIFY_PRIORITIES:
+        automation.notify_priority = payload.notify_priority
+    try:
+        automation.next_run_at = compute_next_run(automation.trigger_type, json.loads(automation.trigger_config or "{}"))
+    except json.JSONDecodeError:
+        automation.next_run_at = None
+    session.commit()
+    session.refresh(automation)
+    return _serialize_automation(automation)
+
+
+@router.delete("/automations/{automation_id}", tags=["automations"], summary="Delete an automation")
+def delete_automation(
+    automation_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> dict:
+    automation = session.scalar(select(Automation).where(Automation.id == automation_id, Automation.owner_id == user.id))
+    if automation:
+        session.delete(automation)
+        session.commit()
+    return {"ok": True}
+
+
+@router.post("/automations/{automation_id}/run", tags=["automations"], summary="Run an automation now")
+def run_automation_now(
+    automation_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.automations_manage)),
+) -> dict:
+    automation = session.scalar(select(Automation).where(Automation.id == automation_id, Automation.owner_id == user.id))
+    if not automation:
+        raise HTTPException(status_code=404, detail="Automation not found")
+    status, message = run_automation(session, automation, trigger_source="manual")
+    return {"status": status, "message": message}
+
+
+@router.post("/automations/hooks/{token}", tags=["automations"], summary="Webhook trigger (IFTTT) — token is the auth")
+def automation_webhook(token: str, session: Session = Depends(get_session)) -> dict:
+    automation = session.scalar(select(Automation).where(Automation.webhook_token == token))
+    if not automation or not automation.enabled:
+        raise HTTPException(status_code=404, detail="Unknown or disabled automation")
+    status, message = run_automation(session, automation, trigger_source="webhook")
+    return {"status": status, "message": message}
 
 
 @router.get("/users/playback", tags=["users"], summary="Get all users' playback state", response_model=dict)

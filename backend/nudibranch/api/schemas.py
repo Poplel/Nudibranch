@@ -482,4 +482,45 @@ class PlayerCommandOut(BaseModel):
     shuffle: bool = False
     status: str
     device_id: str | None = None
+
+
+class AutomationCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    enabled: bool = True
+    trigger_type: str
+    trigger_config: dict = Field(default_factory=dict)
+    action_type: str
+    action_config: dict = Field(default_factory=dict)
+    notify_mode: str = "log"
+    notify_priority: str = "normal"
+
+
+class AutomationUpdate(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+    trigger_type: str | None = None
+    trigger_config: dict | None = None
+    action_type: str | None = None
+    action_config: dict | None = None
+    notify_mode: str | None = None
+    notify_priority: str | None = None
+
+
+class AutomationOut(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    trigger_type: str
+    trigger_config: dict = Field(default_factory=dict)
+    action_type: str
+    action_config: dict = Field(default_factory=dict)
+    notify_mode: str
+    notify_priority: str
+    webhook_token: str | None = None
+    webhook_url: str | None = None
+    last_run_at: datetime | None = None
+    last_status: str | None = None
+    last_error: str | None = None
+    next_run_at: datetime | None = None
+    created_at: datetime
     created_at: datetime

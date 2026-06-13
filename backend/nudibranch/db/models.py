@@ -35,6 +35,7 @@ class Permission(str, enum.Enum):
     users_manage = "users:manage"
     backups_manage = "backups:manage"
     jellyfin_manage = "jellyfin:manage"
+    automations_manage = "automations:manage"
 
 
 class ProposalKind(str, enum.Enum):
@@ -359,3 +360,24 @@ class PlaybackCommand(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class Automation(Base):
+    __tablename__ = "automations"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    trigger_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    trigger_config: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    action_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    action_config: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    notify_mode: Mapped[str] = mapped_column(String(16), default="log", nullable=False)
+    notify_priority: Mapped[str] = mapped_column(String(8), default="normal", nullable=False)
+    webhook_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_status: Mapped[str | None] = mapped_column(String(16))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
