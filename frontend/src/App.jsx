@@ -44,6 +44,7 @@ import {
   Users,
   Wrench,
   X,
+  Zap,
 } from "lucide-react";
 import "./styles.css";
 
@@ -62,6 +63,7 @@ const navItems = [
   ["Playlists", FileAudio],
   ["Activity", Database],
   ["Tools", Wrench],
+  ["Automations", Zap],
   ["Users", Users],
   ["Settings", Settings],
 ];
@@ -77,6 +79,7 @@ const pageDescriptions = {
   Playlists: "Create, import, and manage playlists.",
   Activity: "Track queued, running, completed, and failed work.",
   Tools: "Run maintenance checks and library actions.",
+  Automations: "Run tools or play music automatically on a schedule, webhook, or event.",
   Users: "Manage users, PINs, API access, and permissions.",
   Settings: "Manage appearance, integrations, and system status.",
 };
@@ -1740,7 +1743,8 @@ function App() {
                 onUpdateJellyfinUser={updateUserJellyfinUser}
               />
             )}
-            {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users"].includes(page) && <Placeholder page={page} />}
+            {page === "Automations" && <AutomationsView api={api} notify={notify} user={user} />}
+            {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
           </section>
 
           <Inspector
@@ -4402,6 +4406,7 @@ function canViewPage(user, page) {
       hasPermission(user, permission),
     );
   }
+  if (page === "Automations") return hasPermission(user, "automations:manage");
   if (page === "Users") return true;
   if (page === "Settings") return true;
   return false;
@@ -4782,6 +4787,584 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
     </div>
   );
 }
+
+// ─── Automations ─────────────────────────────────────────────────────────────
+
+function buildCron({ frequency, time, weekday }) {
+  const [h, m] = (time || "00:00").split(":").map((n) => parseInt(n, 10) || 0);
+  if (frequency === "weekly") return `${m} ${h} * * ${weekday ?? 0}`;
+  return `${m} ${h} * * *`; // daily
+}
+
+function parseCronToSimple(cron) {
+  // Returns {simpleMode: true, frequency, time, weekday} or {simpleMode: false, raw}
+  if (!cron) return { simpleMode: true, frequency: "daily", time: "00:00", weekday: 0 };
+  const parts = cron.trim().split(/\s+/);
+  if (parts.length === 5) {
+    const [minute, hour, dom, month, dow] = parts;
+    if (dom === "*" && month === "*") {
+      const h = parseInt(hour, 10);
+      const m = parseInt(minute, 10);
+      const timeStr = `${String(isNaN(h) ? 0 : h).padStart(2, "0")}:${String(isNaN(m) ? 0 : m).padStart(2, "0")}`;
+      if (dow === "*") return { simpleMode: true, frequency: "daily", time: timeStr, weekday: 0 };
+      const dowNum = parseInt(dow, 10);
+      if (!isNaN(dowNum)) return { simpleMode: true, frequency: "weekly", time: timeStr, weekday: dowNum };
+    }
+  }
+  return { simpleMode: false, raw: cron };
+}
+
+const TOOL_OPTIONS = [
+  ["Scan Jellyfin", "jellyfin-scan"],
+  ["Remap tracks", "remap-tracks"],
+  ["Find missing album tracks", "check-missing-tracks"],
+  ["Check files", "check-files"],
+  ["Find duplicates", "check-duplicates"],
+  ["Check album covers", "check-album-covers"],
+  ["Check lyrics", "check-lyrics"],
+  ["Check MusicBrainz IDs", "check-musicbrainz-ids"],
+  ["Check audio content", "check-audio-content"],
+  ["Check lossy tracks", "check-non-lossless"],
+  ["Normalize volume", "normalize-volume"],
+  ["Consolidate folders", "consolidate-folders"],
+  ["Clear downloads", "clear-downloads"],
+  ["Clear discover cache", "clear-discover-cache"],
+  ["Backup now", "backup"],
+];
+
+function triggerSummary(automation) {
+  const { trigger_type, trigger_config } = automation;
+  if (trigger_type === "webhook") return "Webhook";
+  if (trigger_type === "event") {
+    const labels = { download_complete: "On download complete", wishlist_match: "On wishlist match", scan_complete: "On scan complete" };
+    return labels[trigger_config?.event] || "On event";
+  }
+  if (trigger_type === "interval") {
+    const secs = trigger_config?.seconds || 0;
+    if (secs >= 3600 && secs % 3600 === 0) return `Every ${secs / 3600} hr`;
+    return `Every ${Math.round(secs / 60)} min`;
+  }
+  if (trigger_type === "time") {
+    const cron = trigger_config?.cron || "";
+    const parsed = parseCronToSimple(cron);
+    if (parsed.simpleMode) {
+      const label = parsed.frequency === "weekly"
+        ? `Weekly ${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][parsed.weekday ?? 0]} ${parsed.time}`
+        : `Daily ${parsed.time}`;
+      return label;
+    }
+    return `Cron: ${cron}`;
+  }
+  return trigger_type;
+}
+
+function actionSummary(automation) {
+  const { action_type, action_config } = automation;
+  if (action_type === "tool") {
+    const found = TOOL_OPTIONS.find(([, slug]) => slug === action_config?.action);
+    return `Tool: ${found ? found[0] : action_config?.action || "—"}`;
+  }
+  if (action_type === "play") {
+    const parts = [`Play ${action_config?.target_type || "?"} "${action_config?.target_query || ""}"`];
+    if (action_config?.shuffle) parts.push("shuffle");
+    if (action_config?.loop && action_config.loop !== "off") parts.push(`loop ${action_config.loop}`);
+    return parts.join(", ");
+  }
+  if (action_type === "media_control") return `Media: ${action_config?.control || "—"}`;
+  return action_type;
+}
+
+function AutomationsView({ api, notify }) {
+  const [automations, setAutomations] = useState([]);
+  const [editingId, setEditingId] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+
+  // Form state
+  const [name, setName] = useState("");
+  const [triggerType, setTriggerType] = useState("time");
+  const [actionType, setActionType] = useState("tool");
+  const [notifyMode, setNotifyMode] = useState("log");
+  const [notifyPriority, setNotifyPriority] = useState("normal");
+
+  // Trigger sub-fields
+  const [cronSimple, setCronSimple] = useState(true); // true = simple, false = raw cron
+  const [cronFrequency, setCronFrequency] = useState("daily");
+  const [cronTime, setCronTime] = useState("00:00");
+  const [cronWeekday, setCronWeekday] = useState(0);
+  const [cronRaw, setCronRaw] = useState("");
+  const [intervalValue, setIntervalValue] = useState(30);
+  const [intervalUnit, setIntervalUnit] = useState("minutes");
+  const [eventType, setEventType] = useState("download_complete");
+
+  // Action sub-fields
+  const [toolSlug, setToolSlug] = useState("backup");
+  const [playTargetType, setPlayTargetType] = useState("artist");
+  const [playTargetQuery, setPlayTargetQuery] = useState("");
+  const [playLoop, setPlayLoop] = useState("off");
+  const [playShuffle, setPlayShuffle] = useState(false);
+  const [mediaControl, setMediaControl] = useState("pause");
+
+  async function reload() {
+    try {
+      const data = await api("/automations");
+      setAutomations(data);
+    } catch (err) {
+      notify("Automation error", err.message, "ui_error");
+    }
+  }
+
+  useEffect(() => { reload(); }, []);
+
+  function resetForm() {
+    setEditingId(null);
+    setName("");
+    setTriggerType("time");
+    setActionType("tool");
+    setNotifyMode("log");
+    setNotifyPriority("normal");
+    setCronSimple(true);
+    setCronFrequency("daily");
+    setCronTime("00:00");
+    setCronWeekday(0);
+    setCronRaw("");
+    setIntervalValue(30);
+    setIntervalUnit("minutes");
+    setEventType("download_complete");
+    setToolSlug("backup");
+    setPlayTargetType("artist");
+    setPlayTargetQuery("");
+    setPlayLoop("off");
+    setPlayShuffle(false);
+    setMediaControl("pause");
+    setShowForm(false);
+  }
+
+  function openCreate() {
+    resetForm();
+    setShowForm(true);
+  }
+
+  function openEdit(a) {
+    setEditingId(a.id);
+    setName(a.name || "");
+    setTriggerType(a.trigger_type || "time");
+    setActionType(a.action_type || "tool");
+    setNotifyMode(a.notify_mode || "log");
+    setNotifyPriority(a.notify_priority || "normal");
+
+    // Reverse-map trigger_config
+    const tc = a.trigger_config || {};
+    if (a.trigger_type === "time") {
+      const parsed = parseCronToSimple(tc.cron || "");
+      if (parsed.simpleMode) {
+        setCronSimple(true);
+        setCronFrequency(parsed.frequency);
+        setCronTime(parsed.time);
+        setCronWeekday(parsed.weekday ?? 0);
+        setCronRaw("");
+      } else {
+        setCronSimple(false);
+        setCronRaw(parsed.raw || tc.cron || "");
+      }
+    } else if (a.trigger_type === "interval") {
+      const secs = tc.seconds || 60;
+      if (secs >= 3600 && secs % 3600 === 0) { setIntervalValue(secs / 3600); setIntervalUnit("hours"); }
+      else { setIntervalValue(Math.round(secs / 60)); setIntervalUnit("minutes"); }
+    } else if (a.trigger_type === "event") {
+      setEventType(tc.event || "download_complete");
+    }
+
+    // Reverse-map action_config
+    const ac = a.action_config || {};
+    if (a.action_type === "tool") {
+      setToolSlug(ac.action || "backup");
+    } else if (a.action_type === "play") {
+      setPlayTargetType(ac.target_type || "artist");
+      setPlayTargetQuery(ac.target_query || "");
+      setPlayLoop(ac.loop || "off");
+      setPlayShuffle(ac.shuffle || false);
+    } else if (a.action_type === "media_control") {
+      setMediaControl(ac.control || "pause");
+    }
+
+    setShowForm(true);
+  }
+
+  function buildTriggerConfig() {
+    if (triggerType === "time") {
+      const cron = cronSimple ? buildCron({ frequency: cronFrequency, time: cronTime, weekday: cronWeekday }) : cronRaw;
+      return { cron };
+    }
+    if (triggerType === "interval") return { seconds: intervalValue * (intervalUnit === "hours" ? 3600 : 60) };
+    if (triggerType === "webhook") return {};
+    if (triggerType === "event") return { event: eventType };
+    return {};
+  }
+
+  function buildActionConfig() {
+    if (actionType === "tool") return { action: toolSlug };
+    if (actionType === "play") return { target_type: playTargetType, target_query: playTargetQuery, loop: playLoop, shuffle: playShuffle };
+    if (actionType === "media_control") return { control: mediaControl };
+    return {};
+  }
+
+  async function handleSave() {
+    if (!name.trim()) { notify("Validation", "Name is required.", "ui_error"); return; }
+    const body = {
+      name: name.trim(),
+      trigger_type: triggerType,
+      trigger_config: buildTriggerConfig(),
+      action_type: actionType,
+      action_config: buildActionConfig(),
+      notify_mode: notifyMode,
+      notify_priority: notifyPriority,
+    };
+    try {
+      if (editingId) {
+        await api(`/automations/${editingId}`, { method: "PATCH", body: JSON.stringify(body) });
+        notify("Automation updated", name.trim());
+      } else {
+        await api("/automations", { method: "POST", body: JSON.stringify(body) });
+        notify("Automation created", name.trim());
+      }
+      resetForm();
+      reload();
+    } catch (err) {
+      notify("Automation error", err.message, "ui_error");
+    }
+  }
+
+  async function handleToggle(a) {
+    try {
+      await api(`/automations/${a.id}`, { method: "PATCH", body: JSON.stringify({ enabled: !a.enabled }) });
+      reload();
+    } catch (err) {
+      notify("Automation error", err.message, "ui_error");
+    }
+  }
+
+  async function handleRunNow(a) {
+    try {
+      const result = await api(`/automations/${a.id}/run`, { method: "POST" });
+      notify("Automation triggered", result.message || result.status || "Running");
+      reload();
+    } catch (err) {
+      notify("Automation error", err.message, "ui_error");
+    }
+  }
+
+  async function handleDelete(a) {
+    try {
+      await api(`/automations/${a.id}`, { method: "DELETE" });
+      notify("Automation deleted", a.name);
+      reload();
+    } catch (err) {
+      notify("Automation error", err.message, "ui_error");
+    }
+  }
+
+  function handleCopyWebhook(a) {
+    const url = window.location.origin + (a.webhook_url || "");
+    navigator.clipboard.writeText(url).then(
+      () => notify("Copied", "Webhook URL copied to clipboard."),
+      () => notify("Copy failed", "Could not access clipboard.", "ui_error"),
+    );
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "Never";
+    const d = new Date(iso);
+    return d.toLocaleString();
+  }
+
+  return (
+    <div className="automations-view">
+      <div className="automation-card-row" style={{ justifyContent: "flex-end" }}>
+        {!showForm && (
+          <button className="secondary compact" onClick={openCreate}>
+            <Plus size={15} />
+            New automation
+          </button>
+        )}
+      </div>
+
+      {showForm && (
+        <section className="settings-section automation-form">
+          <h2>{editingId ? "Edit automation" : "New automation"}</h2>
+
+          <label className="setting-row">
+            <span>Name</span>
+            <input
+              type="text"
+              placeholder="e.g. Daily backup"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ flex: 1, minWidth: 0 }}
+            />
+          </label>
+
+          {/* Trigger */}
+          <label className="setting-row">
+            <span>Trigger</span>
+            <select value={triggerType} onChange={(e) => setTriggerType(e.target.value)}>
+              <option value="time">Time (schedule)</option>
+              <option value="interval">Interval</option>
+              <option value="webhook">Webhook</option>
+              <option value="event">Event</option>
+            </select>
+          </label>
+
+          {triggerType === "time" && (
+            <>
+              <label className="setting-row">
+                <span>Mode</span>
+                <select value={cronSimple ? "simple" : "cron"} onChange={(e) => setCronSimple(e.target.value === "simple")}>
+                  <option value="simple">Simple</option>
+                  <option value="cron">Cron expression</option>
+                </select>
+              </label>
+              {cronSimple ? (
+                <>
+                  <label className="setting-row">
+                    <span>Frequency</span>
+                    <select value={cronFrequency} onChange={(e) => setCronFrequency(e.target.value)}>
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                    </select>
+                  </label>
+                  <label className="setting-row">
+                    <span>Time</span>
+                    <input type="time" value={cronTime} onChange={(e) => setCronTime(e.target.value)} />
+                  </label>
+                  {cronFrequency === "weekly" && (
+                    <label className="setting-row">
+                      <span>Weekday</span>
+                      <select value={cronWeekday} onChange={(e) => setCronWeekday(Number(e.target.value))}>
+                        {["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"].map((day, i) => (
+                          <option key={day} value={i}>{day}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </>
+              ) : (
+                <label className="setting-row">
+                  <span>Cron expression</span>
+                  <input
+                    type="text"
+                    placeholder="M H * * D"
+                    value={cronRaw}
+                    onChange={(e) => setCronRaw(e.target.value)}
+                    style={{ flex: 1, minWidth: 0 }}
+                  />
+                </label>
+              )}
+            </>
+          )}
+
+          {triggerType === "interval" && (
+            <label className="setting-row">
+              <span>Every</span>
+              <span style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="number"
+                  min={1}
+                  value={intervalValue}
+                  onChange={(e) => setIntervalValue(Math.max(1, Number(e.target.value)))}
+                  style={{ width: 70 }}
+                />
+                <select value={intervalUnit} onChange={(e) => setIntervalUnit(e.target.value)}>
+                  <option value="minutes">Minutes</option>
+                  <option value="hours">Hours</option>
+                </select>
+              </span>
+            </label>
+          )}
+
+          {triggerType === "webhook" && (
+            <p className="automation-summary">A webhook URL will be generated after saving. POST to it to trigger the automation.</p>
+          )}
+
+          {triggerType === "event" && (
+            <label className="setting-row">
+              <span>Event</span>
+              <select value={eventType} onChange={(e) => setEventType(e.target.value)}>
+                <option value="download_complete">Download complete</option>
+                <option value="wishlist_match">Wishlist match</option>
+                <option value="scan_complete">Scan complete</option>
+              </select>
+            </label>
+          )}
+
+          {/* Action */}
+          <label className="setting-row">
+            <span>Action</span>
+            <select value={actionType} onChange={(e) => setActionType(e.target.value)}>
+              <option value="tool">Run a tool</option>
+              <option value="play">Play music</option>
+              <option value="media_control">Media control</option>
+            </select>
+          </label>
+
+          {actionType === "tool" && (
+            <label className="setting-row">
+              <span>Tool</span>
+              <select value={toolSlug} onChange={(e) => setToolSlug(e.target.value)}>
+                {TOOL_OPTIONS.map(([label, slug]) => (
+                  <option key={slug} value={slug}>{label}</option>
+                ))}
+              </select>
+            </label>
+          )}
+
+          {actionType === "play" && (
+            <>
+              <label className="setting-row">
+                <span>Target type</span>
+                <select value={playTargetType} onChange={(e) => setPlayTargetType(e.target.value)}>
+                  <option value="artist">Artist</option>
+                  <option value="album">Album</option>
+                  <option value="track">Track</option>
+                  <option value="playlist">Playlist</option>
+                </select>
+              </label>
+              <label className="setting-row">
+                <span>Search query</span>
+                <input
+                  type="text"
+                  placeholder={`e.g. ${playTargetType === "artist" ? "Coldplay" : playTargetType === "album" ? "A Rush of Blood to the Head" : playTargetType === "playlist" ? "Favorites" : "The Scientist"}`}
+                  value={playTargetQuery}
+                  onChange={(e) => setPlayTargetQuery(e.target.value)}
+                  style={{ flex: 1, minWidth: 0 }}
+                />
+              </label>
+              <label className="setting-row">
+                <span>Loop</span>
+                <select value={playLoop} onChange={(e) => setPlayLoop(e.target.value)}>
+                  <option value="off">Off</option>
+                  <option value="one">Repeat one</option>
+                  <option value="all">Repeat all</option>
+                </select>
+              </label>
+              <label className="setting-row">
+                <span>Shuffle</span>
+                <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
+              </label>
+            </>
+          )}
+
+          {actionType === "media_control" && (
+            <label className="setting-row">
+              <span>Control</span>
+              <select value={mediaControl} onChange={(e) => setMediaControl(e.target.value)}>
+                <option value="pause">Pause</option>
+                <option value="resume">Resume</option>
+                <option value="next">Next</option>
+                <option value="previous">Previous</option>
+                <option value="stop">Stop</option>
+              </select>
+            </label>
+          )}
+
+          {/* Notify */}
+          <label className="setting-row">
+            <span>Notify</span>
+            <select value={notifyMode} onChange={(e) => setNotifyMode(e.target.value)}>
+              <option value="log">Log only</option>
+              <option value="notification">Notification</option>
+              <option value="both">Both</option>
+            </select>
+          </label>
+          <label className="setting-row">
+            <span>Priority</span>
+            <select value={notifyPriority} onChange={(e) => setNotifyPriority(e.target.value)}>
+              <option value="low">Low</option>
+              <option value="normal">Normal</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            <button className="secondary compact" onClick={resetForm}>
+              <X size={15} />
+              Cancel
+            </button>
+            <button onClick={handleSave}>
+              <Check size={15} />
+              {editingId ? "Save changes" : "Create"}
+            </button>
+          </div>
+        </section>
+      )}
+
+      {automations.length === 0 && !showForm && (
+        <div className="automation-empty">
+          <Zap size={28} />
+          <p>No automations yet. Create one to run tools or play music on a schedule.</p>
+        </div>
+      )}
+
+      {automations.map((a) => (
+        <div key={a.id} className="automation-card">
+          <div className="automation-card-row">
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <Zap size={16} />
+              <strong>{a.name}</strong>
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <button
+                className={`secondary compact${a.enabled ? "" : " danger"}`}
+                title={a.enabled ? "Disable" : "Enable"}
+                onClick={() => handleToggle(a)}
+              >
+                {a.enabled ? "Enabled" : "Disabled"}
+              </button>
+              <button className="secondary compact" onClick={() => handleRunNow(a)}>
+                <Play size={13} />
+                Run now
+              </button>
+              <button className="secondary compact" onClick={() => openEdit(a)}>
+                <Pencil size={13} />
+                Edit
+              </button>
+              <button className="secondary compact danger" onClick={() => handleDelete(a)}>
+                <Trash2 size={13} />
+                Delete
+              </button>
+            </span>
+          </div>
+          <div className="automation-summary">
+            <span>{triggerSummary(a)}</span>
+            <span>→</span>
+            <span>{actionSummary(a)}</span>
+          </div>
+          {a.trigger_type === "webhook" && a.webhook_url && (
+            <div className="automation-summary" style={{ gap: 6 }}>
+              <span style={{ fontFamily: "monospace", fontSize: 12, wordBreak: "break-all" }}>
+                {window.location.origin + a.webhook_url}
+              </span>
+              <button className="secondary compact" style={{ flexShrink: 0 }} onClick={() => handleCopyWebhook(a)}>
+                Copy
+              </button>
+            </div>
+          )}
+          <div className="automation-summary">
+            <span>Last run: {fmtDate(a.last_run_at)}</span>
+            {a.last_status && (
+              <span className={a.last_status === "error" ? "automation-status-error" : ""}>
+                {a.last_status}
+              </span>
+            )}
+            {a.next_run_at && <span>Next: {fmtDate(a.next_run_at)}</span>}
+          </div>
+          {a.last_error && <div className="automation-status-error" style={{ fontSize: 12 }}>{a.last_error}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function CheckFilesResult({ result, onFix }) {
   const missingFiles = result?.missing_files || [];

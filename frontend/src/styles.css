@@ -3530,3 +3530,63 @@ nav button:hover,
     display: none;
   }
 }
+
+/* ─── Automations page ─────────────────────────────────────────────────────── */
+
+.automations-view {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.automation-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.automation-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted, #888);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.automation-form {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-form h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.automation-status-error {
+  color: var(--danger);
+}
+
+.automation-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 12px;
+  color: var(--muted, #888);
+  text-align: center;
+}
