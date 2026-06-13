@@ -1869,6 +1869,22 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
         .filter((artist) => artist.albums.length > 0),
     [artists, apiKey],
   );
+  const [bucket, setBucket] = useState("all");
+  const availableBuckets = useMemo(() => {
+    const present = new Set(visibleArtists.map(artistBucket));
+    const ordered = [];
+    if (present.has("symbol")) ordered.push("symbol");
+    if (present.has("0-9")) ordered.push("0-9");
+    for (let i = 65; i <= 90; i++) {
+      const L = String.fromCharCode(i);
+      if (present.has(L)) ordered.push(L);
+    }
+    return ordered;
+  }, [visibleArtists]);
+  const bucketedArtists = useMemo(
+    () => (bucket === "all" ? visibleArtists : visibleArtists.filter((a) => artistBucket(a) === bucket)),
+    [visibleArtists, bucket],
+  );
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
   const canUsePlaylists = hasPermission(user, "playlists:manage");
@@ -1890,8 +1906,25 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
           }}
         />
       )}
+      {visibleArtists.length > 0 && availableBuckets.length > 1 && (
+        <div className="tree-toolbar">
+          <div className="mode-toggle">
+            {["all", ...availableBuckets].map((b) => (
+              <button
+                key={b}
+                type="button"
+                className={bucket === b ? "active" : ""}
+                title={b === "symbol" ? "Symbols" : undefined}
+                onClick={() => setBucket(b)}
+              >
+                {b === "all" ? "All" : b === "symbol" ? "#" : b}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
       <div className="tree">
-        {visibleArtists.map((artist) => (
+        {bucketedArtists.map((artist) => (
           <div key={artist.id}>
             <div className="tree-action-row library-row-actions">
               <TreeRow
@@ -4175,6 +4208,15 @@ function albumCoverUrl(album, apiKey) {
   }
   if (!apiKey || !album?.id) return "";
   return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
+}
+
+function artistBucket(artist) {
+  const s = ((artist.sort_name || artist.name) || "").trim();
+  if (!s) return "symbol";
+  const c = s[0].toUpperCase();
+  if (c >= "0" && c <= "9") return "0-9";
+  if (c >= "A" && c <= "Z") return c;
+  return "symbol";
 }
 
 function playlistPlayableTrack(track) {
