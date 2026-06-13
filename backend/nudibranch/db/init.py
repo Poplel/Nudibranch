@@ -95,6 +95,11 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "repeat" not in pstate_cols:
         session.execute(text("ALTER TABLE player_states ADD COLUMN repeat VARCHAR(8) NOT NULL DEFAULT 'off'"))
         session.commit()
+    device_cols = {row[1] for row in session.execute(text("PRAGMA table_info(mobile_devices)"))}
+    if device_cols and "proxy_grant" not in device_cols:
+        # Per-pairing APNS proxy grant token (App Attest model); NULL = direct/legacy device.
+        session.execute(text("ALTER TABLE mobile_devices ADD COLUMN proxy_grant TEXT"))
+        session.commit()
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)

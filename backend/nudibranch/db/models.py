@@ -340,7 +340,11 @@ class MobileDevice(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     device_name: Mapped[str] = mapped_column(String(255), nullable=False)
-    apns_token: Mapped[str] = mapped_column(Text, nullable=False)
+    # Direct mode keeps the raw APNS token here; proxy (App Attest) mode keeps a
+    # per-pairing grant token in proxy_grant and leaves apns_token empty (the proxy
+    # holds the real token).
+    apns_token: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    proxy_grant: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 

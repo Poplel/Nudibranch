@@ -3,32 +3,33 @@ APNS notification delivery.
 
 Two delivery modes:
   - Direct: Nudibranch holds Apple Developer credentials and calls APNS itself.
-  - Proxy:  Nudibranch signs requests with _PROXY_CLIENT_SECRET and sends them
-            to a NudibranchProxy server, which holds the Apple credentials.
+  - Proxy:  Nudibranch relays through a NudibranchProxy server which holds the Apple
+            credentials, so the end-user needs no Apple Developer account.
 
-Proxy mode requires no Apple Developer account from the end-user.  The secret
-below is the shared credential that proves to the proxy that the caller is a
-legitimate Nudibranch instance.  Keep it out of logs and UI output.
+Proxy mode uses the App Attest per-pairing grant model (see docs/apns-proxy-auth.md):
+this server has an Ed25519 identity keypair; the iOS app authorises this server (by its
+public key + instance_id) with the proxy via App Attest and hands back an opaque grant
+token, stored per device in MobileDevice.proxy_grant.  To push, this server signs each
+request with its private key; the proxy verifies the signature against the grant-bound
+public key.  There is no shared secret — a stolen grant is useless without this key.
 """
 
-import hashlib
-import hmac
+import base64
+import json
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
 import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy.exc import OperationalError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.models import AppSetting, MobileDevice, Notification, Permission, User
-
-# Shared secret with the NudibranchProxy server.
-# Must match NUDIBRANCH_PROXY_CLIENT_SECRET in the proxy's environment.
-_PROXY_CLIENT_SECRET = "nb-proxy-v1-placeholder-replace-before-deploying-proxy"
 
 
 def _get_or_create_instance_id(session: Session) -> str:
@@ -41,16 +42,68 @@ def _get_or_create_instance_id(session: Session) -> str:
     return row.value
 
 
-def _proxy_signature(
-    instance_id: str,
+def get_or_create_signing_key(session: Session) -> Ed25519PrivateKey:
+    """Return this server's Ed25519 push-signing private key, creating it on first call."""
+    row = session.get(AppSetting, "proxy_signing_private_key")
+    if row is None:
+        key = Ed25519PrivateKey.generate()
+        pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
+        row = AppSetting(key="proxy_signing_private_key", value=pem)
+        session.add(row)
+        session.flush()
+        return key
+    return serialization.load_pem_private_key(row.value.encode(), password=None)
+
+
+def signing_public_key_pem(session: Session) -> str:
+    """PEM of this server's push-signing public key (handed to the app at pairing)."""
+    key = get_or_create_signing_key(session)
+    return key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode()
+
+
+def push_identity(session: Session) -> dict:
+    """Identity the iOS app needs to authorise this server with the proxy."""
+    settings = get_settings()
+    return {
+        "instance_id": _get_or_create_instance_id(session),
+        "public_key": signing_public_key_pem(session),
+        "proxy_url": settings.apns_proxy_url,
+    }
+
+
+def _canonical_push_message(
+    *,
+    grant_token: str,
     timestamp: int,
     nonce: str,
-    apns_token: str,
+    event_type: str,
     title: str,
     body: str,
-) -> str:
-    message = f"{timestamp}:{nonce}:{instance_id}:{apns_token}:{title}:{body}"
-    return hmac.new(_PROXY_CLIENT_SECRET.encode(), message.encode(), hashlib.sha256).hexdigest()
+    target_url: str | None,
+    notification_id: str | None,
+) -> bytes:
+    """Must byte-for-byte match the proxy's grants.push_message()."""
+    return json.dumps(
+        {
+            "grant_token": grant_token,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "event_type": event_type,
+            "title": title,
+            "body": body,
+            "target_url": target_url,
+            "notification_id": notification_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
 
 def create_notification(
@@ -131,7 +184,7 @@ async def deliver_apns_notifications(session: Session) -> int:
 
 
 async def _deliver_via_proxy(session: Session, pending, devices, proxy_url: str) -> int:
-    instance_id = _get_or_create_instance_id(session)
+    signing_key = get_or_create_signing_key(session)
     delivered = 0
     base = proxy_url.rstrip("/")
     rate_limited = False
@@ -140,33 +193,39 @@ async def _deliver_via_proxy(session: Session, pending, devices, proxy_url: str)
         for notification in pending:
             if rate_limited:
                 break
-            target_devices = [d for d in devices if d.enabled and notification.user_id in (None, d.user_id)]
+            # Proxy mode targets only paired (grant-bearing) devices.
+            target_devices = [
+                d for d in devices
+                if d.enabled and d.proxy_grant and notification.user_id in (None, d.user_id)
+            ]
             notification_delivered = False
             for device in target_devices:
                 timestamp = int(time.time())
                 nonce = secrets.token_hex(16)
-                sig = _proxy_signature(
-                    instance_id=instance_id,
+                message = _canonical_push_message(
+                    grant_token=device.proxy_grant,
                     timestamp=timestamp,
                     nonce=nonce,
-                    apns_token=device.apns_token,
+                    event_type=notification.event_type,
                     title=notification.title,
                     body=notification.body,
+                    target_url=notification.target_url,
+                    notification_id=notification.id,
                 )
+                signature = base64.b64encode(signing_key.sign(message)).decode()
                 try:
                     response = await client.post(
                         f"{base}/push",
                         json={
-                            "instance_id": instance_id,
+                            "grant_token": device.proxy_grant,
                             "timestamp": timestamp,
                             "nonce": nonce,
-                            "apns_token": device.apns_token,
+                            "event_type": notification.event_type,
                             "title": notification.title,
                             "body": notification.body,
-                            "event_type": notification.event_type,
                             "target_url": notification.target_url,
                             "notification_id": notification.id,
-                            "signature": sig,
+                            "signature": signature,
                         },
                     )
                     if response.status_code == 200:
@@ -179,6 +238,9 @@ async def _deliver_via_proxy(session: Session, pending, devices, proxy_url: str)
                     elif response.status_code == 429:
                         rate_limited = True
                         break
+                    elif response.status_code == 401:
+                        # Grant revoked/invalid (e.g. user unpaired) — stop using this device.
+                        device.enabled = False
                 except httpx.HTTPError:
                     continue
             all_devices_gone = bool(target_devices) and all(not d.enabled for d in target_devices)

@@ -25,6 +25,7 @@ from nudibranch.api.schemas import (
     DeviceRegistration,
     DiscoverTaskQueueRequest,
     FavoritesOut,
+    PushIdentityResponse,
     ImportMusicBrainzLookupRequest,
     IntegrationSettings,
     ImportScanRequest,
@@ -114,7 +115,7 @@ from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
-from nudibranch.services.notifications import create_notification
+from nudibranch.services.notifications import create_notification, push_identity
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
@@ -2884,24 +2885,54 @@ def list_notifications(
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
 
 
+@router.get("/notifications/push-identity", tags=["notifications"], summary="This server's APNS push identity", response_model=PushIdentityResponse)
+def get_push_identity(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> PushIdentityResponse:
+    """Identity the iOS app needs to authorise this server with the APNS proxy
+    (App Attest grant flow): the server's instance_id, Ed25519 public key, and proxy URL."""
+    return PushIdentityResponse(**push_identity(session))
+
+
 @router.post("/notifications/devices", tags=["notifications"], summary="Register push notification device", response_model=dict)
 def register_device(
     payload: DeviceRegistration,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict:
-    existing = session.scalar(
-        select(MobileDevice).where(
-            MobileDevice.user_id == user.id,
-            MobileDevice.apns_token == payload.apns_token,
+    if not payload.proxy_grant and not payload.apns_token:
+        raise HTTPException(status_code=400, detail="Provide apns_token (direct) or proxy_grant (proxy mode)")
+
+    # Dedupe on whichever credential identifies the device for the active mode.
+    if payload.proxy_grant:
+        existing = session.scalar(
+            select(MobileDevice).where(
+                MobileDevice.user_id == user.id,
+                MobileDevice.proxy_grant == payload.proxy_grant,
+            )
         )
-    )
+    else:
+        existing = session.scalar(
+            select(MobileDevice).where(
+                MobileDevice.user_id == user.id,
+                MobileDevice.apns_token == payload.apns_token,
+            )
+        )
     if existing:
         existing.device_name = payload.device_name
+        existing.apns_token = payload.apns_token or existing.apns_token
+        if payload.proxy_grant:
+            existing.proxy_grant = payload.proxy_grant
         existing.enabled = True
         session.commit()
         return {"device_id": existing.id, "enabled": existing.enabled}
-    device = MobileDevice(user_id=user.id, device_name=payload.device_name, apns_token=payload.apns_token)
+    device = MobileDevice(
+        user_id=user.id,
+        device_name=payload.device_name,
+        apns_token=payload.apns_token,
+        proxy_grant=payload.proxy_grant,
+    )
     session.add(device)
     session.commit()
     return {"device_id": device.id, "enabled": device.enabled}

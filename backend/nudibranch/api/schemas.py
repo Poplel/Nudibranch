@@ -222,7 +222,16 @@ class NotificationOut(BaseModel):
 
 class DeviceRegistration(BaseModel):
     device_name: str
-    apns_token: str
+    # Direct mode supplies apns_token; App Attest proxy mode supplies proxy_grant
+    # (the opaque per-pairing grant token the app obtained from the proxy).
+    apns_token: str = ""
+    proxy_grant: str | None = None
+
+
+class PushIdentityResponse(BaseModel):
+    instance_id: str
+    public_key: str
+    proxy_url: str
 
 
 class IntegrationSettings(BaseModel):
