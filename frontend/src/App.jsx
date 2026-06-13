@@ -1143,6 +1143,22 @@ function App() {
     }
   }
 
+  async function searchLibrary(q, minConfidence) {
+    const params = new URLSearchParams({ q });
+    if (minConfidence != null) params.set("min_confidence", String(minConfidence));
+    const data = await api(`/library/search?${params.toString()}`);
+    return data?.results || [];
+  }
+
+  async function saveSearchThreshold(value) {
+    try {
+      const updated = await api("/me/search-settings", { method: "PUT", body: JSON.stringify({ min_confidence: value }) });
+      setUser((prev) => (prev ? { ...prev, search_min_confidence: updated.search_min_confidence } : updated));
+    } catch (e) {
+      notify("Could not save search threshold", e.message, "ui_error");
+    }
+  }
+
   async function proposePlaylistPosition(entryId, position) {
     setLoading(true);
     try {
@@ -1605,6 +1621,8 @@ function App() {
                 apiKey={token}
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
+                onSearchLibrary={searchLibrary}
+                onSaveSearchThreshold={saveSearchThreshold}
               />
             )}
             {page === "Discover" && (
@@ -1850,7 +1868,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue, onSearchLibrary, onSaveSearchThreshold }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1888,42 +1906,141 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
   const canUsePlaylists = hasPermission(user, "playlists:manage");
+
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState(null); // null = not searching
+  const [threshold, setThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
+
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (!q) { setSearchResults(null); return; }
+    let active = true;
+    const t = setTimeout(async () => {
+      try {
+        const res = await onSearchLibrary(q, threshold);
+        if (active) setSearchResults(res);
+      } catch { if (active) setSearchResults([]); }
+    }, 250);
+    return () => { active = false; clearTimeout(t); };
+  }, [searchQuery, threshold, onSearchLibrary]);
+
+  function revealResult(r) {
+    setBucket("all");
+    if (r.kind === "artist") {
+      setOpenArtists((prev) => new Set(prev).add(r.id));
+    } else if (r.kind === "album") {
+      setOpenArtists((prev) => new Set(prev).add(r.artist_id));
+      setOpenAlbums((prev) => new Set(prev).add(r.id));
+    } else {
+      setOpenArtists((prev) => new Set(prev).add(r.artist_id));
+      setOpenAlbums((prev) => new Set(prev).add(r.album_id));
+    }
+    setSearchQuery("");
+    setSearchResults(null);
+  }
+
+  function commitThreshold() { if (onSaveSearchThreshold) onSaveSearchThreshold(threshold); }
+
   return (
     <div className="library-view">
       {visibleArtists.length === 0 && (
         <EmptyState title="No library records" body="Import queued music to populate the managed library." />
       )}
       {visibleArtists.length > 0 && (
-        <TreeToolbar
-          expanded={openArtists.size > 0 || openAlbums.size > 0}
-          onExpand={() => {
-            setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
-            setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
-          }}
-          onCollapse={() => {
-            setOpenArtists(new Set());
-            setOpenAlbums(new Set());
-          }}
-        />
-      )}
-      {visibleArtists.length > 0 && availableBuckets.length > 1 && (
-        <div className="tree-toolbar">
-          <div className="mode-toggle">
-            {["all", ...availableBuckets].map((b) => (
-              <button
-                key={b}
-                type="button"
-                className={bucket === b ? "active" : ""}
-                title={b === "symbol" ? "Symbols" : undefined}
-                onClick={() => setBucket(b)}
-              >
-                {b === "all" ? "All" : b === "symbol" ? "#" : b}
+        <div className="tree-toolbar library-search-row">
+          <div className="library-search-input-wrap">
+            <input
+              type="text"
+              className="library-search-input"
+              placeholder="Search artists, albums, tracks…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+            />
+            {searchQuery && (
+              <button className="secondary compact" onClick={() => setSearchQuery("")} title="Clear search">
+                ✕
               </button>
-            ))}
+            )}
           </div>
+          <label className="library-search-threshold">
+            <input
+              type="range"
+              min="0"
+              max="100"
+              value={Math.round(threshold * 100)}
+              onChange={(e) => setThreshold(Number(e.target.value) / 100)}
+              onMouseUp={commitThreshold}
+              onTouchEnd={commitThreshold}
+            />
+            <span>Min match: {Math.round(threshold * 100)}%</span>
+          </label>
         </div>
       )}
-      <div className="tree">
+      {searchResults !== null ? (
+        <div className="tree library-search-results">
+          {searchResults.length === 0 ? (
+            <div className="tree-empty-message">No matches</div>
+          ) : (
+            [
+              { label: "Artists", kind: "artist" },
+              { label: "Albums", kind: "album" },
+              { label: "Tracks", kind: "track" },
+            ]
+              .filter(({ kind }) => searchResults.some((r) => r.kind === kind))
+              .map(({ label, kind }) => (
+                <div key={kind} className="library-search-group">
+                  <div className="library-search-group-label">{label}</div>
+                  {searchResults
+                    .filter((r) => r.kind === kind)
+                    .map((r) => (
+                      <button
+                        key={`${r.kind}:${r.id}`}
+                        type="button"
+                        className="library-search-result-row"
+                        onClick={() => revealResult(r)}
+                        title="Show in library"
+                      >
+                        <span className="library-search-result-name">{r.name}</span>
+                        <small className="library-search-result-confidence muted">{Math.round(r.confidence * 100)}%</small>
+                      </button>
+                    ))}
+                </div>
+              ))
+          )}
+        </div>
+      ) : (
+        <>
+          {visibleArtists.length > 0 && (
+            <TreeToolbar
+              expanded={openArtists.size > 0 || openAlbums.size > 0}
+              onExpand={() => {
+                setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
+                setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
+              }}
+              onCollapse={() => {
+                setOpenArtists(new Set());
+                setOpenAlbums(new Set());
+              }}
+            />
+          )}
+          {visibleArtists.length > 0 && availableBuckets.length > 1 && (
+            <div className="tree-toolbar">
+              <div className="mode-toggle">
+                {["all", ...availableBuckets].map((b) => (
+                  <button
+                    key={b}
+                    type="button"
+                    className={bucket === b ? "active" : ""}
+                    title={b === "symbol" ? "Symbols" : undefined}
+                    onClick={() => setBucket(b)}
+                  >
+                    {b === "all" ? "All" : b === "symbol" ? "#" : b}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+          <div className="tree">
         {bucketedArtists.map((artist) => (
           <div key={artist.id}>
             <div className="tree-action-row library-row-actions">
@@ -2100,6 +2217,8 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
           </div>
         ))}
       </div>
+        </>
+      )}
     </div>
   );
 }
