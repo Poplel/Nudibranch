@@ -19,6 +19,16 @@ def hash_secret(value: str) -> str:
 def init_db(session: Session) -> None:
     Base.metadata.create_all(bind=engine)
     ensure_lightweight_migrations(session)
+    try:
+        from nudibranch.services.search import ensure_populated
+
+        ensure_populated(session)
+    except Exception as exc:  # search index is non-critical; never block startup
+        session.rollback()
+        try:
+            write_app_log(session, "warning", f"Search index init failed: {exc}")
+        except Exception:
+            pass
     existing_admin = session.scalar(select(User).where(User.is_admin.is_(True)))
     if existing_admin:
         return

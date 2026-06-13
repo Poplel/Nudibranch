@@ -56,6 +56,8 @@ from nudibranch.api.schemas import (
     ProposalItemOut,
     ProposalRejectRequest,
     ProposalSelectionUpdate,
+    SearchResponse,
+    SearchResultItem,
     SessionOut,
     StaticKeyCreate,
     StaticKeyOut,
@@ -110,6 +112,7 @@ from nudibranch.services.proposals import approve_batch, reject_items, set_selec
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
+from nudibranch.services.search import rebuild_search_index, search_library
 
 router = APIRouter(prefix="/api/v1")
 
@@ -644,6 +647,31 @@ def library_buckets(
     counts = [BucketCount(bucket=r[0], count=r[1]) for r in rows]
     counts.sort(key=lambda c: _bucket_sort_key(c.bucket))
     return counts
+
+
+@router.get("/library/search", response_model=SearchResponse, tags=["library"], summary="Fuzzy search artists/albums/tracks")
+def library_search(
+    q: str = Query(..., min_length=1),
+    types: str | None = Query(None, description="Comma list of artist,album,track"),
+    min_confidence: float | None = Query(None, ge=0.0, le=1.0),
+    limit: int = Query(50, ge=1, le=200),
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.library_read)),
+) -> SearchResponse:
+    kinds = [t.strip() for t in types.split(",") if t.strip()] if types else None
+    threshold = min_confidence if min_confidence is not None else (
+        user.search_min_confidence if user.search_min_confidence is not None else 0.4
+    )
+    results = search_library(session, q, kinds=kinds, min_confidence=threshold, limit=limit)
+    return SearchResponse(query=q, min_confidence=threshold, results=[SearchResultItem(**r) for r in results])
+
+
+@router.post("/library/search/reindex", tags=["library"], summary="Rebuild the search index")
+def library_search_reindex(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> dict:
+    return {"indexed": rebuild_search_index(session)}
 
 
 @router.put("/me/search-settings", response_model=UserOut, tags=["users"], summary="Update my search confidence threshold")

@@ -443,3 +443,18 @@ class StaticKeyOut(BaseModel):
 
 class StaticKeyCreated(StaticKeyOut):
     api_key: str
+
+
+class SearchResultItem(BaseModel):
+    kind: str
+    id: str
+    name: str
+    artist_id: str | None = None
+    album_id: str | None = None
+    confidence: float
+
+
+class SearchResponse(BaseModel):
+    query: str
+    min_confidence: float
+    results: list[SearchResultItem] = Field(default_factory=list)
