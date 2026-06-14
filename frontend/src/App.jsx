@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import {
+  ArrowLeft,
   Bell,
   Check,
   CheckCircle,
@@ -121,6 +122,7 @@ function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("Library");
+  const [albumDetail, setAlbumDetail] = useState(null);
   const [dark, setDark] = useState(initialAppearance.dark);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -1473,6 +1475,37 @@ function App() {
     }
   }
 
+  function openAlbumDetail(album, origin) {
+    if (!album?.id) return;
+    setAlbumDetail({
+      id: album.id,
+      title: album.title,
+      artist_name: album.artist || album.artist_name || "",
+      artist_id: album.artist_id,
+      cover_path: album.cover_path,
+      origin: origin || page,
+    });
+  }
+
+  function closeAlbumDetail() {
+    if (albumDetail?.origin) setPage(albumDetail.origin);
+    setAlbumDetail(null);
+  }
+
+  async function playArtistFromHome(artist) {
+    try {
+      const data = await api(`/library/albums?artist_id=${encodeURIComponent(artist.id)}&page_size=500`);
+      let tracks = [];
+      for (const al of data?.items || []) {
+        tracks = tracks.concat(await loadAlbumPlayables(al));
+      }
+      if (tracks.length === 0) { notify("Playback", "No tracks found for this artist.", "ui_error"); return; }
+      await playTracks(tracks);
+    } catch (error) {
+      notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
   async function playPlaylistFromHome(playlistId) {
     try {
       const tracks = await resolvePlaylistTracks(playlistId);
@@ -1790,9 +1823,21 @@ function App() {
 
         <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
+            {albumDetail && (
+              <AlbumDetailPage
+                detail={albumDetail}
+                api={api}
+                apiKey={token}
+                onBack={closeAlbumDetail}
+                onPlayAlbum={playAlbumFromHome}
+                onQueueAlbum={queueAlbumFromHome}
+                onPlayTracks={playTracks}
+                onQueueTracks={addTracksToPlayerQueue}
+              />
+            )}
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -4579,6 +4624,16 @@ function albumCoverUrl(album, apiKey) {
   return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
 }
 
+function artistCoverUrl(artist, apiKey) {
+  const coverPath = artist?.cover_path || "";
+  if (!coverPath) return "";
+  if (/^(https?:|data:|blob:)/i.test(coverPath) || coverPath.startsWith(`${API_BASE}/`)) {
+    return coverPath;
+  }
+  if (!apiKey || !artist?.id) return "";
+  return `${API_BASE}/library/artists/${artist.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
+}
+
 function artistBucket(artist) {
   const s = ((artist.sort_name || artist.name) || "").trim();
   if (!s) return "#";
@@ -6464,13 +6519,120 @@ function fmtTimeAgo(isoString) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onPlayPlaylist }) {
+function AlbumCard({ album, apiKey, onPlay, onQueue, onOpen, pinned, onTogglePin }) {
+  const cover = albumCoverUrl(album, apiKey);
+  const subtitle = album.artist || album.artist_name || "";
+  return (
+    <div className="album-card" title={`${album.title} — ${subtitle}`}>
+      <div className="album-card-art" onClick={() => onOpen?.(album)} role="button" tabIndex={0}>
+        {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={24} />}
+        <span className="album-card-hover">
+          {onTogglePin && (
+            <button className={`album-card-pin${pinned ? " active" : ""}`} onClick={(e) => { e.stopPropagation(); onTogglePin(album); }} title={pinned ? "Unpin from Home" : "Pin to Home"}>
+              {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+            </button>
+          )}
+          {onQueue && (
+            <button className="album-card-queue" onClick={(e) => { e.stopPropagation(); onQueue(album); }} title="Add to queue">
+              <ListPlus size={15} />
+            </button>
+          )}
+          {onPlay && (
+            <button className="album-card-play" onClick={(e) => { e.stopPropagation(); onPlay(album); }} title="Play">
+              <Play size={20} />
+            </button>
+          )}
+        </span>
+      </div>
+      <div className="album-card-meta" onClick={() => onOpen?.(album)}>
+        <span className="album-card-title">{album.title}</span>
+        <span className="album-card-artist">{subtitle}</span>
+      </div>
+    </div>
+  );
+}
+
+function ArtistCard({ artist, apiKey, onPlay, pinned, onTogglePin }) {
+  const cover = artistCoverUrl(artist, apiKey);
+  return (
+    <div className="album-card artist-card" title={artist.name}>
+      <div className="album-card-art" onClick={() => onPlay?.(artist)} role="button" tabIndex={0}>
+        {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={24} />}
+        <span className="album-card-hover">
+          {onTogglePin && (
+            <button className={`album-card-pin${pinned ? " active" : ""}`} onClick={(e) => { e.stopPropagation(); onTogglePin(artist); }} title={pinned ? "Unpin from Home" : "Pin to Home"}>
+              {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+            </button>
+          )}
+          {onPlay && (
+            <button className="album-card-play" onClick={(e) => { e.stopPropagation(); onPlay(artist); }} title="Play">
+              <Play size={20} />
+            </button>
+          )}
+        </span>
+      </div>
+      <div className="album-card-meta" onClick={() => onPlay?.(artist)}>
+        <span className="album-card-title">{artist.name}</span>
+      </div>
+    </div>
+  );
+}
+
+function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbum, onPlayTracks, onQueueTracks }) {
+  const [tracks, setTracks] = useState(null);
+  useEffect(() => {
+    let active = true;
+    setTracks(null);
+    api(`/library/tracks?album_id=${encodeURIComponent(detail.id)}&page_size=500`)
+      .then((d) => { if (active) setTracks(d?.items || []); })
+      .catch(() => { if (active) setTracks([]); });
+    return () => { active = false; };
+  }, [api, detail.id]);
+  const cover = albumCoverUrl({ id: detail.id, cover_path: detail.cover_path }, apiKey)
+    || `${API_BASE}/library/albums/${encodeURIComponent(detail.id)}/cover?api_key=${encodeURIComponent(apiKey)}`;
+  const hydrate = (t) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title, album_id: t.album_id, _coverUrl: cover || undefined });
+  return (
+    <div className="album-detail-overlay">
+      <div className="album-detail-head">
+        <button className="secondary compact" onClick={onBack}><ArrowLeft size={16} /> Back</button>
+      </div>
+      <div className="album-detail-hero">
+        <div className="album-detail-cover">{cover ? <img src={cover} alt="" /> : <Music size={48} />}</div>
+        <div className="album-detail-info">
+          <h1>{detail.title}</h1>
+          <p className="muted">{detail.artist_name}</p>
+          <p className="muted">{tracks ? `${tracks.length} track${tracks.length === 1 ? "" : "s"}` : ""}</p>
+          <div className="album-detail-actions">
+            <button onClick={() => onPlayAlbum(detail)}><Play size={15} /> Play</button>
+            <button className="secondary" onClick={() => onQueueAlbum(detail)}><ListPlus size={15} /> Queue</button>
+          </div>
+        </div>
+      </div>
+      <div className="album-detail-tracks">
+        {tracks === null ? (
+          <p className="muted">Loading…</p>
+        ) : tracks.length === 0 ? (
+          <p className="muted">No tracks.</p>
+        ) : (
+          tracks.map((t) => (
+            <div key={t.id} className="tree-action-row library-row-actions">
+              <TreeRow depth={0} icon={FileAudio} title={`${t.track_number ? String(t.track_number).padStart(2, "0") : "#"}-${t.title}`} meta={t.format || "audio"} warning={!t.is_lossless} />
+              <QuickLibraryActions onPlay={() => onPlayTracks([hydrate(t)])} onQueue={() => onQueueTracks([hydrate(t)])} onRemove={null} />
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist }) {
   const [home, setHome] = useState(null);
   useEffect(() => {
     let active = true;
     api("/me/home")
       .then((data) => { if (active) setHome(data); })
-      .catch(() => { if (active) setHome({ recently_added: [], recently_approved: [], recent_plays: [], favorites: null, pinned_playlists: [] }); });
+      .catch(() => { if (active) setHome({ recently_added: [], recently_approved: [], recent_plays: [], favorites: null, pinned_playlists: [], pinned_albums: [], pinned_artists: [] }); });
     return () => { active = false; };
   }, [api]);
 
@@ -6497,6 +6659,20 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayPlaylist }) {
           ))}
           {home.pinned_playlists.length === 0 && <p className="muted">Pin playlists from the Playlists page.</p>}
         </div>
+        {home.pinned_artists?.length > 0 && (
+          <div className="home-album-grid home-pinned-grid">
+            {home.pinned_artists.map((ar) => (
+              <ArtistCard key={ar.id} artist={ar} apiKey={apiKey} onPlay={onPlayArtist} />
+            ))}
+          </div>
+        )}
+        {home.pinned_albums?.length > 0 && (
+          <div className="home-album-grid home-pinned-grid">
+            {home.pinned_albums.map((al) => (
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} />
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="home-section">
@@ -6505,18 +6681,9 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayPlaylist }) {
           <p className="muted">Nothing added yet.</p>
         ) : (
           <div className="home-album-grid">
-            {home.recently_added.map((al) => {
-              const cover = albumCoverUrl(al, apiKey);
-              return (
-                <button key={al.id} className="home-album-card" onClick={() => onPlayAlbum(al)} title={`${al.title} — ${al.artist || ""}`}>
-                  <span className="home-album-art">
-                    {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={22} />}
-                  </span>
-                  <span className="home-album-title">{al.title}</span>
-                  <span className="home-album-artist">{al.artist || ""}</span>
-                </button>
-              );
-            })}
+            {home.recently_added.map((al) => (
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} />
+            ))}
           </div>
         )}
       </section>

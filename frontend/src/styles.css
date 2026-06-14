@@ -336,6 +336,7 @@ nav button:hover {
 
 .main-panel {
   overflow: auto;
+  position: relative;
 }
 
 .panel-header {
@@ -3796,6 +3797,94 @@ nav button:hover {
   grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
   gap: 12px;
 }
+
+.album-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.album-card-art {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  cursor: pointer;
+}
+.album-card-art img { width: 100%; height: 100%; object-fit: cover; }
+.artist-card .album-card-art { border-radius: 50%; }
+.album-card-hover {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.album-card-art:hover .album-card-hover,
+.album-card-art:focus-within .album-card-hover { opacity: 1; pointer-events: auto; }
+.album-card-play {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: 0;
+  display: grid; place-items: center;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.album-card-queue, .album-card-pin {
+  position: absolute;
+  top: 6px;
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  border: 0;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+}
+.album-card-queue { right: 6px; }
+.album-card-pin { left: 6px; }
+.album-card-pin.active { background: var(--accent); }
+.album-card-meta { display: flex; flex-direction: column; gap: 2px; cursor: pointer; min-width: 0; }
+.album-card-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.album-card-artist { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artist-card .album-card-meta { align-items: center; text-align: center; }
+.home-pinned-grid { margin-top: 12px; }
+
+.album-detail-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  overflow: auto;
+  background: var(--panel);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.album-detail-head { display: flex; }
+.album-detail-hero { display: flex; gap: 20px; align-items: flex-end; }
+.album-detail-cover {
+  width: 200px; height: 200px;
+  flex: none;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  display: grid; place-items: center;
+  color: var(--muted);
+}
+.album-detail-cover img { width: 100%; height: 100%; object-fit: cover; }
+.album-detail-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.album-detail-info h1 { margin: 0; }
+.album-detail-actions { display: flex; gap: 8px; margin-top: 10px; }
+.album-detail-tracks { display: flex; flex-direction: column; gap: 2px; }
 
 .home-album-card {
   display: flex;
