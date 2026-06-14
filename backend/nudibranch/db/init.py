@@ -1,5 +1,6 @@
 import hashlib
 import json
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy import select
@@ -111,16 +112,29 @@ def ensure_lightweight_migrations(session: Session) -> None:
 
 
 def _migrate_library_timestamps(session: Session) -> None:
-    """Add created_at/updated_at to artists/albums/tracks for delta sync + recently-added."""
+    """Add created_at/updated_at to artists/albums/tracks for delta sync + recently-added.
+
+    SQLite forbids ALTER TABLE ADD COLUMN with a non-constant DEFAULT (CURRENT_TIMESTAMP),
+    so add the columns nullable, then backfill existing rows with a constant timestamp.
+    """
+    now = datetime.now(timezone.utc).isoformat()
     for table in ("artists", "albums", "tracks"):
         cols = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
         if not cols:
             continue
+        added = False
         if "created_at" not in cols:
-            session.execute(text(f"ALTER TABLE {table} ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
+            session.execute(text(f"ALTER TABLE {table} ADD COLUMN created_at DATETIME"))
+            added = True
         if "updated_at" not in cols:
-            session.execute(text(f"ALTER TABLE {table} ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
+            session.execute(text(f"ALTER TABLE {table} ADD COLUMN updated_at DATETIME"))
             session.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_updated_at ON {table}(updated_at)"))
+            added = True
+        if added:
+            session.execute(
+                text(f"UPDATE {table} SET created_at = COALESCE(created_at, :now), updated_at = COALESCE(updated_at, :now)"),
+                {"now": now},
+            )
     session.commit()
 
 
