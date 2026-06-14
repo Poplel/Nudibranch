@@ -1433,15 +1433,43 @@ function App() {
     }
   }
 
-  async function playAlbumFromHome(albumId) {
-    if (!albumId) return;
+  // Build playable track objects for an album, hydrating each with the album's
+  // cover URL so the player art shows regardless of which tab launched playback.
+  async function loadAlbumPlayables(album) {
+    const albumId = typeof album === "string" ? album : album?.id;
+    if (!albumId) return [];
+    const data = await api(`/library/tracks?album_id=${encodeURIComponent(albumId)}&page_size=500`);
+    const coverUrl =
+      typeof album === "object" && album
+        ? albumCoverUrl(album, token)
+        : `${API_BASE}/library/albums/${encodeURIComponent(albumId)}/cover?api_key=${encodeURIComponent(token)}`;
+    return (data?.items || []).map((t) => ({
+      id: t.id,
+      title: t.title,
+      _artist: t.artist_name,
+      _album: t.album_title,
+      album_id: t.album_id,
+      _coverUrl: coverUrl || undefined,
+    }));
+  }
+
+  async function playAlbumFromHome(album) {
     try {
-      const data = await api(`/library/tracks?album_id=${encodeURIComponent(albumId)}&page_size=500`);
-      const tracks = (data?.items || []).map((t) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title }));
+      const tracks = await loadAlbumPlayables(album);
       if (tracks.length === 0) { notify("Playback", "No tracks found for this album.", "ui_error"); return; }
       await playTracks(tracks);
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
+  async function queueAlbumFromHome(album) {
+    try {
+      const tracks = await loadAlbumPlayables(album);
+      if (tracks.length === 0) { notify("Queue", "No tracks found for this album.", "ui_error"); return; }
+      addTracksToPlayerQueue(tracks);
+    } catch (error) {
+      notify("Queue failed", error.message, "ui_error");
     }
   }
 
@@ -2067,13 +2095,10 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
   );
   const [bucket, setBucket] = useState("all");
   const availableBuckets = useMemo(() => {
-    const present = new Set(visibleArtists.map(artistBucket));
-    const ordered = [];
-    if (present.has("symbol")) ordered.push("symbol");
-    ordered.push("0-9");
+    const ordered = ["#"];
     for (let i = 65; i <= 90; i++) ordered.push(String.fromCharCode(i));
     return ordered;
-  }, [visibleArtists]);
+  }, []);
   const bucketedArtists = useMemo(
     () => (bucket === "all" ? visibleArtists : visibleArtists.filter((a) => artistBucket(a) === bucket)),
     [visibleArtists, bucket],
@@ -2186,10 +2211,10 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                       key={b}
                       type="button"
                       className={`bucket-btn${bucket === b ? " active" : ""}`}
-                      title={b === "symbol" ? "Symbols" : undefined}
+                      title={b === "#" ? "Numbers & symbols" : undefined}
                       onClick={() => setBucket(b)}
                     >
-                      {b === "all" ? "All" : b === "symbol" ? "#" : b}
+                      {b === "all" ? "All" : b}
                     </button>
                   ))}
                 </div>
@@ -4556,11 +4581,10 @@ function albumCoverUrl(album, apiKey) {
 
 function artistBucket(artist) {
   const s = ((artist.sort_name || artist.name) || "").trim();
-  if (!s) return "symbol";
+  if (!s) return "#";
   const c = s[0].toUpperCase();
-  if (c >= "0" && c <= "9") return "0-9";
   if (c >= "A" && c <= "Z") return c;
-  return "symbol";
+  return "#";
 }
 
 function playlistPlayableTrack(track) {
@@ -6484,7 +6508,7 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayPlaylist }) {
             {home.recently_added.map((al) => {
               const cover = albumCoverUrl(al, apiKey);
               return (
-                <button key={al.id} className="home-album-card" onClick={() => onPlayAlbum(al.id)} title={`${al.title} — ${al.artist || ""}`}>
+                <button key={al.id} className="home-album-card" onClick={() => onPlayAlbum(al)} title={`${al.title} — ${al.artist || ""}`}>
                   <span className="home-album-art">
                     {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={22} />}
                   </span>

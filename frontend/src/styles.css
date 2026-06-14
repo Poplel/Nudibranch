@@ -3484,21 +3484,24 @@ nav button:hover {
 .bucket-row {
   display: flex;
   flex: 1;
-  flex-wrap: wrap;
-  gap: 2px;
+  flex-wrap: nowrap;
+  gap: 1px;
   min-width: 0;
 }
 
 .bucket-btn {
-  flex: 1;
-  min-width: 26px;
-  padding: 4px 6px;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 2px;
   border: 0;
   border-radius: 4px;
   background: transparent;
   color: var(--muted);
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
+  line-height: 1.1;
+  text-align: center;
+  white-space: nowrap;
   cursor: pointer;
 }
 
