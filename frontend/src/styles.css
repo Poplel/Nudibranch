@@ -157,8 +157,7 @@ nav {
   gap: 4px;
 }
 
-nav button,
-.theme-toggle {
+nav button {
   display: flex;
   align-items: center;
   gap: 9px;
@@ -173,15 +172,9 @@ nav button,
 }
 
 nav button.active,
-nav button:hover,
-.theme-toggle:hover {
+nav button:hover {
   background: var(--accent-soft);
   color: var(--text);
-}
-
-.theme-toggle {
-  margin-top: auto;
-  border: 1px solid var(--line);
 }
 
 .workspace {
@@ -366,8 +359,7 @@ nav button:hover,
   font-size: 13px;
 }
 
-.error-banner,
-.loading-line {
+.error-banner {
   margin: 10px 12px 0;
   padding: 10px;
   border-radius: 4px;
@@ -378,12 +370,6 @@ nav button:hover,
   border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
   background: color-mix(in srgb, var(--danger) 10%, var(--panel-strong));
   color: var(--danger);
-}
-
-.loading-line {
-  border: 1px solid var(--line);
-  background: var(--panel-strong);
-  color: var(--muted);
 }
 
 .approval-actions {
@@ -427,7 +413,6 @@ nav button:hover,
   padding: 8px;
 }
 
-.action-bar,
 .batch-header {
   display: flex;
   align-items: center;
@@ -437,10 +422,6 @@ nav button:hover,
   border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--panel-strong);
-}
-
-.action-bar {
-  justify-content: flex-start;
 }
 
 .batch {
@@ -458,11 +439,6 @@ nav button:hover,
   margin: 3px 0 0;
   color: var(--muted);
   font-size: 12px;
-}
-
-.file-list {
-  display: grid;
-  gap: 4px;
 }
 
 .file-row,
@@ -1213,17 +1189,6 @@ nav button:hover,
   gap: 8px;
 }
 
-.playback-columns {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-}
-
-.playback-columns h3 {
-  margin: 0 0 8px;
-  font-size: 13px;
-}
-
 .playback-row {
   display: grid;
   grid-template-columns: minmax(120px, 1fr) auto;
@@ -1656,16 +1621,6 @@ nav button:hover,
   flex: 1;
   min-height: 0;
   gap: 42px;
-}
-
-.pip-lyrics-panel {
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 0 24px;
-  scrollbar-width: thin;
-  scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
 }
 
 .lyric-line {
@@ -2181,17 +2136,6 @@ nav button:hover,
   justify-self: end;
 }
 
-.task-row-inline {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 90px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 8px;
-  background: var(--panel);
-}
-
 .task-detail {
   overflow: auto;
   max-height: 320px;
@@ -2463,32 +2407,6 @@ nav button:hover,
   gap: 8px;
 }
 
-.wizard-step {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  min-height: 52px;
-  padding: 10px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--panel-strong);
-}
-
-.wizard-step span {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--soft);
-  color: var(--accent-strong);
-  font-size: 12px;
-}
-
-.wizard-step.current {
-  border-color: var(--accent);
-}
-
 .inspector {
   padding: 14px;
   overflow: auto;
@@ -2621,12 +2539,6 @@ nav button:hover,
   color: var(--fg-muted);
   font-size: 11px;
   padding-top: 2px;
-}
-
-.error-text {
-  font-size: 12px;
-  color: var(--danger, #e55);
-  margin: 0;
 }
 
 .diff {
@@ -3012,8 +2924,7 @@ nav button:hover,
     display: flex;
   }
 
-  nav button,
-  .theme-toggle {
+  nav button {
     min-width: max-content;
   }
 
