@@ -3590,3 +3590,335 @@ nav button:hover,
   color: var(--muted, #888);
   text-align: center;
 }
+
+/* ── Utility ─────────────────────────────────────────────────────────────── */
+.muted {
+  color: var(--muted);
+}
+
+/* ── Inspector removal (Settings / Discover) ─────────────────────────────── */
+.content-grid.no-inspector {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* ── Library: search bar (discover style) + bucket/expand row + page size ── */
+.library-search-bar {
+  margin-bottom: 8px;
+}
+
+.library-bucket-bar {
+  gap: 12px;
+}
+
+.bucket-row {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+}
+
+.bucket-btn {
+  flex: 1;
+  min-width: 26px;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.bucket-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.bucket-btn.active {
+  color: var(--accent);
+}
+
+.library-page-size-row {
+  margin-top: 8px;
+  border-bottom: 0;
+}
+
+.library-page-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.library-page-size select {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+/* ── Security: sessions tree + API keys rows ─────────────────────────────── */
+.security-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.security-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.security-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.security-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.security-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.current-badge {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.security-row .icon-button {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+}
+
+.security-create-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.security-key-input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.security-new-key-reveal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.security-new-key-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--warn, #d08b16);
+}
+
+.security-new-key-row {
+  display: flex;
+  gap: 8px;
+}
+
+.security-secret-input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: monospace;
+}
+
+/* Sessions tree (Tools page) */
+.sessions-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sessions-tree-header h2 {
+  margin: 0;
+}
+
+.sessions-tree-header .muted-label {
+  margin-left: auto;
+}
+
+.sessions-list {
+  margin-top: 10px;
+}
+
+/* ── Automations: stats header + Trigger › Action › Notify builder ───────── */
+.automation-stats {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.automation-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-right: 18px;
+  border-right: 1px solid var(--line);
+}
+
+.automation-stat:nth-child(3) {
+  border-right: 0;
+}
+
+.automation-stat-value {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.automation-stat-label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automation-stats-actions {
+  margin-left: auto;
+}
+
+.automation-name-bar {
+  margin-bottom: 4px;
+}
+
+.automation-builder {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.automation-stage {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.automation-stage-head {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-strong);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.automation-stage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-stage-arrow {
+  align-self: center;
+  font-size: 22px;
+  color: var(--muted);
+}
+
+.automation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.automation-field > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automation-field select,
+.automation-field input {
+  width: 100%;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.automation-field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.automation-field-inline input {
+  width: auto;
+  height: auto;
+}
+
+.automation-stage-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automation-builder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: 660px) {
+  .automation-builder {
+    flex-direction: column;
+  }
+  .automation-stage-arrow {
+    transform: rotate(90deg);
+  }
+}

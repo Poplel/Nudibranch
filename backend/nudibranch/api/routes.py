@@ -154,6 +154,12 @@ def login(payload: LoginRequest, session: Session = Depends(get_session)) -> Log
     token = generate_token()
     now = datetime.now(timezone.utc)
     expires = now + SESSION_TTL
+    label = payload.device_label or None
+    if label:
+        for old in session.scalars(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.device_label == label)).all():
+            session.delete(old)
+    for old in session.scalars(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.expires_at < now)).all():
+        session.delete(old)
     session.add(AuthSession(
         user_id=user.id,
         token_hash=hash_token(token),
@@ -931,7 +937,10 @@ def update_search_settings(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> UserOut:
-    user.search_min_confidence = payload.min_confidence
+    if payload.min_confidence is not None:
+        user.search_min_confidence = payload.min_confidence
+    if payload.page_size is not None:
+        user.library_page_size = payload.page_size
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -3162,6 +3171,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
+        library_page_size=user.library_page_size if user.library_page_size is not None else 100,
         jellyfin_user_id=user.jellyfin_user_id or None,
     )
 

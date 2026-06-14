@@ -51,6 +51,18 @@ import "./styles.css";
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
 const APPEARANCE_LAST_KEY = "nudibranch_appearance_last";
+const DEVICE_LABEL_KEY = "nudibranch_device_label";
+
+// Stable per-browser device label so re-logins reuse one session instead of
+// piling up a fresh "Web" session every time (backend dedupes by device_label).
+function getDeviceLabel() {
+  let label = localStorage.getItem(DEVICE_LABEL_KEY);
+  if (!label) {
+    label = `Web · ${Math.random().toString(36).slice(2, 8)}`;
+    localStorage.setItem(DEVICE_LABEL_KEY, label);
+  }
+  return label;
+}
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
 
 const navItems = [
@@ -350,7 +362,7 @@ function App() {
       const response = await fetch(`${API_BASE}/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password, device_label: "Web" }),
+        body: JSON.stringify({ username, password, device_label: getDeviceLabel() }),
       });
       if (!response.ok) {
         const body = await response.json().catch(() => ({}));
@@ -1162,6 +1174,15 @@ function App() {
     }
   }
 
+  async function saveLibraryPageSize(value) {
+    try {
+      const updated = await api("/me/search-settings", { method: "PUT", body: JSON.stringify({ page_size: value }) });
+      setUser((prev) => (prev ? { ...prev, library_page_size: updated.library_page_size } : updated));
+    } catch (e) {
+      notify("Could not save page size", e.message, "ui_error");
+    }
+  }
+
   async function proposePlaylistPosition(entryId, position) {
     setLoading(true);
     try {
@@ -1603,7 +1624,7 @@ function App() {
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
-        <div className="content-grid">
+        <div className={`content-grid${["Settings", "Discover"].includes(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {page === "Library" && (
@@ -1625,7 +1646,7 @@ function App() {
                 onPlay={playTracks}
                 onQueue={addTracksToPlayerQueue}
                 onSearchLibrary={searchLibrary}
-                onSaveSearchThreshold={saveSearchThreshold}
+                onSavePageSize={saveLibraryPageSize}
               />
             )}
             {page === "Discover" && (
@@ -1679,6 +1700,7 @@ function App() {
                 setDark={setDark}
                 crossfadeDuration={crossfadeDuration}
                 setCrossfadeDuration={setCrossfadeDuration}
+                onSaveSearchThreshold={saveSearchThreshold}
                 user={user}
                 apiKey={token}
                 playlists={playlists}
@@ -1697,6 +1719,8 @@ function App() {
                 backups={backups}
                 onRun={runTool}
                 onFix={proposeCheckFileFix}
+                api={api}
+                notify={notify}
               />
             )}
             {page === "Wishlist" && (
@@ -1747,6 +1771,7 @@ function App() {
             {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
           </section>
 
+          {!["Settings", "Discover"].includes(page) && (
           <Inspector
             page={page}
             library={library}
@@ -1782,6 +1807,7 @@ function App() {
               onImport: importPlaylist,
             }}
           />
+          )}
         </div>
         {toast && <Toast title={toast.title} body={toast.body} onClose={() => setToast(null)} />}
       </section>
@@ -1872,7 +1898,7 @@ function PanelHeader({ page, queueSummary }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue, onSearchLibrary, onSaveSearchThreshold }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, onPlay, onQueue, onSearchLibrary, onSavePageSize }) {
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -1907,13 +1933,15 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
     () => (bucket === "all" ? visibleArtists : visibleArtists.filter((a) => artistBucket(a) === bucket)),
     [visibleArtists, bucket],
   );
+  const [pageSize, setPageSize] = useState(() => (user && user.library_page_size != null ? user.library_page_size : 100));
+  const pagedArtists = useMemo(() => bucketedArtists.slice(0, pageSize), [bucketedArtists, pageSize]);
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
   const canUsePlaylists = hasPermission(user, "playlists:manage");
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState(null); // null = not searching
-  const [threshold, setThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
+  const threshold = user && user.search_min_confidence != null ? user.search_min_confidence : 0.4;
 
   useEffect(() => {
     const q = searchQuery.trim();
@@ -1943,42 +1971,28 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
     setSearchResults(null);
   }
 
-  function commitThreshold() { if (onSaveSearchThreshold) onSaveSearchThreshold(threshold); }
-
   return (
     <div className="library-view">
       {visibleArtists.length === 0 && (
         <EmptyState title="No library records" body="Import queued music to populate the managed library." />
       )}
       {visibleArtists.length > 0 && (
-        <div className="tree-toolbar library-search-row">
-          <div className="library-search-input-wrap">
-            <input
-              type="text"
-              className="library-search-input"
-              placeholder="Search artists, albums, tracks…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-            {searchQuery && (
-              <button className="secondary compact" onClick={() => setSearchQuery("")} title="Clear search">
-                ✕
-              </button>
-            )}
-          </div>
-          <label className="library-search-threshold">
-            <input
-              type="range"
-              min="0"
-              max="100"
-              value={Math.round(threshold * 100)}
-              onChange={(e) => setThreshold(Number(e.target.value) / 100)}
-              onMouseUp={commitThreshold}
-              onTouchEnd={commitThreshold}
-            />
-            <span>Min match: {Math.round(threshold * 100)}%</span>
-          </label>
-        </div>
+        <form className="discover-search library-search-bar" onSubmit={(e) => e.preventDefault()}>
+          <Search size={17} />
+          <input
+            type="text"
+            placeholder="Search artists, albums, tracks…"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+          {searchQuery ? (
+            <button type="button" className="secondary compact" onClick={() => setSearchQuery("")} title="Clear search">
+              ✕
+            </button>
+          ) : (
+            <span />
+          )}
+        </form>
       )}
       {searchResults !== null ? (
         <div className="tree library-search-results">
@@ -2015,37 +2029,41 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
       ) : (
         <>
           {visibleArtists.length > 0 && (
-            <TreeToolbar
-              expanded={openArtists.size > 0 || openAlbums.size > 0}
-              onExpand={() => {
-                setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
-                setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
-              }}
-              onCollapse={() => {
-                setOpenArtists(new Set());
-                setOpenAlbums(new Set());
-              }}
-            />
-          )}
-          {visibleArtists.length > 0 && availableBuckets.length > 1 && (
-            <div className="tree-toolbar">
-              <div className="mode-toggle">
-                {["all", ...availableBuckets].map((b) => (
-                  <button
-                    key={b}
-                    type="button"
-                    className={bucket === b ? "active" : ""}
-                    title={b === "symbol" ? "Symbols" : undefined}
-                    onClick={() => setBucket(b)}
-                  >
-                    {b === "all" ? "All" : b === "symbol" ? "#" : b}
-                  </button>
-                ))}
-              </div>
+            <div className="tree-toolbar library-bucket-bar">
+              {availableBuckets.length > 1 && (
+                <div className="bucket-row">
+                  {["all", ...availableBuckets].map((b) => (
+                    <button
+                      key={b}
+                      type="button"
+                      className={`bucket-btn${bucket === b ? " active" : ""}`}
+                      title={b === "symbol" ? "Symbols" : undefined}
+                      onClick={() => setBucket(b)}
+                    >
+                      {b === "all" ? "All" : b === "symbol" ? "#" : b}
+                    </button>
+                  ))}
+                </div>
+              )}
+              <button
+                className="secondary compact"
+                onClick={() => {
+                  const expanded = openArtists.size > 0 || openAlbums.size > 0;
+                  if (expanded) {
+                    setOpenArtists(new Set());
+                    setOpenAlbums(new Set());
+                  } else {
+                    setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
+                    setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
+                  }
+                }}
+              >
+                {openArtists.size > 0 || openAlbums.size > 0 ? "Collapse all" : "Expand all"}
+              </button>
             </div>
           )}
           <div className="tree">
-        {bucketedArtists.map((artist) => (
+        {pagedArtists.map((artist) => (
           <div key={artist.id}>
             <div className="tree-action-row library-row-actions">
               <TreeRow
@@ -2221,6 +2239,30 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
           </div>
         ))}
       </div>
+          {bucketedArtists.length > 0 && (
+            <div className="tree-toolbar library-page-size-row">
+              <span className="muted">
+                Showing {Math.min(pageSize, bucketedArtists.length)} of {bucketedArtists.length}
+              </span>
+              <label className="library-page-size">
+                <span>Per page</span>
+                <select
+                  value={pageSize}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setPageSize(v);
+                    if (onSavePageSize) onSavePageSize(v);
+                  }}
+                >
+                  {[20, 50, 100, 500, 1000].map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
         </>
       )}
     </div>
@@ -4711,7 +4753,7 @@ function InlineProgress({ value = 0, label = "", indeterminate = false, compact 
   );
 }
 
-function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
+function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify }) {
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
@@ -4771,6 +4813,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix }) {
           </div>
         </section>
       )}
+      <SessionsPanel api={api} notify={notify} />
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
           <div className="log-header">
@@ -5077,221 +5120,261 @@ function AutomationsView({ api, notify }) {
     return d.toLocaleString();
   }
 
+  const stats = useMemo(() => {
+    const enabled = automations.filter((a) => a.enabled).length;
+    const lastRun = automations
+      .map((a) => a.last_run_at)
+      .filter(Boolean)
+      .sort()
+      .slice(-1)[0];
+    const now = Date.now();
+    const nextRun = automations
+      .map((a) => a.next_run_at)
+      .filter((d) => d && new Date(d).getTime() >= now)
+      .sort()[0];
+    return { total: automations.length, enabled, lastRun, nextRun };
+  }, [automations]);
+
   return (
     <div className="automations-view">
-      <div className="automation-card-row" style={{ justifyContent: "flex-end" }}>
-        {!showForm && (
-          <button className="secondary compact" onClick={openCreate}>
-            <Plus size={15} />
-            New automation
-          </button>
-        )}
+      <div className="automation-stats">
+        <div className="automation-stat">
+          <span className="automation-stat-value">{stats.total}</span>
+          <span className="automation-stat-label">Automations{stats.total ? ` · ${stats.enabled} enabled` : ""}</span>
+        </div>
+        <div className="automation-stat">
+          <span className="automation-stat-value">{fmtDate(stats.lastRun)}</span>
+          <span className="automation-stat-label">Last run</span>
+        </div>
+        <div className="automation-stat">
+          <span className="automation-stat-value">{fmtDate(stats.nextRun)}</span>
+          <span className="automation-stat-label">Next run</span>
+        </div>
+        <div className="automation-stats-actions">
+          {!showForm && (
+            <button className="secondary compact" onClick={openCreate}>
+              <Plus size={15} />
+              New automation
+            </button>
+          )}
+        </div>
       </div>
 
       {showForm && (
         <section className="settings-section automation-form">
           <h2>{editingId ? "Edit automation" : "New automation"}</h2>
 
-          <label className="setting-row">
-            <span>Name</span>
+          <div className="discover-search automation-name-bar">
+            <Zap size={17} />
             <input
               type="text"
-              placeholder="e.g. Daily backup"
+              placeholder="Automation name (e.g. Daily backup)"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              style={{ flex: 1, minWidth: 0 }}
             />
-          </label>
+            <span />
+          </div>
 
-          {/* Trigger */}
-          <label className="setting-row">
-            <span>Trigger</span>
-            <select value={triggerType} onChange={(e) => setTriggerType(e.target.value)}>
-              <option value="time">Time (schedule)</option>
-              <option value="interval">Interval</option>
-              <option value="webhook">Webhook</option>
-              <option value="event">Event</option>
-            </select>
-          </label>
+          <div className="automation-builder">
+            {/* Trigger */}
+            <div className="automation-stage">
+              <div className="automation-stage-head">Trigger</div>
+              <div className="automation-stage-body">
+                <label className="automation-field">
+                  <span>Type</span>
+                  <select value={triggerType} onChange={(e) => setTriggerType(e.target.value)}>
+                    <option value="time">Time (schedule)</option>
+                    <option value="interval">Interval</option>
+                    <option value="webhook">Webhook</option>
+                    <option value="event">Event</option>
+                  </select>
+                </label>
 
-          {triggerType === "time" && (
-            <>
-              <label className="setting-row">
-                <span>Mode</span>
-                <select value={cronSimple ? "simple" : "cron"} onChange={(e) => setCronSimple(e.target.value === "simple")}>
-                  <option value="simple">Simple</option>
-                  <option value="cron">Cron expression</option>
-                </select>
-              </label>
-              {cronSimple ? (
-                <>
-                  <label className="setting-row">
-                    <span>Frequency</span>
-                    <select value={cronFrequency} onChange={(e) => setCronFrequency(e.target.value)}>
-                      <option value="daily">Daily</option>
-                      <option value="weekly">Weekly</option>
-                    </select>
-                  </label>
-                  <label className="setting-row">
-                    <span>Time</span>
-                    <input type="time" value={cronTime} onChange={(e) => setCronTime(e.target.value)} />
-                  </label>
-                  {cronFrequency === "weekly" && (
-                    <label className="setting-row">
-                      <span>Weekday</span>
-                      <select value={cronWeekday} onChange={(e) => setCronWeekday(Number(e.target.value))}>
-                        {["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"].map((day, i) => (
-                          <option key={day} value={i}>{day}</option>
-                        ))}
+                {triggerType === "time" && (
+                  <>
+                    <label className="automation-field">
+                      <span>Mode</span>
+                      <select value={cronSimple ? "simple" : "cron"} onChange={(e) => setCronSimple(e.target.value === "simple")}>
+                        <option value="simple">Simple</option>
+                        <option value="cron">Cron expression</option>
                       </select>
                     </label>
-                  )}
-                </>
-              ) : (
-                <label className="setting-row">
-                  <span>Cron expression</span>
-                  <input
-                    type="text"
-                    placeholder="M H * * D"
-                    value={cronRaw}
-                    onChange={(e) => setCronRaw(e.target.value)}
-                    style={{ flex: 1, minWidth: 0 }}
-                  />
+                    {cronSimple ? (
+                      <>
+                        <label className="automation-field">
+                          <span>Frequency</span>
+                          <select value={cronFrequency} onChange={(e) => setCronFrequency(e.target.value)}>
+                            <option value="daily">Daily</option>
+                            <option value="weekly">Weekly</option>
+                          </select>
+                        </label>
+                        <label className="automation-field">
+                          <span>Time</span>
+                          <input type="time" value={cronTime} onChange={(e) => setCronTime(e.target.value)} />
+                        </label>
+                        {cronFrequency === "weekly" && (
+                          <label className="automation-field">
+                            <span>Weekday</span>
+                            <select value={cronWeekday} onChange={(e) => setCronWeekday(Number(e.target.value))}>
+                              {["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"].map((day, i) => (
+                                <option key={day} value={i}>{day}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                      </>
+                    ) : (
+                      <label className="automation-field">
+                        <span>Cron expression</span>
+                        <input type="text" placeholder="M H * * D" value={cronRaw} onChange={(e) => setCronRaw(e.target.value)} />
+                      </label>
+                    )}
+                  </>
+                )}
+
+                {triggerType === "interval" && (
+                  <>
+                    <label className="automation-field">
+                      <span>Every</span>
+                      <input type="number" min={1} value={intervalValue} onChange={(e) => setIntervalValue(Math.max(1, Number(e.target.value)))} />
+                    </label>
+                    <label className="automation-field">
+                      <span>Unit</span>
+                      <select value={intervalUnit} onChange={(e) => setIntervalUnit(e.target.value)}>
+                        <option value="minutes">Minutes</option>
+                        <option value="hours">Hours</option>
+                      </select>
+                    </label>
+                  </>
+                )}
+
+                {triggerType === "webhook" && (
+                  <p className="automation-stage-note">A webhook URL is generated after saving. POST to it to trigger this automation.</p>
+                )}
+
+                {triggerType === "event" && (
+                  <label className="automation-field">
+                    <span>Event</span>
+                    <select value={eventType} onChange={(e) => setEventType(e.target.value)}>
+                      <option value="download_complete">Download complete</option>
+                      <option value="wishlist_match">Wishlist match</option>
+                      <option value="scan_complete">Scan complete</option>
+                    </select>
+                  </label>
+                )}
+              </div>
+            </div>
+
+            <div className="automation-stage-arrow">›</div>
+
+            {/* Action */}
+            <div className="automation-stage">
+              <div className="automation-stage-head">Action</div>
+              <div className="automation-stage-body">
+                <label className="automation-field">
+                  <span>Type</span>
+                  <select value={actionType} onChange={(e) => setActionType(e.target.value)}>
+                    <option value="tool">Run a tool</option>
+                    <option value="play">Play music</option>
+                    <option value="media_control">Media control</option>
+                  </select>
                 </label>
-              )}
-            </>
-          )}
 
-          {triggerType === "interval" && (
-            <label className="setting-row">
-              <span>Every</span>
-              <span style={{ display: "flex", gap: 8 }}>
-                <input
-                  type="number"
-                  min={1}
-                  value={intervalValue}
-                  onChange={(e) => setIntervalValue(Math.max(1, Number(e.target.value)))}
-                  style={{ width: 70 }}
-                />
-                <select value={intervalUnit} onChange={(e) => setIntervalUnit(e.target.value)}>
-                  <option value="minutes">Minutes</option>
-                  <option value="hours">Hours</option>
-                </select>
-              </span>
-            </label>
-          )}
+                {actionType === "tool" && (
+                  <label className="automation-field">
+                    <span>Tool</span>
+                    <select value={toolSlug} onChange={(e) => setToolSlug(e.target.value)}>
+                      {TOOL_OPTIONS.map(([label, slug]) => (
+                        <option key={slug} value={slug}>{label}</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
 
-          {triggerType === "webhook" && (
-            <p className="automation-summary">A webhook URL will be generated after saving. POST to it to trigger the automation.</p>
-          )}
+                {actionType === "play" && (
+                  <>
+                    <label className="automation-field">
+                      <span>Target type</span>
+                      <select value={playTargetType} onChange={(e) => setPlayTargetType(e.target.value)}>
+                        <option value="artist">Artist</option>
+                        <option value="album">Album</option>
+                        <option value="track">Track</option>
+                        <option value="playlist">Playlist</option>
+                      </select>
+                    </label>
+                    <label className="automation-field">
+                      <span>Search query</span>
+                      <input
+                        type="text"
+                        placeholder={`e.g. ${playTargetType === "artist" ? "Coldplay" : playTargetType === "album" ? "A Rush of Blood to the Head" : playTargetType === "playlist" ? "Favorites" : "The Scientist"}`}
+                        value={playTargetQuery}
+                        onChange={(e) => setPlayTargetQuery(e.target.value)}
+                      />
+                    </label>
+                    <label className="automation-field">
+                      <span>Loop</span>
+                      <select value={playLoop} onChange={(e) => setPlayLoop(e.target.value)}>
+                        <option value="off">Off</option>
+                        <option value="one">Repeat one</option>
+                        <option value="all">Repeat all</option>
+                      </select>
+                    </label>
+                    <label className="automation-field automation-field-inline">
+                      <span>Shuffle</span>
+                      <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
+                    </label>
+                  </>
+                )}
 
-          {triggerType === "event" && (
-            <label className="setting-row">
-              <span>Event</span>
-              <select value={eventType} onChange={(e) => setEventType(e.target.value)}>
-                <option value="download_complete">Download complete</option>
-                <option value="wishlist_match">Wishlist match</option>
-                <option value="scan_complete">Scan complete</option>
-              </select>
-            </label>
-          )}
+                {actionType === "media_control" && (
+                  <label className="automation-field">
+                    <span>Control</span>
+                    <select value={mediaControl} onChange={(e) => setMediaControl(e.target.value)}>
+                      <option value="pause">Pause</option>
+                      <option value="resume">Resume</option>
+                      <option value="next">Next</option>
+                      <option value="previous">Previous</option>
+                      <option value="stop">Stop</option>
+                    </select>
+                  </label>
+                )}
+              </div>
+            </div>
 
-          {/* Action */}
-          <label className="setting-row">
-            <span>Action</span>
-            <select value={actionType} onChange={(e) => setActionType(e.target.value)}>
-              <option value="tool">Run a tool</option>
-              <option value="play">Play music</option>
-              <option value="media_control">Media control</option>
-            </select>
-          </label>
+            <div className="automation-stage-arrow">›</div>
 
-          {actionType === "tool" && (
-            <label className="setting-row">
-              <span>Tool</span>
-              <select value={toolSlug} onChange={(e) => setToolSlug(e.target.value)}>
-                {TOOL_OPTIONS.map(([label, slug]) => (
-                  <option key={slug} value={slug}>{label}</option>
-                ))}
-              </select>
-            </label>
-          )}
+            {/* Notify */}
+            <div className="automation-stage">
+              <div className="automation-stage-head">Notify</div>
+              <div className="automation-stage-body">
+                <label className="automation-field">
+                  <span>Mode</span>
+                  <select value={notifyMode} onChange={(e) => setNotifyMode(e.target.value)}>
+                    <option value="log">Log only</option>
+                    <option value="notification">Notification</option>
+                    <option value="both">Both</option>
+                  </select>
+                </label>
+                <label className="automation-field">
+                  <span>Priority</span>
+                  <select value={notifyPriority} onChange={(e) => setNotifyPriority(e.target.value)}>
+                    <option value="low">Low</option>
+                    <option value="normal">Normal</option>
+                    <option value="high">High</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+          </div>
 
-          {actionType === "play" && (
-            <>
-              <label className="setting-row">
-                <span>Target type</span>
-                <select value={playTargetType} onChange={(e) => setPlayTargetType(e.target.value)}>
-                  <option value="artist">Artist</option>
-                  <option value="album">Album</option>
-                  <option value="track">Track</option>
-                  <option value="playlist">Playlist</option>
-                </select>
-              </label>
-              <label className="setting-row">
-                <span>Search query</span>
-                <input
-                  type="text"
-                  placeholder={`e.g. ${playTargetType === "artist" ? "Coldplay" : playTargetType === "album" ? "A Rush of Blood to the Head" : playTargetType === "playlist" ? "Favorites" : "The Scientist"}`}
-                  value={playTargetQuery}
-                  onChange={(e) => setPlayTargetQuery(e.target.value)}
-                  style={{ flex: 1, minWidth: 0 }}
-                />
-              </label>
-              <label className="setting-row">
-                <span>Loop</span>
-                <select value={playLoop} onChange={(e) => setPlayLoop(e.target.value)}>
-                  <option value="off">Off</option>
-                  <option value="one">Repeat one</option>
-                  <option value="all">Repeat all</option>
-                </select>
-              </label>
-              <label className="setting-row">
-                <span>Shuffle</span>
-                <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
-              </label>
-            </>
-          )}
-
-          {actionType === "media_control" && (
-            <label className="setting-row">
-              <span>Control</span>
-              <select value={mediaControl} onChange={(e) => setMediaControl(e.target.value)}>
-                <option value="pause">Pause</option>
-                <option value="resume">Resume</option>
-                <option value="next">Next</option>
-                <option value="previous">Previous</option>
-                <option value="stop">Stop</option>
-              </select>
-            </label>
-          )}
-
-          {/* Notify */}
-          <label className="setting-row">
-            <span>Notify</span>
-            <select value={notifyMode} onChange={(e) => setNotifyMode(e.target.value)}>
-              <option value="log">Log only</option>
-              <option value="notification">Notification</option>
-              <option value="both">Both</option>
-            </select>
-          </label>
-          <label className="setting-row">
-            <span>Priority</span>
-            <select value={notifyPriority} onChange={(e) => setNotifyPriority(e.target.value)}>
-              <option value="low">Low</option>
-              <option value="normal">Normal</option>
-              <option value="high">High</option>
-            </select>
-          </label>
-
-          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <div className="automation-builder-actions">
             <button className="secondary compact" onClick={resetForm}>
               <X size={15} />
               Cancel
             </button>
             <button onClick={handleSave}>
               <Check size={15} />
-              {editingId ? "Save changes" : "Create"}
+              {editingId ? "Save changes" : "Add"}
             </button>
           </div>
         </section>
@@ -5635,13 +5718,10 @@ function Placeholder({ page }) {
   );
 }
 
-function SecuritySettings({ api, notify }) {
+function SessionsPanel({ api, notify }) {
   const [sessions, setSessions] = useState(null);
-  const [apiKeys, setApiKeys] = useState(null);
-  const [newKeyName, setNewKeyName] = useState("");
-  const [createdSecret, setCreatedSecret] = useState(null); // { id, name, api_key }
+  const [open, setOpen] = useState(false); // collapsed by default
   const [loadingRevoke, setLoadingRevoke] = useState({});
-  const [creatingKey, setCreatingKey] = useState(false);
 
   async function loadSessions() {
     try {
@@ -5650,6 +5730,75 @@ function SecuritySettings({ api, notify }) {
       notify("Sessions error", err.message, "ui_error");
     }
   }
+
+  useEffect(() => {
+    loadSessions();
+  }, []);
+
+  async function revokeSession(id) {
+    setLoadingRevoke((prev) => ({ ...prev, [id]: true }));
+    try {
+      await api(`/me/sessions/${id}`, { method: "DELETE" });
+      notify("Session revoked", "The session has been signed out.", "ui_notice");
+      loadSessions();
+    } catch (err) {
+      notify("Revoke failed", err.message, "ui_error");
+    } finally {
+      setLoadingRevoke((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  return (
+    <section className="settings-section sessions-panel">
+      <button type="button" className="sessions-tree-header" onClick={() => setOpen((o) => !o)}>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        <h2>Sessions</h2>
+        <span className="muted-label">{sessions ? sessions.length : 0}</span>
+      </button>
+      {open &&
+        (sessions === null ? (
+          <p className="muted-label">Loading…</p>
+        ) : sessions.length === 0 ? (
+          <p className="muted-label">No active sessions found.</p>
+        ) : (
+          <div className="security-list sessions-list">
+            {sessions.map((session) => (
+              <div key={session.id} className="security-row session-row">
+                <div className="security-row-info">
+                  <span className="security-row-label">
+                    {session.device_label || "Unknown device"}
+                    {session.current && <span className="security-badge current-badge">This device</span>}
+                  </span>
+                  <small className="muted-label">
+                    Last used: {session.last_used_at ? new Date(session.last_used_at).toLocaleString() : "never"}
+                    {" · "}
+                    Expires: {session.expires_at ? new Date(session.expires_at).toLocaleString() : "never"}
+                  </small>
+                </div>
+                {!session.current && (
+                  <button
+                    className="icon-button session-revoke"
+                    title="Revoke session"
+                    disabled={loadingRevoke[session.id]}
+                    onClick={() => revokeSession(session.id)}
+                  >
+                    <X size={15} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        ))}
+    </section>
+  );
+}
+
+function SecuritySettings({ api, notify }) {
+  const [apiKeys, setApiKeys] = useState(null);
+  const [newKeyName, setNewKeyName] = useState("");
+  const [createdSecret, setCreatedSecret] = useState(null); // { id, name, api_key }
+  const [loadingRevoke, setLoadingRevoke] = useState({});
+  const [creatingKey, setCreatingKey] = useState(false);
 
   async function loadApiKeys() {
     try {
@@ -5660,22 +5809,8 @@ function SecuritySettings({ api, notify }) {
   }
 
   useEffect(() => {
-    loadSessions();
     loadApiKeys();
   }, []);
-
-  async function revokeSession(id) {
-    setLoadingRevoke((prev) => ({ ...prev, [`session-${id}`]: true }));
-    try {
-      await api(`/me/sessions/${id}`, { method: "DELETE" });
-      notify("Session revoked", "The session has been signed out.", "ui_notice");
-      loadSessions();
-    } catch (err) {
-      notify("Revoke failed", err.message, "ui_error");
-    } finally {
-      setLoadingRevoke((prev) => ({ ...prev, [`session-${id}`]: false }));
-    }
-  }
 
   async function createApiKey() {
     if (!newKeyName.trim()) return;
@@ -5709,52 +5844,15 @@ function SecuritySettings({ api, notify }) {
     }
   }
 
-  return (
-    <>
-      <section className="settings-section">
-        <h2>Active sessions</h2>
-        {sessions === null ? (
-          <p className="muted-label">Loading…</p>
-        ) : sessions.length === 0 ? (
-          <p className="muted-label">No active sessions found.</p>
-        ) : (
-          <div className="security-list">
-            {sessions.map((session) => (
-              <div key={session.id} className="security-row">
-                <div className="security-row-info">
-                  <span className="security-row-label">
-                    {session.device_label || "Unknown device"}
-                    {session.current && (
-                      <span className="security-badge current-badge">This device</span>
-                    )}
-                  </span>
-                  <small className="muted-label">
-                    Last used: {session.last_used_at ? new Date(session.last_used_at).toLocaleString() : "never"}
-                    {" · "}
-                    Expires: {session.expires_at ? new Date(session.expires_at).toLocaleString() : "never"}
-                  </small>
-                </div>
-                {!session.current && (
-                  <button
-                    className="secondary compact"
-                    disabled={loadingRevoke[`session-${session.id}`]}
-                    onClick={() => revokeSession(session.id)}
-                  >
-                    <LogOut size={14} />
-                    Revoke
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+  const activeKeys = apiKeys ? apiKeys.filter((k) => !k.revoked) : null;
 
+  return (
       <section className="settings-section">
         <h2>API keys</h2>
         <div className="security-create-row">
           <input
             type="text"
+            className="security-key-input"
             placeholder="Key name (e.g. Home server)"
             value={newKeyName}
             onChange={(e) => setNewKeyName(e.target.value)}
@@ -5799,19 +5897,16 @@ function SecuritySettings({ api, notify }) {
           </div>
         )}
 
-        {apiKeys === null ? (
+        {activeKeys === null ? (
           <p className="muted-label">Loading…</p>
-        ) : apiKeys.length === 0 ? (
+        ) : activeKeys.length === 0 ? (
           <p className="muted-label">No API keys yet.</p>
         ) : (
           <div className="security-list">
-            {apiKeys.map((key) => (
-              <div key={key.id} className={`security-row${key.revoked ? " security-row-revoked" : ""}`}>
+            {activeKeys.map((key) => (
+              <div key={key.id} className="security-row">
                 <div className="security-row-info">
-                  <span className="security-row-label">
-                    {key.name}
-                    {key.revoked && <span className="security-badge revoked-badge">Revoked</span>}
-                  </span>
+                  <span className="security-row-label">{key.name}</span>
                   <small className="muted-label">
                     Prefix: {key.prefix}
                     {" · "}
@@ -5820,22 +5915,19 @@ function SecuritySettings({ api, notify }) {
                     Last used: {key.last_used_at ? new Date(key.last_used_at).toLocaleString() : "never"}
                   </small>
                 </div>
-                {!key.revoked && (
-                  <button
-                    className="secondary compact"
-                    disabled={loadingRevoke[`key-${key.id}`]}
-                    onClick={() => revokeApiKey(key.id)}
-                  >
-                    <Trash2 size={14} />
-                    Revoke
-                  </button>
-                )}
+                <button
+                  className="icon-button"
+                  title="Revoke key"
+                  disabled={loadingRevoke[`key-${key.id}`]}
+                  onClick={() => revokeApiKey(key.id)}
+                >
+                  <Trash2 size={15} />
+                </button>
               </div>
             ))}
           </div>
         )}
       </section>
-    </>
   );
 }
 
@@ -5848,6 +5940,7 @@ function SettingsPanel({
   setDark,
   crossfadeDuration,
   setCrossfadeDuration,
+  onSaveSearchThreshold,
   user,
   apiKey,
   playlists,
@@ -5858,6 +5951,7 @@ function SettingsPanel({
   notify,
 }) {
   const [showApiKey, setShowApiKey] = useState(false);
+  const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
   const canViewApiKey =
@@ -5909,6 +6003,23 @@ function SettingsPanel({
             value={crossfadeDuration}
             style={{ "--progress": `${(crossfadeDuration / 15) * 100}%` }}
             onChange={(event) => setCrossfadeDuration(Number(event.target.value))}
+          />
+        </label>
+        <label className="setting-row crossfade-row">
+          <span>
+            Min match
+            <small>Library search confidence threshold. {Math.round(searchThreshold * 100)}%</small>
+          </span>
+          <input
+            className="crossfade-slider"
+            type="range"
+            min="0"
+            max="100"
+            value={Math.round(searchThreshold * 100)}
+            style={{ "--progress": `${Math.round(searchThreshold * 100)}%` }}
+            onChange={(event) => setSearchThreshold(Number(event.target.value) / 100)}
+            onMouseUp={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
+            onTouchEnd={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
           />
         </label>
       </section>

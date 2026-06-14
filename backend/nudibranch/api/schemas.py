@@ -32,6 +32,7 @@ class UserOut(BaseModel):
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
     search_min_confidence: float = 0.4
+    library_page_size: int = 100
     jellyfin_user_id: str | None = None
 
 
@@ -427,7 +428,8 @@ class BucketCount(BaseModel):
 
 
 class UserSearchSettingsUpdate(BaseModel):
-    min_confidence: float = Field(ge=0.0, le=1.0)
+    min_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    page_size: int | None = Field(default=None, ge=1, le=5000)
 
 
 class SessionOut(BaseModel):
