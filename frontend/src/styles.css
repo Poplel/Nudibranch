@@ -3858,6 +3858,30 @@ nav button:hover {
 .artist-card .album-card-meta { align-items: center; text-align: center; }
 .home-pinned-grid { margin-top: 12px; }
 
+.library-view-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--panel-strong);
+}
+.library-view-toggle button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.library-view-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+.library-album-view { display: flex; flex-direction: column; gap: 14px; }
+.album-page-nav { display: inline-flex; align-items: center; gap: 8px; }
+
 .album-detail-overlay {
   position: absolute;
   inset: 0;
