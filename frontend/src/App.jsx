@@ -1807,7 +1807,7 @@ function App() {
         </div>
         <nav>
           {visibleNavItems.map(([label, Icon]) => (
-            <button className={page === label ? "active" : ""} key={label} onClick={() => setPage(label)}>
+            <button className={page === label ? "active" : ""} key={label} onClick={() => { setAlbumDetail(null); setPage(label); }}>
               <Icon size={17} />
               {label === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : label}
             </button>
