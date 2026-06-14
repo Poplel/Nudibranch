@@ -167,6 +167,7 @@ class Artist(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     sort_name: Mapped[str | None] = mapped_column(String(255))
     musicbrainz_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    cover_path: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 
@@ -270,6 +271,19 @@ class PinnedPlaylist(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     playlist_id: Mapped[str] = mapped_column(String(128), nullable=False)  # Jellyfin item id, or "favorites"
     name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
+class PinnedItem(Base):
+    """Home-pinned library albums/artists (playlists use PinnedPlaylist)."""
+
+    __tablename__ = "pinned_items"
+    __table_args__ = (UniqueConstraint("user_id", "kind", "item_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)  # "album" | "artist"
+    item_id: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 

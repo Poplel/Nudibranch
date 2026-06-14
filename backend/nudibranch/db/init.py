@@ -57,6 +57,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE wishlist_items ADD COLUMN status_changed_at DATETIME"))
         session.execute(text("UPDATE wishlist_items SET status_changed_at = created_at WHERE status_changed_at IS NULL"))
         session.commit()
+    artist_columns = {row[1] for row in session.execute(text("PRAGMA table_info(artists)"))}
+    if "cover_path" not in artist_columns:
+        session.execute(text("ALTER TABLE artists ADD COLUMN cover_path TEXT"))
+        session.commit()
     track_columns = {row[1] for row in session.execute(text("PRAGMA table_info(tracks)"))}
     if "musicbrainz_verified" not in track_columns:
         session.execute(text("ALTER TABLE tracks ADD COLUMN musicbrainz_verified BOOLEAN NOT NULL DEFAULT 0"))

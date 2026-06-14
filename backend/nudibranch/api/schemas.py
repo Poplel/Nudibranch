@@ -120,6 +120,7 @@ class LibraryTreeArtist(BaseModel):
     name: str
     sort_name: str | None = None
     musicbrainz_id: str | None = None
+    cover_path: str | None = None
     albums: list[LibraryTreeAlbum] = Field(default_factory=list)
 
 
@@ -305,6 +306,14 @@ class PinPlaylistIn(BaseModel):
     name: str | None = None
 
 
+class PinAlbumIn(BaseModel):
+    album_id: str
+
+
+class PinArtistIn(BaseModel):
+    artist_id: str
+
+
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None
@@ -397,6 +406,7 @@ class LibraryArtistRow(BaseModel):
     id: str
     name: str
     sort_name: str | None = None
+    cover_path: str | None = None
     album_count: int = 0
 
 

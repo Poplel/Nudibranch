@@ -22,6 +22,8 @@ from nudibranch.api.schemas import (
     BackupRestoreRequest,
     BucketCount,
     CheckFileFixRequest,
+    PinAlbumIn,
+    PinArtistIn,
     PinPlaylistIn,
     PlayEventOut,
     PlayRecordIn,
@@ -96,6 +98,7 @@ from nudibranch.db.models import (
     PlaybackCommand,
     NotificationStatus,
     Permission,
+    PinnedItem,
     PinnedPlaylist,
     PlayEvent,
     Playlist,
@@ -119,7 +122,7 @@ from nudibranch.services.imports import discover_import_files, read_audio_metada
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
-from nudibranch.services.metadata_lookup import album_cover_candidate_urls, cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification, push_identity
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
@@ -798,6 +801,85 @@ def unpin_playlist(
     return list_pinned_playlists(session, user)
 
 
+def _pinned_item_ids(session: Session, user: User, kind: str) -> list[str]:
+    return [
+        p.item_id
+        for p in session.scalars(
+            select(PinnedItem)
+            .where(PinnedItem.user_id == user.id, PinnedItem.kind == kind)
+            .order_by(PinnedItem.created_at.asc())
+        )
+    ]
+
+
+def _toggle_pinned_item(session: Session, user: User, kind: str, item_id: str, pin: bool) -> None:
+    existing = session.scalar(
+        select(PinnedItem).where(PinnedItem.user_id == user.id, PinnedItem.kind == kind, PinnedItem.item_id == item_id)
+    )
+    if pin and not existing:
+        session.add(PinnedItem(user_id=user.id, kind=kind, item_id=item_id))
+        session.commit()
+    elif not pin and existing:
+        session.delete(existing)
+        session.commit()
+
+
+@router.get("/me/pinned-albums", tags=["users"], summary="My pinned albums", response_model=list[dict])
+def list_pinned_albums(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    return [{"album_id": item_id} for item_id in _pinned_item_ids(session, user, "album")]
+
+
+@router.post("/me/pinned-albums", tags=["users"], summary="Pin an album", response_model=list[dict])
+def pin_album(
+    payload: PinAlbumIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    _toggle_pinned_item(session, user, "album", payload.album_id, pin=True)
+    return list_pinned_albums(session, user)
+
+
+@router.delete("/me/pinned-albums/{album_id}", tags=["users"], summary="Unpin an album", response_model=list[dict])
+def unpin_album(
+    album_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    _toggle_pinned_item(session, user, "album", album_id, pin=False)
+    return list_pinned_albums(session, user)
+
+
+@router.get("/me/pinned-artists", tags=["users"], summary="My pinned artists", response_model=list[dict])
+def list_pinned_artists(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    return [{"artist_id": item_id} for item_id in _pinned_item_ids(session, user, "artist")]
+
+
+@router.post("/me/pinned-artists", tags=["users"], summary="Pin an artist", response_model=list[dict])
+def pin_artist(
+    payload: PinArtistIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    _toggle_pinned_item(session, user, "artist", payload.artist_id, pin=True)
+    return list_pinned_artists(session, user)
+
+
+@router.delete("/me/pinned-artists/{artist_id}", tags=["users"], summary="Unpin an artist", response_model=list[dict])
+def unpin_artist(
+    artist_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    _toggle_pinned_item(session, user, "artist", artist_id, pin=False)
+    return list_pinned_artists(session, user)
+
+
 @router.get("/me/home", tags=["users"], summary="Home dashboard aggregate", response_model=dict)
 def me_home(
     session: Session = Depends(get_session),
@@ -844,6 +926,31 @@ def me_home(
         )
     ]
 
+    # Pinned albums/artists, resolved (in pin order) to title + cover for the Home grid.
+    pinned_album_ids = _pinned_item_ids(session, user, "album")
+    albums_by_id = {}
+    if pinned_album_ids:
+        albums_by_id = {
+            al.id: al
+            for al in session.scalars(
+                select(Album).options(selectinload(Album.artist)).where(Album.id.in_(pinned_album_ids))
+            )
+        }
+    pinned_albums = [
+        {"id": al.id, "title": al.title, "artist": al.artist.name if al.artist else None, "cover_path": al.cover_path}
+        for aid in pinned_album_ids
+        if (al := albums_by_id.get(aid))
+    ]
+    pinned_artist_ids = _pinned_item_ids(session, user, "artist")
+    artists_by_id = {}
+    if pinned_artist_ids:
+        artists_by_id = {a.id: a for a in session.scalars(select(Artist).where(Artist.id.in_(pinned_artist_ids)))}
+    pinned_artists = [
+        {"id": a.id, "name": a.name, "cover_path": a.cover_path}
+        for aid in pinned_artist_ids
+        if (a := artists_by_id.get(aid))
+    ]
+
     # Favorites count is a single cheap call when Jellyfin is linked.
     favorites: dict | None = None
     client, jf_user_id = _jf_client(session, user)
@@ -861,6 +968,8 @@ def me_home(
         "recent_plays": [e.model_dump(mode="json") for e in recent_plays],
         "favorites": favorites,
         "pinned_playlists": pinned,
+        "pinned_albums": pinned_albums,
+        "pinned_artists": pinned_artists,
     }
 
 
@@ -1035,6 +1144,9 @@ def _bucket_condition(sort_expr, bucket: str):
     if not bucket or bucket == "all":
         return None
     first = _bucket_first_char(sort_expr)
+    # "#" is the unified non-letter bucket (digits + symbols).
+    if bucket == "#":
+        return first.op("NOT GLOB")("[A-Za-z]")
     if bucket == "0-9":
         return first.op("GLOB")("[0-9]")
     if bucket == "symbol":
@@ -1045,18 +1157,15 @@ def _bucket_condition(sort_expr, bucket: str):
 def _bucket_label(sort_expr):
     first = _bucket_first_char(sort_expr)
     return case(
-        (first.op("GLOB")("[0-9]"), literal("0-9")),
         (func.upper(first).op("GLOB")("[A-Z]"), func.upper(first)),
-        else_=literal("symbol"),
+        else_=literal("#"),
     )
 
 
 def _bucket_sort_key(bucket: str):
-    if bucket == "symbol":
+    if bucket == "#":
         return (0, "")
-    if bucket == "0-9":
-        return (1, "")
-    return (2, bucket)
+    return (1, bucket)
 
 
 def _artist_sort_expr():
@@ -1111,6 +1220,7 @@ def library_tree(
             ],
             sort_name=artist.sort_name,
             musicbrainz_id=artist.musicbrainz_id,
+            cover_path=artist.cover_path,
         )
         for artist in artists
     ]
@@ -1136,7 +1246,7 @@ def library_artists(
     rows = session.scalars(
         stmt.order_by(sort_expr, Artist.name).offset((page - 1) * page_size).limit(page_size).options(selectinload(Artist.albums))
     )
-    items = [LibraryArtistRow(id=a.id, name=a.name, sort_name=a.sort_name, album_count=len(a.albums)) for a in rows]
+    items = [LibraryArtistRow(id=a.id, name=a.name, sort_name=a.sort_name, cover_path=a.cover_path, album_count=len(a.albums)) for a in rows]
     return PaginatedArtists(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -1826,6 +1936,42 @@ def album_cover_candidates(
         results = []
     urls = album_cover_candidate_urls(artist_name, album.title, results)
     return {"album_id": album.id, "urls": urls, "cover_path": urls[0] if urls else None}
+
+
+@router.get("/library/artists/{artist_id}/cover", tags=["library"], summary="Get artist cover art", response_class=FileResponse)
+def artist_cover(
+    artist_id: str,
+    api_key: str = Query(""),
+    session: Session = Depends(get_session),
+) -> FileResponse:
+    user = resolve_media_user(session, api_key)
+    permissions = {permission.permission for permission in user.permissions} if user else set()
+    if not user or (not user.is_admin and Permission.library_read not in permissions):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    artist = session.get(Artist, artist_id)
+    if not artist or not artist.cover_path:
+        raise HTTPException(status_code=404, detail="Artist cover not found")
+    path = Path(artist.cover_path)
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artist cover file is missing")
+    library_root = get_settings().library_path.resolve()
+    resolved = path.resolve()
+    if library_root not in [resolved, *resolved.parents]:
+        raise HTTPException(status_code=403, detail="Artist cover is outside the library")
+    return FileResponse(resolved)
+
+
+@router.get("/library/artists/{artist_id}/cover-candidates", tags=["library"], summary="Search artist cover art sources", response_model=dict)
+def artist_cover_candidates(
+    artist_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    artist = session.get(Artist, artist_id)
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    urls = artist_image_candidate_urls(artist.name)
+    return {"artist_id": artist.id, "urls": urls, "cover_path": urls[0] if urls else None}
 
 
 @router.post("/imports/scan", tags=["imports"], summary="Scan staging directory for audio files", response_model=dict)
@@ -2869,6 +3015,14 @@ def tool_check_album_covers(
     _: User = Depends(require_permission(Permission.library_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_album_covers", {}))
+
+
+@router.post("/tools/check-artist-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing artist art")
+def tool_check_artist_covers(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "check_artist_covers", {}))
 
 
 @router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"], summary="Apply file check fix")

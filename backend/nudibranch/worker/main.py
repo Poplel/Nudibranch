@@ -20,7 +20,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import album_cover_candidate_urls, clear_discover_art_cache, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, clear_discover_art_cache, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -3008,12 +3008,11 @@ COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
 COVER_FILE_STEMS = ("cover", "folder", "front", "albumart", "album")
 
 
-def find_existing_cover_file(album: Album) -> str | None:
-    album_dir = album_folder_path(album)
+def find_existing_cover_file_in_dir(directory: Path) -> str | None:
     try:
-        if not album_dir.is_dir():
+        if not directory.is_dir():
             return None
-        entries = list(album_dir.iterdir())
+        entries = list(directory.iterdir())
     except OSError:
         return None
     by_stem: dict[str, Path] = {}
@@ -3033,6 +3032,10 @@ def find_existing_cover_file(album: Album) -> str | None:
         if match is not None:
             return str(match)
     return None
+
+
+def find_existing_cover_file(album: Album) -> str | None:
+    return find_existing_cover_file_in_dir(album_folder_path(album))
 
 
 def album_has_valid_local_cover(album: Album) -> bool:
@@ -3065,6 +3068,52 @@ def download_album_cover_to_library(session: Session, album: Album, urls: list[s
             append_task_log(session, None, f"{album.artist.name} / {album.title}: cover download failed from {url}: {error}", "warning")
     if last_error:
         append_task_log(session, None, f"{album.artist.name} / {album.title}: no cover source could be downloaded: {last_error}", "warning")
+    return None
+
+
+def artist_folder_path(artist: Artist) -> Path:
+    return get_settings().library_path / safe_path_part(artist.name, "Unknown Artist")
+
+
+def artist_has_valid_local_cover(artist: Artist) -> bool:
+    cover_path = artist.cover_path
+    if not cover_path:
+        return False
+    if cover_path.startswith("http://") or cover_path.startswith("https://"):
+        return False
+    candidate = Path(cover_path)
+    return candidate.exists() and candidate.is_file()
+
+
+def download_artist_cover_to_library(session: Session, artist: Artist, urls: list[str]) -> str | None:
+    artist_dir = artist_folder_path(artist)
+    artist_dir.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for url in urls:
+        try:
+            response = httpx.get(url, timeout=20, follow_redirects=True, headers={"User-Agent": "Nudibranch/0.1"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.casefold().startswith("image/"):
+                raise ValueError(f"unexpected content type {content_type or 'unknown'}")
+            cover_path = artist_dir / f"cover{cover_extension(content_type, url)}"
+            cover_path.write_bytes(response.content)
+            append_task_log(session, None, f"{artist.name}: downloaded artist art to {cover_path}")
+            return str(cover_path)
+        except Exception as error:  # noqa: BLE001 - try the next artwork source.
+            last_error = error
+            append_task_log(session, None, f"{artist.name}: artist art download failed from {url}: {error}", "warning")
+    if last_error:
+        append_task_log(session, None, f"{artist.name}: no artist art source could be downloaded: {last_error}", "warning")
+    return None
+
+
+def representative_album_cover(artist: Artist) -> str | None:
+    """The first local album cover for this artist, used as a fallback artist image
+    (the cover endpoint serves any file under the library, so no copy is needed)."""
+    for album in artist.albums:
+        if album_has_valid_local_cover(album):
+            return album.cover_path
     return None
 
 
@@ -4871,8 +4920,19 @@ def sync_album_folder(session: Session, album: Album) -> None:
 
 
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
+    # A remote cover_path URL (artist editor "Auto lookup" / Check Artist Covers)
+    # is downloaded into the artist folder so GET /library/artists/{id}/cover serves
+    # a real local file instead of 404ing on the URL (mirror apply_album_changes).
+    cover_value = changes.get("cover_path")
+    if isinstance(cover_value, str) and cover_value.lower().startswith(("http://", "https://")):
+        changes = dict(changes)
+        local_cover = download_artist_cover_to_library(session, artist, [cover_value])
+        if local_cover:
+            changes["cover_path"] = local_cover
+        else:
+            changes.pop("cover_path", None)
     old_name = artist.name
-    apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id"})
+    apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id", "cover_path"})
     name_changed = artist.name != old_name
     if not name_changed:
         # sort_name / musicbrainz_id-only edits must not merge into a same-name artist
@@ -6261,6 +6321,74 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
     return {"albums_checked": len(albums), "cover_changes": found, "batch_id": batch.id}
 
 
+def run_check_artist_covers(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Download missing artist covers", ProposalKind.artwork)
+    artists = list(
+        session.scalars(
+            select(Artist)
+            .options(selectinload(Artist.albums))
+            .order_by(Artist.name.asc())
+        )
+    )
+    batch = ProposalBatch(title="Download missing artist covers", kind=ProposalKind.artwork, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    found = 0
+    for artist in artists:
+        if artist_has_valid_local_cover(artist):
+            continue
+        try:
+            cover_path = find_existing_cover_file_in_dir(artist_folder_path(artist))
+            if cover_path:
+                append_task_log(session, task=None, message=f"{artist.name}: adopting existing artist cover file {cover_path}")
+            else:
+                cover_path = download_artist_cover_to_library(session, artist, artist_image_candidate_urls(artist.name))
+            if not cover_path:
+                cover_path = representative_album_cover(artist)
+                if cover_path:
+                    append_task_log(session, task=None, message=f"{artist.name}: using album cover as artist art {cover_path}")
+        except Exception as error:  # noqa: BLE001 - keep checking other artists.
+            append_task_log(session, task=None, message=f"{artist.name}: artist cover lookup failed: {error}", level="warning")
+            continue
+        if not cover_path or cover_path == artist.cover_path:
+            continue
+        found += 1
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=artist.name,
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"cover_path": artist.cover_path}),
+                new_value=json.dumps({"cover_path": cover_path}),
+                payload_json=json.dumps(
+                    {
+                        "target_type": "artist",
+                        "target_id": artist.id,
+                        "changes": {"cover_path": cover_path},
+                    }
+                ),
+            )
+        )
+    if found == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Artist cover check complete",
+            body=f"{len(artists)} artists checked. No missing covers were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"artists_checked": len(artists), "cover_changes": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Artist cover review ready",
+        body=f"{found} artist cover changes were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"artists_checked": len(artists), "cover_changes": found, "batch_id": batch.id}
+
+
 def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Missing album tracks", ProposalKind.download)
     albums = list(
@@ -7208,6 +7336,7 @@ TASK_HANDLERS = {
     "check_lyrics": run_check_lyrics,
     "check_musicbrainz_ids": run_check_musicbrainz_ids,
     "check_album_covers": run_check_album_covers,
+    "check_artist_covers": run_check_artist_covers,
     "check_missing_tracks": run_check_missing_tracks,
     "check_non_lossless": run_check_non_lossless,
     "check_audio_content": run_check_audio_content,
@@ -7397,6 +7526,7 @@ def task_notification_title(task_type: str) -> str:
         "check_duplicates": "Duplicate check",
         "check_lyrics": "Lyrics check",
         "check_album_covers": "Album cover check",
+        "check_artist_covers": "Artist cover check",
         "check_missing_tracks": "Missing tracks check",
         "check_non_lossless": "Lossless check",
         "check_musicbrainz_ids": "MusicBrainz ID check",
@@ -7417,7 +7547,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache", "consolidate_folders"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache", "consolidate_folders"}:
         return "/tools"
     return "/activity"
 

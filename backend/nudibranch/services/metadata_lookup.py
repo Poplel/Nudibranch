@@ -723,5 +723,44 @@ def album_cover_candidate_urls(artist: str, album: str, results: list[dict]) -> 
     return unique_urls
 
 
+def deezer_artist_image_urls(name: str) -> list[str]:
+    """Ordered artist photo URLs from Deezer's public search API (no API key)."""
+    try:
+        response = httpx.get(
+            "https://api.deezer.com/search/artist",
+            params={"q": name, "limit": 5},
+            timeout=10,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return []
+    results = response.json().get("data", []) or []
+    normalized = normalize(name)
+    ordered: list[str] = []
+    # Prefer an exact-ish name match, then fall back to the first result.
+    for prefer_match in (True, False):
+        for result in results:
+            if prefer_match and normalize(result.get("name")) != normalized:
+                continue
+            for key in ("picture_xl", "picture_big", "picture_medium", "picture"):
+                url = result.get(key)
+                if url and url not in ordered:
+                    ordered.append(url)
+                    break
+    return ordered
+
+
+def artist_image_candidate_urls(name: str) -> list[str]:
+    """De-duplicated artist photo URLs (currently Deezer's keyless search API)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for url in deezer_artist_image_urls(name):
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
 def normalize(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
