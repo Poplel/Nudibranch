@@ -3004,6 +3004,47 @@ def cover_extension(content_type: str, url: str) -> str:
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
 
 
+COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+COVER_FILE_STEMS = ("cover", "folder", "front", "albumart", "album")
+
+
+def find_existing_cover_file(album: Album) -> str | None:
+    album_dir = album_folder_path(album)
+    try:
+        if not album_dir.is_dir():
+            return None
+        entries = list(album_dir.iterdir())
+    except OSError:
+        return None
+    by_stem: dict[str, Path] = {}
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        if entry.suffix.lower() not in COVER_IMAGE_EXTENSIONS:
+            continue
+        stem = entry.stem.casefold()
+        if stem in COVER_FILE_STEMS and stem not in by_stem:
+            by_stem[stem] = entry
+    for stem in COVER_FILE_STEMS:
+        match = by_stem.get(stem)
+        if match is not None:
+            return str(match)
+    return None
+
+
+def album_has_valid_local_cover(album: Album) -> bool:
+    cover_path = album.cover_path
+    if not cover_path:
+        return False
+    if cover_path.startswith("http://") or cover_path.startswith("https://"):
+        return False
+    candidate = Path(cover_path)
+    return candidate.exists() and candidate.is_file()
+
+
 def download_album_cover_to_library(session: Session, album: Album, urls: list[str]) -> str | None:
     album_dir = album_folder_path(album)
     album_dir.mkdir(parents=True, exist_ok=True)
@@ -6159,7 +6200,6 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
         session.scalars(
             select(Album)
             .options(selectinload(Album.artist))
-            .where((Album.cover_path.is_(None)) | (Album.cover_path == ""))
             .order_by(Album.title.asc())
         )
     )
@@ -6168,13 +6208,21 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
     session.flush()
     found = 0
     for album in albums:
-        try:
-            results = search_album_releases(album.artist.name, album.title)
-        except Exception as error:  # noqa: BLE001 - keep checking other albums.
-            append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: album cover lookup failed: {error}", level="warning")
+        if album_has_valid_local_cover(album):
             continue
-        cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
+        cover_path = find_existing_cover_file(album)
+        if cover_path:
+            append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: adopting existing cover file {cover_path}")
+        else:
+            try:
+                results = search_album_releases(album.artist.name, album.title)
+            except Exception as error:  # noqa: BLE001 - keep checking other albums.
+                append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: album cover lookup failed: {error}", level="warning")
+                continue
+            cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
         if not cover_path:
+            continue
+        if cover_path == album.cover_path:
             continue
         found += 1
         session.add(

@@ -11,7 +11,7 @@ import httpx
 from sqlalchemy import case, func, literal, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission
+from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
     AutomationCreate,
@@ -85,7 +85,6 @@ from nudibranch.api.schemas import (
     WishlistCreate,
     WishlistOut,
 )
-from nudibranch.db.init import hash_secret
 from nudibranch.db.models import (
     Album,
     AppSetting,
@@ -1754,7 +1753,7 @@ def stream_track(
     api_key: str = Query(""),
     session: Session = Depends(get_session),
 ) -> FileResponse:
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
     if not user or (not user.is_admin and Permission.library_read not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -1773,7 +1772,7 @@ def get_track_lyrics(
     api_key: str = Query(""),
     session: Session = Depends(get_session),
 ) -> dict:
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
     if not user or (not user.is_admin and Permission.library_read not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -1794,7 +1793,7 @@ def album_cover(
     api_key: str = Query(""),
     session: Session = Depends(get_session),
 ) -> FileResponse:
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
     if not user or (not user.is_admin and Permission.library_read not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -2196,7 +2195,7 @@ def discover_art(
     api_key: str = Query(""),
     session: Session = Depends(get_session),
 ) -> FileResponse:
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(api_key)))
+    user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
     if not user or (not user.is_admin and Permission.wishlist_manage_own not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")

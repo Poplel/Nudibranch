@@ -55,6 +55,41 @@ def get_current_user(
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
+def resolve_media_user(session: Session, token: str) -> User | None:
+    """Resolve a user from a media query-param token (``?api_key=...``).
+
+    Audio/cover/lyrics are loaded by ``<audio>``/``<img>`` elements that cannot
+    send an Authorization header, so they pass the token in the query string.
+    This mirrors ``get_current_user``'s precedence — session token, static API
+    key, then the legacy ``api_key_hash`` — so a logged-in session token works
+    for media the same way it does for header-authed routes. Returns ``None`` if
+    the token matches nothing (callers raise their own 401/permission error).
+    """
+    if not token:
+        return None
+    token_h = hash_token(token)
+    now = datetime.now(timezone.utc)
+
+    auth_session = session.scalar(select(AuthSession).where(AuthSession.token_hash == token_h))
+    if auth_session:
+        if _aware(auth_session.expires_at) < now:
+            return None
+        auth_session.last_used_at = now
+        auth_session.expires_at = now + SESSION_TTL
+        session.commit()
+        return auth_session.user
+
+    static_key = session.scalar(
+        select(StaticApiKey).where(StaticApiKey.key_hash == token_h, StaticApiKey.revoked.is_(False))
+    )
+    if static_key:
+        static_key.last_used_at = now
+        session.commit()
+        return static_key.user
+
+    return session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
+
+
 def require_permission(permission: Permission):
     def dependency(user: User = Depends(get_current_user)) -> User:
         if user.is_admin:

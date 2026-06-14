@@ -1433,6 +1433,28 @@ function App() {
     }
   }
 
+  async function playAlbumFromHome(albumId) {
+    if (!albumId) return;
+    try {
+      const data = await api(`/library/tracks?album_id=${encodeURIComponent(albumId)}&page_size=500`);
+      const tracks = (data?.items || []).map((t) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title }));
+      if (tracks.length === 0) { notify("Playback", "No tracks found for this album.", "ui_error"); return; }
+      await playTracks(tracks);
+    } catch (error) {
+      notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
+  async function playPlaylistFromHome(playlistId) {
+    try {
+      const tracks = await resolvePlaylistTracks(playlistId);
+      if (tracks.length === 0) { notify("Playback", "This playlist has no tracks.", "ui_error"); return; }
+      await playTracks(tracks);
+    } catch (error) {
+      notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
   async function executeRemoteCommand(cmd) {
     const action = (cmd.action || "").toLowerCase();
     const ctl = playbackControlRef.current;
@@ -1740,9 +1762,9 @@ function App() {
 
         <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
-            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
+            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} setPage={setPage} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -2005,13 +2027,19 @@ function TrayItem({ title, body, tone = "normal" }) {
   );
 }
 
-function PanelHeader({ page, queueSummary }) {
+function PanelHeader({ page, queueSummary, displayName }) {
   const description = page === "Task Queue" ? queueSummary : pageDescriptions[page];
+  let heading = page;
+  if (page === "Home") {
+    const hour = new Date().getHours();
+    const period = hour < 12 ? "morning" : hour < 18 ? "afternoon" : "evening";
+    heading = `Good ${period}${displayName ? `, ${displayName}` : ""}`;
+  }
 
   return (
     <div className="panel-header">
       <div>
-        <h1>{page}</h1>
+        <h1>{heading}</h1>
         <p>{description ?? "Manage this section of Nudibranch."}</p>
       </div>
     </div>
@@ -2042,11 +2070,8 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
     const present = new Set(visibleArtists.map(artistBucket));
     const ordered = [];
     if (present.has("symbol")) ordered.push("symbol");
-    if (present.has("0-9")) ordered.push("0-9");
-    for (let i = 65; i <= 90; i++) {
-      const L = String.fromCharCode(i);
-      if (present.has(L)) ordered.push(L);
-    }
+    ordered.push("0-9");
+    for (let i = 65; i <= 90; i++) ordered.push(String.fromCharCode(i));
     return ordered;
   }, [visibleArtists]);
   const bucketedArtists = useMemo(
@@ -3614,13 +3639,15 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                 onPlay={() => onPlay(playableTracks)}
                 onQueue={() => onQueue(playableTracks)}
               />
-              <button
-                className={`row-icon-button${pinnedIds.has(playlist.id) ? " active" : ""}`}
-                onClick={() => togglePin(playlist)}
-                title={pinnedIds.has(playlist.id) ? "Unpin from Home" : "Pin to Home"}
-              >
-                {pinnedIds.has(playlist.id) ? <PinOff size={14} /> : <Pin size={14} />}
-              </button>
+              {!playlist.protected && (
+                <button
+                  className={`row-icon-button${pinnedIds.has(playlist.id) ? " active" : ""}`}
+                  onClick={() => togglePin(playlist)}
+                  title={pinnedIds.has(playlist.id) ? "Unpin from Home" : "Pin to Home"}
+                >
+                  {pinnedIds.has(playlist.id) ? <PinOff size={14} /> : <Pin size={14} />}
+                </button>
+              )}
               <button className="row-icon-button" onClick={() => setAddOpen(addOpen === playlist.id ? null : playlist.id)} title="Add music">
                 <Plus size={14} />
               </button>
@@ -4312,13 +4339,15 @@ function LibraryMetadataEditor({
                     <input
                       type="checkbox"
                       checked={Boolean(draft[field.key])}
+                      disabled={field.readOnly}
                       onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.checked }))}
                     />
                   ) : (
                     <input
                       type={field.type === "number" ? "number" : "text"}
                       value={draft[field.key] ?? ""}
-                      onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
+                      readOnly={field.readOnly}
+                      onChange={(event) => field.readOnly ? undefined : setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
                     />
                   )}
                   {(onAutoLookup || onSearchAlbums) && (
@@ -4418,7 +4447,7 @@ function albumFields(album) {
     { key: "musicbrainz_release_id", label: "MusicBrainz release ID", value: album.musicbrainz_release_id },
     { key: "musicbrainz_release_group_id", label: "MusicBrainz release group ID", value: album.musicbrainz_release_group_id },
     { key: "cover_path", label: "Cover art", value: album.cover_path },
-    { key: "path", label: "Path", value: album.path },
+    { key: "path", label: "Path", value: album.path, readOnly: true },
   ];
 }
 
@@ -4427,14 +4456,14 @@ function trackFields(track) {
     { key: "title", label: "Title", value: track.title },
     { key: "track_number", label: "Track number", value: track.track_number, type: "number" },
     { key: "disc_number", label: "Disc number", value: track.disc_number, type: "number" },
-    { key: "duration_ms", label: "Duration ms", value: track.duration_ms, type: "number" },
+    { key: "duration_ms", label: "Duration ms", value: track.duration_ms, type: "number", readOnly: true },
     { key: "format", label: "Format", value: track.format },
-    { key: "bitrate", label: "Bitrate", value: track.bitrate, type: "number" },
-    { key: "path", label: "Path", value: track.path },
+    { key: "bitrate", label: "Bitrate", value: track.bitrate, type: "number", readOnly: true },
+    { key: "path", label: "Path", value: track.path, readOnly: true },
     { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id },
     { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
-    { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean" },
-    { key: "musicbrainz_verified", label: "MusicBrainz verified", value: track.musicbrainz_verified, type: "boolean" },
+    { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean", readOnly: true },
+    { key: "musicbrainz_verified", label: "MusicBrainz verified", value: track.musicbrainz_verified, type: "boolean", readOnly: true },
     { key: "metadata_locked", label: "Metadata locked", value: track.metadata_locked, type: "boolean" },
     { key: "artwork_locked", label: "Artwork locked", value: track.artwork_locked, type: "boolean" },
     { key: "filename_locked", label: "Filename locked", value: track.filename_locked, type: "boolean" },
@@ -5321,15 +5350,6 @@ function AutomationsView({ api, notify }) {
 
   return (
     <div className="automations-view">
-      <div className="automation-card-row" style={{ justifyContent: "flex-end" }}>
-        {!showForm && (
-          <button className="secondary compact" onClick={openCreate}>
-            <Plus size={15} />
-            New automation
-          </button>
-        )}
-      </div>
-
       {showForm && (
         <section className="settings-section automation-form">
           <h2>{editingId ? "Edit automation" : "New automation"}</h2>
@@ -5678,6 +5698,15 @@ function AutomationsView({ api, notify }) {
           {a.last_error && <div className="automation-status-error" style={{ fontSize: 12 }}>{a.last_error}</div>}
         </div>
       ))}
+
+      <div className="automation-card-row" style={{ justifyContent: "center" }}>
+        {!showForm && (
+          <button className="secondary compact" onClick={openCreate}>
+            <Plus size={15} />
+            New automation
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -6241,7 +6270,6 @@ function SettingsPanel({
   api,
   notify,
 }) {
-  const [showApiKey, setShowApiKey] = useState(false);
   const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
   // Resync if the user object loads/changes after mount.
   useEffect(() => {
@@ -6329,17 +6357,6 @@ function SettingsPanel({
           <strong>Connected</strong>
         </div>
       </section>
-      {canViewApiKey && (
-        <section className="settings-section">
-          <h2>API Access</h2>
-          <div className="api-key-row">
-            <input readOnly type={showApiKey ? "text" : "password"} value={apiKey} />
-            <button className="secondary" onClick={() => setShowApiKey((value) => !value)}>
-              {showApiKey ? "Hide" : "Show"}
-            </button>
-          </div>
-        </section>
-      )}
       {canManageSettings(user) && (
         <section className="settings-section">
           <h2>Integrations</h2>
@@ -6423,7 +6440,7 @@ function fmtTimeAgo(isoString) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function HomeView({ api, apiKey, setPage }) {
+function HomeView({ api, apiKey, onPlayAlbum, onPlayPlaylist }) {
   const [home, setHome] = useState(null);
   useEffect(() => {
     let active = true;
@@ -6440,10 +6457,26 @@ function HomeView({ api, apiKey, setPage }) {
   return (
     <div className="home-view">
       <section className="home-section">
-        <div className="home-section-head">
-          <h2>Recently added</h2>
-          <button className="secondary compact" onClick={() => setPage("Library")}>Library</button>
+        <h2>Favorites &amp; pinned</h2>
+        <div className="home-pin-row">
+          <button className="home-pin-card" onClick={() => onPlayPlaylist("favorites")}>
+            <Heart size={16} />
+            <span className="home-list-main">Favorites</span>
+            <span className="home-list-sub">{home.favorites ? `${home.favorites.track_count} tracks` : "—"}</span>
+          </button>
+          {home.pinned_playlists.map((p) => (
+            <button key={p.playlist_id} className="home-pin-card" onClick={() => onPlayPlaylist(p.playlist_id)}>
+              <Pin size={15} />
+              <span className="home-list-main">{p.name}</span>
+              <span className="home-list-sub">{p.track_count != null ? `${p.track_count} tracks` : ""}</span>
+            </button>
+          ))}
+          {home.pinned_playlists.length === 0 && <p className="muted">Pin playlists from the Playlists page.</p>}
         </div>
+      </section>
+
+      <section className="home-section">
+        <h2>Recently added</h2>
         {home.recently_added.length === 0 ? (
           <p className="muted">Nothing added yet.</p>
         ) : (
@@ -6451,7 +6484,7 @@ function HomeView({ api, apiKey, setPage }) {
             {home.recently_added.map((al) => {
               const cover = albumCoverUrl(al, apiKey);
               return (
-                <button key={al.id} className="home-album-card" onClick={() => setPage("Library")} title={`${al.title} — ${al.artist || ""}`}>
+                <button key={al.id} className="home-album-card" onClick={() => onPlayAlbum(al.id)} title={`${al.title} — ${al.artist || ""}`}>
                   <span className="home-album-art">
                     {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={22} />}
                   </span>
@@ -6497,25 +6530,6 @@ function HomeView({ api, apiKey, setPage }) {
           )}
         </section>
       </div>
-
-      <section className="home-section">
-        <h2>Favorites &amp; pinned</h2>
-        <div className="home-pin-row">
-          <button className="home-pin-card" onClick={() => setPage("Playlists")}>
-            <Heart size={16} />
-            <span className="home-list-main">Favorites</span>
-            <span className="home-list-sub">{home.favorites ? `${home.favorites.track_count} tracks` : "—"}</span>
-          </button>
-          {home.pinned_playlists.map((p) => (
-            <button key={p.playlist_id} className="home-pin-card" onClick={() => setPage("Playlists")}>
-              <Pin size={15} />
-              <span className="home-list-main">{p.name}</span>
-              <span className="home-list-sub">{p.track_count != null ? `${p.track_count} tracks` : ""}</span>
-            </button>
-          ))}
-          {home.pinned_playlists.length === 0 && <p className="muted">Pin playlists from the Playlists page.</p>}
-        </div>
-      </section>
     </div>
   );
 }

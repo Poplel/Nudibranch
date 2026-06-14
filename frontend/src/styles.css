@@ -226,7 +226,7 @@ nav button:hover {
   min-width: 18px;
   height: 18px;
   border-radius: 9px;
-  background: var(--danger);
+  background: var(--accent);
   color: #fff;
   font-size: 11px;
   line-height: 18px;
