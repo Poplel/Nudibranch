@@ -14,6 +14,7 @@ import {
   Folder,
   GripVertical,
   HardDriveUpload,
+  House,
   Heart,
   ListChecks,
   ListMusic,
@@ -28,6 +29,8 @@ import {
   Music,
   Pencil,
   Pause,
+  Pin,
+  PinOff,
   PictureInPicture2,
   Play,
   Plus,
@@ -66,6 +69,7 @@ function getDeviceLabel() {
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
 
 const navItems = [
+  ["Home", House],
   ["Library", Music],
   ["Discover", Compass],
   ["Import/Add", HardDriveUpload],
@@ -81,6 +85,7 @@ const navItems = [
 ];
 
 const pageDescriptions = {
+  Home: "Your library at a glance — recently added, recent plays, favorites, and pinned playlists.",
   Library: "Browse artists, albums, and tracks in the managed library.",
   Discover: "Search MusicBrainz for artists, albums, and tracks to request or queue.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
@@ -1408,10 +1413,16 @@ function App() {
     try {
       setAudioUrl(`${API_BASE}/library/tracks/${track.id}/stream?api_key=${encodeURIComponent(token)}`);
       setCurrentTrack(track);
+      recordPlay(track.id);
       reportPlayerStatus(track, "playing", { queue_length: playerQueue.length || 1, current_index: Math.max(0, playerQueue.findIndex((queuedTrack) => queuedTrack.id === track.id)) });
     } catch (playError) {
       notify("Playback failed", playError.message, "ui_error");
     }
+  }
+
+  function recordPlay(trackId) {
+    if (!trackId) return;
+    api("/me/plays", { method: "POST", body: JSON.stringify({ track_id: trackId }) }).catch(() => {});
   }
 
   function reportPlayerStatus(track = currentTrack, status = "stopped", details = {}) {
@@ -1624,9 +1635,12 @@ function App() {
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
-        <div className={`content-grid${["Settings", "Discover"].includes(page) ? " no-inspector" : ""}`}>
+        <div className={`content-grid${["Home", "Settings", "Discover"].includes(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
+            {page === "Home" && (
+              <HomeView api={api} apiKey={token} setPage={setPage} />
+            )}
             {page === "Library" && (
               <LibraryTree
                 artists={library}
@@ -1749,6 +1763,7 @@ function App() {
                 onQueue={addTracksToPlayerQueue}
                 onQueuePosition={proposePlaylistPosition}
                 onInspectorActionsChange={setPlaylistInspectorActions}
+                api={api}
               />
             )}
             {page === "Users" && (
@@ -1765,15 +1780,17 @@ function App() {
                 jellyfinUsersLoading={jellyfinUsersLoading}
                 onLoadJellyfinUsers={loadJellyfinUsers}
                 onUpdateJellyfinUser={updateUserJellyfinUser}
+                api={api}
               />
             )}
             {page === "Automations" && <AutomationsView api={api} notify={notify} user={user} />}
-            {!["Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
+            {!["Home", "Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
           </section>
 
-          {!["Settings", "Discover"].includes(page) && (
+          {!["Home", "Settings", "Discover"].includes(page) && (
           <Inspector
             page={page}
+            api={api}
             library={library}
             importFiles={importFiles}
             importDownloadRequests={importDownloadRequests}
@@ -3399,7 +3416,26 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onQueue, onQueuePosition, onInspectorActionsChange }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onQueue, onQueuePosition, onInspectorActionsChange, api }) {
+  const [pinnedIds, setPinnedIds] = useState(() => new Set());
+  useEffect(() => {
+    let active = true;
+    api("/me/pinned-playlists")
+      .then((rows) => { if (active) setPinnedIds(new Set((rows || []).map((r) => r.playlist_id))); })
+      .catch(() => {});
+    return () => { active = false; };
+  }, [api]);
+  async function togglePin(playlist) {
+    const isPinned = pinnedIds.has(playlist.id);
+    try {
+      const rows = isPinned
+        ? await api(`/me/pinned-playlists/${encodeURIComponent(playlist.id)}`, { method: "DELETE" })
+        : await api("/me/pinned-playlists", { method: "POST", body: JSON.stringify({ playlist_id: playlist.id, name: playlist.name }) });
+      setPinnedIds(new Set((rows || []).map((r) => r.playlist_id)));
+    } catch {
+      /* best-effort */
+    }
+  }
   const [openPlaylists, setOpenPlaylists] = useState(() => new Set());
   const [addOpen, setAddOpen] = useState(null);
   const [editOpen, setEditOpen] = useState(null);
@@ -3471,6 +3507,13 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                 onPlay={() => onPlay(playableTracks)}
                 onQueue={() => onQueue(playableTracks)}
               />
+              <button
+                className={`row-icon-button${pinnedIds.has(playlist.id) ? " active" : ""}`}
+                onClick={() => togglePin(playlist)}
+                title={pinnedIds.has(playlist.id) ? "Unpin from Home" : "Pin to Home"}
+              >
+                {pinnedIds.has(playlist.id) ? <PinOff size={14} /> : <Pin size={14} />}
+              </button>
               <button className="row-icon-button" onClick={() => setAddOpen(addOpen === playlist.id ? null : playlist.id)} title="Add music">
                 <Plus size={14} />
               </button>
@@ -4449,6 +4492,7 @@ function canViewPage(user, page) {
     );
   }
   if (page === "Automations") return hasPermission(user, "automations:manage");
+  if (page === "Home") return true;
   if (page === "Users") return true;
   if (page === "Settings") return true;
   return false;
@@ -5498,7 +5542,40 @@ function CheckFilesResult({ result, onFix }) {
   );
 }
 
-function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
+function PlayHistoryPanel({ api }) {
+  const [plays, setPlays] = useState(null);
+  useEffect(() => {
+    let active = true;
+    api("/me/plays?limit=50")
+      .then((data) => { if (active) setPlays(data || []); })
+      .catch(() => { if (active) setPlays([]); });
+    return () => { active = false; };
+  }, [api]);
+  return (
+    <section className="settings-section play-history">
+      <h2>My play history</h2>
+      {plays === null ? (
+        <p className="muted">Loading…</p>
+      ) : plays.length === 0 ? (
+        <p className="muted">No plays recorded yet.</p>
+      ) : (
+        <ul className="home-list play-history-list">
+          {plays.map((p, i) => (
+            <li key={`${p.track_id}-${i}`}>
+              <span className="home-list-main">{p.title || "Unknown"}</span>
+              <span className="home-list-sub">
+                {[p.artist, p.album].filter(Boolean).join(" · ")}
+                {p.played_at ? ` · ${new Date(p.played_at).toLocaleString()}` : ""}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser, api }) {
   const [newUser, setNewUser] = useState({ display_name: "", username: "", password: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
@@ -5519,6 +5596,7 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
 
   return (
     <div className="users-view">
+      <PlayHistoryPanel api={api} />
       {canManage && (
         <form className="user-create-panel" onSubmit={submitNewUser}>
           <h2>Create user</h2>
@@ -6128,8 +6206,140 @@ function fmtTimeAgo(isoString) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+function HomeView({ api, apiKey, setPage }) {
+  const [home, setHome] = useState(null);
+  useEffect(() => {
+    let active = true;
+    api("/me/home")
+      .then((data) => { if (active) setHome(data); })
+      .catch(() => { if (active) setHome({ recently_added: [], recently_approved: [], recent_plays: [], favorites: null, pinned_playlists: [] }); });
+    return () => { active = false; };
+  }, [api]);
+
+  if (!home) return <div className="home-view"><p className="muted">Loading…</p></div>;
+
+  const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString() : "");
+
+  return (
+    <div className="home-view">
+      <section className="home-section">
+        <div className="home-section-head">
+          <h2>Recently added</h2>
+          <button className="secondary compact" onClick={() => setPage("Library")}>Library</button>
+        </div>
+        {home.recently_added.length === 0 ? (
+          <p className="muted">Nothing added yet.</p>
+        ) : (
+          <div className="home-album-grid">
+            {home.recently_added.map((al) => {
+              const cover = albumCoverUrl(al, apiKey);
+              return (
+                <button key={al.id} className="home-album-card" onClick={() => setPage("Library")} title={`${al.title} — ${al.artist || ""}`}>
+                  <span className="home-album-art">
+                    {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={22} />}
+                  </span>
+                  <span className="home-album-title">{al.title}</span>
+                  <span className="home-album-artist">{al.artist || ""}</span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
+      <div className="home-columns">
+        <section className="home-section">
+          <h2>Recent plays</h2>
+          {home.recent_plays.length === 0 ? (
+            <p className="muted">No plays yet.</p>
+          ) : (
+            <ul className="home-list">
+              {home.recent_plays.map((p, i) => (
+                <li key={`${p.track_id}-${i}`}>
+                  <span className="home-list-main">{p.title || "Unknown"}</span>
+                  <span className="home-list-sub">{p.artist || ""}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="home-section">
+          <h2>Recently approved</h2>
+          {home.recently_approved.length === 0 ? (
+            <p className="muted">No approved wishlist items yet.</p>
+          ) : (
+            <ul className="home-list">
+              {home.recently_approved.map((w) => (
+                <li key={w.id}>
+                  <span className="home-list-main">{w.track || w.album || w.artist}</span>
+                  <span className="home-list-sub">{w.track || w.album ? w.artist : ""}{w.approved_at ? ` · ${fmt(w.approved_at)}` : ""}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      </div>
+
+      <section className="home-section">
+        <h2>Favorites &amp; pinned</h2>
+        <div className="home-pin-row">
+          <button className="home-pin-card" onClick={() => setPage("Playlists")}>
+            <Heart size={16} />
+            <span className="home-list-main">Favorites</span>
+            <span className="home-list-sub">{home.favorites ? `${home.favorites.track_count} tracks` : "—"}</span>
+          </button>
+          {home.pinned_playlists.map((p) => (
+            <button key={p.playlist_id} className="home-pin-card" onClick={() => setPage("Playlists")}>
+              <Pin size={15} />
+              <span className="home-list-main">{p.name}</span>
+              <span className="home-list-sub">{p.track_count != null ? `${p.track_count} tracks` : ""}</span>
+            </button>
+          ))}
+          {home.pinned_playlists.length === 0 && <p className="muted">Pin playlists from the Playlists page.</p>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function LibraryTopStats({ api }) {
+  const [top, setTop] = useState(null);
+  useEffect(() => {
+    let active = true;
+    api("/library/top?days=30")
+      .then((data) => { if (active) setTop(data); })
+      .catch(() => { if (active) setTop({ artist: null, album: null, track: null }); });
+    return () => { active = false; };
+  }, [api]);
+  if (!top) return null;
+  const rows = [
+    ["Top artist", top.artist && `${top.artist.name} · ${top.artist.plays} play${top.artist.plays === 1 ? "" : "s"}`],
+    ["Top album", top.album && `${top.album.title} · ${top.album.plays} play${top.album.plays === 1 ? "" : "s"}`],
+    ["Top track", top.track && `${top.track.title} · ${top.track.plays} play${top.track.plays === 1 ? "" : "s"}`],
+  ];
+  return (
+    <div className="inspector-section library-top">
+      <div className="inspector-section-label">Last 30 days</div>
+      {rows.every(([, v]) => !v) ? (
+        <p className="inspector-hint">No plays recorded yet.</p>
+      ) : (
+        <dl className="library-top-list">
+          {rows.map(([label, value]) => (
+            <div key={label} className="library-top-row">
+              <dt>{label}</dt>
+              <dd>{value || "—"}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  );
+}
+
 function Inspector({
   page,
+  api,
   library,
   importFiles,
   importDownloadRequests,
@@ -6162,6 +6372,7 @@ function Inspector({
   return (
     <aside className="panel inspector">
       <h2>Inspector</h2>
+      {page === "Library" && <LibraryTopStats api={api} />}
       {page === "Import/Add" && importActions && (
         <div className="inspector-actions">
           <button className="primary" onClick={importActions.onScan} disabled={importActions.loading}>

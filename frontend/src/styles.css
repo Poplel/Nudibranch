@@ -3922,3 +3922,179 @@ nav button:hover,
     transform: rotate(90deg);
   }
 }
+
+/* ── Home dashboard ───────────────────────────────────────────────────────── */
+.home-view {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+}
+
+.home-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.home-section h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.home-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.home-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+
+.home-album-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.home-album-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.home-album-art {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  color: var(--muted);
+}
+
+.home-album-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.home-album-title {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-album-artist {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.home-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.home-list-main {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-list-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.play-history-list {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.home-pin-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.home-pin-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 140px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+}
+
+@media (max-width: 660px) {
+  .home-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Inspector: library top (30d) + section labels ────────────────────────── */
+.inspector-section-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.library-top-list {
+  margin: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.library-top-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.library-top-row dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.library-top-row dd {
+  margin: 0;
+  font-size: 13px;
+}
+
+.row-icon-button.active {
+  color: var(--accent);
+}
