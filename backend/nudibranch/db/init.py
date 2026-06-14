@@ -117,7 +117,9 @@ def _migrate_library_timestamps(session: Session) -> None:
     SQLite forbids ALTER TABLE ADD COLUMN with a non-constant DEFAULT (CURRENT_TIMESTAMP),
     so add the columns nullable, then backfill existing rows with a constant timestamp.
     """
-    now = datetime.now(timezone.utc).isoformat()
+    # Match SQLAlchemy's SQLite DATETIME storage format (space-separated, no offset) so
+    # string comparisons in /library/changes (updated_at > :since) work against ORM-written rows.
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
     for table in ("artists", "albums", "tracks"):
         cols = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
         if not cols:

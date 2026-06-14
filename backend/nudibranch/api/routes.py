@@ -168,9 +168,14 @@ def login(payload: LoginRequest, session: Session = Depends(get_session)) -> Log
     # (re-keys the token + extends expiry; keeps created_at, label, and id stable).
     existing = None
     if label:
-        existing = session.scalar(
+        same_label = list(session.scalars(
             select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.device_label == label).order_by(AuthSession.created_at.asc())
-        )
+        ))
+        if same_label:
+            existing = same_label[0]
+            # Collapse any pre-existing duplicate same-label rows so one device == one session.
+            for dup in same_label[1:]:
+                session.delete(dup)
     if existing:
         existing.token_hash = hash_token(token)
         existing.last_used_at = now
@@ -210,15 +215,19 @@ def logout(
     return {"ok": True}
 
 
+def _current_session_hash(authorization: str | None) -> str | None:
+    if authorization and authorization.lower().startswith("bearer "):
+        return hash_token(authorization.split(" ", 1)[1].strip())
+    return None
+
+
 @router.get("/me/sessions", response_model=list[SessionOut], tags=["auth"], summary="List my active sessions")
 def list_sessions(
     authorization: str | None = Header(default=None),
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> list[SessionOut]:
-    current_hash = None
-    if authorization and authorization.lower().startswith("bearer "):
-        current_hash = hash_token(authorization.split(" ", 1)[1].strip())
+    current_hash = _current_session_hash(authorization)
     rows = session.scalars(
         select(AuthSession).where(AuthSession.user_id == user.id).order_by(AuthSession.last_used_at.desc())
     )
@@ -246,11 +255,12 @@ def rename_session(
     existing = session.scalar(select(AuthSession).where(AuthSession.id == session_id, AuthSession.user_id == user.id))
     if not existing:
         raise HTTPException(status_code=404, detail="Session not found")
-    existing.device_label = (payload.device_label or "").strip()[:255] or None
+    label = (payload.device_label or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Session name cannot be empty")
+    existing.device_label = label[:255]
     session.commit()
-    current_hash = None
-    if authorization and authorization.lower().startswith("bearer "):
-        current_hash = hash_token(authorization.split(" ", 1)[1].strip())
+    current_hash = _current_session_hash(authorization)
     return SessionOut(
         id=existing.id,
         device_label=existing.device_label,
@@ -636,7 +646,7 @@ def list_my_plays(
         .order_by(PlayEvent.played_at.desc())
         .limit(limit)
     )
-    if days:
+    if days is not None:
         since = datetime.now(timezone.utc) - timedelta(days=days)
         query = query.where(PlayEvent.played_at >= since)
     return [_play_event_out(e) for e in session.scalars(query)]
@@ -705,16 +715,23 @@ def library_changes(
     def _filter(query, model):
         return query.where(model.updated_at > since_dt) if since_dt else query
 
+    def _iso(dt):
+        # SQLite stores these tz-naive; they are UTC, so emit a UTC-aware ISO string
+        # consistent with server_time for client cursor math.
+        if not dt:
+            return None
+        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+
     artists = [
         {"id": a.id, "name": a.name, "sort_name": a.sort_name, "musicbrainz_id": a.musicbrainz_id,
-         "updated_at": a.updated_at.isoformat() if a.updated_at else None}
+         "updated_at": _iso(a.updated_at)}
         for a in session.scalars(_filter(select(Artist), Artist))
     ]
     albums = [
         {"id": al.id, "artist_id": al.artist_id, "title": al.title, "release_title": al.release_title,
          "cover_path": al.cover_path, "musicbrainz_release_id": al.musicbrainz_release_id,
          "musicbrainz_release_group_id": al.musicbrainz_release_group_id,
-         "updated_at": al.updated_at.isoformat() if al.updated_at else None}
+         "updated_at": _iso(al.updated_at)}
         for al in session.scalars(_filter(select(Album), Album))
     ]
     tracks = [
@@ -723,7 +740,7 @@ def library_changes(
          "bitrate": t.bitrate, "is_lossless": t.is_lossless, "explicit": t.explicit,
          "musicbrainz_recording_id": t.musicbrainz_recording_id, "jellyfin_item_id": t.jellyfin_item_id,
          "musicbrainz_verified": t.musicbrainz_verified,
-         "updated_at": t.updated_at.isoformat() if t.updated_at else None}
+         "updated_at": _iso(t.updated_at)}
         for t in session.scalars(_filter(select(Track), Track))
     ]
     return {
@@ -820,9 +837,16 @@ def me_home(
     # Recent plays
     recent_plays = list_my_plays(limit=12, days=None, session=session, user=user)
 
-    # Favorites + pinned playlists (Jellyfin-backed when linked)
+    # Pinned playlists (names from our own table — no per-playlist Jellyfin fan-out).
+    pinned = [
+        {"playlist_id": p.playlist_id, "name": p.name}
+        for p in session.scalars(
+            select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc())
+        )
+    ]
+
+    # Favorites count is a single cheap call when Jellyfin is linked.
     favorites: dict | None = None
-    pinned: list[dict] = []
     client, jf_user_id = _jf_client(session, user)
     if client:
         with client:
@@ -831,21 +855,6 @@ def me_home(
                 favorites = {"id": "favorites", "name": "Favorites", "track_count": fav.track_count}
             except Exception:
                 favorites = None
-            for p in session.scalars(
-                select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc())
-            ):
-                count = None
-                if p.playlist_id != "favorites":
-                    try:
-                        resp = client.get(f"/Playlists/{p.playlist_id}/Items", params={"UserId": jf_user_id, "Limit": "0"})
-                        resp.raise_for_status()
-                        count = resp.json().get("TotalRecordCount")
-                    except Exception:
-                        count = None
-                pinned.append({"playlist_id": p.playlist_id, "name": p.name, "track_count": count})
-    else:
-        pinned = [{"playlist_id": p.playlist_id, "name": p.name, "track_count": None}
-                  for p in session.scalars(select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc()))]
 
     return {
         "recently_added": recently_added,

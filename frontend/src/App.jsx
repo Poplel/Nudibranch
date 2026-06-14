@@ -101,6 +101,9 @@ const pageDescriptions = {
   Settings: "Manage appearance, integrations, and system status.",
 };
 
+// Pages that render full-width with no Inspector aside.
+const NO_INSPECTOR_PAGES = new Set(["Home", "Settings", "Discover"]);
+
 const approvalTypeLabels = {
   import_files: "Imports",
   download: "Download candidates",
@@ -131,6 +134,8 @@ function App() {
   const playbackControlRef = useRef(null);
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
+  const lastRecordedPlayRef = useRef(null);
+  const commandPollingRef = useRef(false);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
@@ -346,7 +351,7 @@ function App() {
     return () => { cancelled = true; if (intervalId !== null) clearInterval(intervalId); };
   }, [token, user?.id]);
 
-  async function api(path, options = {}) {
+  const api = useCallback(async (path, options = {}) => {
     const isFormData = options.body instanceof FormData;
     const response = await fetch(`${API_BASE}${path}`, {
       ...options,
@@ -361,7 +366,7 @@ function App() {
       throw new Error(body.detail || `${response.status} ${response.statusText}`);
     }
     return response.json();
-  }
+  }, [token]);
 
   async function login(username, password) {
     setLoading(true);
@@ -1422,7 +1427,7 @@ function App() {
   async function resolvePlaylistTracks(playlistId) {
     try {
       const pl = playlistId === "favorites" ? await api("/playlists/favorites") : (await api("/playlists")).find((p) => p.id === playlistId);
-      return (pl?.tracks || []).map((t) => ({ id: t.id, title: t.title, _artist: t.artist, _album: t.album }));
+      return (pl?.tracks || []).map((t) => ({ id: t.track_id, title: t.title, _artist: t.artist, _album: t.album }));
     } catch {
       return [];
     }
@@ -1471,6 +1476,8 @@ function App() {
     if (!token || !user?.id) return undefined;
     let stopped = false;
     async function poll() {
+      if (commandPollingRef.current) return; // never let two polls overlap → no double-execution
+      commandPollingRef.current = true;
       try {
         const dev = currentSessionIdRef.current;
         const cmds = await api(`/player/commands${dev ? `?device_id=${encodeURIComponent(dev)}` : ""}`);
@@ -1480,6 +1487,8 @@ function App() {
         }
       } catch {
         /* offline / transient */
+      } finally {
+        commandPollingRef.current = false;
       }
     }
     poll();
@@ -1509,6 +1518,12 @@ function App() {
 
   function recordPlay(trackId) {
     if (!trackId) return;
+    // De-dupe rapid re-loads of the same track (scrubbing prev/next) so play counts
+    // aren't inflated; a genuine replay after 30s still records.
+    const now = Date.now();
+    const last = lastRecordedPlayRef.current;
+    if (last && last.id === trackId && now - last.at < 30000) return;
+    lastRecordedPlayRef.current = { id: trackId, at: now };
     api("/me/plays", { method: "POST", body: JSON.stringify({ track_id: trackId }) }).catch(() => {});
   }
 
@@ -1723,7 +1738,7 @@ function App() {
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
-        <div className={`content-grid${["Home", "Settings", "Discover"].includes(page) ? " no-inspector" : ""}`}>
+        <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} />
             {page === "Home" && (
@@ -1875,7 +1890,7 @@ function App() {
             {!["Home", "Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
           </section>
 
-          {!["Home", "Settings", "Discover"].includes(page) && (
+          {!NO_INSPECTOR_PAGES.has(page) && (
           <Inspector
             page={page}
             api={api}
@@ -2039,6 +2054,10 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
     [visibleArtists, bucket],
   );
   const [pageSize, setPageSize] = useState(() => (user && user.library_page_size != null ? user.library_page_size : 100));
+  // Resync if the user object loads/changes after mount (the workspace can render before /me resolves).
+  useEffect(() => {
+    if (user && user.library_page_size != null) setPageSize(user.library_page_size);
+  }, [user?.library_page_size]);
   const pagedArtists = useMemo(() => bucketedArtists.slice(0, pageSize), [bucketedArtists, pageSize]);
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
@@ -5223,6 +5242,16 @@ function AutomationsView({ api, notify }) {
 
   async function handleSave() {
     if (!name.trim()) { notify("Validation", "Name is required.", "ui_error"); return; }
+    if (actionType === "play") {
+      if (playTargetType === "playlist" && !playTargetQuery.trim()) {
+        notify("Validation", "Enter a playlist name to play.", "ui_error");
+        return;
+      }
+      if (playTargetType !== "playlist" && !playTargetId) {
+        notify("Validation", `Search and select the ${playTargetType} to play.`, "ui_error");
+        return;
+      }
+    }
     const body = {
       name: name.trim(),
       trigger_type: triggerType,
@@ -5459,7 +5488,7 @@ function AutomationsView({ api, notify }) {
                     ) : (
                       <div className="automation-field">
                         <span>{playTargetType.charAt(0).toUpperCase() + playTargetType.slice(1)}</span>
-                        {playTargetId ? (
+                        {playTargetId || playTargetQuery ? (
                           <div className="automation-selected">
                             <span className="automation-selected-name" title={playTargetQuery}>{playTargetQuery}</span>
                             <button
@@ -6214,6 +6243,10 @@ function SettingsPanel({
 }) {
   const [showApiKey, setShowApiKey] = useState(false);
   const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
+  // Resync if the user object loads/changes after mount.
+  useEffect(() => {
+    if (user && user.search_min_confidence != null) setSearchThreshold(user.search_min_confidence);
+  }, [user?.search_min_confidence]);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
   const canViewApiKey =
