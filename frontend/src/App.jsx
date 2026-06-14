@@ -123,6 +123,8 @@ function App() {
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("Library");
   const [albumDetail, setAlbumDetail] = useState(null);
+  const [pinnedAlbumIds, setPinnedAlbumIds] = useState(() => new Set());
+  const [pinnedArtistIds, setPinnedArtistIds] = useState(() => new Set());
   const [dark, setDark] = useState(initialAppearance.dark);
   const [trayOpen, setTrayOpen] = useState(false);
   const [toast, setToast] = useState(null);
@@ -1137,6 +1139,52 @@ function App() {
     }
   }
 
+  async function searchArtistCover(artistId) {
+    setLoading(true);
+    try {
+      const data = await api(`/library/artists/${artistId}/cover-candidates`);
+      if (!data.cover_path) {
+        notify("No artist art found", "No artist image source matched.", "ui_error");
+      }
+      return data;
+    } catch (coverError) {
+      notify("Cover search failed", coverError.message, "ui_error");
+      return null;
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!token) return;
+    api("/me/pinned-albums").then((rows) => setPinnedAlbumIds(new Set((rows || []).map((r) => r.album_id)))).catch(() => {});
+    api("/me/pinned-artists").then((rows) => setPinnedArtistIds(new Set((rows || []).map((r) => r.artist_id)))).catch(() => {});
+  }, [token]);
+
+  async function toggleAlbumPin(album) {
+    const pinned = pinnedAlbumIds.has(album.id);
+    try {
+      const rows = pinned
+        ? await api(`/me/pinned-albums/${encodeURIComponent(album.id)}`, { method: "DELETE" })
+        : await api("/me/pinned-albums", { method: "POST", body: JSON.stringify({ album_id: album.id }) });
+      setPinnedAlbumIds(new Set((rows || []).map((r) => r.album_id)));
+    } catch (pinError) {
+      notify("Pin failed", pinError.message, "ui_error");
+    }
+  }
+
+  async function toggleArtistPin(artist) {
+    const pinned = pinnedArtistIds.has(artist.id);
+    try {
+      const rows = pinned
+        ? await api(`/me/pinned-artists/${encodeURIComponent(artist.id)}`, { method: "DELETE" })
+        : await api("/me/pinned-artists", { method: "POST", body: JSON.stringify({ artist_id: artist.id }) });
+      setPinnedArtistIds(new Set((rows || []).map((r) => r.artist_id)));
+    } catch (pinError) {
+      notify("Pin failed", pinError.message, "ui_error");
+    }
+  }
+
   async function proposeLibraryMetadata(targetType, targetId, changes) {
     setLoading(true);
     try {
@@ -1833,11 +1881,13 @@ function App() {
                 onQueueAlbum={queueAlbumFromHome}
                 onPlayTracks={playTracks}
                 onQueueTracks={addTracksToPlayerQueue}
+                pinned={pinnedAlbumIds.has(albumDetail.id)}
+                onTogglePin={toggleAlbumPin}
               />
             )}
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -1863,6 +1913,11 @@ function App() {
                 onPlayAlbum={playAlbumFromHome}
                 onQueueAlbum={queueAlbumFromHome}
                 onOpenAlbum={(al) => openAlbumDetail(al, "Library")}
+                onTogglePinAlbum={toggleAlbumPin}
+                pinnedAlbumIds={pinnedAlbumIds}
+                onTogglePinArtist={toggleArtistPin}
+                pinnedArtistIds={pinnedArtistIds}
+                onArtistCoverSearch={searchArtistCover}
               />
             )}
             {page === "Discover" && (
@@ -2182,7 +2237,7 @@ function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onP
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch }) {
   const [libraryView, setLibraryView] = useState("artist");
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2369,6 +2424,15 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                 onQueue={() => onQueue(artistTracks(artist))}
                 onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("artist", artist.id)) : null}
               />
+              {onTogglePinArtist && (
+                <button
+                  className={`row-icon-button${pinnedArtistIds?.has(artist.id) ? " active" : ""}`}
+                  onClick={() => onTogglePinArtist(artist)}
+                  title={pinnedArtistIds?.has(artist.id) ? "Unpin from Home" : "Pin to Home"}
+                >
+                  {pinnedArtistIds?.has(artist.id) ? <PinOff size={15} /> : <Pin size={15} />}
+                </button>
+              )}
               {canEditMetadata && (
                 <button className="row-icon-button" onClick={() => toggleSet(setOpenArtistDetails, artist.id)} title="Edit artist">
                   <Pencil size={15} />
@@ -2395,6 +2459,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                 targetTrackIds={artistTracks(artist).map((track) => track.id)}
                 onAddToPlaylist={onAddToPlaylist}
                 onQueue={onQueueMetadata}
+                onAutoLookup={(field, draft) => artistAutoLookup(field, draft, artist.id, onArtistCoverSearch)}
                 onClose={() => toggleSet(setOpenArtistDetails, artist.id)}
               />
             )}
@@ -4594,7 +4659,18 @@ function artistFields(artist) {
     { key: "name", label: "Name", value: artist.name },
     { key: "sort_name", label: "Sort name", value: artist.sort_name },
     { key: "musicbrainz_id", label: "MusicBrainz ID", value: artist.musicbrainz_id },
+    { key: "cover_path", label: "Cover art", value: artist.cover_path },
   ];
+}
+
+async function artistAutoLookup(field, draft, artistId, onCoverSearch) {
+  // Artist cover "Auto lookup" hits Deezer (keyless) the same way Check Artist Covers
+  // does; apply downloads the URL into the artist folder.
+  if (field === "cover_path" && onCoverSearch && artistId) {
+    const found = await onCoverSearch(artistId);
+    if (found?.cover_path) return { cover_path: found.cover_path };
+  }
+  return null;
 }
 
 function albumFields(album) {
@@ -5109,6 +5185,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
     ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash on approval.", "check-duplicates", "library:manage"],
     ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
+    ["Check artist covers", "Find artists without cover art and fetch images (Deezer) for review.", "check-artist-covers", "library:manage"],
     ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
     ["Check MusicBrainz IDs", "Scan the library for missing MusicBrainz IDs and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
     ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
@@ -5210,6 +5287,7 @@ const TOOL_OPTIONS = [
   ["Check files", "check-files"],
   ["Find duplicates", "check-duplicates"],
   ["Check album covers", "check-album-covers"],
+  ["Check artist covers", "check-artist-covers"],
   ["Check lyrics", "check-lyrics"],
   ["Check MusicBrainz IDs", "check-musicbrainz-ids"],
   ["Check audio content", "check-audio-content"],
@@ -6665,7 +6743,7 @@ function ArtistCard({ artist, apiKey, onPlay, pinned, onTogglePin }) {
   );
 }
 
-function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbum, onPlayTracks, onQueueTracks }) {
+function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbum, onPlayTracks, onQueueTracks, pinned, onTogglePin }) {
   const [tracks, setTracks] = useState(null);
   useEffect(() => {
     let active = true;
@@ -6692,6 +6770,11 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
           <div className="album-detail-actions">
             <button onClick={() => onPlayAlbum(detail)}><Play size={15} /> Play</button>
             <button className="secondary" onClick={() => onQueueAlbum(detail)}><ListPlus size={15} /> Queue</button>
+            {onTogglePin && (
+              <button className="secondary" onClick={() => onTogglePin(detail)}>
+                {pinned ? <PinOff size={15} /> : <Pin size={15} />} {pinned ? "Pinned" : "Pin"}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -6713,7 +6796,7 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   );
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist }) {
   const [home, setHome] = useState(null);
   useEffect(() => {
     let active = true;
@@ -6749,14 +6832,14 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
         {home.pinned_artists?.length > 0 && (
           <div className="home-album-grid home-pinned-grid">
             {home.pinned_artists.map((ar) => (
-              <ArtistCard key={ar.id} artist={ar} apiKey={apiKey} onPlay={onPlayArtist} />
+              <ArtistCard key={ar.id} artist={ar} apiKey={apiKey} onPlay={onPlayArtist} pinned={pinnedArtistIds?.has(ar.id)} onTogglePin={onTogglePinArtist} />
             ))}
           </div>
         )}
         {home.pinned_albums?.length > 0 && (
           <div className="home-album-grid home-pinned-grid">
             {home.pinned_albums.map((al) => (
-              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} />
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} pinned={pinnedAlbumIds?.has(al.id)} onTogglePin={onTogglePinAlbum} />
             ))}
           </div>
         )}
@@ -6769,7 +6852,7 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
         ) : (
           <div className="home-album-grid">
             {home.recently_added.map((al) => (
-              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} />
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onQueue={onQueueAlbum} onOpen={onOpenAlbum} pinned={pinnedAlbumIds?.has(al.id)} onTogglePin={onTogglePinAlbum} />
             ))}
           </div>
         )}
