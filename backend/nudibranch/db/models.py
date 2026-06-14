@@ -167,6 +167,8 @@ class Artist(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     sort_name: Mapped[str | None] = mapped_column(String(255))
     musicbrainz_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 
     albums: Mapped[list["Album"]] = relationship(back_populates="artist")
 
@@ -182,6 +184,8 @@ class Album(Base):
     musicbrainz_release_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
     path: Mapped[str | None] = mapped_column(Text)
     cover_path: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 
     artist: Mapped[Artist] = relationship(back_populates="albums")
     tracks: Mapped[list["Track"]] = relationship(back_populates="album")
@@ -207,6 +211,8 @@ class Track(Base):
     metadata_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     artwork_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     filename_locked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 
     album: Mapped[Album] = relationship(back_populates="tracks")
 
@@ -241,6 +247,30 @@ class Playlist(Base):
     user: Mapped["User | None"] = relationship()
 
     tracks: Mapped[list["PlaylistTrack"]] = relationship(back_populates="playlist", cascade="all, delete-orphan")
+
+
+class PlayEvent(Base):
+    __tablename__ = "play_events"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    track_id: Mapped[str] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False, index=True)
+    played_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="nudibranch", nullable=False)
+    reported_to_jellyfin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    track: Mapped["Track"] = relationship()
+
+
+class PinnedPlaylist(Base):
+    __tablename__ = "pinned_playlists"
+    __table_args__ = (UniqueConstraint("user_id", "playlist_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    playlist_id: Mapped[str] = mapped_column(String(128), nullable=False)  # Jellyfin item id, or "favorites"
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class PlaylistTrack(Base):

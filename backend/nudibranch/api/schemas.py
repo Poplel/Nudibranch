@@ -283,6 +283,24 @@ class PlaylistAddTracks(BaseModel):
     track_ids: list[str] = Field(min_length=1)
 
 
+class PlayRecordIn(BaseModel):
+    track_id: str
+
+
+class PlayEventOut(BaseModel):
+    track_id: str
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    album_id: str | None = None
+    played_at: datetime
+
+
+class PinPlaylistIn(BaseModel):
+    playlist_id: str
+    name: str | None = None
+
+
 class ImportScanRequest(BaseModel):
     path: str | None = None
     files: list[dict[str, Any]] | None = None

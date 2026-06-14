@@ -22,6 +22,9 @@ from nudibranch.api.schemas import (
     BackupRestoreRequest,
     BucketCount,
     CheckFileFixRequest,
+    PinPlaylistIn,
+    PlayEventOut,
+    PlayRecordIn,
     DeviceRegistration,
     DiscoverTaskQueueRequest,
     FavoritesOut,
@@ -93,6 +96,8 @@ from nudibranch.db.models import (
     PlaybackCommand,
     NotificationStatus,
     Permission,
+    PinnedPlaylist,
+    PlayEvent,
     Playlist,
     PlaylistTrack,
     PlayerState,
@@ -528,6 +533,290 @@ def ack_player_command(
         command.consumed_at = datetime.now(timezone.utc)
         session.commit()
     return {"ok": True}
+
+
+# ── Play history (local PlayEvent + best-effort Jellyfin report) ───────────────
+
+def _report_play_to_jellyfin(session: Session, user: User, track: Track) -> bool:
+    """Increment Jellyfin's play count for this user+track. Best-effort; never raises."""
+    if not user.jellyfin_user_id or not track.jellyfin_item_id:
+        return False
+    client, jf_user_id = _jf_client(session, user)
+    if not client:
+        return False
+    try:
+        with client:
+            resp = client.post(f"/Users/{jf_user_id}/PlayedItems/{track.jellyfin_item_id}")
+            resp.raise_for_status()
+        return True
+    except Exception:
+        return False
+
+
+def _play_event_out(event: PlayEvent) -> PlayEventOut:
+    track = event.track
+    album = track.album if track else None
+    artist = album.artist if album else None
+    return PlayEventOut(
+        track_id=event.track_id,
+        title=track.title if track else None,
+        artist=artist.name if artist else None,
+        album=album.title if album else None,
+        album_id=album.id if album else None,
+        played_at=event.played_at,
+    )
+
+
+@router.post("/me/plays", response_model=PlayEventOut, tags=["users"], summary="Record a track play (local history + Jellyfin)")
+def record_play(
+    payload: PlayRecordIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> PlayEventOut:
+    track = session.get(Track, payload.track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    reported = _report_play_to_jellyfin(session, user, track)
+    event = PlayEvent(user_id=user.id, track_id=track.id, source="nudibranch", reported_to_jellyfin=reported)
+    session.add(event)
+    session.commit()
+    session.refresh(event)
+    return _play_event_out(event)
+
+
+@router.get("/me/plays", response_model=list[PlayEventOut], tags=["users"], summary="My recent plays")
+def list_my_plays(
+    limit: int = 50,
+    days: int | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[PlayEventOut]:
+    limit = max(1, min(limit, 500))
+    query = (
+        select(PlayEvent)
+        .where(PlayEvent.user_id == user.id)
+        .options(selectinload(PlayEvent.track).selectinload(Track.album).selectinload(Album.artist))
+        .order_by(PlayEvent.played_at.desc())
+        .limit(limit)
+    )
+    if days:
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        query = query.where(PlayEvent.played_at >= since)
+    return [_play_event_out(e) for e in session.scalars(query)]
+
+
+def _top_for_window(session: Session, user: User, days: int) -> dict:
+    """Top artist / album / track for a user over the last `days` (by local play count)."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    base = (
+        select(PlayEvent.track_id, func.count(PlayEvent.id).label("plays"))
+        .where(PlayEvent.user_id == user.id, PlayEvent.played_at >= since)
+        .group_by(PlayEvent.track_id)
+    ).subquery()
+    rows = list(
+        session.execute(
+            select(Track, Album, Artist, base.c.plays)
+            .join(base, base.c.track_id == Track.id)
+            .join(Album, Track.album_id == Album.id)
+            .join(Artist, Album.artist_id == Artist.id)
+        )
+    )
+    if not rows:
+        return {"days": days, "artist": None, "album": None, "track": None}
+    artist_counts: dict[str, dict] = {}
+    album_counts: dict[str, dict] = {}
+    top_track = None
+    top_track_plays = -1
+    for track, album, artist, plays in rows:
+        a = artist_counts.setdefault(artist.id, {"id": artist.id, "name": artist.name, "plays": 0})
+        a["plays"] += plays
+        al = album_counts.setdefault(album.id, {"id": album.id, "title": album.title, "artist": artist.name, "plays": 0})
+        al["plays"] += plays
+        if plays > top_track_plays:
+            top_track_plays = plays
+            top_track = {"id": track.id, "title": track.title, "artist": artist.name, "album": album.title, "plays": plays}
+    top_artist = max(artist_counts.values(), key=lambda x: x["plays"])
+    top_album = max(album_counts.values(), key=lambda x: x["plays"])
+    return {"days": days, "artist": top_artist, "album": top_album, "track": top_track}
+
+
+@router.get("/library/top", tags=["library"], summary="Top artist/album/track over a window", response_model=dict)
+def library_top(
+    days: int = 30,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    days = max(1, min(days, 365))
+    return _top_for_window(session, user, days)
+
+
+# ── Offline delta sync ────────────────────────────────────────────────────────
+
+@router.get("/library/changes", tags=["library"], summary="Library rows changed since a timestamp (delta sync)", response_model=dict)
+def library_changes(
+    since: str | None = None,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_read)),
+) -> dict:
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid 'since' timestamp (use ISO 8601)")
+
+    def _filter(query, model):
+        return query.where(model.updated_at > since_dt) if since_dt else query
+
+    artists = [
+        {"id": a.id, "name": a.name, "sort_name": a.sort_name, "musicbrainz_id": a.musicbrainz_id,
+         "updated_at": a.updated_at.isoformat() if a.updated_at else None}
+        for a in session.scalars(_filter(select(Artist), Artist))
+    ]
+    albums = [
+        {"id": al.id, "artist_id": al.artist_id, "title": al.title, "release_title": al.release_title,
+         "cover_path": al.cover_path, "musicbrainz_release_id": al.musicbrainz_release_id,
+         "musicbrainz_release_group_id": al.musicbrainz_release_group_id,
+         "updated_at": al.updated_at.isoformat() if al.updated_at else None}
+        for al in session.scalars(_filter(select(Album), Album))
+    ]
+    tracks = [
+        {"id": t.id, "album_id": t.album_id, "title": t.title, "track_number": t.track_number,
+         "disc_number": t.disc_number, "duration_ms": t.duration_ms, "format": t.format,
+         "bitrate": t.bitrate, "is_lossless": t.is_lossless, "explicit": t.explicit,
+         "musicbrainz_recording_id": t.musicbrainz_recording_id, "jellyfin_item_id": t.jellyfin_item_id,
+         "musicbrainz_verified": t.musicbrainz_verified,
+         "updated_at": t.updated_at.isoformat() if t.updated_at else None}
+        for t in session.scalars(_filter(select(Track), Track))
+    ]
+    return {
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "since": since_dt.isoformat() if since_dt else None,
+        "artists": artists,
+        "albums": albums,
+        "tracks": tracks,
+        # NOTE: deletions are not delta-tracked; clients should occasionally full-resync (since omitted) to prune.
+    }
+
+
+# ── Pinned playlists + home dashboard ─────────────────────────────────────────
+
+@router.get("/me/pinned-playlists", tags=["users"], summary="My pinned playlists", response_model=list[dict])
+def list_pinned_playlists(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    rows = session.scalars(
+        select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc())
+    )
+    return [{"playlist_id": p.playlist_id, "name": p.name} for p in rows]
+
+
+@router.post("/me/pinned-playlists", tags=["users"], summary="Pin a playlist", response_model=list[dict])
+def pin_playlist(
+    payload: PinPlaylistIn,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    existing = session.scalar(
+        select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id, PinnedPlaylist.playlist_id == payload.playlist_id)
+    )
+    if not existing:
+        session.add(PinnedPlaylist(user_id=user.id, playlist_id=payload.playlist_id, name=(payload.name or payload.playlist_id)[:255]))
+        session.commit()
+    elif payload.name and existing.name != payload.name:
+        existing.name = payload.name[:255]
+        session.commit()
+    return list_pinned_playlists(session, user)
+
+
+@router.delete("/me/pinned-playlists/{playlist_id}", tags=["users"], summary="Unpin a playlist", response_model=list[dict])
+def unpin_playlist(
+    playlist_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    existing = session.scalar(
+        select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id, PinnedPlaylist.playlist_id == playlist_id)
+    )
+    if existing:
+        session.delete(existing)
+        session.commit()
+    return list_pinned_playlists(session, user)
+
+
+@router.get("/me/home", tags=["users"], summary="Home dashboard aggregate", response_model=dict)
+def me_home(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    # Recently added albums (by created_at)
+    recent_albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist))
+            .order_by(Album.created_at.desc())
+            .limit(12)
+        )
+    )
+    recently_added = [
+        {"id": al.id, "title": al.title, "artist": al.artist.name if al.artist else None,
+         "cover_path": al.cover_path, "created_at": al.created_at.isoformat() if al.created_at else None}
+        for al in recent_albums
+    ]
+
+    # Recently approved from my wishlist (completed items)
+    approved = list(
+        session.scalars(
+            select(WishlistItem)
+            .where(WishlistItem.user_id == user.id, WishlistItem.status == "completed")
+            .order_by(WishlistItem.status_changed_at.desc())
+            .limit(12)
+        )
+    )
+    recently_approved = [
+        {"id": w.id, "artist": w.artist, "album": w.album, "track": w.track,
+         "approved_at": w.status_changed_at.isoformat() if w.status_changed_at else None}
+        for w in approved
+    ]
+
+    # Recent plays
+    recent_plays = list_my_plays(limit=12, days=None, session=session, user=user)
+
+    # Favorites + pinned playlists (Jellyfin-backed when linked)
+    favorites: dict | None = None
+    pinned: list[dict] = []
+    client, jf_user_id = _jf_client(session, user)
+    if client:
+        with client:
+            try:
+                fav = _jf_favorites_out(session, client, jf_user_id)
+                favorites = {"id": "favorites", "name": "Favorites", "track_count": fav.track_count}
+            except Exception:
+                favorites = None
+            for p in session.scalars(
+                select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc())
+            ):
+                count = None
+                if p.playlist_id != "favorites":
+                    try:
+                        resp = client.get(f"/Playlists/{p.playlist_id}/Items", params={"UserId": jf_user_id, "Limit": "0"})
+                        resp.raise_for_status()
+                        count = resp.json().get("TotalRecordCount")
+                    except Exception:
+                        count = None
+                pinned.append({"playlist_id": p.playlist_id, "name": p.name, "track_count": count})
+    else:
+        pinned = [{"playlist_id": p.playlist_id, "name": p.name, "track_count": None}
+                  for p in session.scalars(select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc()))]
+
+    return {
+        "recently_added": recently_added,
+        "recently_approved": recently_approved,
+        "recent_plays": [e.model_dump(mode="json") for e in recent_plays],
+        "favorites": favorites,
+        "pinned_playlists": pinned,
+    }
 
 
 def _serialize_automation(automation: Automation) -> AutomationOut:

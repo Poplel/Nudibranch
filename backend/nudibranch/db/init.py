@@ -106,7 +106,22 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
+    _migrate_library_timestamps(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _migrate_library_timestamps(session: Session) -> None:
+    """Add created_at/updated_at to artists/albums/tracks for delta sync + recently-added."""
+    for table in ("artists", "albums", "tracks"):
+        cols = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
+        if not cols:
+            continue
+        if "created_at" not in cols:
+            session.execute(text(f"ALTER TABLE {table} ADD COLUMN created_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
+        if "updated_at" not in cols:
+            session.execute(text(f"ALTER TABLE {table} ADD COLUMN updated_at DATETIME DEFAULT CURRENT_TIMESTAMP"))
+            session.execute(text(f"CREATE INDEX IF NOT EXISTS ix_{table}_updated_at ON {table}(updated_at)"))
+    session.commit()
 
 
 def _backfill_usernames(session: Session) -> None:

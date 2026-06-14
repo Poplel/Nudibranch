@@ -726,25 +726,33 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         batch.status = ProposalStatus.pending
     session.commit()
 
-    create_notification(
-        session,
-        title="Task queue item failed" if errors else "Downloads queued" if open_downloads else "Task queue item completed",
-        body=task_queue_notification_body(
-            imported,
-            metadata_updated,
-            file_actions,
-            playlist_changes,
-            download_changes,
-            lyric_changes,
-            skipped,
-            errors,
-            download_errors,
-            downloaded_import,
-            open_downloads,
-        ),
-        event_type="task_completed",
-        target_url="/downloads" if open_downloads else "/activity",
+    summary_body = task_queue_notification_body(
+        imported,
+        metadata_updated,
+        file_actions,
+        playlist_changes,
+        download_changes,
+        lyric_changes,
+        skipped,
+        errors,
+        download_errors,
+        downloaded_import,
+        open_downloads,
     )
+    total_changes = imported + metadata_updated + file_actions + playlist_changes + download_changes + lyric_changes
+    title = "Task queue item failed" if errors else "Downloads queued" if open_downloads else "Task queue item completed"
+    # Only surface meaningful outcomes as notifications; a no-op completion just goes to the log.
+    important = bool(errors or download_errors or open_downloads or total_changes or (downloaded_import and downloaded_import.get("imported")))
+    if important:
+        create_notification(
+            session,
+            title=title,
+            body=summary_body,
+            event_type="task_completed",
+            target_url="/downloads" if open_downloads else "/activity",
+        )
+    else:
+        write_app_log(f"{title}: {summary_body}", level="info", event_type="task_completed")
     return {
         "batch_id": batch_id,
         "imported": imported,
@@ -774,21 +782,26 @@ def task_queue_notification_body(
     downloaded_import: dict | None = None,
     open_downloads: bool = False,
 ) -> str:
-    parts = [
-        f"{imported} tracks imported",
-        f"{metadata_updated} metadata changes applied",
-        f"{file_actions} files handled",
-        f"{playlist_changes} playlist changes applied",
-        f"{download_changes} downloads handled",
-        f"{lyric_changes} lyrics downloaded",
-    ]
+    parts = []
+    if imported:
+        parts.append(f"{imported} tracks imported")
+    if metadata_updated:
+        parts.append(f"{metadata_updated} metadata changes applied")
+    if file_actions:
+        parts.append(f"{file_actions} files handled")
+    if playlist_changes:
+        parts.append(f"{playlist_changes} playlist changes applied")
+    if download_changes:
+        parts.append(f"{download_changes} downloads handled")
+    if lyric_changes:
+        parts.append(f"{lyric_changes} lyrics downloaded")
     if skipped:
         parts.append(f"{skipped} items skipped")
     if downloaded_import and downloaded_import.get("imported"):
         parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
     if open_downloads:
         parts.append("downloads are running and will move to the library after verification")
-    body = ". ".join(parts) + "."
+    body = (". ".join(parts) + ".") if parts else "No changes were applied."
     if errors:
         return f"{body} First failure: {errors[0]}"
     if download_errors:
@@ -5397,7 +5410,7 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
     with httpx.Client(base_url=jellyfin_url, headers={"X-Emby-Token": jellyfin_api_key}, timeout=25) as client:
         response = client.post("/Library/Refresh")
         response.raise_for_status()
-    create_notification(session, title="Jellyfin scan queued", body="Library refresh was requested.", event_type="tool_completed", target_url="/tools")
+    write_app_log("Jellyfin scan queued: library refresh requested", level="info", event_type="tool_completed")
     # Queue a remap after the scan so newly indexed items get matched. Jellyfin scans
     # asynchronously so this fires immediately; the 5-min periodic remap catches any
     # items Jellyfin hasn't indexed yet by the time this task runs.
@@ -5407,7 +5420,7 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
 
 def run_clear_discover_cache(session: Session, _payload: dict) -> dict:
     removed = clear_discover_art_cache()
-    create_notification(session, title="Discover cache cleared", body=f"{removed} cached file(s) removed.", event_type="tool_completed", target_url="/tools")
+    write_app_log(f"Discover cache cleared: {removed} cached file(s) removed", level="info", event_type="tool_completed")
     return {"removed": removed}
 
 
@@ -6528,7 +6541,7 @@ def run_normalize_volume(session: Session, _payload: dict) -> dict:
         created += 1
     if created == 0:
         session.delete(batch)
-        create_notification(session, title="Volume check complete", body="No library files were found to normalize.", event_type="tool_completed", target_url="/tools")
+        write_app_log("Volume check complete: no library files were found to normalize", level="info", event_type="tool_completed")
         return {"tracks_checked": len(tracks), "items_created": 0, "batch_id": None}
     create_notification(
         session,
@@ -7129,7 +7142,7 @@ def run_consolidate_folders(session: Session, _payload: dict, task: Task | None 
             created += 1
     if created == 0:
         session.delete(batch)
-        create_notification(session, title="Folder consolidation complete", body="All album tracks are already in one folder per album.", event_type="tool_completed", target_url="/tools")
+        write_app_log("Folder consolidation complete: all album tracks are already in one folder per album", level="info", event_type="tool_completed")
         return {"albums_checked": len(albums), "moves": 0, "batch_id": None}
     create_notification(session, title="Folder consolidation ready", body=f"{created} track file(s) can be moved into one folder per album — review in the Task Queue.", event_type="approval_needed", target_url="/task-queue")
     return {"albums_checked": len(albums), "moves": created, "batch_id": batch.id}
