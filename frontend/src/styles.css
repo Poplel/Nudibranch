@@ -4098,3 +4098,70 @@ nav button:hover,
 .row-icon-button.active {
   color: var(--accent);
 }
+
+/* ── Sessions row actions ─────────────────────────────────────────────────── */
+.session-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ── Automation: definitive target picker ─────────────────────────────────── */
+.automation-selected {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.automation-selected-name {
+  flex: 1;
+  min-width: 0;
+  padding: 0 4px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-selected .icon-button {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+
+.automation-search {
+  position: relative;
+}
+
+.automation-search-results {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.automation-search-result {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-search-result:hover {
+  background: var(--accent-soft);
+}

@@ -283,6 +283,10 @@ class PlaylistAddTracks(BaseModel):
     track_ids: list[str] = Field(min_length=1)
 
 
+class SessionRenameRequest(BaseModel):
+    device_label: str = Field(min_length=1, max_length=255)
+
+
 class PlayRecordIn(BaseModel):
     track_id: str
 

@@ -128,6 +128,9 @@ function App() {
   const [importFiles, setImportFiles] = useState([]);
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const addImportAlbumsRef = useRef(null);
+  const playbackControlRef = useRef(null);
+  const currentSessionIdRef = useRef(null);
+  const remoteExecRef = useRef(null);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
@@ -1400,6 +1403,90 @@ function App() {
     await loadPlayerTrack(playable[0]);
   }
 
+  function resolvePlayableFromLibrary(targetType, targetId) {
+    const out = [];
+    for (const artist of library || []) {
+      for (const album of artist.albums || []) {
+        for (const track of album.tracks || []) {
+          const match =
+            (targetType === "track" && track.id === targetId) ||
+            (targetType === "album" && album.id === targetId) ||
+            (targetType === "artist" && artist.id === targetId);
+          if (match) out.push({ id: track.id, title: track.title, _artist: artist.name, _album: album.title });
+        }
+      }
+    }
+    return out;
+  }
+
+  async function resolvePlaylistTracks(playlistId) {
+    try {
+      const pl = playlistId === "favorites" ? await api("/playlists/favorites") : (await api("/playlists")).find((p) => p.id === playlistId);
+      return (pl?.tracks || []).map((t) => ({ id: t.id, title: t.title, _artist: t.artist, _album: t.album }));
+    } catch {
+      return [];
+    }
+  }
+
+  async function executeRemoteCommand(cmd) {
+    const action = (cmd.action || "").toLowerCase();
+    const ctl = playbackControlRef.current;
+    if (action === "pause") return ctl?.pause?.();
+    if (action === "stop") return ctl?.stop?.();
+    if (action === "next") return playNextTrack();
+    if (action === "previous") return playPreviousTrack();
+    if (action === "resume" && !cmd.target_id) return ctl?.resume?.();
+    if (action === "play" || (action === "resume" && cmd.target_id)) {
+      let tracks = resolvePlayableFromLibrary(cmd.target_type, cmd.target_id);
+      if (tracks.length === 0 && cmd.target_type === "playlist") tracks = await resolvePlaylistTracks(cmd.target_id);
+      if (tracks.length === 0) {
+        notify("Remote playback", `Could not find ${cmd.target_label || "the requested item"} in the library.`, "ui_error");
+        return undefined;
+      }
+      if (cmd.shuffle) {
+        for (let i = tracks.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
+        }
+      }
+      return playTracks(tracks);
+    }
+    return undefined;
+  }
+  remoteExecRef.current = executeRemoteCommand;
+
+  // Identify this client's session so commands can target it specifically.
+  useEffect(() => {
+    if (!token) return;
+    api("/me/sessions")
+      .then((rows) => {
+        const current = (rows || []).find((s) => s.current);
+        if (current) currentSessionIdRef.current = current.id;
+      })
+      .catch(() => {});
+  }, [token]);
+
+  // Consume remote playback commands for this client (broadcast or targeted to this session).
+  useEffect(() => {
+    if (!token || !user?.id) return undefined;
+    let stopped = false;
+    async function poll() {
+      try {
+        const dev = currentSessionIdRef.current;
+        const cmds = await api(`/player/commands${dev ? `?device_id=${encodeURIComponent(dev)}` : ""}`);
+        for (const cmd of cmds || []) {
+          try { await remoteExecRef.current?.(cmd); } catch { /* keep going */ }
+          await api(`/player/commands/${cmd.id}/ack`, { method: "POST" }).catch(() => {});
+        }
+      } catch {
+        /* offline / transient */
+      }
+    }
+    poll();
+    const timer = setInterval(() => { if (!stopped) poll(); }, 4000);
+    return () => { stopped = true; clearInterval(timer); };
+  }, [token, user?.id]);
+
   function addTracksToPlayerQueue(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
@@ -1586,6 +1673,7 @@ function App() {
         <header className="topbar">
           {playerOpen && (
             <AudioPlayer
+              controlRef={playbackControlRef}
               currentTrack={currentTrack}
               audioUrl={audioUrl}
               nextAudioUrl={nextAudioUrl}
@@ -4986,10 +5074,16 @@ function AutomationsView({ api, notify }) {
   // Action sub-fields
   const [toolSlug, setToolSlug] = useState("backup");
   const [playTargetType, setPlayTargetType] = useState("artist");
-  const [playTargetQuery, setPlayTargetQuery] = useState("");
+  const [playTargetQuery, setPlayTargetQuery] = useState(""); // display label of the selected item
+  const [playTargetId, setPlayTargetId] = useState(""); // definitive selection
   const [playLoop, setPlayLoop] = useState("off");
   const [playShuffle, setPlayShuffle] = useState(false);
   const [mediaControl, setMediaControl] = useState("pause");
+  const [deviceId, setDeviceId] = useState(""); // "" = any device (broadcast)
+  const [sessions, setSessions] = useState([]);
+  // Live search for definitive target selection
+  const [targetSearch, setTargetSearch] = useState("");
+  const [targetResults, setTargetResults] = useState([]);
 
   async function reload() {
     try {
@@ -5001,6 +5095,23 @@ function AutomationsView({ api, notify }) {
   }
 
   useEffect(() => { reload(); }, []);
+  useEffect(() => {
+    api("/me/sessions").then((rows) => setSessions(rows || [])).catch(() => {});
+  }, []);
+
+  // Debounced live search for the play-target picker.
+  useEffect(() => {
+    const q = targetSearch.trim();
+    if (!q || playTargetType === "playlist") { setTargetResults([]); return undefined; }
+    let active = true;
+    const t = setTimeout(async () => {
+      try {
+        const data = await api(`/library/search?q=${encodeURIComponent(q)}&types=${playTargetType}&limit=8`);
+        if (active) setTargetResults(data?.results || []);
+      } catch { if (active) setTargetResults([]); }
+    }, 250);
+    return () => { active = false; clearTimeout(t); };
+  }, [targetSearch, playTargetType, api]);
 
   function resetForm() {
     setEditingId(null);
@@ -5020,9 +5131,13 @@ function AutomationsView({ api, notify }) {
     setToolSlug("backup");
     setPlayTargetType("artist");
     setPlayTargetQuery("");
+    setPlayTargetId("");
     setPlayLoop("off");
     setPlayShuffle(false);
     setMediaControl("pause");
+    setDeviceId("");
+    setTargetSearch("");
+    setTargetResults([]);
     setShowForm(false);
   }
 
@@ -5068,11 +5183,13 @@ function AutomationsView({ api, notify }) {
     } else if (a.action_type === "play") {
       setPlayTargetType(ac.target_type || "artist");
       setPlayTargetQuery(ac.target_query || "");
+      setPlayTargetId(ac.target_id || "");
       setPlayLoop(ac.loop || "off");
       setPlayShuffle(ac.shuffle || false);
     } else if (a.action_type === "media_control") {
       setMediaControl(ac.control || "pause");
     }
+    setDeviceId(ac.device_id || "");
 
     setShowForm(true);
   }
@@ -5090,8 +5207,17 @@ function AutomationsView({ api, notify }) {
 
   function buildActionConfig() {
     if (actionType === "tool") return { action: toolSlug };
-    if (actionType === "play") return { target_type: playTargetType, target_query: playTargetQuery, loop: playLoop, shuffle: playShuffle };
-    if (actionType === "media_control") return { control: mediaControl };
+    if (actionType === "play") {
+      const cfg = { target_type: playTargetType, target_query: playTargetQuery, loop: playLoop, shuffle: playShuffle };
+      if (playTargetId) cfg.target_id = playTargetId;
+      if (deviceId) cfg.device_id = deviceId;
+      return cfg;
+    }
+    if (actionType === "media_control") {
+      const cfg = { control: mediaControl };
+      if (deviceId) cfg.device_id = deviceId;
+      return cfg;
+    }
     return {};
   }
 
@@ -5164,44 +5290,15 @@ function AutomationsView({ api, notify }) {
     return d.toLocaleString();
   }
 
-  const stats = useMemo(() => {
-    const enabled = automations.filter((a) => a.enabled).length;
-    const lastRun = automations
-      .map((a) => a.last_run_at)
-      .filter(Boolean)
-      .sort()
-      .slice(-1)[0];
-    const now = Date.now();
-    const nextRun = automations
-      .map((a) => a.next_run_at)
-      .filter((d) => d && new Date(d).getTime() >= now)
-      .sort()[0];
-    return { total: automations.length, enabled, lastRun, nextRun };
-  }, [automations]);
-
   return (
     <div className="automations-view">
-      <div className="automation-stats">
-        <div className="automation-stat">
-          <span className="automation-stat-value">{stats.total}</span>
-          <span className="automation-stat-label">Automations{stats.total ? ` · ${stats.enabled} enabled` : ""}</span>
-        </div>
-        <div className="automation-stat">
-          <span className="automation-stat-value">{fmtDate(stats.lastRun)}</span>
-          <span className="automation-stat-label">Last run</span>
-        </div>
-        <div className="automation-stat">
-          <span className="automation-stat-value">{fmtDate(stats.nextRun)}</span>
-          <span className="automation-stat-label">Next run</span>
-        </div>
-        <div className="automation-stats-actions">
-          {!showForm && (
-            <button className="secondary compact" onClick={openCreate}>
-              <Plus size={15} />
-              New automation
-            </button>
-          )}
-        </div>
+      <div className="automation-card-row" style={{ justifyContent: "flex-end" }}>
+        {!showForm && (
+          <button className="secondary compact" onClick={openCreate}>
+            <Plus size={15} />
+            New automation
+          </button>
+        )}
       </div>
 
       {showForm && (
@@ -5339,22 +5436,67 @@ function AutomationsView({ api, notify }) {
                   <>
                     <label className="automation-field">
                       <span>Target type</span>
-                      <select value={playTargetType} onChange={(e) => setPlayTargetType(e.target.value)}>
+                      <select
+                        value={playTargetType}
+                        onChange={(e) => { setPlayTargetType(e.target.value); setPlayTargetId(""); setPlayTargetQuery(""); setTargetSearch(""); setTargetResults([]); }}
+                      >
                         <option value="artist">Artist</option>
                         <option value="album">Album</option>
                         <option value="track">Track</option>
                         <option value="playlist">Playlist</option>
                       </select>
                     </label>
-                    <label className="automation-field">
-                      <span>Search query</span>
-                      <input
-                        type="text"
-                        placeholder={`e.g. ${playTargetType === "artist" ? "Coldplay" : playTargetType === "album" ? "A Rush of Blood to the Head" : playTargetType === "playlist" ? "Favorites" : "The Scientist"}`}
-                        value={playTargetQuery}
-                        onChange={(e) => setPlayTargetQuery(e.target.value)}
-                      />
-                    </label>
+                    {playTargetType === "playlist" ? (
+                      <label className="automation-field">
+                        <span>Playlist name</span>
+                        <input
+                          type="text"
+                          placeholder="e.g. Favorites"
+                          value={playTargetQuery}
+                          onChange={(e) => { setPlayTargetQuery(e.target.value); setPlayTargetId(""); }}
+                        />
+                      </label>
+                    ) : (
+                      <div className="automation-field">
+                        <span>{playTargetType.charAt(0).toUpperCase() + playTargetType.slice(1)}</span>
+                        {playTargetId ? (
+                          <div className="automation-selected">
+                            <span className="automation-selected-name" title={playTargetQuery}>{playTargetQuery}</span>
+                            <button
+                              type="button"
+                              className="icon-button"
+                              title="Change selection"
+                              onClick={() => { setPlayTargetId(""); setPlayTargetQuery(""); setTargetSearch(""); setTargetResults([]); }}
+                            >
+                              <X size={14} />
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="automation-search">
+                            <input
+                              type="text"
+                              placeholder={`Search ${playTargetType}…`}
+                              value={targetSearch}
+                              onChange={(e) => setTargetSearch(e.target.value)}
+                            />
+                            {targetResults.length > 0 && (
+                              <div className="automation-search-results">
+                                {targetResults.map((r) => (
+                                  <button
+                                    type="button"
+                                    key={`${r.kind}:${r.id}`}
+                                    className="automation-search-result"
+                                    onClick={() => { setPlayTargetId(r.id); setPlayTargetQuery(r.name); setTargetSearch(""); setTargetResults([]); }}
+                                  >
+                                    {r.name}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <label className="automation-field">
                       <span>Loop</span>
                       <select value={playLoop} onChange={(e) => setPlayLoop(e.target.value)}>
@@ -5367,20 +5509,40 @@ function AutomationsView({ api, notify }) {
                       <span>Shuffle</span>
                       <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
                     </label>
+                    <label className="automation-field">
+                      <span>Device</span>
+                      <select value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
+                        <option value="">Any device</option>
+                        {sessions.map((s) => (
+                          <option key={s.id} value={s.id}>{s.device_label || "Unknown device"}</option>
+                        ))}
+                      </select>
+                    </label>
                   </>
                 )}
 
                 {actionType === "media_control" && (
-                  <label className="automation-field">
-                    <span>Control</span>
-                    <select value={mediaControl} onChange={(e) => setMediaControl(e.target.value)}>
-                      <option value="pause">Pause</option>
-                      <option value="resume">Resume</option>
-                      <option value="next">Next</option>
-                      <option value="previous">Previous</option>
-                      <option value="stop">Stop</option>
-                    </select>
-                  </label>
+                  <>
+                    <label className="automation-field">
+                      <span>Control</span>
+                      <select value={mediaControl} onChange={(e) => setMediaControl(e.target.value)}>
+                        <option value="pause">Pause</option>
+                        <option value="resume">Resume</option>
+                        <option value="next">Next</option>
+                        <option value="previous">Previous</option>
+                        <option value="stop">Stop</option>
+                      </select>
+                    </label>
+                    <label className="automation-field">
+                      <span>Device</span>
+                      <select value={deviceId} onChange={(e) => setDeviceId(e.target.value)}>
+                        <option value="">Any device</option>
+                        {sessions.map((s) => (
+                          <option key={s.id} value={s.id}>{s.device_label || "Unknown device"}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </>
                 )}
               </div>
             </div>
@@ -5826,6 +5988,19 @@ function SessionsPanel({ api, notify }) {
     }
   }
 
+  async function renameSession(s) {
+    const next = window.prompt("Name this session", s.device_label || "");
+    if (next == null) return;
+    const label = next.trim();
+    if (!label || label === s.device_label) return;
+    try {
+      await api(`/me/sessions/${s.id}`, { method: "PATCH", body: JSON.stringify({ device_label: label }) });
+      loadSessions();
+    } catch (err) {
+      notify("Rename failed", err.message, "ui_error");
+    }
+  }
+
   return (
     <section className="settings-section sessions-panel">
       <button type="button" className="sessions-tree-header" onClick={() => setOpen((o) => !o)}>
@@ -5853,16 +6028,25 @@ function SessionsPanel({ api, notify }) {
                     Expires: {session.expires_at ? new Date(session.expires_at).toLocaleString() : "never"}
                   </small>
                 </div>
-                {!session.current && (
+                <div className="session-row-actions">
                   <button
-                    className="icon-button session-revoke"
-                    title="Revoke session"
-                    disabled={loadingRevoke[session.id]}
-                    onClick={() => revokeSession(session.id)}
+                    className="icon-button"
+                    title="Rename session"
+                    onClick={() => renameSession(session)}
                   >
-                    <X size={15} />
+                    <Pencil size={14} />
                   </button>
-                )}
+                  {!session.current && (
+                    <button
+                      className="icon-button session-revoke"
+                      title="Revoke session"
+                      disabled={loadingRevoke[session.id]}
+                      onClick={() => revokeSession(session.id)}
+                    >
+                      <X size={15} />
+                    </button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
@@ -6303,6 +6487,41 @@ function HomeView({ api, apiKey, setPage }) {
   );
 }
 
+function AutomationsInspector({ api }) {
+  const [automations, setAutomations] = useState(null);
+  useEffect(() => {
+    let active = true;
+    const load = () => api("/automations").then((d) => { if (active) setAutomations(d || []); }).catch(() => {});
+    load();
+    const t = setInterval(load, 10000);
+    return () => { active = false; clearInterval(t); };
+  }, [api]);
+  if (!automations) return null;
+  const fmt = (iso) => (iso ? new Date(iso).toLocaleString() : "Never");
+  const enabled = automations.filter((a) => a.enabled).length;
+  const lastRun = automations.map((a) => a.last_run_at).filter(Boolean).sort().slice(-1)[0];
+  const now = Date.now();
+  const nextRun = automations.map((a) => a.next_run_at).filter((d) => d && new Date(d).getTime() >= now).sort()[0];
+  const rows = [
+    ["Automations", `${automations.length}${automations.length ? ` · ${enabled} enabled` : ""}`],
+    ["Last run", fmt(lastRun)],
+    ["Next run", fmt(nextRun)],
+  ];
+  return (
+    <div className="inspector-section">
+      <div className="inspector-section-label">Automations</div>
+      <dl className="library-top-list">
+        {rows.map(([label, value]) => (
+          <div key={label} className="library-top-row">
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
 function LibraryTopStats({ api }) {
   const [top, setTop] = useState(null);
   useEffect(() => {
@@ -6373,6 +6592,7 @@ function Inspector({
     <aside className="panel inspector">
       <h2>Inspector</h2>
       {page === "Library" && <LibraryTopStats api={api} />}
+      {page === "Automations" && <AutomationsInspector api={api} />}
       {page === "Import/Add" && importActions && (
         <div className="inspector-actions">
           <button className="primary" onClick={importActions.onScan} disabled={importActions.loading}>
@@ -6681,6 +6901,7 @@ function parseLrc(text) {
 }
 
 function AudioPlayer({
+  controlRef,
   currentTrack,
   audioUrl,
   nextAudioUrl,
@@ -7009,6 +7230,20 @@ function AudioPlayer({
       audio.pause();
     }
   }
+
+  // Expose imperative transport controls for the remote-command consumer.
+  useEffect(() => {
+    if (!controlRef) return undefined;
+    controlRef.current = {
+      pause: () => audioRef.current?.pause(),
+      resume: () => audioRef.current?.play().catch(() => {}),
+      stop: () => {
+        const a = audioRef.current;
+        if (a) { a.pause(); try { a.currentTime = 0; } catch { /* ignore */ } }
+      },
+    };
+    return () => { if (controlRef) controlRef.current = null; };
+  }, [controlRef]);
 
   function notifyPlaybackState(status, event) {
     onPlaybackState?.(status, {

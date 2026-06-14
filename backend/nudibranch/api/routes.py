@@ -25,6 +25,7 @@ from nudibranch.api.schemas import (
     PinPlaylistIn,
     PlayEventOut,
     PlayRecordIn,
+    SessionRenameRequest,
     DeviceRegistration,
     DiscoverTaskQueueRequest,
     FavoritesOut,
@@ -160,19 +161,29 @@ def login(payload: LoginRequest, session: Session = Depends(get_session)) -> Log
     now = datetime.now(timezone.utc)
     expires = now + SESSION_TTL
     label = payload.device_label or None
-    if label:
-        for old in session.scalars(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.device_label == label)).all():
-            session.delete(old)
+    # Prune expired sessions for this user.
     for old in session.scalars(select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.expires_at < now)).all():
         session.delete(old)
-    session.add(AuthSession(
-        user_id=user.id,
-        token_hash=hash_token(token),
-        device_label=(payload.device_label or None),
-        created_at=now,
-        last_used_at=now,
-        expires_at=expires,
-    ))
+    # Renew the existing session row for this device instead of spawning a new one
+    # (re-keys the token + extends expiry; keeps created_at, label, and id stable).
+    existing = None
+    if label:
+        existing = session.scalar(
+            select(AuthSession).where(AuthSession.user_id == user.id, AuthSession.device_label == label).order_by(AuthSession.created_at.asc())
+        )
+    if existing:
+        existing.token_hash = hash_token(token)
+        existing.last_used_at = now
+        existing.expires_at = expires
+    else:
+        session.add(AuthSession(
+            user_id=user.id,
+            token_hash=hash_token(token),
+            device_label=label,
+            created_at=now,
+            last_used_at=now,
+            expires_at=expires,
+        ))
     session.commit()
     return LoginResponse(
         user_id=user.id,
@@ -222,6 +233,32 @@ def list_sessions(
         )
         for s in rows
     ]
+
+
+@router.patch("/me/sessions/{session_id}", response_model=SessionOut, tags=["auth"], summary="Rename one of my sessions")
+def rename_session(
+    session_id: str,
+    payload: SessionRenameRequest,
+    authorization: str | None = Header(default=None),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> SessionOut:
+    existing = session.scalar(select(AuthSession).where(AuthSession.id == session_id, AuthSession.user_id == user.id))
+    if not existing:
+        raise HTTPException(status_code=404, detail="Session not found")
+    existing.device_label = (payload.device_label or "").strip()[:255] or None
+    session.commit()
+    current_hash = None
+    if authorization and authorization.lower().startswith("bearer "):
+        current_hash = hash_token(authorization.split(" ", 1)[1].strip())
+    return SessionOut(
+        id=existing.id,
+        device_label=existing.device_label,
+        created_at=existing.created_at,
+        last_used_at=existing.last_used_at,
+        expires_at=existing.expires_at,
+        current=(existing.token_hash == current_hash),
+    )
 
 
 @router.delete("/me/sessions/{session_id}", tags=["auth"], summary="Revoke one of my sessions")
