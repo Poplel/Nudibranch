@@ -123,6 +123,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("Library");
   const [albumDetail, setAlbumDetail] = useState(null);
+  const [homeVersion, setHomeVersion] = useState(0);
   const [pinnedAlbumIds, setPinnedAlbumIds] = useState(() => new Set());
   const [pinnedArtistIds, setPinnedArtistIds] = useState(() => new Set());
   const [dark, setDark] = useState(initialAppearance.dark);
@@ -136,7 +137,6 @@ function App() {
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const addImportAlbumsRef = useRef(null);
   const playbackControlRef = useRef(null);
-  const importUploadRef = useRef(null);
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
   const lastRecordedPlayRef = useRef(null);
@@ -433,6 +433,7 @@ function App() {
       setPlaylists(playlistData);
       setBackups(backupData.backups || []);
       setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
+      setHomeVersion((v) => v + 1);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
@@ -1169,6 +1170,7 @@ function App() {
         ? await api(`/me/pinned-albums/${encodeURIComponent(album.id)}`, { method: "DELETE" })
         : await api("/me/pinned-albums", { method: "POST", body: JSON.stringify({ album_id: album.id }) });
       setPinnedAlbumIds(new Set((rows || []).map((r) => r.album_id)));
+      setHomeVersion((v) => v + 1);
     } catch (pinError) {
       notify("Pin failed", pinError.message, "ui_error");
     }
@@ -1181,8 +1183,18 @@ function App() {
         ? await api(`/me/pinned-artists/${encodeURIComponent(artist.id)}`, { method: "DELETE" })
         : await api("/me/pinned-artists", { method: "POST", body: JSON.stringify({ artist_id: artist.id }) });
       setPinnedArtistIds(new Set((rows || []).map((r) => r.artist_id)));
+      setHomeVersion((v) => v + 1);
     } catch (pinError) {
       notify("Pin failed", pinError.message, "ui_error");
+    }
+  }
+
+  async function unpinPlaylist(playlistId) {
+    try {
+      await api(`/me/pinned-playlists/${encodeURIComponent(playlistId)}`, { method: "DELETE" });
+      setHomeVersion((v) => v + 1);
+    } catch (pinError) {
+      notify("Unpin failed", pinError.message, "ui_error");
     }
   }
 
@@ -1896,6 +1908,7 @@ function App() {
               }}
               onRemoveFromQueue={removeFromQueue}
               crossfadeDuration={crossfadeDuration}
+              apiKey={token}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
                 setPlayerOpen(false);
@@ -1911,7 +1924,6 @@ function App() {
                 <button className="icon-button" onClick={openNotificationTray} title="Notifications">
                   <Bell size={18} />
                   {unreadNotifications.length > 0 && <span className="badge">{unreadNotifications.length}</span>}
-                  {unreadNotifications.length > 0 && <span className={`severity-dot ${activeSeverity}`} />}
                 </button>
                 {trayOpen && <NotificationTray notifications={notifications} onClear={clearNotifications} />}
               </div>
@@ -1941,7 +1953,7 @@ function App() {
             )}
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -3556,9 +3568,15 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                 )}
               </div>
               {openArtists.has(artist.id) && (() => {
-                const allAlbums = [...(artist.albums || [])].sort(
-                  (a, b) => (b.track_count || 0) - (a.track_count || 0),
-                );
+                const seenAlbumKeys = new Set();
+                const allAlbums = (artist.albums || [])
+                  .filter((a) => {
+                    const key = a.id || `${a.title}|${a.date || ""}|${a.track_count || ""}`;
+                    if (seenAlbumKeys.has(key)) return false;
+                    seenAlbumKeys.add(key);
+                    return true;
+                  })
+                  .sort((a, b) => (b.track_count || 0) - (a.track_count || 0));
                 const showAll = expandedAllAlbums.has(artist.id);
                 const visibleAlbums = showAll ? allAlbums : allAlbums.slice(0, DISCOVER_ALBUMS_INITIAL);
                 return (
@@ -4633,7 +4651,7 @@ function LibraryMetadataEditor({
                       onChange={(event) => field.readOnly ? undefined : setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
                     />
                   )}
-                  {(onAutoLookup || onSearchAlbums) && (
+                  {(onAutoLookup || onSearchAlbums) && field.key !== "cover_path" && field.key !== "path" && (
                     <button className="row-icon-button" onClick={() => autoLookup(field)} title="Auto lookup">
                       <Search size={14} />
                     </button>
@@ -4855,6 +4873,7 @@ function albumTracks(artist, album) {
 function hydrateTrack(track, artist, album) {
   return {
     ...track,
+    album_id: track.album_id ?? album.id,
     _artist: artist.name,
     _album: album.title,
     _coverUrl: album._coverUrl || album.cover_path,
@@ -4871,6 +4890,15 @@ function albumCoverUrl(album, apiKey) {
   }
   if (!apiKey || !album?.id) return "";
   return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
+}
+
+function playerCoverUrl(track, apiKey) {
+  const c = track?._coverUrl || "";
+  if (/^(https?:|data:|blob:)/i.test(c) || c.startsWith(`${API_BASE}/`)) return c;
+  if (track?.album_id && apiKey) {
+    return `${API_BASE}/library/albums/${encodeURIComponent(track.album_id)}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
+  }
+  return c;
 }
 
 function artistCoverUrl(artist, apiKey) {
@@ -6882,7 +6910,7 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   );
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
   const [home, setHome] = useState(null);
   useEffect(() => {
     let active = true;
@@ -6890,7 +6918,7 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
       .then((data) => { if (active) setHome(data); })
       .catch(() => { if (active) setHome({ recently_added: [], recently_approved: [], recent_plays: [], favorites: null, pinned_playlists: [], pinned_albums: [], pinned_artists: [] }); });
     return () => { active = false; };
-  }, [api]);
+  }, [api, homeVersion]);
 
   if (!home) return <div className="home-view"><p className="muted">Loading…</p></div>;
 
@@ -6907,11 +6935,18 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
             <span className="home-list-sub">{home.favorites ? `${home.favorites.track_count} tracks` : "—"}</span>
           </button>
           {home.pinned_playlists.map((p) => (
-            <button key={p.playlist_id} className="home-pin-card" onClick={() => onPlayPlaylist(p.playlist_id)}>
-              <Pin size={15} />
-              <span className="home-list-main">{p.name}</span>
-              <span className="home-list-sub">{p.track_count != null ? `${p.track_count} tracks` : ""}</span>
-            </button>
+            <div key={p.playlist_id} className="home-pin-card-wrap">
+              <button className="home-pin-card" onClick={() => onPlayPlaylist(p.playlist_id)}>
+                <Pin size={15} />
+                <span className="home-list-main">{p.name}</span>
+                <span className="home-list-sub">{p.track_count != null ? `${p.track_count} tracks` : ""}</span>
+              </button>
+              {onUnpinPlaylist && (
+                <button className="home-pin-unpin icon-button" title="Unpin" onClick={() => onUnpinPlaylist(p.playlist_id)}>
+                  <X size={14} />
+                </button>
+              )}
+            </div>
           ))}
           {home.pinned_playlists.length === 0 && <p className="muted">Pin playlists from the Playlists page.</p>}
         </div>
@@ -7069,6 +7104,7 @@ function Inspector({
   mappingSyncStats,
   playlistImportActions,
 }) {
+  const importUploadRef = useRef(null);
   const stats = inspectorStats({
     page,
     library,
@@ -7431,6 +7467,7 @@ function AudioPlayer({
   onDockChange,
   onClose,
   crossfadeDuration = 0.5,
+  apiKey,
 }) {
   const audioRef = useRef(null);
   const nextAudioRef = useRef(null);
@@ -7465,6 +7502,7 @@ function AudioPlayer({
   const isFavorite = currentTrack?.id ? favoriteTrackIds.has(currentTrack.id) : false;
   const nearEndThreshold = duration ? Math.min(30, Math.max(8, duration * 0.15)) : 0;
   const showUpNext = Boolean(nextTrack && duration && duration - currentTime <= nearEndThreshold);
+  const cover = playerCoverUrl(currentTrack, apiKey);
 
   useEffect(() => {
     const wasCrossfading = crossfading.current;
@@ -7885,7 +7923,7 @@ function AudioPlayer({
         <div className="audio-player topbar" ref={(el) => { dockRef.current = el; playerContainerRef.current = el; }}>
           <div className="topbar-player-row" ref={coreRef}>
             <div className="player-art">
-              {currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={18} />}
+              {cover ? <img src={cover} alt="" /> : <Music size={18} />}
             </div>
             <div className="topbar-track-copy" ref={trackCopyRef}>
               <strong>{currentTrack?.title || "Local player"}</strong>
@@ -7957,26 +7995,29 @@ function AudioPlayer({
       return <div className="lyrics-empty">No lyrics available</div>;
     })();
 
-    const upNextWidget = nextTrack ? (
+    const upNextWidget = nextTrack ? (() => {
+      const upNextCover = playerCoverUrl(nextTrack, apiKey);
+      return (
       <div className={`fullscreen-next${showUpNext ? " is-visible" : ""}`} ref={upNextRef}>
-        <div className="up-next-art">{nextTrack._coverUrl ? <img src={nextTrack._coverUrl} alt="" /> : <Music size={18} />}</div>
+        <div className="up-next-art">{upNextCover ? <img src={upNextCover} alt="" /> : <Music size={18} />}</div>
         <div className="up-next-text">
           <span>Up next</span>
           <strong>{nextTrack.title}</strong>
           <small>{[nextTrack._artist, nextTrack._album].filter(Boolean).join(" / ") || "Library queue"}</small>
         </div>
       </div>
-    ) : null;
+      );
+    })() : null;
 
     return (
       <div
         className={`${popped ? "audio-player popped pip-player" : "audio-player pip-player main-fullscreen-player"}${fullscreenPlayer ? " is-window-fullscreen" : ""}${nextTrack ? " has-up-next" : ""}${lyricsOpen ? " has-lyrics" : ""}`}
         ref={(el) => { fsPlayerRef.current = el; if (!popped) dockRef.current = el; }}
-        style={currentTrack?._coverUrl ? { "--fullscreen-art": `url(${currentTrack._coverUrl})` } : undefined}
+        style={cover ? { "--fullscreen-art": `url(${cover})` } : undefined}
       >
         <div className="player-core" ref={(el) => { fsCoreRef.current = el; if (!popped) coreRef.current = el; }}>
           <div className="audio-header">
-            <div className="player-art" ref={fsArtRef}>{currentTrack?._coverUrl ? <img src={currentTrack._coverUrl} alt="" /> : <Music size={34} />}</div>
+            <div className="player-art" ref={fsArtRef}>{cover ? <img src={cover} alt="" /> : <Music size={34} />}</div>
             <div className="audio-track-copy" ref={pipTrackCopyRef}>
               <span className="playing-from">Playing from library</span>
               <strong>{currentTrack?.title || "Local player"}</strong>

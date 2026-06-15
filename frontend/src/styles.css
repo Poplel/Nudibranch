@@ -4115,3 +4115,16 @@ nav button:hover {
 .automation-search-result:hover {
   background: var(--accent-soft);
 }
+
+.home-pin-card-wrap { position: relative; display: inline-flex; }
+.home-pin-card-wrap .home-pin-unpin {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 22px;
+  height: 22px;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.home-pin-card-wrap:hover .home-pin-unpin,
+.home-pin-card-wrap:focus-within .home-pin-unpin { opacity: 1; }

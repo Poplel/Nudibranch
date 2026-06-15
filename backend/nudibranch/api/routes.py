@@ -2040,6 +2040,7 @@ async def upload_artist_cover(
     destination.write_bytes(content)
     artist.cover_path = str(destination)
     session.commit()
+    write_app_log(f"Uploaded artist art for {artist.name}", source="upload", kind="artist_cover")
     return {"cover_path": str(destination)}
 
 
@@ -2079,6 +2080,7 @@ async def upload_album_cover(
     destination.write_bytes(content)
     album.cover_path = str(destination)
     session.commit()
+    write_app_log(f"Uploaded cover art for {album.artist.name} — {album.title}", source="upload", kind="album_cover")
     return {"cover_path": str(destination)}
 
 
@@ -2101,16 +2103,19 @@ async def upload_import_files(
 ) -> dict:
     import_root = get_settings().import_path
     import_root.mkdir(parents=True, exist_ok=True)
+    write_app_log(f"Import upload started: {len(files)} file(s) received", source="upload", kind="import")
     saved: list[str] = []
     rejected: list[dict] = []
     for upload in files:
         name = os.path.basename(upload.filename or "").strip()
         if not name:
             rejected.append({"name": upload.filename or "(unnamed)", "reason": "missing filename"})
+            write_app_log(f"Import upload rejected {upload.filename or '(unnamed)'}: missing filename", level="warning", source="upload", kind="import")
             continue
         ext = Path(name).suffix.lower()
         if ext not in SUPPORTED_AUDIO_EXTENSIONS:
             rejected.append({"name": name, "reason": f"unsupported type {ext or '(none)'}"})
+            write_app_log(f"Import upload rejected {name}: unsupported type {ext or '(none)'}", level="warning", source="upload", kind="import")
             continue
         content = await upload.read()
         destination = import_root / name
@@ -2129,8 +2134,10 @@ async def upload_import_files(
             except OSError:
                 pass
             rejected.append({"name": name, "reason": "not a valid audio file"})
+            write_app_log(f"Import upload rejected {name}: not a valid audio file", level="warning", source="upload", kind="import")
             continue
         saved.append(destination.name)
+    write_app_log(f"Import upload complete: {len(saved)} saved, {len(rejected)} rejected", level="warning" if rejected else "info", source="upload", kind="import")
     return {"saved": saved, "rejected": rejected, "count": len(saved)}
 
 
