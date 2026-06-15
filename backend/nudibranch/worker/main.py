@@ -706,6 +706,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     if imported:
         append_task_log(session, task, f"Imported {imported} file(s) into the library; queueing Jellyfin scan")
         enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
     downloaded_import = import_completed_downloads(session)
     open_downloads = batch_has_open_downloads(batch)
 
@@ -835,6 +836,28 @@ def batch_has_open_downloads(batch: ProposalBatch) -> bool:
     return any(keeps_download_batch_open(item) and item.status == ProposalStatus.executing for item in batch.items)
 
 
+# Newly imported tracks awaiting lyrics/art enrichment. Module-level because imports land via
+# several drivers in this single-process worker (import wizard, download manifest, sweep, yt-dlp);
+# import_file_to_library queues each newly created track here, and every driver calls
+# flush_import_enrichment() at its completion to enqueue one aggregated enrich_imports task.
+_pending_enrichment_track_ids: list[str] = []
+
+
+def queue_track_for_enrichment(track_id: str | None) -> None:
+    if track_id and track_id not in _pending_enrichment_track_ids:
+        _pending_enrichment_track_ids.append(track_id)
+
+
+def flush_import_enrichment(session: Session) -> None:
+    global _pending_enrichment_track_ids
+    if not _pending_enrichment_track_ids:
+        return
+    track_ids = _pending_enrichment_track_ids
+    _pending_enrichment_track_ids = []
+    enqueue_task(session, "enrich_imports", {"track_ids": track_ids})
+    append_task_log(session, None, f"Queued lyrics/art enrichment for {len(track_ids)} imported track(s)")
+
+
 def import_track_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     replace_track_id = payload.get("replace_track_id")
@@ -927,25 +950,29 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
     elif metadata.get("musicbrainz_album_id"):
         album.musicbrainz_release_id = metadata.get("musicbrainz_album_id")
 
+    # If the imported folder shipped its own cover image, adopt it before any online lookup runs.
+    adopt_source_folder_cover(session, album, source_path.parent, target_path.parent)
+
     existing_track = session.scalar(select(Track).where(Track.path == str(target_path)))
     if existing_track:
         return
 
-    session.add(
-        Track(
-            album_id=album.id,
-            title=track_title,
-            track_number=metadata.get("track_number"),
-            disc_number=metadata.get("disc_number"),
-            duration_ms=metadata.get("duration_ms"),
-            format=metadata.get("format"),
-            bitrate=metadata.get("bitrate"),
-            path=str(target_path),
-            musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
-            is_lossless=metadata.get("is_lossless", False),
-            musicbrainz_verified=bool(metadata.get("musicbrainz_verified")),
-        )
+    track = Track(
+        album_id=album.id,
+        title=track_title,
+        track_number=metadata.get("track_number"),
+        disc_number=metadata.get("disc_number"),
+        duration_ms=metadata.get("duration_ms"),
+        format=metadata.get("format"),
+        bitrate=metadata.get("bitrate"),
+        path=str(target_path),
+        musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
+        is_lossless=metadata.get("is_lossless", False),
+        musicbrainz_verified=bool(metadata.get("musicbrainz_verified")),
     )
+    session.add(track)
+    session.flush()
+    queue_track_for_enrichment(track.id)
 
 
 def apply_metadata_item(session: Session, item: ProposalItem) -> None:
@@ -1363,6 +1390,7 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -
         )
         append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
         enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
         return {"imported": manifest_imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
     if manifest_waiting or manifest_ready or manifest_failed:
         return {"imported": 0, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
@@ -1416,6 +1444,7 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -
         )
         append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
         enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
     return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
 
 
@@ -3117,6 +3146,70 @@ def representative_album_cover(artist: Artist) -> str | None:
     return None
 
 
+def adopt_source_folder_cover(session: Session, album: Album, source_dir: Path, album_dir: Path) -> None:
+    """If the imported source folder contains a cover image, copy it into the album folder.
+
+    Only audio files are moved into the library on import, so a cover.jpg that shipped alongside the
+    tracks would otherwise be left behind in /app/import. Runs only when the album has no valid local
+    cover yet, so it never overwrites existing art."""
+    if album_has_valid_local_cover(album):
+        return
+    source_cover = find_existing_cover_file_in_dir(source_dir)
+    if not source_cover:
+        return
+    source_cover_path = Path(source_cover)
+    try:
+        album_dir.mkdir(parents=True, exist_ok=True)
+        dest = album_dir / f"cover{source_cover_path.suffix.lower()}"
+        if source_cover_path.resolve() != dest.resolve():
+            shutil.copy2(source_cover_path, dest)
+        album.cover_path = str(dest)
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: adopted cover from import folder ({source_cover})")
+    except OSError as error:
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: could not adopt import-folder cover: {error}", "warning")
+
+
+def ensure_album_cover(session: Session, album: Album) -> None:
+    """Set a local album cover if missing: adopt one already in the folder, else download online."""
+    if album_has_valid_local_cover(album):
+        return
+    existing = find_existing_cover_file(album)
+    if existing:
+        album.cover_path = existing
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: adopting existing cover file {existing}")
+        return
+    try:
+        results = search_album_releases(album.artist.name, album.title)
+    except Exception as error:  # noqa: BLE001 - art should not block import enrichment.
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: album art lookup failed: {error}", "warning")
+        return
+    cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
+    if cover_path:
+        album.cover_path = cover_path
+
+
+def ensure_artist_cover(session: Session, artist: Artist) -> None:
+    """Set a local artist image if missing: adopt one in the folder, else Deezer, else album cover."""
+    if artist_has_valid_local_cover(artist):
+        return
+    existing = find_existing_cover_file_in_dir(artist_folder_path(artist))
+    if existing:
+        artist.cover_path = existing
+        append_task_log(session, None, f"{artist.name}: adopting existing artist cover file {existing}")
+        return
+    try:
+        cover_path = download_artist_cover_to_library(session, artist, artist_image_candidate_urls(artist.name))
+    except Exception as error:  # noqa: BLE001 - art should not block import enrichment.
+        append_task_log(session, None, f"{artist.name}: artist art lookup failed: {error}", "warning")
+        cover_path = None
+    if not cover_path:
+        cover_path = representative_album_cover(artist)
+        if cover_path:
+            append_task_log(session, None, f"{artist.name}: using album cover as artist art {cover_path}")
+    if cover_path:
+        artist.cover_path = cover_path
+
+
 def ensure_album_cover_for_import(session: Session, artist_name: str, album_title: str) -> None:
     album = session.scalar(
         select(Album)
@@ -3509,7 +3602,7 @@ def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
     audio_path = Path(track.path)
     if not audio_path.exists():
         raise FileNotFoundError(f"{audio_path} is missing")
-    lyric_text = fetch_lrclib_lyrics(track)
+    lyric_text = fetch_lyrics_with_fallback(track)
     if not lyric_text:
         raise ValueError("No synced or unsynced lyrics were found")
     lrc_path = audio_path.with_suffix(".lrc")
@@ -4776,6 +4869,64 @@ def fetch_lrclib_lyrics(track: Track) -> str | None:
     return payload.get("syncedLyrics") or payload.get("plainLyrics")
 
 
+def fetch_lrclib_lyrics_search(track: Track) -> str | None:
+    """Secondary lyrics source: LRCLIB's fuzzy /api/search.
+
+    /api/get requires an exact track+artist+album(+duration) match and 404s often. /api/search is
+    looser but can return the wrong recording, so each candidate is validated with title/artist
+    similarity and a duration sanity check before its lyrics are accepted."""
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    artist_name = track.album.artist.name
+    params = {"track_name": track.title or "", "artist_name": artist_name or ""}
+    headers = {"User-Agent": "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"}
+    try:
+        with httpx.Client(base_url="https://lrclib.net", headers=headers, timeout=20) as client:
+            response = client.get("/api/search", params=params)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            results = response.json()
+    except httpx.HTTPError:
+        return None
+    if not isinstance(results, list) or not results:
+        return None
+
+    duration_seconds = round((track.duration_ms or 0) / 1000) if track.duration_ms else None
+    title_norm = normalize(track.title or "")
+    artist_norm = normalize(artist_name or "")
+    best = None
+    best_score = 0.0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        title_sim = text_similarity(title_norm, normalize(result.get("trackName") or ""))
+        artist_sim = text_similarity(artist_norm, normalize(result.get("artistName") or ""))
+        # The title must clearly match; require at least a loose artist match too.
+        if title_sim < 0.6 or artist_sim < 0.5:
+            continue
+        result_duration = result.get("duration")
+        if duration_seconds and result_duration:
+            # A different recording (live/remix/wrong song) usually differs by more than ~15s.
+            if abs(float(result_duration) - duration_seconds) > 15:
+                continue
+        score = title_sim * 0.6 + artist_sim * 0.4
+        if score > best_score:
+            best_score = score
+            best = result
+    if not best or best_score < 0.6:
+        return None
+    return best.get("syncedLyrics") or best.get("plainLyrics")
+
+
+def fetch_lyrics_with_fallback(track: Track) -> str | None:
+    """LRCLIB exact match first, then a heuristically-validated fuzzy search fallback."""
+    lyric_text = fetch_lrclib_lyrics(track)
+    if lyric_text:
+        return lyric_text
+    return fetch_lrclib_lyrics_search(track)
+
+
 def download_query(request: dict) -> str:
     return " ".join(str(part) for part in [request.get("artist"), request.get("album"), request.get("track")] if part).strip()
 
@@ -5254,6 +5405,7 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
                 )
                 session.flush()
                 enqueue_task(session, "jellyfin_scan", {})
+                flush_import_enrichment(session)
             else:
                 append_task_log(session, task, f"yt-dlp: '{query}' already in library, skipping import")
         except Exception as import_error:  # noqa: BLE001
@@ -6246,6 +6398,98 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
         target_url="/task-queue",
     )
     return {"checked": n_albums_scanned, "proposed": proposed, "batch_id": batch.id}
+
+
+def run_enrich_imports(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Post-import enrichment for newly added tracks: album art, artist art, and lyrics.
+
+    Art is only fetched when missing; lyrics use LRCLIB exact match then a validated fuzzy fallback.
+    Tracks left without lyrics are logged and surfaced as a single 'Lyrics could not be found'
+    notification rather than per-track 'needs attention' items."""
+    track_ids = payload.get("track_ids") or []
+    tracks: list[Track] = []
+    for track_id in track_ids:
+        track = session.scalar(
+            select(Track)
+            .where(Track.id == track_id)
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+        if track and track.album and track.album.artist:
+            tracks.append(track)
+    if not tracks:
+        return {"tracks": 0, "lyrics_found": 0, "lyrics_missing": 0}
+
+    total = len(tracks)
+    progress_total = total * 2  # art pass + lyrics pass
+    progress_current = 0
+
+    # Artwork (deduped per album/artist).
+    seen_albums: set[str] = set()
+    seen_artists: set[str] = set()
+    for track in tracks:
+        album = track.album
+        artist = album.artist
+        if artist.id not in seen_artists:
+            seen_artists.add(artist.id)
+            ensure_artist_cover(session, artist)
+        if album.id not in seen_albums:
+            seen_albums.add(album.id)
+            ensure_album_cover(session, album)
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, progress_current, progress_total, f"Checking artwork ({progress_current}/{total})")
+    session.commit()
+
+    # Lyrics.
+    lyrics_found = 0
+    missing: list[Track] = []
+    for index, track in enumerate(tracks, start=1):
+        if not track.path:
+            progress_current += 1
+            continue
+        lrc_path = Path(track.path).with_suffix(".lrc")
+        if lrc_path.exists():
+            lyrics_found += 1
+            progress_current += 1
+            continue
+        try:
+            lyric_text = fetch_lyrics_with_fallback(track)
+        except Exception as error:  # noqa: BLE001 - one bad lookup must not abort the batch.
+            lyric_text = None
+            write_app_log(f"Lyrics lookup error for {track.album.artist.name} — {track.title}: {error}", "warning")
+        if lyric_text:
+            try:
+                lrc_path.write_text(lyric_text, encoding="utf-8")
+                lyrics_found += 1
+                append_task_log(session, task, f"Fetched lyrics for {track.album.artist.name} / {track.title}")
+            except OSError as error:
+                append_task_log(session, task, f"Could not write lyrics for {track.title}: {error}", "warning")
+                missing.append(track)
+        else:
+            missing.append(track)
+            write_app_log(
+                f"No lyrics found for {track.album.artist.name} — {track.title}",
+                "info",
+                artist=track.album.artist.name,
+                album=track.album.title,
+                track=track.title,
+            )
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, f"Fetching lyrics ({index}/{total})")
+
+    if missing:
+        names = "; ".join(f"{t.album.artist.name} — {t.title}" for t in missing[:10])
+        more = f" (+{len(missing) - 10} more — see Activity)" if len(missing) > 10 else ""
+        create_notification(
+            session,
+            title="Lyrics could not be found",
+            body=f"No lyrics found for {len(missing)} imported track(s): {names}{more}",
+            event_type="tool_completed",
+            target_url="/activity",
+        )
+    session.commit()
+    return {"tracks": total, "lyrics_found": lyrics_found, "lyrics_missing": len(missing)}
 
 
 def run_check_album_covers(session: Session, _payload: dict) -> dict:
@@ -7340,6 +7584,7 @@ TASK_HANDLERS = {
     "clear_downloads": run_clear_downloads,
     "search_candidates": run_search_candidates,
     "consolidate_folders": run_consolidate_folders,
+    "enrich_imports": run_enrich_imports,
 }
 
 
@@ -7470,7 +7715,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders", "enrich_imports"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -7531,6 +7776,7 @@ def task_notification_title(task_type: str) -> str:
         "clear_downloads": "Clear downloads",
         "search_candidates": "Searching downloads",
         "consolidate_folders": "Folder consolidation",
+        "enrich_imports": "Import enrichment",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
@@ -7541,6 +7787,8 @@ def task_target_url(task_type: str) -> str:
         return "/import"
     if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
         return "/tools"
+    if task_type == "enrich_imports":
+        return "/library"
     return "/activity"
 
 

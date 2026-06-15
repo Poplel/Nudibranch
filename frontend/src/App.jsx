@@ -5708,6 +5708,7 @@ function taskDisplayName(task) {
     propose_import: "Preparing import",
     ytdlp_download: "Downloading",
     jellyfin_scan: "Scanning Jellyfin",
+    enrich_imports: "Enriching imports",
   };
   return names[task.type] || task.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
