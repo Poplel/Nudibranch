@@ -143,6 +143,7 @@ function App() {
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const addImportAlbumsRef = useRef(null);
   const playbackControlRef = useRef(null);
+  const unshuffledQueueRef = useRef(null); // snapshot of queue order before shuffle, to revert
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
   const lastRecordedPlayRef = useRef(null);
@@ -1829,16 +1830,49 @@ function App() {
   }
 
   function nextQueueIndex() {
+    // Shuffle now physically reorders the queue, so "next" is always sequential.
     if (playerQueue.length === 0) return -1;
-    if (shuffle) {
-      if (playerQueue.length === 1) return repeat === "all" ? 0 : -1;
-      let candidate = currentTrackIndex;
-      while (candidate === currentTrackIndex) candidate = Math.floor(Math.random() * playerQueue.length);
-      return candidate;
-    }
     const next = (currentTrackIndex < 0 ? -1 : currentTrackIndex) + 1;
     if (next >= playerQueue.length) return repeat === "all" ? 0 : -1;
     return next;
+  }
+
+  // Toggle shuffle by reordering the queue itself (not by jumping to random
+  // entries). Enabling snapshots the current order and shuffles only the
+  // upcoming tracks (the played ones + the current track stay put). Disabling
+  // restores the snapshot order with already-played tracks dropped.
+  function toggleShuffle() {
+    setShuffle((on) => {
+      const turningOn = !on;
+      if (turningOn) {
+        setPlayerQueue((current) => {
+          unshuffledQueueRef.current = [...current];
+          const idx = current.findIndex((track) => track.id === currentTrack?.id);
+          const head = idx >= 0 ? current.slice(0, idx + 1) : [];
+          const tail = idx >= 0 ? current.slice(idx + 1) : [...current];
+          for (let i = tail.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [tail[i], tail[j]] = [tail[j], tail[i]];
+          }
+          return [...head, ...tail];
+        });
+      } else {
+        setPlayerQueue((current) => {
+          const snapshot = unshuffledQueueRef.current;
+          unshuffledQueueRef.current = null;
+          if (!snapshot) return current;
+          const idx = current.findIndex((track) => track.id === currentTrack?.id);
+          const playedIds = new Set(idx > 0 ? current.slice(0, idx).map((track) => track.id) : []);
+          const snapshotIds = new Set(snapshot.map((track) => track.id));
+          // Original order minus what's already been played, then append anything
+          // queued during shuffle that wasn't in the snapshot (and isn't played).
+          const restored = snapshot.filter((track) => !playedIds.has(track.id));
+          const added = current.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
+          return [...restored, ...added];
+        });
+      }
+      return turningOn;
+    });
   }
 
   async function playNextTrack() {
@@ -1997,7 +2031,7 @@ function App() {
               onSkipForward={playNextTrack}
               shuffle={shuffle}
               repeat={repeat}
-              onToggleShuffle={() => setShuffle((v) => !v)}
+              onToggleShuffle={toggleShuffle}
               onCycleRepeat={() => setRepeat((r) => (r === "off" ? "all" : r === "all" ? "one" : "off"))}
               onFavorite={toggleFavoriteTrack}
               favoriteTrackIds={favoriteTrackIds}
@@ -7909,7 +7943,7 @@ function AudioPlayer({
   const nearEndThreshold = duration ? Math.min(30, Math.max(8, duration * 0.15)) : 0;
   const showUpNext = Boolean(nextTrack && duration && duration - currentTime <= nearEndThreshold);
   const cover = playerCoverUrl(currentTrack, apiKey);
-  const canSkipForward = currentIndex >= 0 && (currentIndex < queue.length - 1 || repeat === "all" || shuffle);
+  const canSkipForward = currentIndex >= 0 && (currentIndex < queue.length - 1 || repeat === "all");
   const renderShuffle = (size) => (onToggleShuffle ? (
     <button className={`player-icon-button${shuffle ? " active" : ""}`} onClick={onToggleShuffle} title={shuffle ? "Shuffle on" : "Shuffle off"}>
       <Shuffle size={size} />
@@ -7983,7 +8017,7 @@ function AudioPlayer({
     const ms = navigator.mediaSession;
     ms.setActionHandler("play", () => togglePlayback());
     ms.setActionHandler("pause", () => togglePlayback());
-    ms.setActionHandler("previoustrack", () => onSkipBack?.());
+    ms.setActionHandler("previoustrack", () => handleSkipBack());
     ms.setActionHandler("nexttrack", () => onSkipForward?.());
     try { ms.setActionHandler("stop", () => onClose?.()); } catch { /* unsupported */ }
     return () => {
@@ -8221,7 +8255,6 @@ function AudioPlayer({
     const fadeSec = crossfadeDuration > 0 ? crossfadeDuration : 0;
     if (!fadeSec || !duration || !nextAudioUrl || crossfading.current) return;
     if (repeat === "one") return; // repeating the same track: nothing to fade into
-    if (shuffle) return; // shuffle's next is nondeterministic, so the preloaded next won't match
     const remaining = duration - currentTime;
     if (remaining > fadeSec || remaining <= 0) return;
     const otherKey = activeKeyRef.current === "a" ? "b" : "a";
@@ -8278,6 +8311,19 @@ function AudioPlayer({
     } else {
       audio.pause();
     }
+  }
+
+  // Skip-back restarts the current track; pressing again while still near the
+  // start (< 1s in) jumps to the previous track. Playback position doubles as
+  // the "pressed again quickly" timer.
+  function handleSkipBack() {
+    const audio = activeAudio();
+    if (audio && audio.currentTime > 1) {
+      try { audio.currentTime = 0; } catch { /* not seekable yet */ }
+      setCurrentTime(0);
+      return;
+    }
+    onSkipBack?.();
   }
 
   // Expose imperative transport controls for the remote-command consumer.
@@ -8468,7 +8514,7 @@ function AudioPlayer({
             </div>
             <div className="topbar-controls">
               {renderShuffle(16)}
-              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+              <button className="player-icon-button" onClick={handleSkipBack} disabled={!currentTrack} title="Previous">
                 <SkipBack size={16} />
               </button>
               <button className="player-play-button compact" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
@@ -8592,7 +8638,7 @@ function AudioPlayer({
                 <Ban size={19} className="lyric-icon-off" />
               </button>
               {renderShuffle(18)}
-              <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
+              <button className="player-icon-button" onClick={handleSkipBack} disabled={!currentTrack} title="Previous">
                 <SkipBack size={18} />
               </button>
               <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
