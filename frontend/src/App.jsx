@@ -7867,8 +7867,18 @@ function AudioPlayer({
   crossfadeDuration = 0.5,
   apiKey,
 }) {
-  const audioRef = useRef(null);
-  const nextAudioRef = useRef(null);
+  // Double-buffer: two audio elements. One is "active" (audible); the other
+  // preloads the upcoming track so the next song is already buffered and we can
+  // swap to it with no reload — gapless on track-end, and the handoff target for
+  // crossfade. src is managed imperatively (see effects below), never via React.
+  const audioARef = useRef(null);
+  const audioBRef = useRef(null);
+  const [activeKey, setActiveKey] = useState("a");
+  const activeKeyRef = useRef("a");
+  activeKeyRef.current = activeKey;
+  const loadedUrlRef = useRef({ a: null, b: null });
+  const activeAudio = () => (activeKeyRef.current === "a" ? audioARef.current : audioBRef.current);
+  const inactiveAudio = () => (activeKeyRef.current === "a" ? audioBRef.current : audioARef.current);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const trackCopyRef = useRef(null);
@@ -7879,7 +7889,6 @@ function AudioPlayer({
   const lastPlaybackReportSecond = useRef(-1);
   const crossfading = useRef(false);
   const crossfadeIntervalRef = useRef(null);
-  const seekOnLoad = useRef(null);
   const [lyricsOpen, setLyricsOpen] = useState(false);
   const [lyricsData, setLyricsData] = useState(null);
   const lyricsPanelRef = useRef(null);
@@ -7913,23 +7922,57 @@ function AudioPlayer({
     </button>
   ) : null);
 
+  // Load + play the current track on the active element. If the upcoming track was
+  // already preloaded on the OTHER element, swap to it instead of reloading (gapless).
   useEffect(() => {
-    const wasCrossfading = crossfading.current;
-    if (!wasCrossfading) seekOnLoad.current = null;
-    setPlaying(false);
-    setCurrentTime(0);
-    crossfading.current = false;
     if (crossfadeIntervalRef.current) {
       clearInterval(crossfadeIntervalRef.current);
       crossfadeIntervalRef.current = null;
     }
-    if (audioRef.current) {
-      audioRef.current.volume = 1;
-      // Kick playback as soon as the new source is set, rather than waiting on the
-      // autoPlay attribute to notice the src change (snappier track switching).
-      audioRef.current.play?.().catch(() => {});
+    crossfading.current = false;
+    setCurrentTime(0);
+    if (!audioUrl) { setPlaying(false); return; }
+    const loaded = loadedUrlRef.current;
+    const key = activeKeyRef.current;
+    const otherKey = key === "a" ? "b" : "a";
+    if (loaded[key] !== audioUrl && loaded[otherKey] === audioUrl) {
+      // The preloaded element already has this track — promote it (no reload).
+      setActiveKey(otherKey);
+      return;
     }
-  }, [audioUrl]);
+    const el = activeAudio();
+    if (!el) return;
+    const other = inactiveAudio();
+    if (other && other !== el) { other.pause(); other.volume = 0; }
+    if (loaded[key] !== audioUrl) {
+      el.src = audioUrl;
+      loaded[key] = audioUrl;
+      try { el.currentTime = 0; } catch { /* not seekable yet */ }
+    }
+    el.volume = 1;
+    if (el.duration) setDuration(el.duration);
+    el.play?.().catch(() => {});
+  }, [audioUrl, activeKey]);
+
+  // Keep the inactive element preloading the upcoming track.
+  useEffect(() => {
+    const inactive = inactiveAudio();
+    if (!inactive) return;
+    const otherKey = activeKeyRef.current === "a" ? "b" : "a";
+    const loaded = loadedUrlRef.current;
+    if (nextAudioUrl) {
+      if (loaded[otherKey] !== nextAudioUrl) {
+        inactive.src = nextAudioUrl;
+        loaded[otherKey] = nextAudioUrl;
+        inactive.volume = 0;
+        try { inactive.load(); } catch { /* ignore */ }
+      }
+    } else if (loaded[otherKey] !== null) {
+      inactive.removeAttribute("src");
+      try { inactive.load(); } catch { /* ignore */ }
+      loaded[otherKey] = null;
+    }
+  }, [nextAudioUrl, activeKey]);
 
   // Browser/OS media widget (Media Session API): metadata + hardware/lock-screen controls.
   useEffect(() => {
@@ -8174,25 +8217,30 @@ function AudioPlayer({
   useEffect(() => {
     const fadeSec = crossfadeDuration > 0 ? crossfadeDuration : 0;
     if (!fadeSec || !duration || !nextAudioUrl || crossfading.current) return;
+    if (repeat === "one") return; // repeating the same track: nothing to fade into
+    if (shuffle) return; // shuffle's next is nondeterministic, so the preloaded next won't match
     const remaining = duration - currentTime;
     if (remaining > fadeSec || remaining <= 0) return;
+    const otherKey = activeKeyRef.current === "a" ? "b" : "a";
+    if (loadedUrlRef.current[otherKey] !== nextAudioUrl) return; // next not preloaded yet
+    const active = activeAudio();
+    const next = inactiveAudio();
+    if (!next) return;
     crossfading.current = true;
-    const next = nextAudioRef.current;
-    if (!next?.src) return;
-    next.currentTime = 0;
+    try { next.currentTime = 0; } catch { /* ignore */ }
     next.volume = 0;
     next.play().catch(() => {});
     const startTime = performance.now();
     crossfadeIntervalRef.current = setInterval(() => {
       const elapsed = (performance.now() - startTime) / 1000;
       const frac = Math.min(elapsed / fadeSec, 1);
-      if (audioRef.current) audioRef.current.volume = Math.max(0, 1 - frac);
+      if (active) active.volume = Math.max(0, 1 - frac);
       if (next) next.volume = Math.min(1, frac);
       if (frac >= 1) {
         clearInterval(crossfadeIntervalRef.current);
         crossfadeIntervalRef.current = null;
-        seekOnLoad.current = next.currentTime;
-        next.pause();
+        // Advance: App updates audioUrl → the loader effect promotes `next` (already
+        // playing at full volume) to active with no reload.
         onEndedRef.current?.();
       }
     }, 30);
@@ -8220,10 +8268,10 @@ function AudioPlayer({
   }, [onDockChange, pipContainer, currentTrack?.id]);
 
   function togglePlayback() {
-    const audio = audioRef.current;
+    const audio = activeAudio();
     if (!audio) return;
     if (audio.paused) {
-      audio.play();
+      audio.play().catch(() => {});
     } else {
       audio.pause();
     }
@@ -8233,10 +8281,10 @@ function AudioPlayer({
   useEffect(() => {
     if (!controlRef) return undefined;
     controlRef.current = {
-      pause: () => audioRef.current?.pause(),
-      resume: () => audioRef.current?.play().catch(() => {}),
+      pause: () => activeAudio()?.pause(),
+      resume: () => activeAudio()?.play().catch(() => {}),
       stop: () => {
-        const a = audioRef.current;
+        const a = activeAudio();
         if (a) { a.pause(); try { a.currentTime = 0; } catch { /* ignore */ } }
       },
     };
@@ -8250,8 +8298,44 @@ function AudioPlayer({
     });
   }
 
+  function handleTrackEnded(key) {
+    if (key !== activeKeyRef.current) return; // an old (now-inactive) element finishing — ignore
+    if (crossfading.current) return; // the crossfade is driving the advance
+    if (repeat === "one") {
+      const a = activeAudio();
+      if (a) { a.currentTime = 0; a.play().catch(() => {}); }
+      return;
+    }
+    onEnded?.();
+  }
+
+  // Both buffers render the same element; handlers no-op unless this is the active one.
+  function renderAudioElement(key, ref) {
+    return (
+      <audio
+        key={key}
+        ref={ref}
+        preload="auto"
+        style={{ display: "none" }}
+        onPlay={(event) => { if (key !== activeKeyRef.current) return; setPlaying(true); notifyPlaybackState("playing", event); }}
+        onPause={(event) => { if (key !== activeKeyRef.current) return; setPlaying(false); notifyPlaybackState("paused", event); }}
+        onTimeUpdate={(event) => {
+          if (key !== activeKeyRef.current) return;
+          const second = Math.round(event.currentTarget.currentTime);
+          setCurrentTime(event.currentTarget.currentTime);
+          if (second !== lastPlaybackReportSecond.current && second % 15 === 0) {
+            lastPlaybackReportSecond.current = second;
+            notifyPlaybackState(playing ? "playing" : "paused", event);
+          }
+        }}
+        onLoadedMetadata={(event) => { if (key !== activeKeyRef.current) return; setDuration(event.currentTarget.duration || 0); }}
+        onEnded={() => handleTrackEnded(key)}
+      />
+    );
+  }
+
   function seek(event) {
-    const audio = audioRef.current;
+    const audio = activeAudio();
     if (!audio || !duration) return;
     const nextTime = Number(event.target.value);
     audio.currentTime = nextTime;
@@ -8528,45 +8612,8 @@ function AudioPlayer({
   return (
     <>
       {!pipContainer ? surface() : null}
-      <audio
-        ref={audioRef}
-        autoPlay
-        preload="auto"
-        src={audioUrl}
-        onPlay={(event) => {
-          setPlaying(true);
-          notifyPlaybackState("playing", event);
-        }}
-        onPause={(event) => {
-          setPlaying(false);
-          notifyPlaybackState("paused", event);
-        }}
-        onTimeUpdate={(event) => {
-          const second = Math.round(event.currentTarget.currentTime);
-          setCurrentTime(event.currentTarget.currentTime);
-          if (second !== lastPlaybackReportSecond.current && second % 15 === 0) {
-            lastPlaybackReportSecond.current = second;
-            notifyPlaybackState(playing ? "playing" : "paused", event);
-          }
-        }}
-        onLoadedMetadata={(event) => {
-          setDuration(event.currentTarget.duration || 0);
-          if (seekOnLoad.current !== null) {
-            event.currentTarget.currentTime = seekOnLoad.current;
-            seekOnLoad.current = null;
-          }
-        }}
-        onEnded={() => {
-          if (crossfading.current) return;
-          if (repeat === "one") {
-            const a = audioRef.current;
-            if (a) { a.currentTime = 0; a.play().catch(() => {}); }
-            return;
-          }
-          onEnded?.();
-        }}
-      />
-      {nextAudioUrl && <audio ref={nextAudioRef} preload="auto" src={nextAudioUrl} style={{ display: "none" }} />}
+      {renderAudioElement("a", audioARef)}
+      {renderAudioElement("b", audioBRef)}
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
     </>
   );
