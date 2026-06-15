@@ -1520,8 +1520,13 @@ function App() {
     }
   }
 
-  async function uploadImportFiles(fileList) {
-    let list = Array.from(fileList || []);
+  async function uploadImportFiles(items) {
+    // Accept plain File objects (file picker) or { file, path } entries (folder
+    // picker / drag-drop). A relative path keeps a dropped folder's structure.
+    const relPath = (it) => (it.path || it.file.webkitRelativePath || it.file.name || "").replace(/\\/g, "/").replace(/^\/+/, "");
+    let list = Array.from(items || [])
+      .map((it) => (it instanceof File ? { file: it, path: it.webkitRelativePath || it.name } : it))
+      .filter((it) => it && it.file);
     if (!list.length) return;
     // Skip files that already exist in the import folder — don't re-send them.
     let skipped = 0;
@@ -1529,7 +1534,7 @@ function App() {
       const existing = await api("/imports/existing");
       const have = new Set((existing?.names || []).map((n) => n.toLowerCase()));
       const before = list.length;
-      list = list.filter((f) => !have.has((f.name || "").toLowerCase()));
+      list = list.filter((it) => !have.has(relPath(it).toLowerCase()));
       skipped = before - list.length;
     } catch {
       /* couldn't list the folder — fall back to uploading all (server de-dupes names too) */
@@ -1541,7 +1546,7 @@ function App() {
     setLoading(true);
     setImportUploadProgress(0);
     const body = new FormData();
-    list.forEach((f) => body.append("files", f));
+    list.forEach((it) => { body.append("files", it.file); body.append("paths", relPath(it)); });
     try {
       // XHR (not fetch) so we get real upload-progress events for the whole batch.
       const res = await new Promise((resolve, reject) => {
@@ -7578,6 +7583,54 @@ function LibraryTopStats({ api }) {
   );
 }
 
+// Recursively read a webkit FileSystemEntry into [{ file, path }], preserving folder
+// structure (path stays relative to the dropped item).
+function readFsEntry(entry, base = "") {
+  return new Promise((resolve) => {
+    if (!entry) return resolve([]);
+    if (entry.isFile) {
+      entry.file(
+        (file) => resolve([{ file, path: base + entry.name }]),
+        () => resolve([]),
+      );
+      return;
+    }
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const acc = [];
+      const readBatch = () => {
+        reader.readEntries(
+          (batch) => {
+            if (!batch.length) {
+              Promise.all(acc.map((child) => readFsEntry(child, `${base}${entry.name}/`))).then((nested) => resolve(nested.flat()));
+            } else {
+              acc.push(...batch);
+              readBatch(); // readEntries yields ≤100 entries per call — keep going until empty
+            }
+          },
+          () => resolve([]),
+        );
+      };
+      readBatch();
+      return;
+    }
+    resolve([]);
+  });
+}
+
+// Pull a dropped mix of files and folders into [{ file, path }]. The DataTransfer
+// item list and webkitGetAsEntry() must be read synchronously, so grab the entries
+// before the first await.
+async function collectDroppedItems(dataTransfer) {
+  const items = dataTransfer?.items ? Array.from(dataTransfer.items) : [];
+  const entries = items.map((it) => it.webkitGetAsEntry?.()).filter(Boolean);
+  if (entries.length) {
+    const groups = await Promise.all(entries.map((entry) => readFsEntry(entry)));
+    return groups.flat();
+  }
+  return Array.from(dataTransfer?.files || []).map((file) => ({ file, path: file.name }));
+}
+
 function Inspector({
   page,
   api,
@@ -7598,7 +7651,9 @@ function Inspector({
   playlistImportActions,
 }) {
   const importUploadRef = useRef(null);
+  const importFolderRef = useRef(null);
   const [confirmClearImport, setConfirmClearImport] = useState(false);
+  const [importDragOver, setImportDragOver] = useState(false);
   const stats = inspectorStats({
     page,
     library,
@@ -7623,10 +7678,42 @@ function Inspector({
             <RefreshCw size={16} />
             Scan import folder
           </button>
+          <div
+            className={`import-dropzone${importDragOver ? " dragover" : ""}`}
+            onDragOver={(event) => { event.preventDefault(); setImportDragOver(true); }}
+            onDragLeave={() => setImportDragOver(false)}
+            onDrop={async (event) => {
+              event.preventDefault();
+              setImportDragOver(false);
+              if (importActions.uploadProgress != null) return;
+              const collected = await collectDroppedItems(event.dataTransfer);
+              if (collected.length) importActions.onUpload?.(collected);
+            }}
+          >
+            <Upload size={18} />
+            <span>Drop files or folders here</span>
+          </div>
           <button className="secondary" type="button" disabled={importActions.uploadProgress != null} onClick={() => importUploadRef.current?.click()}>
             <Upload size={16} />
             Upload files
           </button>
+          <button className="secondary" type="button" disabled={importActions.uploadProgress != null} onClick={() => importFolderRef.current?.click()}>
+            <Folder size={16} />
+            Upload folder
+          </button>
+          <input
+            ref={importFolderRef}
+            type="file"
+            webkitdirectory=""
+            directory=""
+            multiple
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const picked = Array.from(event.target.files || []);
+              event.target.value = "";
+              importActions.onUpload?.(picked);
+            }}
+          />
           {importActions.uploadProgress != null && (
             <>
               <InlineProgress value={importActions.uploadProgress * 100} label="Uploading" />

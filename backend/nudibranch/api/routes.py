@@ -8,7 +8,7 @@ from pathlib import Path
 
 from mutagen import File as MutagenFile
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 import httpx
 from sqlalchemy import case, delete, func, literal, or_, select
@@ -2143,7 +2143,7 @@ def list_import_existing(
     import_root = get_settings().import_path
     names: list[str] = []
     if import_root.exists():
-        names = [p.name for p in import_root.rglob("*") if p.is_file()]
+        names = [p.relative_to(import_root).as_posix() for p in import_root.rglob("*") if p.is_file()]
     return {"names": names, "count": len(names)}
 
 
@@ -2171,29 +2171,43 @@ def clear_import_files(
 @router.post("/imports/upload", tags=["imports"], summary="Upload audio files into the import folder")
 async def upload_import_files(
     files: list[UploadFile] = File(...),
+    paths: list[str] = Form(default=[]),
     _: User = Depends(require_permission(Permission.import_run)),
 ) -> dict:
     import_root = get_settings().import_path
     import_root.mkdir(parents=True, exist_ok=True)
+    root_resolved = import_root.resolve()
     write_app_log(f"Import upload started: {len(files)} file(s) received", source="upload", kind="import")
     saved: list[str] = []
     rejected: list[dict] = []
-    for upload in files:
-        name = os.path.basename(upload.filename or "").strip()
+    for index, upload in enumerate(files):
+        # Prefer the client-supplied relative path (folder uploads keep their structure),
+        # falling back to the bare filename. Drop empty/./.. segments so a path can never
+        # escape the import root.
+        raw = paths[index] if index < len(paths) and paths[index] else (upload.filename or "")
+        parts = [segment for segment in re.split(r"[\\/]+", raw) if segment not in ("", ".", "..")]
+        name = parts[-1] if parts else ""
+        rel_display = "/".join(parts) if parts else (upload.filename or "(unnamed)")
         if not name:
             rejected.append({"name": upload.filename or "(unnamed)", "reason": "missing filename"})
             write_app_log(f"Import upload rejected {upload.filename or '(unnamed)'}: missing filename", level="warning", source="upload", kind="import")
             continue
         ext = Path(name).suffix.lower()
         if ext not in SUPPORTED_AUDIO_EXTENSIONS:
-            rejected.append({"name": name, "reason": f"unsupported type {ext or '(none)'}"})
-            write_app_log(f"Import upload rejected {name}: unsupported type {ext or '(none)'}", level="warning", source="upload", kind="import")
+            rejected.append({"name": rel_display, "reason": f"unsupported type {ext or '(none)'}"})
+            write_app_log(f"Import upload rejected {rel_display}: unsupported type {ext or '(none)'}", level="warning", source="upload", kind="import")
             continue
+        target_dir = import_root.joinpath(*parts[:-1]) if len(parts) > 1 else import_root
+        if root_resolved not in [target_dir.resolve(), *target_dir.resolve().parents]:
+            rejected.append({"name": rel_display, "reason": "invalid path"})
+            write_app_log(f"Import upload rejected {rel_display}: path escapes import root", level="warning", source="upload", kind="import")
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
         content = await upload.read()
-        destination = import_root / name
+        destination = target_dir / name
         counter = 1
         while destination.exists():
-            destination = import_root / f"{Path(name).stem} ({counter}){ext}"
+            destination = target_dir / f"{Path(name).stem} ({counter}){ext}"
             counter += 1
         destination.write_bytes(content)
         try:
