@@ -136,6 +136,7 @@ function App() {
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const addImportAlbumsRef = useRef(null);
   const playbackControlRef = useRef(null);
+  const importUploadRef = useRef(null);
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
   const lastRecordedPlayRef = useRef(null);
@@ -1449,6 +1450,59 @@ function App() {
     }
   }
 
+  async function uploadArtistCover(artistId, file) {
+    if (!file) return;
+    setLoading(true);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      await api(`/library/artists/${artistId}/cover`, { method: "POST", body });
+      coverCacheBust = Date.now();
+      await refreshLibrary();
+      setToast({ title: "Artist art updated", body: file.name });
+    } catch (uploadError) {
+      notify("Artist art upload failed", uploadError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function uploadAlbumCover(albumId, file) {
+    if (!file) return;
+    setLoading(true);
+    const body = new FormData();
+    body.append("file", file);
+    try {
+      await api(`/library/albums/${albumId}/cover`, { method: "POST", body });
+      coverCacheBust = Date.now();
+      await refreshLibrary();
+      setToast({ title: "Cover art updated", body: file.name });
+    } catch (uploadError) {
+      notify("Cover art upload failed", uploadError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function uploadImportFiles(fileList) {
+    const list = Array.from(fileList || []);
+    if (!list.length) return;
+    setLoading(true);
+    const body = new FormData();
+    list.forEach((f) => body.append("files", f));
+    try {
+      const res = await api("/imports/upload", { method: "POST", body });
+      const parts = [`${res.count} uploaded`];
+      if (res.rejected?.length) parts.push(`${res.rejected.length} rejected`);
+      setToast({ title: "Upload complete", body: parts.join(", ") });
+      await scanImportFolder();
+    } catch (uploadError) {
+      notify("Import upload failed", uploadError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function playTracks(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
@@ -1918,6 +1972,8 @@ function App() {
                 onTogglePinArtist={toggleArtistPin}
                 pinnedArtistIds={pinnedArtistIds}
                 onArtistCoverSearch={searchArtistCover}
+                onAlbumCoverUpload={uploadAlbumCover}
+                onArtistCoverUpload={uploadArtistCover}
               />
             )}
             {page === "Discover" && (
@@ -2062,6 +2118,7 @@ function App() {
               onScan: scanImportFolder,
               onToggleAlbumSearch: () => setImportAlbumSearchOpen((value) => !value),
               onPropose: () => proposeImport(importDownloadRequests),
+              onUpload: uploadImportFiles,
               loading,
               activeImportTask,
               downloadCount: importDownloadRequests.length,
@@ -2237,7 +2294,7 @@ function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onP
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload }) {
   const [libraryView, setLibraryView] = useState("artist");
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
@@ -2460,6 +2517,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                 onAddToPlaylist={onAddToPlaylist}
                 onQueue={onQueueMetadata}
                 onAutoLookup={(field, draft) => artistAutoLookup(field, draft, artist.id, onArtistCoverSearch)}
+                onCoverUpload={onArtistCoverUpload ? (file) => onArtistCoverUpload(artist.id, file) : undefined}
                 onClose={() => toggleSet(setOpenArtistDetails, artist.id)}
               />
             )}
@@ -2505,6 +2563,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                       fields={albumFields(album)}
                       details={{ artist: artist.name, tracks: album.tracks.length }}
                       onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum, album.id, onCoverSearch)}
+                      onCoverUpload={onAlbumCoverUpload ? (file) => onAlbumCoverUpload(album.id, file) : undefined}
                       onSearchAlbums={onSearchAlbums}
                       playlists={canUsePlaylists ? playlists : []}
                       targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
@@ -4482,6 +4541,7 @@ function LibraryMetadataEditor({
   details = {},
   onAutoLookup,
   onSearchAlbums,
+  onCoverUpload,
   playlists = [],
   targetTrackIds = [],
   onAddToPlaylist,
@@ -4497,6 +4557,7 @@ function LibraryMetadataEditor({
   const [artFailed, setArtFailed] = useState(false);
   const [audioCheckResult, setAudioCheckResult] = useState(null);
   const [audioCheckLoading, setAudioCheckLoading] = useState(false);
+  const coverUploadRef = useRef(null);
   const changed = Object.fromEntries(
     Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
   );
@@ -4576,6 +4637,29 @@ function LibraryMetadataEditor({
                     <button className="row-icon-button" onClick={() => autoLookup(field)} title="Auto lookup">
                       <Search size={14} />
                     </button>
+                  )}
+                  {field.key === "cover_path" && onCoverUpload && (
+                    <>
+                      <button
+                        className="row-icon-button"
+                        type="button"
+                        onClick={() => coverUploadRef.current?.click()}
+                        title="Upload image"
+                      >
+                        <Upload size={14} />
+                      </button>
+                      <input
+                        ref={coverUploadRef}
+                        type="file"
+                        accept="image/*"
+                        style={{ display: "none" }}
+                        onChange={(event) => {
+                          const file = event.target.files?.[0];
+                          event.target.value = "";
+                          if (file) onCoverUpload(file);
+                        }}
+                      />
+                    </>
                   )}
                 </div>
               </label>
@@ -4777,6 +4861,8 @@ function hydrateTrack(track, artist, album) {
   };
 }
 
+let coverCacheBust = 0;
+
 function albumCoverUrl(album, apiKey) {
   const coverPath = album?.cover_path || "";
   if (!coverPath) return "";
@@ -4784,7 +4870,7 @@ function albumCoverUrl(album, apiKey) {
     return coverPath;
   }
   if (!apiKey || !album?.id) return "";
-  return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
+  return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
 }
 
 function artistCoverUrl(artist, apiKey) {
@@ -4794,7 +4880,7 @@ function artistCoverUrl(artist, apiKey) {
     return coverPath;
   }
   if (!apiKey || !artist?.id) return "";
-  return `${API_BASE}/library/artists/${artist.id}/cover?api_key=${encodeURIComponent(apiKey)}`;
+  return `${API_BASE}/library/artists/${artist.id}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
 }
 
 function artistBucket(artist) {
@@ -7007,6 +7093,22 @@ function Inspector({
             <RefreshCw size={16} />
             Scan import folder
           </button>
+          <button className="secondary" type="button" onClick={() => importUploadRef.current?.click()}>
+            <Upload size={16} />
+            Upload files
+          </button>
+          <input
+            ref={importUploadRef}
+            type="file"
+            accept="audio/*,.flac,.alac,.m4a,.wav,.aiff,.aif,.mp3,.ogg,.opus"
+            multiple
+            style={{ display: "none" }}
+            onChange={(event) => {
+              const picked = event.target.files;
+              event.target.value = "";
+              importActions.onUpload?.(picked);
+            }}
+          />
           <button className="secondary" onClick={importActions.onToggleAlbumSearch}>
             <Plus size={16} />
             Add album

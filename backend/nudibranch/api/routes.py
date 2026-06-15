@@ -1,9 +1,12 @@
+import os
 import secrets
 import json
 import re
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
+
+from mutagen import File as MutagenFile
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -118,7 +121,7 @@ from nudibranch.db.models import (
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
 from nudibranch.services.auth import generate_token, hash_password, hash_token, token_prefix, verify_password
-from nudibranch.services.imports import discover_import_files, read_audio_metadata
+from nudibranch.services.imports import discover_import_files, read_audio_metadata, safe_path_part, SUPPORTED_AUDIO_EXTENSIONS
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
@@ -1996,6 +1999,89 @@ def artist_cover_candidates(
     return {"artist_id": artist.id, "urls": urls, "cover_path": urls[0] if urls else None}
 
 
+def _sniff_image_extension(data: bytes) -> str | None:
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:2] == b"BM":
+        return ".bmp"
+    return None
+
+
+@router.post("/library/artists/{artist_id}/cover", tags=["library"], summary="Upload artist cover art")
+async def upload_artist_cover(
+    artist_id: str,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    artist = session.get(Artist, artist_id)
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    content = await file.read()
+    ext = _sniff_image_extension(content)
+    if not ext:
+        raise HTTPException(status_code=400, detail="File is not a valid image (jpg, png, webp, gif, bmp)")
+    folder = get_settings().library_path / safe_path_part(artist.name, "Unknown Artist")
+    folder.mkdir(parents=True, exist_ok=True)
+    destination = folder / f"cover{ext}"
+    if artist.cover_path:
+        old = Path(artist.cover_path)
+        if old != destination and old.exists() and old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    destination.write_bytes(content)
+    artist.cover_path = str(destination)
+    session.commit()
+    return {"cover_path": str(destination)}
+
+
+@router.post("/library/albums/{album_id}/cover", tags=["library"], summary="Upload album cover art")
+async def upload_album_cover(
+    album_id: str,
+    file: UploadFile = File(...),
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    content = await file.read()
+    ext = _sniff_image_extension(content)
+    if not ext:
+        raise HTTPException(status_code=400, detail="File is not a valid image (jpg, png, webp, gif, bmp)")
+    if album.path:
+        folder = Path(album.path)
+    else:
+        folder = None
+        for track in album.tracks:
+            if track.path:
+                folder = Path(track.path).parent
+                break
+        if folder is None:
+            folder = get_settings().library_path / safe_path_part(album.artist.name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")
+    folder.mkdir(parents=True, exist_ok=True)
+    destination = folder / f"cover{ext}"
+    if album.cover_path:
+        old = Path(album.cover_path)
+        if old != destination and old.exists() and old.is_file():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    destination.write_bytes(content)
+    album.cover_path = str(destination)
+    session.commit()
+    return {"cover_path": str(destination)}
+
+
 @router.post("/imports/scan", tags=["imports"], summary="Scan staging directory for audio files", response_model=dict)
 def scan_imports(
     payload: ImportScanRequest,
@@ -2006,6 +2092,46 @@ def scan_imports(
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     return {"files": files, "count": len(files)}
+
+
+@router.post("/imports/upload", tags=["imports"], summary="Upload audio files into the import folder")
+async def upload_import_files(
+    files: list[UploadFile] = File(...),
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    import_root = get_settings().import_path
+    import_root.mkdir(parents=True, exist_ok=True)
+    saved: list[str] = []
+    rejected: list[dict] = []
+    for upload in files:
+        name = os.path.basename(upload.filename or "").strip()
+        if not name:
+            rejected.append({"name": upload.filename or "(unnamed)", "reason": "missing filename"})
+            continue
+        ext = Path(name).suffix.lower()
+        if ext not in SUPPORTED_AUDIO_EXTENSIONS:
+            rejected.append({"name": name, "reason": f"unsupported type {ext or '(none)'}"})
+            continue
+        content = await upload.read()
+        destination = import_root / name
+        counter = 1
+        while destination.exists():
+            destination = import_root / f"{Path(name).stem} ({counter}){ext}"
+            counter += 1
+        destination.write_bytes(content)
+        try:
+            parsed = MutagenFile(destination)
+        except Exception:
+            parsed = None
+        if parsed is None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            rejected.append({"name": name, "reason": "not a valid audio file"})
+            continue
+        saved.append(destination.name)
+    return {"saved": saved, "rejected": rejected, "count": len(saved)}
 
 
 @router.post("/imports/propose", response_model=TaskOut, tags=["imports"], summary="Enqueue import proposal")
