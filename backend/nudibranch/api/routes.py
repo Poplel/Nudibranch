@@ -8,10 +8,10 @@ from pathlib import Path
 
 from mutagen import File as MutagenFile
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Header, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 import httpx
-from sqlalchemy import case, func, literal, or_, select
+from sqlalchemy import case, delete, func, literal, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission, resolve_media_user
@@ -415,6 +415,37 @@ def update_user_pin(
     user.pin_hash = hash_password(payload.password)
     session.commit()
     return serialize_user(load_user(session, user.id))
+
+
+@router.delete("/users/{user_id}", status_code=204, tags=["users"], summary="Delete a user and all their data")
+def delete_user(
+    user_id: str,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(require_permission(Permission.users_manage)),
+) -> Response:
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+    # Delete the user's playlists (and their tracks + any pins referencing them) explicitly.
+    playlist_ids = [row[0] for row in session.execute(select(Playlist.id).where(Playlist.user_id == user_id))]
+    if playlist_ids:
+        session.execute(delete(PlaylistTrack).where(PlaylistTrack.playlist_id.in_(playlist_ids)))
+        session.execute(delete(PinnedPlaylist).where(PinnedPlaylist.playlist_id.in_(playlist_ids)))
+        session.execute(delete(Playlist).where(Playlist.id.in_(playlist_ids)))
+    # Delete remaining user-owned rows that lack ORM cascade.
+    session.execute(delete(PlayEvent).where(PlayEvent.user_id == user_id))
+    session.execute(delete(PinnedPlaylist).where(PinnedPlaylist.user_id == user_id))
+    session.execute(delete(PinnedItem).where(PinnedItem.user_id == user_id))
+    session.execute(delete(MobileDevice).where(MobileDevice.user_id == user_id))
+    session.execute(delete(Notification).where(Notification.user_id == user_id))
+    session.execute(delete(PlaybackCommand).where(PlaybackCommand.user_id == user_id))
+    session.execute(delete(Automation).where(Automation.owner_id == user_id))
+    # ORM cascade handles permissions, wishlists, player_state, auth_sessions, api_keys.
+    session.delete(user)
+    session.commit()
+    return Response(status_code=204)
 
 
 @router.post("/me/pin", response_model=UserOut, tags=["users"], summary="Update own PIN")
@@ -918,8 +949,17 @@ def me_home(
         for w in approved
     ]
 
-    # Recent plays
-    recent_plays = list_my_plays(limit=12, days=None, session=session, user=user)
+    # Recent plays — dedupe by track_id, keeping the most-recent occurrence, cap at 12.
+    _raw_plays = list_my_plays(limit=100, days=None, session=session, user=user)
+    _seen_play_tracks: set[str] = set()
+    recent_plays = []
+    for _play in _raw_plays:
+        if _play.track_id in _seen_play_tracks:
+            continue
+        _seen_play_tracks.add(_play.track_id)
+        recent_plays.append(_play)
+        if len(recent_plays) >= 12:
+            break
 
     # Pinned playlists (names from our own table — no per-playlist Jellyfin fan-out).
     pinned = [

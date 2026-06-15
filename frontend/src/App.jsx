@@ -125,6 +125,7 @@ function App() {
   const [albumDetail, setAlbumDetail] = useState(null);
   const [artistDetail, setArtistDetail] = useState(null);
   const [homeVersion, setHomeVersion] = useState(0);
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const [pinnedAlbumIds, setPinnedAlbumIds] = useState(() => new Set());
   const [pinnedArtistIds, setPinnedArtistIds] = useState(() => new Set());
   const [dark, setDark] = useState(initialAppearance.dark);
@@ -435,6 +436,7 @@ function App() {
       setBackups(backupData.backups || []);
       setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
       setHomeVersion((v) => v + 1);
+      setRefreshVersion((v) => v + 1);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
@@ -2033,6 +2035,10 @@ function App() {
                 onArtistCoverSearch={searchArtistCover}
                 onAlbumCoverUpload={uploadAlbumCover}
                 onArtistCoverUpload={uploadArtistCover}
+                refreshVersion={refreshVersion}
+                onOpenArtist={(ar) => openArtistDetail(ar, "Library")}
+                onPlayArtist={playArtistFromHome}
+                onQueueArtist={queueArtistFromHome}
               />
             )}
             {page === "Discover" && (
@@ -2296,7 +2302,7 @@ function PanelHeader({ page, queueSummary, displayName }) {
   );
 }
 
-function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds }) {
+function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, refreshVersion }) {
   const [data, setData] = useState(null);
   const [page, setPage] = useState(1);
   useEffect(() => { setPage(1); }, [bucket, pageSize]);
@@ -2309,7 +2315,7 @@ function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onP
       .then((d) => { if (active) setData(d); })
       .catch(() => { if (active) setData({ items: [], total: 0 }); });
     return () => { active = false; };
-  }, [api, bucket, page, pageSize]);
+  }, [api, bucket, page, pageSize, refreshVersion]);
   const items = data?.items || [];
   const total = data?.total || 0;
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -2355,8 +2361,121 @@ function LibraryAlbumGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onP
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload }) {
-  const [libraryView, setLibraryView] = useState("artist");
+function LibraryArtistGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, onPlayArtist, onQueueArtist, onOpenArtist, onTogglePinArtist, pinnedArtistIds, refreshVersion }) {
+  const [data, setData] = useState(null);
+  const [page, setPage] = useState(1);
+  useEffect(() => { setPage(1); }, [bucket, pageSize]);
+  useEffect(() => {
+    let active = true;
+    setData(null);
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+    if (bucket && bucket !== "all") params.set("bucket", bucket);
+    api(`/library/artists?${params.toString()}`)
+      .then((d) => { if (active) setData(d); })
+      .catch(() => { if (active) setData({ items: [], total: 0 }); });
+    return () => { active = false; };
+  }, [api, bucket, page, pageSize, refreshVersion]);
+  const items = data?.items || [];
+  const total = data?.total || 0;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
+  return (
+    <div className="library-album-view">
+      {data === null ? (
+        <p className="muted">Loading…</p>
+      ) : items.length === 0 ? (
+        <p className="muted">No artists in this bucket.</p>
+      ) : (
+        <div className="home-album-grid">
+          {items.map((ar) => (
+            <ArtistCard
+              key={ar.id}
+              artist={ar}
+              apiKey={apiKey}
+              onPlay={onPlayArtist}
+              onQueue={onQueueArtist}
+              onOpen={onOpenArtist}
+              pinned={pinnedArtistIds?.has(ar.id)}
+              onTogglePin={onTogglePinArtist}
+            />
+          ))}
+        </div>
+      )}
+      <div className="tree-toolbar library-page-size-row">
+        <span className="muted">{total} artists</span>
+        <div className="album-page-nav">
+          <button type="button" className="secondary compact" disabled={page <= 1} onClick={() => setPage((p) => Math.max(1, p - 1))}>Prev</button>
+          <span className="muted">Page {page} / {totalPages}</span>
+          <button type="button" className="secondary compact" disabled={page >= totalPages} onClick={() => setPage((p) => Math.min(totalPages, p + 1))}>Next</button>
+        </div>
+        <label className="library-page-size">
+          <span>Per page</span>
+          <select value={pageSize} onChange={(e) => onPageSizeChange(Number(e.target.value))}>
+            {[20, 50, 100, 500, 1000].map((n) => (<option key={n} value={n}>{n}</option>))}
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function LibraryAlbumTree({ artists, bucket, pageSize, onPageSizeChange, onPlay, onQueue, onOpenAlbum, pinnedAlbumIds, onTogglePinAlbum }) {
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const flat = useMemo(() => {
+    const rows = [];
+    for (const ar of artists) for (const al of ar.albums) rows.push({ album: al, artist: ar });
+    rows.sort((a, b) => (a.album.title || "").localeCompare(b.album.title || ""));
+    return rows;
+  }, [artists]);
+  const bucketed = useMemo(
+    () => (bucket === "all" ? flat : flat.filter((r) => titleBucket(r.album.title) === bucket)),
+    [flat, bucket],
+  );
+  const paged = useMemo(() => bucketed.slice(0, pageSize), [bucketed, pageSize]);
+  return (
+    <div className="library-album-view">
+      {paged.length === 0 ? (
+        <p className="muted">No albums in this bucket.</p>
+      ) : (
+        <div className="tree">
+          {paged.map(({ album, artist }) => (
+            <div key={album.id}>
+              <div className="tree-action-row library-row-actions">
+                <TreeRow depth={0} icon={Folder} open={openAlbums.has(album.id)} title={album.title} meta={`${artist.name} · ${album.tracks.length} tracks`} onToggle={() => toggleSet(setOpenAlbums, album.id)} />
+                <AlbumResultArt src={album._coverUrl} />
+                <QuickLibraryActions onPlay={() => onPlay(albumTracks(artist, album))} onQueue={() => onQueue(albumTracks(artist, album))} onRemove={null} />
+                {onTogglePinAlbum && (
+                  <button className={`row-icon-button${pinnedAlbumIds?.has(album.id) ? " active" : ""}`} onClick={() => onTogglePinAlbum(album)} title={pinnedAlbumIds?.has(album.id) ? "Unpin from Home" : "Pin to Home"}><Pin size={15} /></button>
+                )}
+                {onOpenAlbum && (
+                  <button className="row-icon-button" onClick={() => onOpenAlbum({ ...album, artist_name: artist.name, artist_id: artist.id })} title="Open album"><Compass size={15} /></button>
+                )}
+              </div>
+              {openAlbums.has(album.id) && album.tracks.map((track) => (
+                <div key={track.id} className="tree-action-row library-row-actions">
+                  <TreeRow depth={1} icon={FileAudio} title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`} meta={track.format || "audio"} warning={!track.is_lossless} />
+                  <QuickLibraryActions onPlay={() => onPlay([hydrateTrack(track, artist, album)])} onQueue={() => onQueue([hydrateTrack(track, artist, album)])} onRemove={null} />
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="tree-toolbar library-page-size-row">
+        <span className="muted">Showing {Math.min(pageSize, bucketed.length)} of {bucketed.length}</span>
+        <label className="library-page-size">
+          <span>Per page</span>
+          <select value={pageSize} onChange={(e) => onPageSizeChange(Number(e.target.value))}>
+            {[20, 50, 100, 500, 1000].map((n) => (<option key={n} value={n}>{n}</option>))}
+          </select>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload, refreshVersion, onOpenArtist, onPlayArtist, onQueueArtist }) {
+  const [libraryEntity, setLibraryEntity] = useState("artist");
+  const [libraryLayout, setLibraryLayout] = useState("tree");
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openArtistDetails, setOpenArtistDetails] = useState(() => new Set());
@@ -2502,11 +2621,11 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                   ))}
                 </div>
               )}
-              <div className="library-view-toggle">
-                <button type="button" className={libraryView === "artist" ? "active" : ""} onClick={() => setLibraryView("artist")}>Artists</button>
-                <button type="button" className={libraryView === "album" ? "active" : ""} onClick={() => setLibraryView("album")}>Albums</button>
-              </div>
-              {libraryView === "artist" && (
+            </div>
+          )}
+          {visibleArtists.length > 0 && (
+            <div className="tree-toolbar library-control-row">
+              {libraryLayout === "tree" && libraryEntity === "artist" && (
                 <button
                   className="secondary compact"
                   onClick={() => {
@@ -2523,9 +2642,17 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                   {openArtists.size > 0 || openAlbums.size > 0 ? "Collapse all" : "Expand all"}
                 </button>
               )}
+              <div className="library-view-toggle">
+                <button type="button" className={libraryLayout === "tree" ? "active" : ""} onClick={() => setLibraryLayout("tree")}>Tree</button>
+                <button type="button" className={libraryLayout === "grid" ? "active" : ""} onClick={() => setLibraryLayout("grid")}>Grid</button>
+              </div>
+              <div className="library-view-toggle">
+                <button type="button" className={libraryEntity === "artist" ? "active" : ""} onClick={() => setLibraryEntity("artist")}>Artists</button>
+                <button type="button" className={libraryEntity === "album" ? "active" : ""} onClick={() => setLibraryEntity("album")}>Albums</button>
+              </div>
             </div>
           )}
-          {libraryView === "artist" && (
+          {libraryEntity === "artist" && libraryLayout === "tree" && (
           <div className="tree">
         {pagedArtists.map((artist) => (
           <div key={artist.id}>
@@ -2548,7 +2675,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                   onClick={() => onTogglePinArtist(artist)}
                   title={pinnedArtistIds?.has(artist.id) ? "Unpin from Home" : "Pin to Home"}
                 >
-                  {pinnedArtistIds?.has(artist.id) ? <PinOff size={15} /> : <Pin size={15} />}
+                  <Pin size={15} />
                 </button>
               )}
               {canEditMetadata && (
@@ -2716,7 +2843,22 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
         ))}
       </div>
           )}
-          {libraryView === "album" && (
+          {libraryEntity === "artist" && libraryLayout === "grid" && (
+            <LibraryArtistGrid
+              api={api}
+              apiKey={apiKey}
+              bucket={bucket}
+              pageSize={pageSize}
+              onPageSizeChange={changePageSize}
+              onPlayArtist={onPlayArtist}
+              onQueueArtist={onQueueArtist}
+              onOpenArtist={onOpenArtist}
+              onTogglePinArtist={onTogglePinArtist}
+              pinnedArtistIds={pinnedArtistIds}
+              refreshVersion={refreshVersion}
+            />
+          )}
+          {libraryEntity === "album" && libraryLayout === "grid" && (
             <LibraryAlbumGrid
               api={api}
               apiKey={apiKey}
@@ -2728,9 +2870,23 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
               onOpenAlbum={onOpenAlbum}
               onTogglePinAlbum={onTogglePinAlbum}
               pinnedAlbumIds={pinnedAlbumIds}
+              refreshVersion={refreshVersion}
             />
           )}
-          {libraryView === "artist" && bucketedArtists.length > 0 && (
+          {libraryEntity === "album" && libraryLayout === "tree" && (
+            <LibraryAlbumTree
+              artists={visibleArtists}
+              bucket={bucket}
+              pageSize={pageSize}
+              onPageSizeChange={changePageSize}
+              onPlay={onPlay}
+              onQueue={onQueue}
+              onOpenAlbum={onOpenAlbum}
+              pinnedAlbumIds={pinnedAlbumIds}
+              onTogglePinAlbum={onTogglePinAlbum}
+            />
+          )}
+          {libraryEntity === "artist" && libraryLayout === "tree" && bucketedArtists.length > 0 && (
             <div className="tree-toolbar library-page-size-row">
               <span className="muted">
                 Showing {Math.min(pageSize, bucketedArtists.length)} of {bucketedArtists.length}
@@ -4962,6 +5118,14 @@ function artistCoverUrl(artist, apiKey) {
 
 function artistBucket(artist) {
   const s = ((artist.sort_name || artist.name) || "").trim();
+  if (!s) return "#";
+  const c = s[0].toUpperCase();
+  if (c >= "A" && c <= "Z") return c;
+  return "#";
+}
+
+function titleBucket(title) {
+  const s = (title || "").trim();
   if (!s) return "#";
   const c = s[0].toUpperCase();
   if (c >= "A" && c <= "Z") return c;
