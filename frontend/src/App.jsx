@@ -42,6 +42,9 @@ import {
   Sparkles,
   SkipBack,
   SkipForward,
+  Shuffle,
+  Repeat,
+  Repeat1,
   Sun,
   Trash2,
   Upload,
@@ -174,6 +177,8 @@ function App() {
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
+  const [shuffle, setShuffle] = useState(false);
+  const [repeat, setRepeat] = useState("off"); // off | all | one
   const [playerOpen, setPlayerOpen] = useState(false);
   const [playerPopped, setPlayerPopped] = useState(false);
   const [playerDockHeight, setPlayerDockHeight] = useState(0);
@@ -1700,6 +1705,11 @@ function App() {
   async function executeRemoteCommand(cmd) {
     const action = (cmd.action || "").toLowerCase();
     const ctl = playbackControlRef.current;
+    // Automations/remote commands share the player's shuffle/repeat state.
+    if (cmd.shuffle != null) setShuffle(Boolean(cmd.shuffle));
+    if (cmd.loop != null) {
+      setRepeat(cmd.loop === true || cmd.loop === "all" ? "all" : cmd.loop === "one" ? "one" : "off");
+    }
     if (action === "pause") return ctl?.pause?.();
     if (action === "stop") return ctl?.stop?.();
     if (action === "next") return playNextTrack();
@@ -1763,9 +1773,16 @@ function App() {
   function addTracksToPlayerQueue(tracks) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
+    const nothingPlaying = !currentTrack;
     setPlayerQueue((current) => [...current, ...playable]);
     setPlayerOpen(true);
-    setToast({ title: "Queue updated", body: `${playable.length} track${playable.length === 1 ? "" : "s"} added locally.` });
+    if (nothingPlaying) {
+      // Nothing is playing yet — start the first added track instead of sitting idle.
+      setQueueOpen(false);
+      loadPlayerTrack(playable[0]);
+    } else {
+      setToast({ title: "Queue updated", body: `${playable.length} track${playable.length === 1 ? "" : "s"} added locally.` });
+    }
   }
 
   async function loadPlayerTrack(track) {
@@ -1805,15 +1822,28 @@ function App() {
         current_index: details.current_index ?? Math.max(0, currentTrackIndex),
         position_seconds: details.position_seconds ?? null,
         duration_seconds: details.duration_seconds ?? null,
+        shuffle,
+        repeat,
       }),
     }).catch(() => {});
   }
 
+  function nextQueueIndex() {
+    if (playerQueue.length === 0) return -1;
+    if (shuffle) {
+      if (playerQueue.length === 1) return repeat === "all" ? 0 : -1;
+      let candidate = currentTrackIndex;
+      while (candidate === currentTrackIndex) candidate = Math.floor(Math.random() * playerQueue.length);
+      return candidate;
+    }
+    const next = (currentTrackIndex < 0 ? -1 : currentTrackIndex) + 1;
+    if (next >= playerQueue.length) return repeat === "all" ? 0 : -1;
+    return next;
+  }
+
   async function playNextTrack() {
-    if (playerQueue.length === 0) return;
-    const index = currentTrackIndex < 0 ? -1 : currentTrackIndex;
-    const nextTrack = playerQueue[index + 1];
-    if (nextTrack) await loadPlayerTrack(nextTrack);
+    const next = nextQueueIndex();
+    if (next >= 0) await loadPlayerTrack(playerQueue[next]);
   }
 
   async function playPreviousTrack() {
@@ -1965,6 +1995,10 @@ function App() {
               onEnded={playNextTrack}
               onSkipBack={playPreviousTrack}
               onSkipForward={playNextTrack}
+              shuffle={shuffle}
+              repeat={repeat}
+              onToggleShuffle={() => setShuffle((v) => !v)}
+              onCycleRepeat={() => setRepeat((r) => (r === "off" ? "all" : r === "all" ? "one" : "off"))}
               onFavorite={toggleFavoriteTrack}
               favoriteTrackIds={favoriteTrackIds}
               onPlaybackState={(status, details) => reportPlayerStatus(currentTrack, status, details)}
@@ -7821,6 +7855,10 @@ function AudioPlayer({
   onEnded,
   onSkipBack,
   onSkipForward,
+  shuffle = false,
+  repeat = "off",
+  onToggleShuffle,
+  onCycleRepeat,
   onFavorite,
   favoriteTrackIds,
   onPlaybackState,
@@ -7863,6 +7901,17 @@ function AudioPlayer({
   const nearEndThreshold = duration ? Math.min(30, Math.max(8, duration * 0.15)) : 0;
   const showUpNext = Boolean(nextTrack && duration && duration - currentTime <= nearEndThreshold);
   const cover = playerCoverUrl(currentTrack, apiKey);
+  const canSkipForward = currentIndex >= 0 && (currentIndex < queue.length - 1 || repeat === "all" || shuffle);
+  const renderShuffle = (size) => (onToggleShuffle ? (
+    <button className={`player-icon-button${shuffle ? " active" : ""}`} onClick={onToggleShuffle} title={shuffle ? "Shuffle on" : "Shuffle off"}>
+      <Shuffle size={size} />
+    </button>
+  ) : null);
+  const renderRepeat = (size) => (onCycleRepeat ? (
+    <button className={`player-icon-button${repeat !== "off" ? " active" : ""}`} onClick={onCycleRepeat} title={repeat === "one" ? "Repeat one" : repeat === "all" ? "Repeat all" : "Repeat off"}>
+      {repeat === "one" ? <Repeat1 size={size} /> : <Repeat size={size} />}
+    </button>
+  ) : null);
 
   useEffect(() => {
     const wasCrossfading = crossfading.current;
@@ -7874,7 +7923,12 @@ function AudioPlayer({
       clearInterval(crossfadeIntervalRef.current);
       crossfadeIntervalRef.current = null;
     }
-    if (audioRef.current) audioRef.current.volume = 1;
+    if (audioRef.current) {
+      audioRef.current.volume = 1;
+      // Kick playback as soon as the new source is set, rather than waiting on the
+      // autoPlay attribute to notice the src change (snappier track switching).
+      audioRef.current.play?.().catch(() => {});
+    }
   }, [audioUrl]);
 
   // Browser/OS media widget (Media Session API): metadata + hardware/lock-screen controls.
@@ -8326,15 +8380,17 @@ function AudioPlayer({
               <small>{[currentTrack?._artist, currentTrack?._album].filter(Boolean).join(" / ") || "Ready"}</small>
             </div>
             <div className="topbar-controls">
+              {renderShuffle(16)}
               <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
                 <SkipBack size={16} />
               </button>
               <button className="player-play-button compact" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
                 {playing ? <Pause size={17} /> : <Play size={17} />}
               </button>
-              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+              <button className="player-icon-button" onClick={onSkipForward} disabled={!canSkipForward} title="Next">
                 <SkipForward size={16} />
               </button>
+              {renderRepeat(16)}
               <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} disabled={!currentTrack} title="Favorite">
                 <Heart size={16} />
               </button>
@@ -8448,15 +8504,17 @@ function AudioPlayer({
                 <Mic2 size={19} className="lyric-icon-on" />
                 <Ban size={19} className="lyric-icon-off" />
               </button>
+              {renderShuffle(18)}
               <button className="player-icon-button" onClick={onSkipBack} disabled={currentIndex <= 0} title="Previous">
                 <SkipBack size={18} />
               </button>
               <button className="player-play-button" onClick={togglePlayback} title={playing ? "Pause" : "Play"}>
                 {playing ? <Pause size={21} /> : <Play size={21} />}
               </button>
-              <button className="player-icon-button" onClick={onSkipForward} disabled={currentIndex < 0 || currentIndex >= queue.length - 1} title="Next">
+              <button className="player-icon-button" onClick={onSkipForward} disabled={!canSkipForward} title="Next">
                 <SkipForward size={18} />
               </button>
+              {renderRepeat(18)}
               <button className={isFavorite ? "player-icon-button active" : "player-icon-button"} onClick={() => onFavorite(currentTrack)} title="Favorite">
                 <Heart size={19} />
               </button>
@@ -8473,6 +8531,7 @@ function AudioPlayer({
       <audio
         ref={audioRef}
         autoPlay
+        preload="auto"
         src={audioUrl}
         onPlay={(event) => {
           setPlaying(true);
@@ -8497,7 +8556,15 @@ function AudioPlayer({
             seekOnLoad.current = null;
           }
         }}
-        onEnded={() => { if (!crossfading.current) onEnded?.(); }}
+        onEnded={() => {
+          if (crossfading.current) return;
+          if (repeat === "one") {
+            const a = audioRef.current;
+            if (a) { a.currentTime = 0; a.play().catch(() => {}); }
+            return;
+          }
+          onEnded?.();
+        }}
       />
       {nextAudioUrl && <audio ref={nextAudioRef} preload="auto" src={nextAudioUrl} style={{ display: "none" }} />}
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
