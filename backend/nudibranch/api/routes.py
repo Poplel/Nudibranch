@@ -1857,6 +1857,26 @@ def queue_musicbrainz_replacement_downloads(session: Session, results: list[dict
     return batch
 
 
+_AUDIO_MEDIA_TYPES = {
+    ".flac": "audio/flac",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/opus",
+    ".wav": "audio/wav",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".wma": "audio/x-ms-wma",
+}
+
+
+def audio_media_type(path: Path) -> str:
+    return _AUDIO_MEDIA_TYPES.get(path.suffix.lower(), "application/octet-stream")
+
+
 @router.get("/library/tracks/{track_id}/stream", tags=["library"], summary="Stream track audio", response_class=FileResponse)
 def stream_track(
     track_id: str,
@@ -1873,7 +1893,9 @@ def stream_track(
     path = Path(track.path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Track file is missing")
-    return FileResponse(path)
+    # Python's mimetypes doesn't know several audio extensions (.flac, .m4a, .opus…),
+    # so FileResponse would fall back to text/plain and some browsers refuse to play.
+    return FileResponse(path, media_type=audio_media_type(path))
 
 
 @router.get("/library/tracks/{track_id}/lyrics", tags=["library"], summary="Get track lyrics")
