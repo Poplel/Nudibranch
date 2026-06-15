@@ -3859,8 +3859,10 @@ nav button:hover {
 .album-card-queue { right: 6px; }
 .album-card-pin { left: 6px; }
 .album-card-pin.active { background: var(--accent); }
-.artist-card .album-card-pin { left: 14%; top: 10%; }
-.artist-card .album-card-queue { right: 14%; top: 10%; }
+.artist-card .album-card-pin,
+.artist-card .album-card-queue { top: 50%; transform: translateY(-50%); }
+.artist-card .album-card-pin { left: 18%; }
+.artist-card .album-card-queue { right: 18%; }
 .artist-detail-cover { border-radius: 50%; }
 .album-card-meta { display: flex; flex-direction: column; gap: 2px; cursor: pointer; min-width: 0; }
 .album-card-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -4128,6 +4130,11 @@ nav button:hover {
   right: 2px;
   width: 22px;
   height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
   opacity: 0;
   transition: opacity 120ms ease;
 }
