@@ -1974,9 +1974,9 @@ nav button:hover {
 
 .player-controls {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(7, 1fr);
   align-items: center;
-  gap: 8px;
+  gap: 4px;
 }
 
 .player-icon-button,
@@ -3314,7 +3314,7 @@ nav button:hover {
 }
 
 .audio-player.pip-player.is-micro .player-controls {
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: repeat(5, 1fr);
   justify-items: center;
 }
 
@@ -3393,7 +3393,7 @@ nav button:hover {
   }
 
   .audio-player.pip-player .player-controls {
-    grid-template-columns: 1fr 1fr 1fr;
+    grid-template-columns: repeat(5, 1fr);
     justify-items: center;
   }
 
