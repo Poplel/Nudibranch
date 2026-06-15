@@ -126,6 +126,7 @@ function App() {
   const [artistDetail, setArtistDetail] = useState(null);
   const [homeVersion, setHomeVersion] = useState(0);
   const [refreshVersion, setRefreshVersion] = useState(0);
+  const [importUploadProgress, setImportUploadProgress] = useState(null);
   const [pinnedAlbumIds, setPinnedAlbumIds] = useState(() => new Set());
   const [pinnedArtistIds, setPinnedArtistIds] = useState(() => new Set());
   const [dark, setDark] = useState(initialAppearance.dark);
@@ -1516,17 +1517,38 @@ function App() {
     const list = Array.from(fileList || []);
     if (!list.length) return;
     setLoading(true);
+    setImportUploadProgress(0);
     const body = new FormData();
     list.forEach((f) => body.append("files", f));
     try {
-      const res = await api("/imports/upload", { method: "POST", body });
-      const parts = [`${res.count} uploaded`];
+      // XHR (not fetch) so we get real upload-progress events for the whole batch.
+      const res = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", `${API_BASE}/imports/upload`);
+        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+        xhr.upload.onprogress = (event) => {
+          if (event.lengthComputable) setImportUploadProgress(event.loaded / event.total);
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
+          } else {
+            let detail = `${xhr.status} ${xhr.statusText}`;
+            try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* keep status */ }
+            reject(new Error(detail));
+          }
+        };
+        xhr.onerror = () => reject(new Error("Upload failed"));
+        xhr.send(body);
+      });
+      const parts = [`${res.count ?? 0} uploaded`];
       if (res.rejected?.length) parts.push(`${res.rejected.length} rejected`);
       setToast({ title: "Upload complete", body: parts.join(", ") });
       await scanImportFolder();
     } catch (uploadError) {
       notify("Import upload failed", uploadError.message, "ui_error");
     } finally {
+      setImportUploadProgress(null);
       setLoading(false);
     }
   }
@@ -2200,6 +2222,7 @@ function App() {
               onToggleAlbumSearch: () => setImportAlbumSearchOpen((value) => !value),
               onPropose: () => proposeImport(importDownloadRequests),
               onUpload: uploadImportFiles,
+              uploadProgress: importUploadProgress,
               loading,
               activeImportTask,
               downloadCount: importDownloadRequests.length,
@@ -7464,10 +7487,13 @@ function Inspector({
             <RefreshCw size={16} />
             Scan import folder
           </button>
-          <button className="secondary" type="button" onClick={() => importUploadRef.current?.click()}>
+          <button className="secondary" type="button" disabled={importActions.uploadProgress != null} onClick={() => importUploadRef.current?.click()}>
             <Upload size={16} />
             Upload files
           </button>
+          {importActions.uploadProgress != null && (
+            <InlineProgress value={importActions.uploadProgress * 100} label="Uploading" />
+          )}
           <input
             ref={importUploadRef}
             type="file"
