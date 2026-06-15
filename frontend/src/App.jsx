@@ -1570,11 +1570,13 @@ function App() {
     let queue = playable;
     if (wantShuffle && playable.length > 1) {
       unshuffledQueueRef.current = [...playable];
-      queue = [...playable];
-      for (let i = queue.length - 1; i > 0; i--) {
+      // Keep the lead track playing first (the clicked/selected song), shuffle the rest.
+      const [first, ...rest] = playable;
+      for (let i = rest.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [queue[i], queue[j]] = [queue[j], queue[i]];
+        [rest[i], rest[j]] = [rest[j], rest[i]];
       }
+      queue = [first, ...rest];
     } else {
       unshuffledQueueRef.current = null;
     }
@@ -2551,6 +2553,13 @@ function LibraryArtistGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, on
 
 function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
   const musicBrainzResult = (ctx.albumChecks?.[album.id]?.tracks || []).find((result) => result.track_id === track.id);
+  // Clicking the row body plays this track and queues the rest of the album after it.
+  const playFromHere = () => {
+    if (!ctx.onPlay) return;
+    const tracks = albumTracks(artist, album);
+    const idx = tracks.findIndex((t) => t.id === track.id);
+    ctx.onPlay(idx >= 0 ? tracks.slice(idx) : [hydrateTrack(track, artist, album)]);
+  };
   return (
     <div>
       <div className="tree-action-row library-row-actions">
@@ -2560,6 +2569,7 @@ function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
           title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
           meta={track.format || "audio"}
           warning={!track.is_lossless}
+          onActivate={ctx.onPlay ? playFromHere : undefined}
         />
         <QuickLibraryActions
           onPlay={() => ctx.onPlay([hydrateTrack(track, artist, album)])}
@@ -7584,7 +7594,9 @@ function Inspector({
             multiple
             style={{ display: "none" }}
             onChange={(event) => {
-              const picked = event.target.files;
+              // Snapshot before clearing the input — event.target.files is a live
+              // FileList, so resetting value first would empty it.
+              const picked = Array.from(event.target.files || []);
               event.target.value = "";
               importActions.onUpload?.(picked);
             }}
@@ -8697,10 +8709,10 @@ function TreeToolbar({ expanded, onExpand, onCollapse, children }) {
   );
 }
 
-function TreeRow({ depth = 0, icon: Icon, open, title, meta, warning = false, onToggle }) {
+function TreeRow({ depth = 0, icon: Icon, open, title, meta, warning = false, onToggle, onActivate }) {
   const Chevron = open ? ChevronDown : ChevronRight;
   return (
-    <button className="tree-row" style={{ "--depth": depth }} onClick={onToggle}>
+    <button className="tree-row" style={{ "--depth": depth }} onClick={onActivate || onToggle}>
       <span className="chevron">{onToggle ? <Chevron size={15} /> : null}</span>
       <Icon size={17} />
       <span className="tree-title">{title}</span>
