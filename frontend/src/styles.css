@@ -3852,6 +3852,9 @@ nav button:hover {
 .album-card-queue { right: 6px; }
 .album-card-pin { left: 6px; }
 .album-card-pin.active { background: var(--accent); }
+.artist-card .album-card-pin { left: 14%; top: 10%; }
+.artist-card .album-card-queue { right: 14%; top: 10%; }
+.artist-detail-cover { border-radius: 50%; }
 .album-card-meta { display: flex; flex-direction: column; gap: 2px; cursor: pointer; min-width: 0; }
 .album-card-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .album-card-artist { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -3883,11 +3886,6 @@ nav button:hover {
 .album-page-nav { display: inline-flex; align-items: center; gap: 8px; }
 
 .album-detail-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 6;
-  overflow: auto;
-  background: var(--panel);
   padding: 20px;
   display: flex;
   flex-direction: column;

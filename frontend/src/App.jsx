@@ -123,6 +123,7 @@ function App() {
   const [user, setUser] = useState(null);
   const [page, setPage] = useState("Library");
   const [albumDetail, setAlbumDetail] = useState(null);
+  const [artistDetail, setArtistDetail] = useState(null);
   const [homeVersion, setHomeVersion] = useState(0);
   const [pinnedAlbumIds, setPinnedAlbumIds] = useState(() => new Set());
   const [pinnedArtistIds, setPinnedArtistIds] = useState(() => new Set());
@@ -1591,6 +1592,7 @@ function App() {
 
   function openAlbumDetail(album, origin) {
     if (!album?.id) return;
+    setArtistDetail(null);
     setAlbumDetail({
       id: album.id,
       title: album.title,
@@ -1606,6 +1608,22 @@ function App() {
     setAlbumDetail(null);
   }
 
+  function openArtistDetail(artist, origin) {
+    if (!artist?.id) return;
+    setAlbumDetail(null);
+    setArtistDetail({
+      id: artist.id,
+      name: artist.name,
+      cover_path: artist.cover_path,
+      origin: origin || page,
+    });
+  }
+
+  function closeArtistDetail() {
+    if (artistDetail?.origin) setPage(artistDetail.origin);
+    setArtistDetail(null);
+  }
+
   async function playArtistFromHome(artist) {
     try {
       const data = await api(`/library/albums?artist_id=${encodeURIComponent(artist.id)}&page_size=500`);
@@ -1617,6 +1635,18 @@ function App() {
       await playTracks(tracks);
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
+  async function queueArtistFromHome(artist) {
+    try {
+      const data = await api(`/library/albums?artist_id=${encodeURIComponent(artist.id)}&page_size=500`);
+      let tracks = [];
+      for (const al of data?.items || []) tracks = tracks.concat(await loadAlbumPlayables(al));
+      if (tracks.length === 0) { notify("Queue", "No tracks found for this artist.", "ui_error"); return; }
+      addTracksToPlayerQueue(tracks);
+    } catch (error) {
+      notify("Queue failed", error.message, "ui_error");
     }
   }
 
@@ -1873,7 +1903,7 @@ function App() {
         </div>
         <nav>
           {visibleNavItems.map(([label, Icon]) => (
-            <button className={page === label ? "active" : ""} key={label} onClick={() => { setAlbumDetail(null); setPage(label); }}>
+            <button className={page === label ? "active" : ""} key={label} onClick={() => { setAlbumDetail(null); setArtistDetail(null); setPage(label); }}>
               <Icon size={17} />
               {label === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : label}
             </button>
@@ -1937,7 +1967,7 @@ function App() {
 
         <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
           <section className="panel main-panel">
-            {albumDetail && (
+            {albumDetail ? (
               <AlbumDetailPage
                 detail={albumDetail}
                 api={api}
@@ -1950,10 +1980,27 @@ function App() {
                 pinned={pinnedAlbumIds.has(albumDetail.id)}
                 onTogglePin={toggleAlbumPin}
               />
-            )}
+            ) : artistDetail ? (
+              <ArtistDetailPage
+                detail={artistDetail}
+                api={api}
+                apiKey={token}
+                onBack={closeArtistDetail}
+                onPlayArtist={playArtistFromHome}
+                onQueueArtist={queueArtistFromHome}
+                onPlayAlbum={playAlbumFromHome}
+                onQueueAlbum={queueAlbumFromHome}
+                onPlayTracks={playTracks}
+                onQueueTracks={addTracksToPlayerQueue}
+                onOpenAlbum={(al) => openAlbumDetail(al, artistDetail?.origin || page)}
+                pinned={pinnedArtistIds.has(artistDetail.id)}
+                onTogglePin={toggleArtistPin}
+              />
+            ) : (
+            <>
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -2110,6 +2157,8 @@ function App() {
             )}
             {page === "Automations" && <AutomationsView api={api} notify={notify} user={user} />}
             {!["Home", "Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
+            </>
+            )}
           </section>
 
           {!NO_INSPECTOR_PAGES.has(page) && (
@@ -6808,7 +6857,7 @@ function AlbumCard({ album, apiKey, onPlay, onQueue, onOpen, pinned, onTogglePin
         <span className="album-card-hover">
           {onTogglePin && (
             <button className={`album-card-pin${pinned ? " active" : ""}`} onClick={(e) => { e.stopPropagation(); onTogglePin(album); }} title={pinned ? "Unpin from Home" : "Pin to Home"}>
-              {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+              <Pin size={15} />
             </button>
           )}
           {onQueue && (
@@ -6831,16 +6880,21 @@ function AlbumCard({ album, apiKey, onPlay, onQueue, onOpen, pinned, onTogglePin
   );
 }
 
-function ArtistCard({ artist, apiKey, onPlay, pinned, onTogglePin }) {
+function ArtistCard({ artist, apiKey, onPlay, onQueue, onOpen, pinned, onTogglePin }) {
   const cover = artistCoverUrl(artist, apiKey);
   return (
     <div className="album-card artist-card" title={artist.name}>
-      <div className="album-card-art" onClick={() => onPlay?.(artist)} role="button" tabIndex={0}>
+      <div className="album-card-art" onClick={() => (onOpen ? onOpen(artist) : onPlay?.(artist))} role="button" tabIndex={0}>
         {cover ? <img src={cover} alt="" loading="lazy" /> : <Music size={24} />}
         <span className="album-card-hover">
           {onTogglePin && (
             <button className={`album-card-pin${pinned ? " active" : ""}`} onClick={(e) => { e.stopPropagation(); onTogglePin(artist); }} title={pinned ? "Unpin from Home" : "Pin to Home"}>
-              {pinned ? <PinOff size={15} /> : <Pin size={15} />}
+              <Pin size={15} />
+            </button>
+          )}
+          {onQueue && (
+            <button className="album-card-queue" onClick={(e) => { e.stopPropagation(); onQueue(artist); }} title="Add to queue">
+              <ListPlus size={15} />
             </button>
           )}
           {onPlay && (
@@ -6850,7 +6904,7 @@ function ArtistCard({ artist, apiKey, onPlay, pinned, onTogglePin }) {
           )}
         </span>
       </div>
-      <div className="album-card-meta" onClick={() => onPlay?.(artist)}>
+      <div className="album-card-meta" onClick={() => (onOpen ? onOpen(artist) : onPlay?.(artist))}>
         <span className="album-card-title">{artist.name}</span>
       </div>
     </div>
@@ -6885,8 +6939,8 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
             <button onClick={() => onPlayAlbum(detail)}><Play size={15} /> Play</button>
             <button className="secondary" onClick={() => onQueueAlbum(detail)}><ListPlus size={15} /> Queue</button>
             {onTogglePin && (
-              <button className="secondary" onClick={() => onTogglePin(detail)}>
-                {pinned ? <PinOff size={15} /> : <Pin size={15} />} {pinned ? "Pinned" : "Pin"}
+              <button className={`secondary${pinned ? " active" : ""}`} onClick={() => onTogglePin(detail)}>
+                <Pin size={15} /> {pinned ? "Pinned" : "Pin"}
               </button>
             )}
           </div>
@@ -6910,7 +6964,89 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   );
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
+function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueArtist, onPlayAlbum, onQueueAlbum, onPlayTracks, onQueueTracks, onOpenAlbum, pinned, onTogglePin }) {
+  const [albums, setAlbums] = useState(null);
+  const [openAlbums, setOpenAlbums] = useState(() => new Set());
+  const [tracksByAlbum, setTracksByAlbum] = useState(() => new Map());
+  useEffect(() => {
+    let active = true;
+    setAlbums(null);
+    api(`/library/albums?artist_id=${encodeURIComponent(detail.id)}&page_size=500`)
+      .then((d) => { if (active) setAlbums(d?.items || []); })
+      .catch(() => { if (active) setAlbums([]); });
+    return () => { active = false; };
+  }, [api, detail.id]);
+  const cover = artistCoverUrl({ id: detail.id, cover_path: detail.cover_path }, apiKey)
+    || `${API_BASE}/library/artists/${encodeURIComponent(detail.id)}/cover?api_key=${encodeURIComponent(apiKey)}`;
+  async function loadTracks(albumId) {
+    if (tracksByAlbum.has(albumId)) return;
+    try {
+      const d = await api(`/library/tracks?album_id=${encodeURIComponent(albumId)}&page_size=500`);
+      setTracksByAlbum((prev) => new Map(prev).set(albumId, d?.items || []));
+    } catch {
+      setTracksByAlbum((prev) => new Map(prev).set(albumId, []));
+    }
+  }
+  const hydrate = (t, al) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title, album_id: t.album_id ?? al.id, _coverUrl: albumCoverUrl(al, apiKey) || undefined });
+  return (
+    <div className="album-detail-overlay">
+      <div className="album-detail-head">
+        <button className="secondary compact" onClick={onBack}><ArrowLeft size={16} /> Back</button>
+      </div>
+      <div className="album-detail-hero">
+        <div className="album-detail-cover artist-detail-cover">{cover ? <img src={cover} alt="" /> : <Music size={48} />}</div>
+        <div className="album-detail-info">
+          <h1>{detail.name}</h1>
+          <p className="muted">{albums ? `${albums.length} album${albums.length === 1 ? "" : "s"}` : ""}</p>
+          <div className="album-detail-actions">
+            <button onClick={() => onPlayArtist(detail)}><Play size={15} /> Play</button>
+            <button className="secondary" onClick={() => onQueueArtist(detail)}><ListPlus size={15} /> Queue</button>
+            {onTogglePin && (
+              <button className={`secondary${pinned ? " active" : ""}`} onClick={() => onTogglePin(detail)}>
+                <Pin size={15} /> {pinned ? "Pinned" : "Pin"}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      <div className="album-detail-tracks tree">
+        {albums === null ? (
+          <p className="muted">Loading…</p>
+        ) : albums.length === 0 ? (
+          <p className="muted">No albums.</p>
+        ) : (
+          albums.map((al) => (
+            <div key={al.id}>
+              <div className="tree-action-row library-row-actions">
+                <TreeRow
+                  depth={0}
+                  icon={Folder}
+                  open={openAlbums.has(al.id)}
+                  title={al.title}
+                  meta={al.track_count ? `${al.track_count} tracks` : ""}
+                  onToggle={() => { const willOpen = !openAlbums.has(al.id); toggleSet(setOpenAlbums, al.id); if (willOpen) loadTracks(al.id); }}
+                />
+                <AlbumResultArt src={albumCoverUrl(al, apiKey)} />
+                <QuickLibraryActions onPlay={() => onPlayAlbum(al)} onQueue={() => onQueueAlbum(al)} onRemove={null} />
+                {onOpenAlbum && (
+                  <button className="row-icon-button" onClick={() => onOpenAlbum(al)} title="Open album"><Compass size={15} /></button>
+                )}
+              </div>
+              {openAlbums.has(al.id) && (tracksByAlbum.get(al.id) || []).map((t) => (
+                <div key={t.id} className="tree-action-row library-row-actions">
+                  <TreeRow depth={1} icon={FileAudio} title={`${t.track_number ? String(t.track_number).padStart(2, "0") : "#"}-${t.title}`} meta={t.format || "audio"} warning={!t.is_lossless} />
+                  <QuickLibraryActions onPlay={() => onPlayTracks([hydrate(t, al)])} onQueue={() => onQueueTracks([hydrate(t, al)])} onRemove={null} />
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onOpenArtist, onQueueArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
   const [home, setHome] = useState(null);
   useEffect(() => {
     let active = true;
@@ -6953,7 +7089,7 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
         {home.pinned_artists?.length > 0 && (
           <div className="home-album-grid home-pinned-grid">
             {home.pinned_artists.map((ar) => (
-              <ArtistCard key={ar.id} artist={ar} apiKey={apiKey} onPlay={onPlayArtist} pinned={pinnedArtistIds?.has(ar.id)} onTogglePin={onTogglePinArtist} />
+              <ArtistCard key={ar.id} artist={ar} apiKey={apiKey} onPlay={onPlayArtist} onQueue={onQueueArtist} onOpen={onOpenArtist} pinned={pinnedArtistIds?.has(ar.id)} onTogglePin={onTogglePinArtist} />
             ))}
           </div>
         )}
