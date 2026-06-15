@@ -2036,7 +2036,7 @@ function App() {
             <>
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onQueueTracks={addTracksToPlayerQueue} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -2115,7 +2115,12 @@ function App() {
                 addAlbumsRef={addImportAlbumsRef}
               />
             )}
-            {page === "Activity" && <TasksView tasks={tasks} playback={userPlayback} onCancel={cancelTask} />}
+            {page === "Activity" && (
+              <>
+                <TasksView tasks={tasks} playback={userPlayback} onCancel={cancelTask} />
+                <PlayHistoryPanel api={api} />
+              </>
+            )}
             {page === "Settings" && (
               <SettingsPanel
                 accentColor={accentColor}
@@ -6412,7 +6417,6 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
 
   return (
     <div className="users-view">
-      <PlayHistoryPanel api={api} />
       {canManage && (
         <form className="user-create-panel" onSubmit={submitNewUser}>
           <h2>Create user</h2>
@@ -7226,8 +7230,16 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
   );
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onOpenArtist, onQueueArtist, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onOpenArtist, onQueueArtist, onPlayTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
   const [home, setHome] = useState(null);
+  const recentToTrack = (p) => ({
+    id: p.track_id,
+    title: p.title,
+    _artist: p.artist,
+    _album: p.album,
+    album_id: p.album_id,
+    _coverUrl: p.album_id ? `${API_BASE}/library/albums/${encodeURIComponent(p.album_id)}/cover?api_key=${encodeURIComponent(apiKey)}` : undefined,
+  });
   useEffect(() => {
     let active = true;
     api("/me/home")
@@ -7303,9 +7315,25 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
           ) : (
             <ul className="home-list">
               {home.recent_plays.map((p, i) => (
-                <li key={`${p.track_id}-${i}`}>
-                  <span className="home-list-main">{p.title || "Unknown"}</span>
-                  <span className="home-list-sub">{p.artist || ""}</span>
+                <li key={`${p.track_id}-${i}`} className="home-list-row">
+                  <div className="home-list-text">
+                    <span className="home-list-main">{p.title || "Unknown"}</span>
+                    <span className="home-list-sub">{p.artist || ""}</span>
+                  </div>
+                  {p.track_id && (onPlayTracks || onQueueTracks) && (
+                    <div className="home-list-actions">
+                      {onPlayTracks && (
+                        <button className="row-icon-button" title="Play" onClick={() => onPlayTracks([recentToTrack(p)])}>
+                          <Play size={14} />
+                        </button>
+                      )}
+                      {onQueueTracks && (
+                        <button className="row-icon-button" title="Add to queue" onClick={() => onQueueTracks([recentToTrack(p)])}>
+                          <ListPlus size={14} />
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>
