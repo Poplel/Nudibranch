@@ -2460,13 +2460,13 @@ function LibraryArtistGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, on
 }
 
 
-function LibraryTrackBranch({ ctx, artist, album, track }) {
+function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
   const musicBrainzResult = (ctx.albumChecks?.[album.id]?.tracks || []).find((result) => result.track_id === track.id);
   return (
     <div>
       <div className="tree-action-row library-row-actions">
         <TreeRow
-          depth={2}
+          depth={depth}
           icon={FileAudio}
           title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
           meta={track.format || "audio"}
@@ -2511,7 +2511,7 @@ function LibraryTrackBranch({ ctx, artist, album, track }) {
       {musicBrainzResult && (
         <div className="track-musicbrainz-result">
           <TreeRow
-            depth={3}
+            depth={depth + 1}
             icon={Search}
             title="MusicBrainz"
             meta={musicBrainzResultMeta(musicBrainzResult)}
@@ -2530,12 +2530,12 @@ function LibraryTrackBranch({ ctx, artist, album, track }) {
   );
 }
 
-function LibraryAlbumBranch({ ctx, artist, album }) {
+function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
   return (
     <div>
       <div className="tree-action-row library-row-actions">
         <TreeRow
-          depth={1}
+          depth={depth}
           icon={Folder}
           open={ctx.openAlbums?.has(album.id)}
           title={album.title}
@@ -2596,7 +2596,7 @@ function LibraryAlbumBranch({ ctx, artist, album }) {
       )}
       {ctx.openAlbums?.has(album.id) &&
         album.tracks.map((track) => (
-          <LibraryTrackBranch key={track.id} ctx={ctx} artist={artist} album={album} track={track} />
+          <LibraryTrackBranch key={track.id} ctx={ctx} artist={artist} album={album} track={track} depth={depth + 1} />
         ))}
     </div>
   );
@@ -2911,7 +2911,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
                 <p className="muted">No albums in this bucket.</p>
               ) : (
                 pagedAlbums.map(({ album, artist }) => (
-                  <LibraryAlbumBranch key={album.id} ctx={treeCtx} artist={artist} album={album} />
+                  <LibraryAlbumBranch key={album.id} ctx={treeCtx} artist={artist} album={album} depth={0} />
                 ))
               )}
             </div>
@@ -2946,15 +2946,36 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
   );
 }
 
+function QueueButton({ onClick, className = "row-icon-button", title = "Add to queue", size = 14, disabled = false, children }) {
+  const [added, setAdded] = useState(false);
+  const timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  return (
+    <button
+      className={`${className}${added ? " queued-flash" : ""}`}
+      type="button"
+      disabled={disabled}
+      title={title}
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick?.(event);
+        setAdded(true);
+        clearTimeout(timer.current);
+        timer.current = setTimeout(() => setAdded(false), 700);
+      }}
+    >
+      {children ?? <ListPlus size={size} />}
+    </button>
+  );
+}
+
 function QuickLibraryActions({ onPlay, onQueue, onRemove }) {
   return (
     <div className="quick-library-actions">
       <button className="row-icon-button" onClick={onPlay} title="Play">
         <Play size={14} />
       </button>
-      <button className="row-icon-button" onClick={onQueue} title="Add to local queue">
-        <ListPlus size={14} />
-      </button>
+      <QueueButton onClick={onQueue} title="Add to local queue" />
       {onRemove && (
         <button className="row-icon-button" onClick={onRemove} title="Remove">
           <Trash2 size={14} />
@@ -4293,9 +4314,7 @@ function PlaylistPlayActions({ disabled = false, onPlay, onQueue }) {
       <button className="row-icon-button" onClick={onPlay} disabled={disabled} title="Play">
         <Play size={14} />
       </button>
-      <button className="row-icon-button" onClick={onQueue} disabled={disabled} title="Add to local queue">
-        <ListPlus size={14} />
-      </button>
+      <QueueButton onClick={onQueue} disabled={disabled} title="Add to local queue" />
     </div>
   );
 }
@@ -7075,9 +7094,7 @@ function AlbumCard({ album, apiKey, onPlay, onQueue, onOpen, pinned, onTogglePin
             </button>
           )}
           {onQueue && (
-            <button className="album-card-queue" onClick={(e) => { e.stopPropagation(); onQueue(album); }} title="Add to queue">
-              <ListPlus size={15} />
-            </button>
+            <QueueButton className="album-card-queue" size={15} onClick={() => onQueue(album)} />
           )}
           {onPlay && (
             <button className="album-card-play" onClick={(e) => { e.stopPropagation(); onPlay(album); }} title="Play">
@@ -7107,9 +7124,7 @@ function ArtistCard({ artist, apiKey, onPlay, onQueue, onOpen, pinned, onToggleP
             </button>
           )}
           {onQueue && (
-            <button className="album-card-queue" onClick={(e) => { e.stopPropagation(); onQueue(artist); }} title="Add to queue">
-              <ListPlus size={15} />
-            </button>
+            <QueueButton className="album-card-queue" size={15} onClick={() => onQueue(artist)} />
           )}
           {onPlay && (
             <button className="album-card-play" onClick={(e) => { e.stopPropagation(); onPlay(artist); }} title="Play">
@@ -7169,7 +7184,7 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
           <p className="muted">No tracks.</p>
         ) : (
           tracks.map((t) => (
-            <LibraryTrackBranch key={t.id} ctx={viewCtx} artist={artistObj} album={albumObj} track={t} />
+            <LibraryTrackBranch key={t.id} ctx={viewCtx} artist={artistObj} album={albumObj} track={t} depth={0} />
           ))
         )}
       </div>
@@ -7222,7 +7237,7 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
           <p className="muted">No albums.</p>
         ) : (
           albums.map((al) => (
-            <LibraryAlbumBranch key={al.id} ctx={viewCtx} artist={node} album={al} />
+            <LibraryAlbumBranch key={al.id} ctx={viewCtx} artist={node} album={al} depth={0} />
           ))
         )}
       </div>
@@ -7328,9 +7343,7 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
                         </button>
                       )}
                       {onQueueTracks && (
-                        <button className="row-icon-button" title="Add to queue" onClick={() => onQueueTracks([recentToTrack(p)])}>
-                          <ListPlus size={14} />
-                        </button>
+                        <QueueButton onClick={() => onQueueTracks([recentToTrack(p)])} />
                       )}
                     </div>
                   )}
@@ -7863,6 +7876,42 @@ function AudioPlayer({
     }
     if (audioRef.current) audioRef.current.volume = 1;
   }, [audioUrl]);
+
+  // Browser/OS media widget (Media Session API): metadata + hardware/lock-screen controls.
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return undefined;
+    const ms = navigator.mediaSession;
+    ms.setActionHandler("play", () => togglePlayback());
+    ms.setActionHandler("pause", () => togglePlayback());
+    ms.setActionHandler("previoustrack", () => onSkipBack?.());
+    ms.setActionHandler("nexttrack", () => onSkipForward?.());
+    try { ms.setActionHandler("stop", () => onClose?.()); } catch { /* unsupported */ }
+    return () => {
+      ms.setActionHandler("play", null);
+      ms.setActionHandler("pause", null);
+      ms.setActionHandler("previoustrack", null);
+      ms.setActionHandler("nexttrack", null);
+      try { ms.setActionHandler("stop", null); } catch { /* unsupported */ }
+    };
+  }, [onSkipBack, onSkipForward, onClose]);
+
+  useEffect(() => {
+    if (!("mediaSession" in navigator) || typeof MediaMetadata === "undefined") return;
+    if (!currentTrack) { navigator.mediaSession.metadata = null; return; }
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: currentTrack.title || "",
+        artist: currentTrack._artist || "",
+        album: currentTrack._album || "",
+        artwork: cover ? [{ src: cover, sizes: "512x512", type: "image/jpeg" }] : [],
+      });
+    } catch { /* ignore */ }
+  }, [currentTrack, cover]);
+
+  useEffect(() => {
+    if (!("mediaSession" in navigator)) return;
+    navigator.mediaSession.playbackState = playing ? "playing" : "paused";
+  }, [playing]);
 
   useEffect(() => {
     const container = trackCopyRef.current;

@@ -4123,6 +4123,9 @@ nav button:hover {
   background: var(--accent-soft);
 }
 
+.row-icon-button.queued-flash { color: var(--accent); }
+.album-card-queue.queued-flash { background: var(--accent); color: #fff; }
+
 .home-list-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .home-list-text { display: flex; flex-direction: column; min-width: 0; }
 .home-list-actions { display: flex; gap: 2px; flex: none; opacity: 0; transition: opacity 120ms ease; }
