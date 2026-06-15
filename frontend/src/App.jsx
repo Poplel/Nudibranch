@@ -613,6 +613,19 @@ function App() {
     }
   }
 
+  async function deleteUserAccount(userId) {
+    setLoading(true);
+    try {
+      await api(`/users/${userId}`, { method: "DELETE" });
+      setUsers((current) => current.filter((u) => u.id !== userId));
+      setToast({ title: "User deleted", body: "Account and its data were removed." });
+    } catch (userError) {
+      notify("Delete failed", userError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function updateUserPin(userId, password) {
     setLoading(true);
     try {
@@ -2152,6 +2165,7 @@ function App() {
                 canManage={canManageUsers(user)}
                 onCreate={createUserAccount}
                 onUpdate={updateUserAccount}
+                onDelete={deleteUserAccount}
                 onUpdatePin={updateUserPin}
                 onUpdateOwnPin={updateOwnPin}
                 jellyfinUsers={jellyfinUsers}
@@ -6366,7 +6380,7 @@ function PlayHistoryPanel({ api }) {
   );
 }
 
-function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser, api }) {
+function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpdate, onDelete, onUpdatePin, onUpdateOwnPin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser, api }) {
   const [newUser, setNewUser] = useState({ display_name: "", username: "", password: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
@@ -6429,6 +6443,7 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
             permissionGroups={permissionGroups}
             canManage={canManage}
             onUpdate={onUpdate}
+            onDelete={canManage ? onDelete : null}
             onUpdatePin={canManage ? onUpdatePin : (_userId, password) => onUpdateOwnPin(password)}
             jellyfinUsers={jellyfinUsers}
             jellyfinUsersLoading={jellyfinUsersLoading}
@@ -6457,9 +6472,10 @@ function PlaybackRow({ row }) {
   );
 }
 
-function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onUpdatePin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
+function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, onDelete, onUpdatePin, jellyfinUsers, jellyfinUsersLoading, onLoadJellyfinUsers, onUpdateJellyfinUser }) {
   const [draft, setDraft] = useState(() => ({ display_name: user.display_name, is_admin: user.is_admin, permissions: user.permissions || [] }));
   const [password, setPassword] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const changed =
     draft.display_name !== user.display_name ||
     draft.is_admin !== user.is_admin ||
@@ -6555,6 +6571,25 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
           Reset Password
         </button>
       </div>
+      {onDelete && user.id !== currentUser?.id && (
+        <div className="pin-reset-row user-delete-row">
+          {confirmDelete ? (
+            <>
+              <span className="user-note">Delete this user and all their data?</span>
+              <button className="secondary compact danger" onClick={() => { setConfirmDelete(false); onDelete(user.id); }}>
+                Confirm delete
+              </button>
+              <button className="secondary compact" onClick={() => setConfirmDelete(false)}>
+                Cancel
+              </button>
+            </>
+          ) : (
+            <button className="secondary compact danger" onClick={() => setConfirmDelete(true)}>
+              <Trash2 size={14} /> Delete user
+            </button>
+          )}
+        </div>
+      )}
     </section>
   );
 }
