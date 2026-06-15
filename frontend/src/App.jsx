@@ -2025,13 +2025,12 @@ function App() {
                 onBack={closeArtistDetail}
                 onPlayArtist={playArtistFromHome}
                 onQueueArtist={queueArtistFromHome}
-                onPlayAlbum={playAlbumFromHome}
-                onQueueAlbum={queueAlbumFromHome}
                 onPlayTracks={playTracks}
                 onQueueTracks={addTracksToPlayerQueue}
                 onOpenAlbum={(al) => openAlbumDetail(al, artistDetail?.origin || page)}
                 pinned={pinnedArtistIds.has(artistDetail.id)}
                 onTogglePin={toggleArtistPin}
+                library={library}
               />
             ) : (
             <>
@@ -2455,57 +2454,145 @@ function LibraryArtistGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, on
   );
 }
 
-function LibraryAlbumTree({ artists, bucket, pageSize, onPageSizeChange, onPlay, onQueue, onOpenAlbum, pinnedAlbumIds, onTogglePinAlbum }) {
-  const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const flat = useMemo(() => {
-    const rows = [];
-    for (const ar of artists) for (const al of ar.albums) rows.push({ album: al, artist: ar });
-    rows.sort((a, b) => (a.album.title || "").localeCompare(b.album.title || ""));
-    return rows;
-  }, [artists]);
-  const bucketed = useMemo(
-    () => (bucket === "all" ? flat : flat.filter((r) => titleBucket(r.album.title) === bucket)),
-    [flat, bucket],
-  );
-  const paged = useMemo(() => bucketed.slice(0, pageSize), [bucketed, pageSize]);
+
+function LibraryTrackBranch({ ctx, artist, album, track }) {
+  const musicBrainzResult = (ctx.albumChecks?.[album.id]?.tracks || []).find((result) => result.track_id === track.id);
   return (
-    <div className="library-album-view">
-      {paged.length === 0 ? (
-        <p className="muted">No albums in this bucket.</p>
-      ) : (
-        <div className="tree">
-          {paged.map(({ album, artist }) => (
-            <div key={album.id}>
-              <div className="tree-action-row library-row-actions">
-                <TreeRow depth={0} icon={Folder} open={openAlbums.has(album.id)} title={album.title} meta={`${artist.name} · ${album.tracks.length} tracks`} onToggle={() => toggleSet(setOpenAlbums, album.id)} />
-                <AlbumResultArt src={album._coverUrl} />
-                <QuickLibraryActions onPlay={() => onPlay(albumTracks(artist, album))} onQueue={() => onQueue(albumTracks(artist, album))} onRemove={null} />
-                {onTogglePinAlbum && (
-                  <button className={`row-icon-button${pinnedAlbumIds?.has(album.id) ? " active" : ""}`} onClick={() => onTogglePinAlbum(album)} title={pinnedAlbumIds?.has(album.id) ? "Unpin from Home" : "Pin to Home"}><Pin size={15} /></button>
-                )}
-                {onOpenAlbum && (
-                  <button className="row-icon-button" onClick={() => onOpenAlbum({ ...album, artist_name: artist.name, artist_id: artist.id })} title="Open album"><Compass size={15} /></button>
-                )}
-              </div>
-              {openAlbums.has(album.id) && album.tracks.map((track) => (
-                <div key={track.id} className="tree-action-row library-row-actions">
-                  <TreeRow depth={1} icon={FileAudio} title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`} meta={track.format || "audio"} warning={!track.is_lossless} />
-                  <QuickLibraryActions onPlay={() => onPlay([hydrateTrack(track, artist, album)])} onQueue={() => onQueue([hydrateTrack(track, artist, album)])} onRemove={null} />
-                </div>
+    <div>
+      <div className="tree-action-row library-row-actions">
+        <TreeRow
+          depth={2}
+          icon={FileAudio}
+          title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
+          meta={track.format || "audio"}
+          warning={!track.is_lossless}
+        />
+        <QuickLibraryActions
+          onPlay={() => ctx.onPlay([hydrateTrack(track, artist, album)])}
+          onQueue={() => ctx.onQueue([hydrateTrack(track, artist, album)])}
+          onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("track", track.id)) : null}
+        />
+        {(ctx.canEditMetadata || ctx.canUsePlaylists) && (
+          <button className="row-icon-button" onClick={() => toggleSet(ctx.setOpenTrackDetails, track.id)} title="Edit song">
+            <Pencil size={15} />
+          </button>
+        )}
+      </div>
+      {ctx.removeTarget === removeKey("track", track.id) && (
+        <RemoveChoice
+          title={track.title}
+          onCancel={() => ctx.setRemoveTarget(null)}
+          onChoose={(action) => { ctx.onQueueRemove("track", track.id, action); ctx.setRemoveTarget(null); }}
+        />
+      )}
+      {ctx.openTrackDetails?.has(track.id) && (
+        <LibraryMetadataEditor
+          targetType="track"
+          targetId={track.id}
+          title={track.title}
+          fields={trackFields(track)}
+          details={{ artist: artist.name, album: album.title }}
+          onAutoLookup={(field, draft) => trackAutoLookup(field, draft, artist.name, album.title, ctx.onCheckAlbum)}
+          onSearchAlbums={ctx.onSearchAlbums}
+          playlists={ctx.canUsePlaylists ? ctx.playlists : []}
+          targetTrackIds={[track.id]}
+          onAddToPlaylist={ctx.onAddToPlaylist}
+          onMusicBrainzCheck={ctx.canEditMetadata ? () => ctx.onCheckTrackMusicBrainz(track, album) : null}
+          onVerifyAudio={ctx.canEditMetadata ? () => ctx.onCheckTrackAudio(track) : null}
+          onQueue={ctx.onQueueMetadata}
+          onClose={() => toggleSet(ctx.setOpenTrackDetails, track.id)}
+        />
+      )}
+      {musicBrainzResult && (
+        <div className="track-musicbrainz-result">
+          <TreeRow
+            depth={3}
+            icon={Search}
+            title="MusicBrainz"
+            meta={musicBrainzResultMeta(musicBrainzResult)}
+            warning={["changed", "unmatched", "missing_file", "error"].includes(musicBrainzResult.status)}
+          />
+          {musicBrainzResult.changes && Object.keys(musicBrainzResult.changes).length > 0 && (
+            <div className="musicbrainz-change-list">
+              {Object.entries(musicBrainzResult.changes).map(([key, value]) => (
+                <span key={key}>{metadataFieldLabel(key)}: {String(value)}</span>
               ))}
             </div>
-          ))}
+          )}
         </div>
       )}
-      <div className="tree-toolbar library-page-size-row">
-        <span className="muted">Showing {Math.min(pageSize, bucketed.length)} of {bucketed.length}</span>
-        <label className="library-page-size">
-          <span>Per page</span>
-          <select value={pageSize} onChange={(e) => onPageSizeChange(Number(e.target.value))}>
-            {[20, 50, 100, 500, 1000].map((n) => (<option key={n} value={n}>{n}</option>))}
-          </select>
-        </label>
+    </div>
+  );
+}
+
+function LibraryAlbumBranch({ ctx, artist, album }) {
+  return (
+    <div>
+      <div className="tree-action-row library-row-actions">
+        <TreeRow
+          depth={1}
+          icon={Folder}
+          open={ctx.openAlbums?.has(album.id)}
+          title={album.title}
+          meta={`${album.tracks.length} tracks`}
+          onToggle={() => toggleSet(ctx.setOpenAlbums, album.id)}
+        />
+        <AlbumResultArt src={album._coverUrl} />
+        <QuickLibraryActions
+          onPlay={() => ctx.onPlay(albumTracks(artist, album))}
+          onQueue={() => ctx.onQueue(albumTracks(artist, album))}
+        />
+        {ctx.onTogglePinAlbum && (
+          <button
+            className={`row-icon-button${ctx.pinnedAlbumIds?.has(album.id) ? " active" : ""}`}
+            onClick={() => ctx.onTogglePinAlbum(album)}
+            title={ctx.pinnedAlbumIds?.has(album.id) ? "Unpin from Home" : "Pin to Home"}
+          >
+            <Pin size={15} />
+          </button>
+        )}
+        {ctx.onOpenAlbum && (
+          <button className="row-icon-button" onClick={() => ctx.onOpenAlbum({ ...album, artist_name: artist.name, artist_id: artist.id })} title="Open album">
+            <Compass size={15} />
+          </button>
+        )}
+        {(ctx.canEditMetadata || ctx.canRemoveLibrary || ctx.canUsePlaylists) && (
+          <button className="row-icon-button" onClick={() => toggleSet(ctx.setOpenAlbumDetails, album.id)} title="Edit album">
+            <Pencil size={15} />
+          </button>
+        )}
       </div>
+      {ctx.removeTarget === removeKey("album", album.id) && (
+        <RemoveChoice
+          title={album.title}
+          onCancel={() => ctx.setRemoveTarget(null)}
+          onChoose={(action) => { ctx.onQueueRemove("album", album.id, action); ctx.setRemoveTarget(null); }}
+        />
+      )}
+      {ctx.openAlbumDetails?.has(album.id) && (
+        <LibraryMetadataEditor
+          targetType="album"
+          targetId={album.id}
+          title={album.title}
+          coverUrl={album._coverUrl}
+          fields={albumFields(album)}
+          details={{ artist: artist.name, tracks: album.tracks.length }}
+          onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, ctx.onCheckAlbum, album.id, ctx.onCoverSearch)}
+          onCoverUpload={ctx.onAlbumCoverUpload ? (file) => ctx.onAlbumCoverUpload(album.id, file) : undefined}
+          onSearchAlbums={ctx.onSearchAlbums}
+          playlists={ctx.canUsePlaylists ? ctx.playlists : []}
+          targetTrackIds={albumTracks(artist, album).map((t) => t.id)}
+          onAddToPlaylist={ctx.onAddToPlaylist}
+          onMusicBrainzCheck={ctx.canEditMetadata ? () => ctx.onCheckAlbumMusicBrainz(album) : null}
+          onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("album", album.id)) : null}
+          onQueue={ctx.onQueueMetadata}
+          onClose={() => toggleSet(ctx.setOpenAlbumDetails, album.id)}
+        />
+      )}
+      {ctx.openAlbums?.has(album.id) &&
+        album.tracks.map((track) => (
+          <LibraryTrackBranch key={track.id} ctx={ctx} artist={artist} album={album} track={track} />
+        ))}
     </div>
   );
 }
@@ -2551,6 +2638,32 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
   const canEditMetadata = hasPermission(user, "metadata:edit");
   const canRemoveLibrary = hasPermission(user, "library:write");
   const canUsePlaylists = hasPermission(user, "playlists:manage");
+  const albumRows = useMemo(() => {
+    const rows = [];
+    for (const ar of visibleArtists) for (const al of ar.albums) rows.push({ album: al, artist: ar });
+    rows.sort((a, b) => (a.album.title || "").localeCompare(b.album.title || ""));
+    return rows;
+  }, [visibleArtists]);
+  const bucketedAlbums = useMemo(
+    () => (bucket === "all" ? albumRows : albumRows.filter((r) => titleBucket(r.album.title) === bucket)),
+    [albumRows, bucket],
+  );
+  const pagedAlbums = useMemo(() => bucketedAlbums.slice(0, pageSize), [bucketedAlbums, pageSize]);
+  const treeCtx = {
+    onPlay, onQueue,
+    canEditMetadata, canRemoveLibrary, canUsePlaylists,
+    playlists, onAddToPlaylist,
+    removeTarget, setRemoveTarget, onQueueRemove,
+    openAlbums, setOpenAlbums,
+    openAlbumDetails, setOpenAlbumDetails,
+    openTrackDetails, setOpenTrackDetails,
+    albumChecks,
+    onCheckAlbum, onCoverSearch, onAlbumCoverUpload, onCheckAlbumMusicBrainz,
+    onSearchAlbums, onQueueMetadata,
+    onCheckTrackMusicBrainz, onCheckTrackAudio,
+    pinnedAlbumIds, onTogglePinAlbum,
+    onOpenAlbum,
+  };
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState(null); // null = not searching
@@ -2662,21 +2775,24 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
           )}
           {visibleArtists.length > 0 && (
             <div className="tree-toolbar library-control-row">
-              {libraryLayout === "tree" && libraryEntity === "artist" && (
+              {libraryLayout === "tree" && (
                 <button
                   className="secondary compact"
                   onClick={() => {
-                    const expanded = openArtists.size > 0 || openAlbums.size > 0;
-                    if (expanded) {
-                      setOpenArtists(new Set());
-                      setOpenAlbums(new Set());
+                    if (libraryEntity === "artist") {
+                      const expanded = openArtists.size > 0 || openAlbums.size > 0;
+                      if (expanded) { setOpenArtists(new Set()); setOpenAlbums(new Set()); }
+                      else {
+                        setOpenArtists(new Set(visibleArtists.map((a) => a.id)));
+                        setOpenAlbums(new Set(visibleArtists.flatMap((a) => a.albums.map((al) => al.id))));
+                      }
                     } else {
-                      setOpenArtists(new Set(visibleArtists.map((artist) => artist.id)));
-                      setOpenAlbums(new Set(visibleArtists.flatMap((artist) => artist.albums.map((album) => album.id))));
+                      if (openAlbums.size > 0) setOpenAlbums(new Set());
+                      else setOpenAlbums(new Set(pagedAlbums.map((r) => r.album.id)));
                     }
                   }}
                 >
-                  {openArtists.size > 0 || openAlbums.size > 0 ? "Collapse all" : "Expand all"}
+                  {(libraryEntity === "artist" ? (openArtists.size > 0 || openAlbums.size > 0) : openAlbums.size > 0) ? "Collapse all" : "Expand all"}
                 </button>
               )}
               <div className="library-view-toggle">
@@ -2748,133 +2864,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
             )}
             {openArtists.has(artist.id) &&
               artist.albums.map((album) => (
-                <div key={album.id}>
-                  <div className="tree-action-row library-row-actions">
-                    <TreeRow
-                      depth={1}
-                      icon={Folder}
-                      open={openAlbums.has(album.id)}
-                      title={album.title}
-                      meta={`${album.tracks.length} tracks`}
-                      onToggle={() => toggleSet(setOpenAlbums, album.id)}
-                    />
-                    <AlbumResultArt src={album._coverUrl} />
-                    <QuickLibraryActions
-                      onPlay={() => onPlay(albumTracks(artist, album))}
-                      onQueue={() => onQueue(albumTracks(artist, album))}
-                    />
-                    {(canEditMetadata || canRemoveLibrary || canUsePlaylists) && (
-                      <button className="row-icon-button" onClick={() => toggleSet(setOpenAlbumDetails, album.id)} title="Edit album">
-                        <Pencil size={15} />
-                      </button>
-                    )}
-                  </div>
-                  {removeTarget === removeKey("album", album.id) && (
-                    <RemoveChoice
-                      title={album.title}
-                      onCancel={() => setRemoveTarget(null)}
-                      onChoose={(action) => {
-                        onQueueRemove("album", album.id, action);
-                        setRemoveTarget(null);
-                      }}
-                    />
-                  )}
-                  {openAlbumDetails.has(album.id) && (
-                    <LibraryMetadataEditor
-                      targetType="album"
-                      targetId={album.id}
-                      title={album.title}
-                      coverUrl={album._coverUrl}
-                      fields={albumFields(album)}
-                      details={{ artist: artist.name, tracks: album.tracks.length }}
-                      onAutoLookup={(field, draft) => albumAutoLookup(field, draft, artist.name, onCheckAlbum, album.id, onCoverSearch)}
-                      onCoverUpload={onAlbumCoverUpload ? (file) => onAlbumCoverUpload(album.id, file) : undefined}
-                      onSearchAlbums={onSearchAlbums}
-                      playlists={canUsePlaylists ? playlists : []}
-                      targetTrackIds={albumTracks(artist, album).map((track) => track.id)}
-                      onAddToPlaylist={onAddToPlaylist}
-                      onMusicBrainzCheck={canEditMetadata ? () => onCheckAlbumMusicBrainz(album) : null}
-                      onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("album", album.id)) : null}
-                      onQueue={onQueueMetadata}
-                      onClose={() => toggleSet(setOpenAlbumDetails, album.id)}
-                    />
-                  )}
-                  {openAlbums.has(album.id) &&
-                    album.tracks.map((track) => {
-                      const musicBrainzResult = (albumChecks[album.id]?.tracks || []).find((result) => result.track_id === track.id);
-                      return (
-                      <div key={track.id}>
-                        <div className="tree-action-row library-row-actions">
-                          <TreeRow
-                            depth={2}
-                            icon={FileAudio}
-                            title={`${track.track_number ? String(track.track_number).padStart(2, "0") : "#"}-${track.title}`}
-                            meta={track.format || "audio"}
-                            warning={!track.is_lossless}
-                          />
-                          <QuickLibraryActions
-                            onPlay={() => onPlay([hydrateTrack(track, artist, album)])}
-                            onQueue={() => onQueue([hydrateTrack(track, artist, album)])}
-                            onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("track", track.id)) : null}
-                          />
-                          {(canEditMetadata || canUsePlaylists) && (
-                            <button className="row-icon-button" onClick={() => toggleSet(setOpenTrackDetails, track.id)} title="Edit song">
-                              <Pencil size={15} />
-                            </button>
-                          )}
-                        </div>
-                        {removeTarget === removeKey("track", track.id) && (
-                          <RemoveChoice
-                            title={track.title}
-                            onCancel={() => setRemoveTarget(null)}
-                            onChoose={(action) => {
-                              onQueueRemove("track", track.id, action);
-                              setRemoveTarget(null);
-                            }}
-                          />
-                        )}
-                        {openTrackDetails.has(track.id) && (
-                          <LibraryMetadataEditor
-                            targetType="track"
-                            targetId={track.id}
-                            title={track.title}
-                            fields={trackFields(track)}
-                            details={{ artist: artist.name, album: album.title }}
-                            onAutoLookup={(field, draft) => trackAutoLookup(field, draft, artist.name, album.title, onCheckAlbum)}
-                            onSearchAlbums={onSearchAlbums}
-                            playlists={canUsePlaylists ? playlists : []}
-                            targetTrackIds={[track.id]}
-                            onAddToPlaylist={onAddToPlaylist}
-                            onMusicBrainzCheck={canEditMetadata ? () => onCheckTrackMusicBrainz(track, album) : null}
-                            onVerifyAudio={canEditMetadata ? () => onCheckTrackAudio(track) : null}
-                            onQueue={onQueueMetadata}
-                            onClose={() => toggleSet(setOpenTrackDetails, track.id)}
-                          />
-                        )}
-                        {musicBrainzResult && (
-                          <div className="track-musicbrainz-result">
-                            <TreeRow
-                              depth={3}
-                              icon={Search}
-                              title="MusicBrainz"
-                              meta={musicBrainzResultMeta(musicBrainzResult)}
-                              warning={["changed", "unmatched", "missing_file", "error"].includes(musicBrainzResult.status)}
-                            />
-                            {musicBrainzResult.changes && Object.keys(musicBrainzResult.changes).length > 0 && (
-                              <div className="musicbrainz-change-list">
-                                {Object.entries(musicBrainzResult.changes).map(([key, value]) => (
-                                  <span key={key}>
-                                    {metadataFieldLabel(key)}: {String(value)}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    );
-                    })}
-                </div>
+                <LibraryAlbumBranch key={album.id} ctx={treeCtx} artist={artist} album={album} />
               ))}
           </div>
         ))}
@@ -2911,22 +2901,20 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
             />
           )}
           {libraryEntity === "album" && libraryLayout === "tree" && (
-            <LibraryAlbumTree
-              artists={visibleArtists}
-              bucket={bucket}
-              pageSize={pageSize}
-              onPageSizeChange={changePageSize}
-              onPlay={onPlay}
-              onQueue={onQueue}
-              onOpenAlbum={onOpenAlbum}
-              pinnedAlbumIds={pinnedAlbumIds}
-              onTogglePinAlbum={onTogglePinAlbum}
-            />
+            <div className="tree">
+              {pagedAlbums.length === 0 ? (
+                <p className="muted">No albums in this bucket.</p>
+              ) : (
+                pagedAlbums.map(({ album, artist }) => (
+                  <LibraryAlbumBranch key={album.id} ctx={treeCtx} artist={artist} album={album} />
+                ))
+              )}
+            </div>
           )}
-          {libraryEntity === "artist" && libraryLayout === "tree" && bucketedArtists.length > 0 && (
+          {libraryLayout === "tree" && (
             <div className="tree-toolbar library-page-size-row">
               <span className="muted">
-                Showing {Math.min(pageSize, bucketedArtists.length)} of {bucketedArtists.length}
+                {libraryEntity === "artist" ? `Showing ${Math.min(pageSize, bucketedArtists.length)} of ${bucketedArtists.length}` : `Showing ${Math.min(pageSize, bucketedAlbums.length)} of ${bucketedAlbums.length}`}
               </span>
               <label className="library-page-size">
                 <span>Per page</span>
@@ -7145,7 +7133,9 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   }, [api, detail.id]);
   const cover = albumCoverUrl({ id: detail.id, cover_path: detail.cover_path }, apiKey)
     || `${API_BASE}/library/albums/${encodeURIComponent(detail.id)}/cover?api_key=${encodeURIComponent(apiKey)}`;
-  const hydrate = (t) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title, album_id: t.album_id, _coverUrl: cover || undefined });
+  const viewCtx = { onPlay: onPlayTracks, onQueue: onQueueTracks, canEditMetadata: false, canRemoveLibrary: false, canUsePlaylists: false, albumChecks: {} };
+  const albumObj = { id: detail.id, title: detail.title, _coverUrl: cover, tracks: tracks || [] };
+  const artistObj = { name: detail.artist_name };
   return (
     <div className="album-detail-overlay">
       <div className="album-detail-head">
@@ -7175,10 +7165,7 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
           <p className="muted">No tracks.</p>
         ) : (
           tracks.map((t) => (
-            <div key={t.id} className="tree-action-row library-row-actions">
-              <TreeRow depth={0} icon={FileAudio} title={`${t.track_number ? String(t.track_number).padStart(2, "0") : "#"}-${t.title}`} meta={t.format || "audio"} warning={!t.is_lossless} />
-              <QuickLibraryActions onPlay={() => onPlayTracks([hydrate(t)])} onQueue={() => onQueueTracks([hydrate(t)])} onRemove={null} />
-            </div>
+            <LibraryTrackBranch key={t.id} ctx={viewCtx} artist={artistObj} album={albumObj} track={t} />
           ))
         )}
       </div>
@@ -7186,30 +7173,25 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   );
 }
 
-function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueArtist, onPlayAlbum, onQueueAlbum, onPlayTracks, onQueueTracks, onOpenAlbum, pinned, onTogglePin }) {
-  const [albums, setAlbums] = useState(null);
+function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueArtist, onPlayTracks, onQueueTracks, onOpenAlbum, pinned, onTogglePin, library }) {
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const [tracksByAlbum, setTracksByAlbum] = useState(() => new Map());
-  useEffect(() => {
-    let active = true;
-    setAlbums(null);
-    api(`/library/albums?artist_id=${encodeURIComponent(detail.id)}&page_size=500`)
-      .then((d) => { if (active) setAlbums(d?.items || []); })
-      .catch(() => { if (active) setAlbums([]); });
-    return () => { active = false; };
-  }, [api, detail.id]);
+  const node = useMemo(() => (library || []).find((a) => a.id === detail.id), [library, detail.id]);
+  const albums = useMemo(() => {
+    if (!node) return [];
+    return node.albums
+      .filter((al) => (al.tracks?.length || 0) > 0)
+      .map((al) => ({ ...al, _coverUrl: albumCoverUrl(al, apiKey) }))
+      .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  }, [node, apiKey]);
   const cover = artistCoverUrl({ id: detail.id, cover_path: detail.cover_path }, apiKey)
     || `${API_BASE}/library/artists/${encodeURIComponent(detail.id)}/cover?api_key=${encodeURIComponent(apiKey)}`;
-  async function loadTracks(albumId) {
-    if (tracksByAlbum.has(albumId)) return;
-    try {
-      const d = await api(`/library/tracks?album_id=${encodeURIComponent(albumId)}&page_size=500`);
-      setTracksByAlbum((prev) => new Map(prev).set(albumId, d?.items || []));
-    } catch {
-      setTracksByAlbum((prev) => new Map(prev).set(albumId, []));
-    }
-  }
-  const hydrate = (t, al) => ({ id: t.id, title: t.title, _artist: t.artist_name, _album: t.album_title, album_id: t.album_id ?? al.id, _coverUrl: albumCoverUrl(al, apiKey) || undefined });
+  const viewCtx = {
+    onPlay: onPlayTracks, onQueue: onQueueTracks,
+    canEditMetadata: false, canRemoveLibrary: false, canUsePlaylists: false,
+    albumChecks: {},
+    openAlbums, setOpenAlbums,
+    onOpenAlbum,
+  };
   return (
     <div className="album-detail-overlay">
       <div className="album-detail-head">
@@ -7219,7 +7201,7 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
         <div className="album-detail-cover artist-detail-cover">{cover ? <img src={cover} alt="" /> : <Music size={48} />}</div>
         <div className="album-detail-info">
           <h1>{detail.name}</h1>
-          <p className="muted">{albums ? `${albums.length} album${albums.length === 1 ? "" : "s"}` : ""}</p>
+          <p className="muted">{`${albums.length} album${albums.length === 1 ? "" : "s"}`}</p>
           <div className="album-detail-actions">
             <button onClick={() => onPlayArtist(detail)}><Play size={15} /> Play</button>
             <button className="secondary" onClick={() => onQueueArtist(detail)}><ListPlus size={15} /> Queue</button>
@@ -7232,35 +7214,11 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
         </div>
       </div>
       <div className="album-detail-tracks tree">
-        {albums === null ? (
-          <p className="muted">Loading…</p>
-        ) : albums.length === 0 ? (
+        {albums.length === 0 ? (
           <p className="muted">No albums.</p>
         ) : (
           albums.map((al) => (
-            <div key={al.id}>
-              <div className="tree-action-row library-row-actions">
-                <TreeRow
-                  depth={0}
-                  icon={Folder}
-                  open={openAlbums.has(al.id)}
-                  title={al.title}
-                  meta={al.track_count ? `${al.track_count} tracks` : ""}
-                  onToggle={() => { const willOpen = !openAlbums.has(al.id); toggleSet(setOpenAlbums, al.id); if (willOpen) loadTracks(al.id); }}
-                />
-                <AlbumResultArt src={albumCoverUrl(al, apiKey)} />
-                <QuickLibraryActions onPlay={() => onPlayAlbum(al)} onQueue={() => onQueueAlbum(al)} onRemove={null} />
-                {onOpenAlbum && (
-                  <button className="row-icon-button" onClick={() => onOpenAlbum(al)} title="Open album"><Compass size={15} /></button>
-                )}
-              </div>
-              {openAlbums.has(al.id) && (tracksByAlbum.get(al.id) || []).map((t) => (
-                <div key={t.id} className="tree-action-row library-row-actions">
-                  <TreeRow depth={1} icon={FileAudio} title={`${t.track_number ? String(t.track_number).padStart(2, "0") : "#"}-${t.title}`} meta={t.format || "audio"} warning={!t.is_lossless} />
-                  <QuickLibraryActions onPlay={() => onPlayTracks([hydrate(t, al)])} onQueue={() => onQueueTracks([hydrate(t, al)])} onRemove={null} />
-                </div>
-              ))}
-            </div>
+            <LibraryAlbumBranch key={al.id} ctx={viewCtx} artist={node} album={al} />
           ))
         )}
       </div>
