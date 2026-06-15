@@ -7042,7 +7042,6 @@ function SettingsPanel({
             ["acoustid_api_key", "AcoustID API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
             ["slskd_album_folder_tries", "Album folder tries"],
-            ["slskd_concurrent_downloads", "Concurrent slskd downloads"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
             ["youtube_cookies_path", "YouTube cookies file"],
           ].map(([key, label]) => (
@@ -7960,6 +7959,10 @@ function AudioPlayer({
     if (!inactive) return;
     const otherKey = activeKeyRef.current === "a" ? "b" : "a";
     const loaded = loadedUrlRef.current;
+    // During an advance there's a render where audioUrl is already the new track but
+    // activeKey hasn't flipped yet — the inactive element is the one about to be
+    // promoted (and may be mid-crossfade). Don't clobber its src, or it reloads from 0.
+    if (loaded[otherKey] === audioUrl) return;
     if (nextAudioUrl) {
       if (loaded[otherKey] !== nextAudioUrl) {
         inactive.src = nextAudioUrl;

@@ -1685,6 +1685,12 @@ nav button:hover {
   border-radius: 12px;
 }
 
+/* Light mode: make the control box an opaque, tinted shade (≈ the main-page
+   background) instead of near-white, matching the queue bubbles' hue. */
+.app:not(.dark) .pip-controls-sticky {
+  background: var(--bg);
+}
+
 /* PiP queue — no box background, semi-transparent bubbles */
 .local-queue.pip-queue {
   display: flex;
