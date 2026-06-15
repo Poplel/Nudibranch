@@ -143,6 +143,7 @@ function App() {
   const [importSeedDownloads, setImportSeedDownloads] = useState([]);
   const addImportAlbumsRef = useRef(null);
   const playbackControlRef = useRef(null);
+  const importUploadXhrRef = useRef(null); // in-flight import upload, so it can be canceled
   const unshuffledQueueRef = useRef(null); // snapshot of queue order before shuffle, to revert
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
@@ -1520,8 +1521,23 @@ function App() {
   }
 
   async function uploadImportFiles(fileList) {
-    const list = Array.from(fileList || []);
+    let list = Array.from(fileList || []);
     if (!list.length) return;
+    // Skip files that already exist in the import folder — don't re-send them.
+    let skipped = 0;
+    try {
+      const existing = await api("/imports/existing");
+      const have = new Set((existing?.names || []).map((n) => n.toLowerCase()));
+      const before = list.length;
+      list = list.filter((f) => !have.has((f.name || "").toLowerCase()));
+      skipped = before - list.length;
+    } catch {
+      /* couldn't list the folder — fall back to uploading all (server de-dupes names too) */
+    }
+    if (!list.length) {
+      setToast({ title: "Nothing to upload", body: skipped ? `${skipped} file${skipped === 1 ? "" : "s"} already in the import folder.` : "No files selected." });
+      return;
+    }
     setLoading(true);
     setImportUploadProgress(0);
     const body = new FormData();
@@ -1530,6 +1546,7 @@ function App() {
       // XHR (not fetch) so we get real upload-progress events for the whole batch.
       const res = await new Promise((resolve, reject) => {
         const xhr = new XMLHttpRequest();
+        importUploadXhrRef.current = xhr;
         xhr.open("POST", `${API_BASE}/imports/upload`);
         xhr.setRequestHeader("Authorization", `Bearer ${token}`);
         xhr.upload.onprogress = (event) => {
@@ -1545,16 +1562,38 @@ function App() {
           }
         };
         xhr.onerror = () => reject(new Error("Upload failed"));
+        xhr.onabort = () => reject(new Error("__canceled__"));
         xhr.send(body);
       });
       const parts = [`${res.count ?? 0} uploaded`];
+      if (skipped) parts.push(`${skipped} already present`);
       if (res.rejected?.length) parts.push(`${res.rejected.length} rejected`);
       setToast({ title: "Upload complete", body: parts.join(", ") });
       await scanImportFolder();
     } catch (uploadError) {
-      notify("Import upload failed", uploadError.message, "ui_error");
+      if (uploadError.message === "__canceled__") setToast({ title: "Upload canceled", body: "" });
+      else notify("Import upload failed", uploadError.message, "ui_error");
     } finally {
+      importUploadXhrRef.current = null;
       setImportUploadProgress(null);
+      setLoading(false);
+    }
+  }
+
+  function cancelImportUpload() {
+    importUploadXhrRef.current?.abort();
+  }
+
+  async function clearImportFolder() {
+    setLoading(true);
+    try {
+      const res = await api("/imports/files", { method: "DELETE" });
+      const removed = res?.removed ?? 0;
+      setToast({ title: "Import folder cleared", body: `${removed} file${removed === 1 ? "" : "s"} removed.` });
+      await scanImportFolder();
+    } catch (clearError) {
+      notify("Clear import folder failed", clearError.message, "ui_error");
+    } finally {
       setLoading(false);
     }
   }
@@ -2317,6 +2356,9 @@ function App() {
               onToggleAlbumSearch: () => setImportAlbumSearchOpen((value) => !value),
               onPropose: () => proposeImport(importDownloadRequests),
               onUpload: uploadImportFiles,
+              onCancelUpload: cancelImportUpload,
+              onClearFolder: clearImportFolder,
+              hasFiles: importFiles.length > 0,
               uploadProgress: importUploadProgress,
               loading,
               activeImportTask,
@@ -7556,6 +7598,7 @@ function Inspector({
   playlistImportActions,
 }) {
   const importUploadRef = useRef(null);
+  const [confirmClearImport, setConfirmClearImport] = useState(false);
   const stats = inspectorStats({
     page,
     library,
@@ -7585,7 +7628,13 @@ function Inspector({
             Upload files
           </button>
           {importActions.uploadProgress != null && (
-            <InlineProgress value={importActions.uploadProgress * 100} label="Uploading" />
+            <>
+              <InlineProgress value={importActions.uploadProgress * 100} label="Uploading" />
+              <button className="secondary" type="button" onClick={importActions.onCancelUpload}>
+                <X size={16} />
+                Cancel upload
+              </button>
+            </>
           )}
           <input
             ref={importUploadRef}
@@ -7608,6 +7657,17 @@ function Inspector({
           <button className="secondary" onClick={importActions.onPropose} disabled={importActions.disabled}>
             {importActions.activeImportTask ? "Import review running" : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
           </button>
+          {confirmClearImport ? (
+            <button className="secondary danger" type="button" disabled={importActions.loading} onClick={() => { setConfirmClearImport(false); importActions.onClearFolder?.(); }}>
+              <Trash2 size={16} />
+              Confirm: delete all import files
+            </button>
+          ) : (
+            <button className="secondary" type="button" disabled={importActions.loading || !importActions.hasFiles} onClick={() => setConfirmClearImport(true)}>
+              <Trash2 size={16} />
+              Clear import folder
+            </button>
+          )}
         </div>
       )}
       {page === "Wishlist" && wishlistActions && (

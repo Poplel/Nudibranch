@@ -2136,6 +2136,38 @@ def scan_imports(
     return {"files": files, "count": len(files)}
 
 
+@router.get("/imports/existing", tags=["imports"], summary="List filenames already in the import folder", response_model=dict)
+def list_import_existing(
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    import_root = get_settings().import_path
+    names: list[str] = []
+    if import_root.exists():
+        names = [p.name for p in import_root.rglob("*") if p.is_file()]
+    return {"names": names, "count": len(names)}
+
+
+@router.delete("/imports/files", tags=["imports"], summary="Delete all files in the import folder", response_model=dict)
+def clear_import_files(
+    _: User = Depends(require_permission(Permission.import_run)),
+) -> dict:
+    import_root = get_settings().import_path
+    removed = 0
+    if import_root.exists():
+        # Deepest paths first so files go before the directories that hold them.
+        for path in sorted(import_root.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            try:
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                    removed += 1
+                elif path.is_dir():
+                    path.rmdir()
+            except OSError:
+                pass
+    write_app_log(f"Import folder cleared: {removed} file(s) removed", source="upload", kind="import")
+    return {"removed": removed}
+
+
 @router.post("/imports/upload", tags=["imports"], summary="Upload audio files into the import folder")
 async def upload_import_files(
     files: list[UploadFile] = File(...),
