@@ -1545,39 +1545,73 @@ function App() {
     }
     setLoading(true);
     setImportUploadProgress(0);
-    const body = new FormData();
-    list.forEach((it) => { body.append("files", it.file); body.append("paths", relPath(it)); });
+    // Split into multiple POSTs so no single request exceeds the upstream proxy's
+    // body cap (Cloudflare's free tier hard-limits requests to 100 MB — a whole
+    // album folder bundled into one request 413s; a few hand-picked files don't).
+    // The endpoint de-dupes by name, so sequential batches are safe.
+    const MAX_UPLOAD_BYTES = 90 * 1024 * 1024;
+    const batches = [];
+    let current = [];
+    let currentBytes = 0;
+    for (const it of list) {
+      const size = it.file.size || 0;
+      if (current.length && currentBytes + size > MAX_UPLOAD_BYTES) {
+        batches.push(current);
+        current = [];
+        currentBytes = 0;
+      }
+      current.push(it);
+      currentBytes += size;
+    }
+    if (current.length) batches.push(current);
+    const totalBytes = list.reduce((sum, it) => sum + (it.file.size || 0), 0) || 1;
+    let uploadedBytes = 0;
+    let uploadedCount = 0;
+    let rejectedCount = 0;
     try {
-      // XHR (not fetch) so we get real upload-progress events for the whole batch.
-      const res = await new Promise((resolve, reject) => {
-        const xhr = new XMLHttpRequest();
-        importUploadXhrRef.current = xhr;
-        xhr.open("POST", `${API_BASE}/imports/upload`);
-        xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-        xhr.upload.onprogress = (event) => {
-          if (event.lengthComputable) setImportUploadProgress(event.loaded / event.total);
-        };
-        xhr.onload = () => {
-          if (xhr.status >= 200 && xhr.status < 300) {
-            try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
-          } else {
-            let detail = `${xhr.status} ${xhr.statusText}`;
-            try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* keep status */ }
-            reject(new Error(detail));
-          }
-        };
-        xhr.onerror = () => reject(new Error("Upload failed"));
-        xhr.onabort = () => reject(new Error("__canceled__"));
-        xhr.send(body);
-      });
-      const parts = [`${res.count ?? 0} uploaded`];
+      for (const batch of batches) {
+        const body = new FormData();
+        batch.forEach((it) => { body.append("files", it.file); body.append("paths", relPath(it)); });
+        const batchBytes = batch.reduce((sum, it) => sum + (it.file.size || 0), 0);
+        // XHR (not fetch) so we get real upload-progress events per batch.
+        const res = await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          importUploadXhrRef.current = xhr;
+          xhr.open("POST", `${API_BASE}/imports/upload`);
+          xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+          xhr.upload.onprogress = (event) => {
+            if (event.lengthComputable) setImportUploadProgress((uploadedBytes + event.loaded) / totalBytes);
+          };
+          xhr.onload = () => {
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
+            } else {
+              let detail = `${xhr.status} ${xhr.statusText}`;
+              try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* keep status */ }
+              reject(new Error(detail));
+            }
+          };
+          xhr.onerror = () => reject(new Error("Upload failed"));
+          xhr.onabort = () => reject(new Error("__canceled__"));
+          xhr.send(body);
+        });
+        uploadedBytes += batchBytes;
+        uploadedCount += res.count ?? 0;
+        rejectedCount += res.rejected?.length ?? 0;
+        setImportUploadProgress(uploadedBytes / totalBytes);
+      }
+      const parts = [`${uploadedCount} uploaded`];
       if (skipped) parts.push(`${skipped} already present`);
-      if (res.rejected?.length) parts.push(`${res.rejected.length} rejected`);
+      if (rejectedCount) parts.push(`${rejectedCount} rejected`);
       setToast({ title: "Upload complete", body: parts.join(", ") });
       await scanImportFolder();
     } catch (uploadError) {
-      if (uploadError.message === "__canceled__") setToast({ title: "Upload canceled", body: "" });
-      else notify("Import upload failed", uploadError.message, "ui_error");
+      if (uploadError.message === "__canceled__") {
+        setToast({ title: "Upload canceled", body: uploadedCount ? `${uploadedCount} uploaded before cancel.` : "" });
+        if (uploadedCount) await scanImportFolder();
+      } else {
+        notify("Import upload failed", uploadError.message, "ui_error");
+      }
     } finally {
       importUploadXhrRef.current = null;
       setImportUploadProgress(null);
