@@ -1559,13 +1559,30 @@ function App() {
     }
   }
 
-  async function playTracks(tracks) {
+  async function playTracks(tracks, opts = {}) {
     const playable = tracks.filter((track) => track?.id);
     if (playable.length === 0) return;
-    setPlayerQueue(playable);
+    // Honor shuffle when starting a new queue: an explicit opts.shuffle (remote
+    // command) wins, otherwise the current shuffle toggle decides. A shuffled
+    // start reorders the new queue and remembers the original order so toggling
+    // shuffle back off can revert it — identical to the in-place toggle path.
+    const wantShuffle = opts.shuffle != null ? Boolean(opts.shuffle) : shuffle;
+    let queue = playable;
+    if (wantShuffle && playable.length > 1) {
+      unshuffledQueueRef.current = [...playable];
+      queue = [...playable];
+      for (let i = queue.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [queue[i], queue[j]] = [queue[j], queue[i]];
+      }
+    } else {
+      unshuffledQueueRef.current = null;
+    }
+    if (opts.shuffle != null) setShuffle(Boolean(opts.shuffle));
+    setPlayerQueue(queue);
     setPlayerOpen(true);
     setQueueOpen(false);
-    await loadPlayerTrack(playable[0]);
+    await loadPlayerTrack(queue[0]);
   }
 
   function resolvePlayableFromLibrary(targetType, targetId) {
@@ -1577,7 +1594,7 @@ function App() {
             (targetType === "track" && track.id === targetId) ||
             (targetType === "album" && album.id === targetId) ||
             (targetType === "artist" && artist.id === targetId);
-          if (match) out.push({ id: track.id, title: track.title, _artist: artist.name, _album: album.title });
+          if (match) out.push({ id: track.id, title: track.title, album_id: album.id, _artist: artist.name, _album: album.title });
         }
       }
     }
@@ -1587,7 +1604,7 @@ function App() {
   async function resolvePlaylistTracks(playlistId) {
     try {
       const pl = playlistId === "favorites" ? await api("/playlists/favorites") : (await api("/playlists")).find((p) => p.id === playlistId);
-      return (pl?.tracks || []).map((t) => ({ id: t.track_id, title: t.title, _artist: t.artist, _album: t.album }));
+      return (pl?.tracks || []).map((t) => ({ id: t.track_id, title: t.title, album_id: t.album_id, _artist: t.artist, _album: t.album }));
     } catch {
       return [];
     }
@@ -1707,29 +1724,27 @@ function App() {
     const action = (cmd.action || "").toLowerCase();
     const ctl = playbackControlRef.current;
     // Automations/remote commands share the player's shuffle/repeat state.
-    if (cmd.shuffle != null) setShuffle(Boolean(cmd.shuffle));
     if (cmd.loop != null) {
       setRepeat(cmd.loop === true || cmd.loop === "all" ? "all" : cmd.loop === "one" ? "one" : "off");
     }
+    const isPlay = action === "play" || (action === "resume" && cmd.target_id);
+    // Reconcile shuffle the same way the UI toggle does. For play/resume-with-target
+    // the new queue is (re)built, so playTracks owns the shuffle decision; for every
+    // other action we reorder the *existing* queue in place via setShuffleState.
+    if (cmd.shuffle != null && !isPlay) setShuffleState(Boolean(cmd.shuffle));
     if (action === "pause") return ctl?.pause?.();
     if (action === "stop") return ctl?.stop?.();
     if (action === "next") return playNextTrack();
     if (action === "previous") return playPreviousTrack();
     if (action === "resume" && !cmd.target_id) return ctl?.resume?.();
-    if (action === "play" || (action === "resume" && cmd.target_id)) {
+    if (isPlay) {
       let tracks = resolvePlayableFromLibrary(cmd.target_type, cmd.target_id);
       if (tracks.length === 0 && cmd.target_type === "playlist") tracks = await resolvePlaylistTracks(cmd.target_id);
       if (tracks.length === 0) {
         notify("Remote playback", `Could not find ${cmd.target_label || "the requested item"} in the library.`, "ui_error");
         return undefined;
       }
-      if (cmd.shuffle) {
-        for (let i = tracks.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
-          [tracks[i], tracks[j]] = [tracks[j], tracks[i]];
-        }
-      }
-      return playTracks(tracks);
+      return playTracks(tracks, { shuffle: cmd.shuffle != null ? Boolean(cmd.shuffle) : undefined });
     }
     return undefined;
   }
@@ -1837,19 +1852,21 @@ function App() {
     return next;
   }
 
-  // Toggle shuffle by reordering the queue itself (not by jumping to random
-  // entries). Enabling snapshots the current order and shuffles only the
-  // upcoming tracks (the played ones + the current track stay put). Disabling
-  // restores the snapshot order with already-played tracks dropped.
-  function toggleShuffle() {
-    setShuffle((on) => {
-      const turningOn = !on;
-      if (turningOn) {
-        setPlayerQueue((current) => {
-          unshuffledQueueRef.current = [...current];
-          const idx = current.findIndex((track) => track.id === currentTrack?.id);
-          const head = idx >= 0 ? current.slice(0, idx + 1) : [];
-          const tail = idx >= 0 ? current.slice(idx + 1) : [...current];
+  // Reconcile the queue to a desired shuffle state by reordering the queue itself
+  // (not by jumping to random entries). Shared by the UI toggle and remote
+  // commands so shuffle behaves identically regardless of client. Enabling
+  // snapshots the current order and shuffles only the upcoming tracks (the played
+  // ones + the current track stay put). Disabling restores the snapshot order with
+  // already-played tracks dropped.
+  function setShuffleState(desired) {
+    setShuffle((current) => {
+      if (current === desired) return current;
+      if (desired) {
+        setPlayerQueue((queue) => {
+          unshuffledQueueRef.current = [...queue];
+          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
+          const head = idx >= 0 ? queue.slice(0, idx + 1) : [];
+          const tail = idx >= 0 ? queue.slice(idx + 1) : [...queue];
           for (let i = tail.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [tail[i], tail[j]] = [tail[j], tail[i]];
@@ -1857,22 +1874,26 @@ function App() {
           return [...head, ...tail];
         });
       } else {
-        setPlayerQueue((current) => {
+        setPlayerQueue((queue) => {
           const snapshot = unshuffledQueueRef.current;
           unshuffledQueueRef.current = null;
-          if (!snapshot) return current;
-          const idx = current.findIndex((track) => track.id === currentTrack?.id);
-          const playedIds = new Set(idx > 0 ? current.slice(0, idx).map((track) => track.id) : []);
+          if (!snapshot) return queue;
+          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
+          const playedIds = new Set(idx > 0 ? queue.slice(0, idx).map((track) => track.id) : []);
           const snapshotIds = new Set(snapshot.map((track) => track.id));
           // Original order minus what's already been played, then append anything
           // queued during shuffle that wasn't in the snapshot (and isn't played).
           const restored = snapshot.filter((track) => !playedIds.has(track.id));
-          const added = current.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
+          const added = queue.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
           return [...restored, ...added];
         });
       }
-      return turningOn;
+      return desired;
     });
+  }
+
+  function toggleShuffle() {
+    setShuffleState(!shuffle);
   }
 
   async function playNextTrack() {
@@ -3781,11 +3802,8 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
   const canQueue = hasPermission(user, "downloads:manage");
 
   function artUrl(src) {
-    if (!src || !apiKey) return src || null;
-    if (src.startsWith(`${API_BASE}/discover/art/`)) {
-      return `${src}?api_key=${encodeURIComponent(apiKey)}`;
-    }
-    return src;
+    // Discover art comes straight from iTunes as an external URL — no auth needed.
+    return src || null;
   }
 
   async function loadAlbumTracks(albumId) {
@@ -5254,6 +5272,7 @@ function playlistPlayableTrack(track) {
     id: track.track_id,
     title: track.title,
     format: track.format,
+    album_id: track.album_id,
     _artist: track.artist,
     _album: track.album,
   };
@@ -5637,7 +5656,6 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
     ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
     ["Consolidate album folders", "Find albums whose tracks are split across folders and move them into one folder per album.", "consolidate-folders", "library:manage"],
     ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
-    ["Clear discover art cache", "Remove cached artist and album artwork used by Discover.", "clear-discover-cache", "settings:manage"],
     ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
@@ -5739,7 +5757,6 @@ const TOOL_OPTIONS = [
   ["Normalize volume", "normalize-volume"],
   ["Consolidate folders", "consolidate-folders"],
   ["Clear downloads", "clear-downloads"],
-  ["Clear discover cache", "clear-discover-cache"],
   ["Backup now", "backup"],
 ];
 

@@ -29,7 +29,6 @@ from nudibranch.services.tasks import enqueue_task
 TOOL_TASK_TYPES = {
     "jellyfin-scan": "jellyfin_scan",
     "remap-tracks": "sync_favorites_jellyfin",
-    "clear-discover-cache": "clear_discover_cache",
     "check-files": "check_files",
     "check-duplicates": "check_duplicates",
     "check-lyrics": "check_lyrics",
@@ -214,7 +213,7 @@ def run_automation(session: Session, automation: Automation, trigger_source: str
                 body=message,
                 event_type="automation",
                 target_url="/automations",
-                user_id=automation.owner_id,
+                user_id=None,  # broadcast automation results to all notification-enabled users
                 deliver_apns=True,
             )
         except Exception:

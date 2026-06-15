@@ -20,7 +20,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTr
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
-from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, clear_discover_art_cache, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -5519,12 +5519,6 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
     return {"requested": True}
 
 
-def run_clear_discover_cache(session: Session, _payload: dict) -> dict:
-    removed = clear_discover_art_cache()
-    write_app_log(f"Discover cache cleared: {removed} cached file(s) removed", level="info", event_type="tool_completed")
-    return {"removed": removed}
-
-
 def run_check_files(session: Session, _payload: dict) -> dict:
     discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
     settings = get_settings()
@@ -7330,7 +7324,6 @@ TASK_HANDLERS = {
     "ytdlp_download": run_ytdlp_download,
     "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
     "jellyfin_scan": run_jellyfin_scan,
-    "clear_discover_cache": run_clear_discover_cache,
     "check_files": run_check_files,
     "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
@@ -7536,7 +7529,6 @@ def task_notification_title(task_type: str) -> str:
         "restore_default": "Restore",
         "restore_backup": "Restore",
         "clear_downloads": "Clear downloads",
-        "clear_discover_cache": "Clear discover cache",
         "search_candidates": "Searching downloads",
         "consolidate_folders": "Folder consolidation",
     }.get(task_type, task_type.replace("_", " ").title())
@@ -7547,7 +7539,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "clear_discover_cache", "consolidate_folders"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
         return "/tools"
     return "/activity"
 

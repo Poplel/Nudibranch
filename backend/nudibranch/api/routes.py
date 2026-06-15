@@ -125,7 +125,7 @@ from nudibranch.services.imports import discover_import_files, read_audio_metada
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
-from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, cache_discover_art, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification, push_identity
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
@@ -2507,11 +2507,6 @@ def discover_search(
     write_app_log("Discover API search requested", feature="discover", query=q, user_id=user.id)
     try:
         payload = discover_music(q)
-        # Fast path: serve already-cached art, return external URLs for misses (no downloads, no blocking)
-        with_cached_discover_art(payload, fast_only=True)
-        # Background: download missing art so the next search is instant
-        if background_tasks is not None:
-            background_tasks.add_task(with_cached_discover_art, payload)
         write_app_log(
             "Discover API search returned",
             feature="discover",
@@ -2528,25 +2523,6 @@ def discover_search(
     except httpx.RequestError as error:
         write_app_log("Discover API search failed: MusicBrainz unreachable", level="error", feature="discover", query=q, user_id=user.id, error=str(error))
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
-
-
-@router.get("/discover/art/{filename}", tags=["discover"], summary="Serve cached album art", response_class=FileResponse)
-def discover_art(
-    filename: str,
-    api_key: str = Query(""),
-    session: Session = Depends(get_session),
-) -> FileResponse:
-    user = resolve_media_user(session, api_key)
-    permissions = {permission.permission for permission in user.permissions} if user else set()
-    if not user or (not user.is_admin and Permission.wishlist_manage_own not in permissions):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    safe_name = Path(filename).name
-    path = get_settings().config_path / "discover-art-cache" / safe_name
-    if not path.exists() or not path.is_file():
-        write_app_log("Discover cached art missing", level="warning", feature="discover", filename=safe_name)
-        raise HTTPException(status_code=404, detail="Cached artwork not found")
-    write_app_log("Discover cached art served", feature="discover", filename=safe_name)
-    return FileResponse(path)
 
 
 @router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)
@@ -2568,46 +2544,6 @@ def discover_task_queue(
     task = enqueue_task(session, "propose_import", {"path": None, "files": [], "download_requests": payload.download_requests})
     write_app_log("Discover task queue created", feature="discover", user_id=user.id, task_id=task.id, downloads=len(payload.download_requests))
     return serialize_task(task)
-
-
-def _cached_art_url_fast(source_url: str | list[str] | None, cache_key: str) -> str | None:
-    """Return the cached local URL if already on disk, otherwise the first external source URL. No downloads."""
-    sources = source_url if isinstance(source_url, list) else ([source_url] if source_url else [])
-    fallback_url = next((url for url in sources if url), None)
-    cache_dir = get_settings().config_path / "discover-art-cache"
-    if cache_dir.exists():
-        safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cache_key).strip("-")[:160] or "art"
-        for ext in (".jpg", ".jpeg", ".png", ".webp"):
-            image_path = cache_dir / f"{safe_key}{ext}"
-            if image_path.exists():
-                return f"/api/v1/discover/art/{image_path.name}"
-    return fallback_url
-
-
-def with_cached_discover_art(payload: dict, fast_only: bool = False) -> dict:
-    """Resolve art URLs in the payload.
-    fast_only=True: serve cached files (disk check only), fall back to external URL — no downloads, safe for request path.
-    fast_only=False: download missing images to cache (blocks, use in background task).
-    """
-
-    def resolve(source_url: str | list[str] | None, cache_key: str) -> str | None:
-        if fast_only:
-            return _cached_art_url_fast(source_url, cache_key)
-        return cache_discover_art(source_url, cache_key)
-
-    for artist in payload.get("artists") or []:
-        artist["image_url"] = resolve(artist.get("image_url"), f"artist-{artist.get('id') or artist.get('name')}")
-        for album in artist.get("albums") or []:
-            album["cover_art_url"] = resolve(
-                album.get("cover_art_urls") or album.get("cover_art_url"),
-                f"album-{album.get('id') or album.get('artist')}-{album.get('title')}",
-            )
-    for album in payload.get("albums") or []:
-        album["cover_art_url"] = resolve(
-            album.get("cover_art_urls") or album.get("cover_art_url"),
-            f"album-{album.get('id') or album.get('artist')}-{album.get('title')}",
-        )
-    return payload
 
 
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"], summary="List wishlist")
@@ -2869,6 +2805,7 @@ def _build_playlist_out(pl_id: str, pl_name: str, items: list[dict], session: Se
                 title=item.get("Name") or track.title,
                 artist=(item.get("Artists") or [artist_name])[0] if item.get("Artists") else artist_name,
                 album=item.get("Album") or album_title,
+                album_id=track.album_id,
                 format=track.format,
             ))
     return FavoritesOut(id=pl_id, name=pl_name, protected=protected, track_ids=track_ids, tracks=playlist_tracks, track_count=len(items))
@@ -3154,14 +3091,6 @@ def tool_remap_tracks(
     _: User = Depends(require_permission(Permission.jellyfin_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
-
-
-@router.post("/tools/clear-discover-cache", response_model=TaskOut, tags=["tools"], summary="Clear discover art cache")
-def tool_clear_discover_cache(
-    session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.settings_manage)),
-) -> TaskOut:
-    return serialize_task(enqueue_task(session, "clear_discover_cache", {}))
 
 
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"], summary="Check library files for issues")
@@ -3809,6 +3738,7 @@ def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
             title=entry.track.title,
             artist=entry.track.album.artist.name,
             album=entry.track.album.title,
+            album_id=entry.track.album_id,
             format=entry.track.format,
         )
         for entry in entries

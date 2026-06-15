@@ -256,6 +256,7 @@ class PlaylistTrackOut(BaseModel):
     title: str
     artist: str
     album: str
+    album_id: str | None = None
     format: str | None = None
 
 

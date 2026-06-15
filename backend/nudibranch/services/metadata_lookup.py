@@ -13,8 +13,6 @@ from nudibranch.services.imports import read_audio_metadata
 
 
 USER_AGENT = "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"
-DISCOVER_CACHE_TTL_SECONDS = 24 * 60 * 60
-DISCOVER_CACHE_MAX_HITS = 3
 MUSICBRAINZ_TIMEOUT_SECONDS = 20
 MUSICBRAINZ_RETRY_COUNT = 3
 DISCOVER_ARTIST_ALBUM_LIMIT = 6
@@ -606,61 +604,6 @@ def unique_urls(urls: list[str | None]) -> list[str]:
         seen.add(key)
         result.append(key)
     return result
-
-
-def cache_discover_art(url: str | list[str] | None, cache_key: str) -> str | None:
-    urls = unique_urls(url if isinstance(url, list) else [url])
-    if not urls:
-        write_app_log("Discover art cache skipped: no source URL", feature="discover", cache_key=cache_key)
-        return None
-    cache_dir = get_settings().config_path / "discover-art-cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    ext = Path(urlparse(urls[0]).path).suffix.lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
-        ext = ".jpg"
-    safe_key = re.sub(r"[^a-zA-Z0-9_.-]+", "-", cache_key).strip("-")[:160] or "art"
-    image_path = cache_dir / f"{safe_key}{ext}"
-    meta_path = cache_dir / f"{safe_key}.json"
-    now = time.time()
-    if image_path.exists() and meta_path.exists():
-        try:
-            metadata = json_load(meta_path)
-            age = now - float(metadata.get("fetched_at") or 0)
-            hits = int(metadata.get("hits") or 0)
-            if age <= DISCOVER_CACHE_TTL_SECONDS and hits < DISCOVER_CACHE_MAX_HITS:
-                metadata["hits"] = hits + 1
-                meta_path.write_text(json_dumps(metadata), encoding="utf-8")
-                write_app_log("Discover art cache hit", feature="discover", cache_key=cache_key, hits=metadata["hits"])
-                return f"/api/v1/discover/art/{image_path.name}"
-        except (OSError, ValueError, TypeError):
-            write_app_log("Discover art cache metadata unreadable; refreshing", level="warning", feature="discover", cache_key=cache_key)
-    for candidate_url in urls:
-        try:
-            write_app_log("Discover art cache download started", feature="discover", cache_key=cache_key, source_url=candidate_url)
-            response = httpx.get(candidate_url, timeout=6, follow_redirects=True, headers={"User-Agent": USER_AGENT})
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if "image" not in content_type:
-                raise ValueError(f"expected image content, got {content_type or 'unknown content type'}")
-            image_path.write_bytes(response.content)
-            meta_path.write_text(json_dumps({"source_url": candidate_url, "fetched_at": now, "hits": 1}), encoding="utf-8")
-            write_app_log("Discover art cache download completed", feature="discover", cache_key=cache_key, bytes=len(response.content))
-            return f"/api/v1/discover/art/{image_path.name}"
-        except (httpx.HTTPError, ValueError) as error:
-            write_app_log("Discover art cache download failed; trying fallback", level="warning", feature="discover", cache_key=cache_key, source_url=candidate_url, error=str(error))
-    write_app_log("Discover art cache exhausted all source URLs", level="warning", feature="discover", cache_key=cache_key, sources=len(urls))
-    return urls[-1]
-
-
-def clear_discover_art_cache() -> int:
-    cache_dir = get_settings().config_path / "discover-art-cache"
-    if not cache_dir.exists():
-        write_app_log("Discover art cache clear skipped: cache directory missing", feature="discover")
-        return 0
-    count = sum(1 for path in cache_dir.iterdir() if path.is_file())
-    shutil.rmtree(cache_dir)
-    write_app_log("Discover art cache cleared", feature="discover", removed=count)
-    return count
 
 
 def json_load(path: Path) -> dict:
