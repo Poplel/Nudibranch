@@ -10,7 +10,6 @@ import {
   ChevronRight,
   Compass,
   Database,
-  Download,
   FileAudio,
   Folder,
   GripVertical,
@@ -79,7 +78,6 @@ const navItems = [
   ["Import/Add", HardDriveUpload],
   ["Wishlist", Sparkles],
   ["Task Queue", ListChecks],
-  ["Downloads", Download],
   ["Playlists", FileAudio],
   ["Activity", Database],
   ["Tools", Wrench],
@@ -96,7 +94,6 @@ const pageDescriptions = {
   Wishlist: "Request music and track each item through approval and download.",
   "Wishlist Approvals": "Review user wishlist requests and choose what moves to the task queue.",
   "Task Queue": "Review requested changes before they run.",
-  Downloads: "Review download searches, candidates, and completed transfers.",
   Playlists: "Create, import, and manage playlists.",
   Activity: "Track queued, running, completed, and failed work.",
   Tools: "Run maintenance checks and library actions.",
@@ -2263,11 +2260,6 @@ function App() {
                 onReject={rejectItems}
               />
             )}
-            {page === "Downloads" && (
-              <DownloadsView
-                approvals={approvals}
-              />
-            )}
             {page === "Import/Add" && (
               <ImportWizard
                 files={importFiles}
@@ -2371,7 +2363,7 @@ function App() {
               />
             )}
             {page === "Automations" && <AutomationsView api={api} notify={notify} user={user} />}
-            {!["Home", "Library", "Discover", "Task Queue", "Downloads", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
+            {!["Home", "Library", "Discover", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
             </>
             )}
           </section>
@@ -3196,131 +3188,6 @@ function Approvals({ approvals, onSelection, onSelectOnly, onApprove, onReject }
         <ApprovalBatch key={group.id} batch={group} onSelection={onSelection} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} />
       ))}
     </div>
-  );
-}
-
-function DownloadsView({ approvals }) {
-  const activeBatches = approvals.filter((batch) => batch.kind === "download" || batch.kind === "lyrics");
-
-  // Build per-batch item lists: download batches use visibleDownloadItems to collapse
-  // alternate candidates down to the single selected one; lyrics batches use raw items.
-  const batchItems = useMemo(() => {
-    return activeBatches.map((batch) => {
-      const items = batch.kind === "download" ? visibleDownloadItems([batch]) : batch.items;
-      return { batch, items };
-    });
-  }, [activeBatches]);
-
-  // Collect the set of all executing item ids, then walk parent_id to include ancestors.
-  const activeIds = useMemo(() => {
-    const allItems = batchItems.flatMap(({ items }) => items);
-    const byId = new Map(allItems.map((item) => [item.id, item]));
-    const ids = new Set();
-    for (const item of allItems) {
-      if (item.status !== "executing") continue;
-      ids.add(item.id);
-      let cur = item;
-      while (cur.parent_id) {
-        ids.add(cur.parent_id);
-        cur = byId.get(cur.parent_id) || {};
-        if (!cur.id) break;
-      }
-    }
-    return ids;
-  }, [batchItems]);
-
-  // Count executing leaf items across all batches.
-  const executingLeafCount = useMemo(() => {
-    return batchItems.reduce((count, { batch, items }) => {
-      const tree = buildItemTree(items);
-      const leaves = items.filter((item) => {
-        const children = tree.childrenById.get(item.id) || [];
-        return children.length === 0 && item.status === "executing";
-      });
-      return count + leaves.length;
-    }, 0);
-  }, [batchItems]);
-
-  if (activeIds.size === 0) {
-    return <EmptyState title="No active downloads" body="Approved downloads and lyric fetches show their progress here while they run." />;
-  }
-
-  return (
-    <div className="approval-tree">
-      <section className="batch download-tree">
-        <div className="batch-header">
-          <div>
-            <h2>Downloading</h2>
-            <p>{executingLeafCount} item{executingLeafCount === 1 ? "" : "s"} in progress</p>
-          </div>
-        </div>
-        {batchItems.map(({ batch, items }) => {
-          const tree = buildItemTree(items);
-          const activeRoots = tree.roots.filter((item) => activeIds.has(item.id));
-          if (activeRoots.length === 0) return null;
-          return activeRoots.map((root) => (
-            <ActiveDownloadNode
-              key={root.id}
-              item={root}
-              childrenById={tree.childrenById}
-              activeIds={activeIds}
-              batchKind={batch.kind}
-              depth={0}
-            />
-          ));
-        })}
-      </section>
-    </div>
-  );
-}
-
-function ActiveDownloadNode({ item, childrenById, activeIds, batchKind, depth }) {
-  const children = (childrenById.get(item.id) || []).filter((child) => activeIds.has(child.id));
-  const isLeaf = children.length === 0;
-
-  if (isLeaf) {
-    // Render progress for the executing leaf.
-    const p = batchKind === "lyrics"
-      ? { indeterminate: true, label: "Downloading lyrics", value: 0 }
-      : downloadStatusProgressForItem(item);
-    return (
-      <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
-        <span />
-        <span />
-        <span className="proposal-title-cell">
-          <span className="proposal-title">{item.title}</span>
-          <InlineProgress
-            value={p ? (p.value || 0) : 0}
-            label={p ? (p.label || itemStatusMeta(item)) : itemStatusMeta(item)}
-            indeterminate={p ? Boolean(p.indeterminate) : false}
-            compact
-          />
-        </span>
-      </div>
-    );
-  }
-
-  // Non-leaf grouping row — always expanded, no checkboxes or buttons.
-  return (
-    <>
-      <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
-        <span />
-        <button className="row-toggle" disabled>
-          <ChevronDown size={15} />
-        </button>
-        <span className="proposal-title">{item.title}</span>
-      </div>
-      {children.map((child) => (
-        <ActiveDownloadNode
-          key={child.id}
-          item={child}
-          childrenById={childrenById}
-          activeIds={activeIds}
-          batchKind={batchKind}
-          depth={depth + 1}
-        />
-      ))}
-    </>
   );
 }
 
@@ -5415,7 +5282,6 @@ function canViewPage(user, page) {
   if (page === "Import/Add") return hasPermission(user, "import:run");
   if (page === "Wishlist") return hasPermission(user, "wishlist:manage_own");
   if (page === "Task Queue") return hasPermission(user, "approvals:manage");
-  if (page === "Downloads") return hasPermission(user, "downloads:manage") && hasPermission(user, "approvals:manage");
   if (page === "Playlists") return hasPermission(user, "playlists:manage");
   if (page === "Activity") return hasPermission(user, "activity:read");
   if (page === "Tools") {
@@ -7922,16 +7788,9 @@ function inspectorStats({
     return { summary: `${selected} selected · ${ready} ready`, rows: musicStatRows(stats) };
   }
   if (page === "Task Queue") {
-    const stats = countApprovalMusic(approvals.filter((batch) => batch.tree_path !== "/downloads" && batch.status !== "executing"));
+    const stats = countApprovalMusic(approvals.filter((batch) => batch.status !== "executing"));
     return {
       summary: `${queueSelectionCount} selected · ${queueItemCount} ready`,
-      rows: musicStatRows(stats),
-    };
-  }
-  if (page === "Downloads") {
-    const stats = countApprovalMusic(approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads"), true);
-    return {
-      summary: `${stats.selected} selected · ${stats.ready} ready`,
       rows: musicStatRows(stats),
     };
   }
@@ -8953,7 +8812,9 @@ function groupApprovalBatches(batches) {
   batches.forEach((batch) => {
     const batchGroupKind = batch.kind === "import_files" ? "import_files" : null;
     batch.items.forEach((item) => {
-      if (!["pending", "approved", "failed"].includes(item.status)) return;
+      // "executing" stays in the Task Queue so in-progress downloads/lyrics remain
+      // visible (with live progress) until they complete — there's no separate Downloads tab.
+      if (!["pending", "approved", "failed", "executing"].includes(item.status)) return;
       const groupKind = batchGroupKind || item.kind;
       // Download items must not be deduped by title — two artists can share a song name
       // and dropping one item breaks its parent's child count (missing chevron).
@@ -9012,9 +8873,9 @@ function groupApprovalBatches(batches) {
         .map((i) => (idRemap.has(i.parent_id) ? { ...i, parent_id: idRemap.get(i.parent_id) } : i));
     }
 
-    // Prune empty grouping branches for the DOWNLOAD group only: when an album's
-    // candidates are all running (shown in Downloads) its grouping rows would otherwise
-    // linger here empty. Keep only download items that are actionable themselves (have a
+    // Prune empty grouping branches for the DOWNLOAD group only: an album whose
+    // candidates have all been consumed would otherwise leave its grouping rows
+    // lingering here empty. Keep only download items that are actionable themselves (have a
     // payload action or are failed) or are ancestors of such items. Other kinds (metadata,
     // import_files, lyrics, artwork) carry no "action" and must NOT be pruned.
     if (group.id === "type:download") {
