@@ -2285,25 +2285,6 @@ nav button:hover {
   margin-left: 8px;
 }
 
-.download-tree {
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 8px;
-  background: color-mix(in srgb, var(--panel) 72%, transparent);
-}
-
-.download-tree .proposal-row {
-  min-height: 36px;
-  border-radius: 3px;
-}
-
-.download-batch-row {
-  margin-top: 4px;
-  border-top: 1px solid var(--line);
-  border-bottom: 1px solid var(--line);
-  background: var(--panel-strong);
-}
-
 .proposal-row.status-executing {
   background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
