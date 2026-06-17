@@ -7270,7 +7270,12 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
             <ul className="home-list">
               {home.recent_plays.map((p, i) => (
                 <li key={`${p.track_id}-${i}`} className="home-list-row">
-                  <div className="home-list-text">
+                  <div
+                    className={`home-list-text${p.track_id && onPlayTracks ? " home-list-text-play" : ""}`}
+                    onClick={p.track_id && onPlayTracks ? () => onPlayTracks([recentToTrack(p)]) : undefined}
+                    role={p.track_id && onPlayTracks ? "button" : undefined}
+                    title={p.track_id && onPlayTracks ? "Play" : undefined}
+                  >
                     <span className="home-list-main">{p.title || "Unknown"}</span>
                     <span className="home-list-sub">{p.artist || ""}</span>
                   </div>

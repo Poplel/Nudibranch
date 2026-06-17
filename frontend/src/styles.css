@@ -4132,7 +4132,9 @@ nav button:hover {
 .album-card-queue.queued-flash { background: var(--accent); color: #fff; }
 
 .home-list li.home-list-row { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; }
-.home-list-text { display: flex; flex-direction: column; min-width: 0; }
+.home-list-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.home-list-text-play { cursor: pointer; }
+.home-list-text-play:hover .home-list-main { color: var(--accent); }
 .home-list-actions { display: flex; gap: 2px; flex: none; opacity: 0; transition: opacity 120ms ease; }
 .home-list-row:hover .home-list-actions,
 .home-list-row:focus-within .home-list-actions { opacity: 1; }
