@@ -1797,6 +1797,28 @@ function App() {
     }
   }
 
+  async function playAllLibrary(shuffleAll = false) {
+    try {
+      const tracks = [];
+      const pageSize = 500;
+      let page = 1;
+      let total = Infinity;
+      while (tracks.length < total) {
+        const data = await api(`/library/tracks?bucket=all&page=${page}&page_size=${pageSize}`);
+        total = data.total ?? 0;
+        for (const t of data.items || []) {
+          tracks.push({ id: t.id, title: t.title, album_id: t.album_id, _artist: t.artist_name, _album: t.album_title });
+        }
+        if (!data.items || data.items.length === 0) break;
+        page += 1;
+      }
+      if (tracks.length === 0) { notify("Playback", "Your library has no tracks.", "ui_error"); return; }
+      await playTracks(tracks, { shuffle: shuffleAll });
+    } catch (error) {
+      notify("Playback failed", error.message, "ui_error");
+    }
+  }
+
   async function executeRemoteCommand(cmd) {
     const action = (cmd.action || "").toLowerCase();
     const ctl = playbackControlRef.current;
@@ -2202,7 +2224,7 @@ function App() {
             <>
             <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onQueueTracks={addTracksToPlayerQueue} />
+              <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -7148,7 +7170,7 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
   );
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onOpenArtist, onQueueArtist, onPlayTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onOpenArtist, onQueueArtist, onPlayTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, homeVersion, onUnpinPlaylist, onPlayAll, onShuffleAll }) {
   const [home, setHome] = useState(null);
   const recentToTrack = (p) => ({
     id: p.track_id,
@@ -7175,6 +7197,20 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
       <section className="home-section">
         <h2>Favorites &amp; pinned</h2>
         <div className="home-pin-row">
+          {onPlayAll && (
+            <button className="home-pin-card" onClick={() => onPlayAll()}>
+              <Play size={16} />
+              <span className="home-list-main">Play all</span>
+              <span className="home-list-sub">Whole library</span>
+            </button>
+          )}
+          {onShuffleAll && (
+            <button className="home-pin-card" onClick={() => onShuffleAll()}>
+              <Shuffle size={16} />
+              <span className="home-list-main">Shuffle all</span>
+              <span className="home-list-sub">Whole library</span>
+            </button>
+          )}
           <button className="home-pin-card" onClick={() => onPlayPlaylist("favorites")}>
             <Heart size={16} />
             <span className="home-list-main">Favorites</span>
