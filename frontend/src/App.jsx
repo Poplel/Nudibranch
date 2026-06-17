@@ -1219,18 +1219,18 @@ function App() {
     }
   }
 
-  async function proposeLibraryMetadata(targetType, targetId, changes) {
+  async function applyLibraryMetadata(targetType, targetId, changes) {
+    // Library metadata edits apply directly on field blur (no review queue).
     setLoading(true);
     try {
-      const batch = await api("/library/metadata", {
+      const result = await api("/library/metadata/apply", {
         method: "POST",
         body: JSON.stringify({ target_type: targetType, target_id: targetId, changes }),
       });
-      setApprovals((current) => [batch, ...current.filter((entry) => entry.id !== batch.id)]);
-      setToast({ title: "Metadata queued", body: "The change was added to the task queue." });
-      return batch;
+      await refreshLibrary();
+      return result;
     } catch (metadataError) {
-      notify("Metadata queue failed", metadataError.message, "ui_error");
+      notify("Metadata change failed", metadataError.message, "ui_error");
       throw metadataError;
     } finally {
       setLoading(false);
@@ -2236,7 +2236,7 @@ function App() {
                 onCheckTrackAudio={checkLibraryTrackAudio}
                 albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
-                onQueueMetadata={proposeLibraryMetadata}
+                onQueueMetadata={applyLibraryMetadata}
                 onQueueRemove={proposeLibraryRemove}
                 playlists={playlists}
                 onAddToPlaylist={addTracksToPlaylist}
@@ -3990,14 +3990,14 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
               {openAlbums.has(albumId) &&
                 (album.tracks.length > 0 ? (
                   album.tracks.map((track) => (
-                    <div className={track.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"} key={track.id}>
+                    <div className={`tree-action-row library-row-actions wishlist-row${track.status === "removed" ? " removed" : ""}`} key={track.id}>
+                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistStatusLabel(track.status)} />
                       <DownloadBranchToggle
                         checked={selectedItems.has(track.id)}
                         disabled={track.status !== "wanted"}
                         onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
                         title="Select wishlist track"
                       />
-                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistStatusLabel(track.status)} />
                       {track.status !== "removed" && (
                         <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
                           <X size={15} />
@@ -4006,7 +4006,8 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
                     </div>
                   ))
                 ) : (
-                  <div className={album.request?.status === "removed" ? "tree-action-row wishlist-row removed" : "tree-action-row wishlist-row"}>
+                  <div className={`tree-action-row library-row-actions wishlist-row${album.request?.status === "removed" ? " removed" : ""}`}>
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={wishlistStatusLabel(album.request?.status || "wanted")} />
                     {album.request && (
                       <DownloadBranchToggle
                         checked={selectedItems.has(album.request.id)}
@@ -4015,7 +4016,6 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
                         title="Select wishlist request"
                       />
                     )}
-                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={wishlistStatusLabel(album.request?.status || "wanted")} />
                     {album.request && album.request.status !== "removed" && (
                       <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
                         <X size={15} />
@@ -4750,45 +4750,33 @@ function LibraryMetadataEditor({
   onQueue,
   onClose,
 }) {
-  const initialValues = useMemo(() => initialFieldValues(fields), [targetId]);
   const [draft, setDraft] = useState(() => initialFieldValues(fields));
-  const [lookupOpen, setLookupOpen] = useState(false);
+  const [baseline, setBaseline] = useState(() => initialFieldValues(fields));
   const [artFailed, setArtFailed] = useState(false);
   const [audioCheckResult, setAudioCheckResult] = useState(null);
   const [audioCheckLoading, setAudioCheckLoading] = useState(false);
   const coverUploadRef = useRef(null);
-  const changed = Object.fromEntries(
-    Object.entries(draft).filter(([key, value]) => String(value ?? "") !== String(initialValues[key] ?? "")),
-  );
-  const hasChanges = Object.keys(changed).length > 0;
 
   useEffect(() => {
-    setDraft(initialValues);
+    const fresh = initialFieldValues(fields);
+    setDraft(fresh);
+    setBaseline(fresh);
     setAudioCheckResult(null);
   }, [targetId]);
 
-  async function autoLookup(field) {
-    if (!onAutoLookup && !onSearchAlbums) return;
-    const patch = onAutoLookup ? await onAutoLookup(field.key, draft) : null;
-    if (patch && Object.prototype.hasOwnProperty.call(patch, field.key)) {
-      setDraft((current) => ({ ...current, [field.key]: patch[field.key] ?? "" }));
-    } else if (onSearchAlbums) {
-      setLookupOpen(true);
+  // Library metadata edits apply directly when a field loses focus. The committed
+  // values become the new baseline so the same field isn't re-submitted on later blurs.
+  async function commit(nextDraft) {
+    const pending = Object.fromEntries(
+      Object.entries(nextDraft).filter(([key, value]) => String(value ?? "") !== String(baseline[key] ?? "")),
+    );
+    if (Object.keys(pending).length === 0) return;
+    try {
+      await onQueue(targetType, targetId, normalizeEntityChanges(pending, fields));
+      setBaseline(nextDraft);
+    } catch {
+      // onQueue surfaces its own error; keep the draft so the user can retry.
     }
-  }
-
-  async function queueChanges() {
-    if (!hasChanges) return;
-    await onQueue(targetType, targetId, normalizeEntityChanges(changed, fields));
-    onClose?.();
-  }
-
-  async function applyLookupAlbum(album) {
-    setDraft((current) => ({
-      ...current,
-      ...metadataPatchFromAlbum(targetType, current, album),
-    }));
-    setLookupOpen(false);
   }
 
   async function runAudioCheck() {
@@ -4812,7 +4800,7 @@ function LibraryMetadataEditor({
         ))}
         <div className="metadata-field-grid">
           {fields.map((field) => {
-            const isChanged = String(draft[field.key] ?? "") !== String(initialValues[field.key] ?? "");
+            const isChanged = String(draft[field.key] ?? "") !== String(baseline[field.key] ?? "");
             return (
               <label className={isChanged ? "changed" : ""} key={field.key}>
                 <span>{field.label}</span>
@@ -4822,7 +4810,12 @@ function LibraryMetadataEditor({
                       type="checkbox"
                       checked={Boolean(draft[field.key])}
                       disabled={field.readOnly}
-                      onChange={(event) => setDraft((current) => ({ ...current, [field.key]: event.target.checked }))}
+                      onChange={(event) => {
+                        if (field.readOnly) return;
+                        const next = { ...draft, [field.key]: event.target.checked };
+                        setDraft(next);
+                        commit(next);
+                      }}
                     />
                   ) : (
                     <input
@@ -4830,12 +4823,8 @@ function LibraryMetadataEditor({
                       value={draft[field.key] ?? ""}
                       readOnly={field.readOnly}
                       onChange={(event) => field.readOnly ? undefined : setDraft((current) => ({ ...current, [field.key]: event.target.value }))}
+                      onBlur={field.readOnly ? undefined : () => commit(draft)}
                     />
-                  )}
-                  {(onAutoLookup || onSearchAlbums) && field.key !== "cover_path" && field.key !== "path" && (
-                    <button className="row-icon-button" onClick={() => autoLookup(field)} title="Auto lookup">
-                      <Search size={14} />
-                    </button>
                   )}
                   {field.key === "cover_path" && onCoverUpload && (
                     <>
@@ -4865,15 +4854,6 @@ function LibraryMetadataEditor({
             );
           })}
         </div>
-        {lookupOpen && (
-          <AlbumSearchPanel
-            initialArtist={String(details.artist || draft.artist || title || "")}
-            initialAlbum={String(details.album || draft.title || draft.release_title || title || "")}
-            onAdd={applyLookupAlbum}
-            onLookup={async (artist, album, releaseId) => ({ artist, album, musicbrainz_album_id: releaseId, tracks: [] })}
-            onSearch={onSearchAlbums}
-          />
-        )}
         {(onMusicBrainzCheck || onVerifyAudio || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
           <div className="metadata-menu-actions">
             {onMusicBrainzCheck && (
@@ -4925,10 +4905,6 @@ function LibraryMetadataEditor({
           </div>
         )}
       </div>
-      <button className="primary compact-button" onClick={queueChanges} disabled={!hasChanges}>
-        <ListChecks size={15} />
-        Add to task queue
-      </button>
     </div>
   );
 }
@@ -7200,14 +7176,14 @@ function HomeView({ api, apiKey, onPlayAlbum, onQueueAlbum, onPlayPlaylist, onOp
           {onPlayAll && (
             <button className="home-pin-card" onClick={() => onPlayAll()}>
               <Play size={16} />
-              <span className="home-list-main">Play all</span>
+              <span className="home-list-main">Play library</span>
               <span className="home-list-sub">Whole library</span>
             </button>
           )}
           {onShuffleAll && (
             <button className="home-pin-card" onClick={() => onShuffleAll()}>
               <Shuffle size={16} />
-              <span className="home-list-main">Shuffle all</span>
+              <span className="home-list-main">Shuffle library</span>
               <span className="home-list-sub">Whole library</span>
             </button>
           )}

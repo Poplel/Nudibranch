@@ -963,7 +963,7 @@ def me_home(
 
     # Pinned playlists (names from our own table — no per-playlist Jellyfin fan-out).
     pinned = [
-        {"playlist_id": p.playlist_id, "name": p.name}
+        {"playlist_id": p.playlist_id, "name": p.name, "track_count": None}
         for p in session.scalars(
             select(PinnedPlaylist).where(PinnedPlaylist.user_id == user.id).order_by(PinnedPlaylist.created_at.asc())
         )
@@ -1004,6 +1004,15 @@ def me_home(
                 favorites = {"id": "favorites", "name": "Favorites", "track_count": fav.track_count}
             except Exception:
                 favorites = None
+            # Per-pinned-playlist track counts (same source as Favorites; pinned playlists are few).
+            for entry in pinned:
+                try:
+                    if entry["playlist_id"] == "favorites":
+                        entry["track_count"] = favorites["track_count"] if favorites else None
+                    else:
+                        entry["track_count"] = _jf_playlist_out(session, client, jf_user_id, entry["playlist_id"], entry["name"]).track_count
+                except Exception:
+                    entry["track_count"] = None
 
     return {
         "recently_added": recently_added,
@@ -1473,6 +1482,46 @@ def propose_library_metadata(
     session.commit()
     session.refresh(batch)
     return serialize_batch(batch)
+
+
+@router.post("/library/metadata/apply", tags=["library"], summary="Apply metadata edit directly")
+def apply_library_metadata(
+    payload: LibraryMetadataProposalRequest,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.metadata_edit)),
+) -> dict:
+    # Direct apply (no review queue): library metadata edits commit on field blur.
+    # Reuses the exact apply path the approved-batch executor runs, so behavior
+    # (cover-URL download, folder sync, duplicate merge) is identical.
+    changes = {key: value for key, value in payload.changes.items() if key in editable_fields(payload.target_type)}
+    if not changes:
+        raise HTTPException(status_code=400, detail="No editable metadata fields were supplied")
+
+    target = metadata_target(session, payload.target_type, payload.target_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Library item not found")
+
+    from nudibranch.worker.main import apply_metadata_item
+
+    # Transient (never added to the session) — apply_metadata_item only reads payload_json.
+    item = ProposalItem(
+        title=metadata_target_title(payload.target_type, target),
+        kind=ProposalKind.metadata,
+        payload_json=json.dumps(
+            {
+                "target_type": payload.target_type,
+                "target_id": payload.target_id,
+                "changes": changes,
+            }
+        ),
+    )
+    try:
+        apply_metadata_item(session, item)
+        session.commit()
+    except Exception as error:  # noqa: BLE001 — surface any apply failure to the client
+        session.rollback()
+        raise HTTPException(status_code=400, detail=f"Could not apply metadata change: {error}")
+    return {"ok": True, "applied": changes}
 
 
 @router.post("/library/remove", response_model=ProposalBatchOut, tags=["library"], summary="Propose library removal")
