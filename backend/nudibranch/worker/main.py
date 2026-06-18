@@ -2806,6 +2806,40 @@ def finalize_completed_download_batch(session: Session, batch: ProposalBatch) ->
     session.flush()
 
 
+def cleanup_orphaned_download_batches(session: Session) -> int:
+    """Finalize download batches whose work is done but which never got marked complete.
+
+    Auto paths (e.g. the yt-dlp fallback) can leave a candidate batch `pending` after its
+    only actionable download item completed — the artist/album grouping nodes carry no
+    `action` and never execute — which renders as an empty "Download candidates · 0 of 0"
+    batch lingering in the Task Queue. Finalize ONLY batches that have at least one
+    completed actionable item and no still-open actionable item. A batch still being
+    searched has zero actionable items (grouping/track rows carry no `action` until
+    candidates attach), so it is deliberately left untouched.
+    """
+    cleaned = 0
+    batches = session.scalars(
+        select(ProposalBatch).where(
+            ProposalBatch.kind == ProposalKind.download,
+            ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.executing]),
+        )
+    ).all()
+    for batch in batches:
+        actionable = [
+            item for item in batch.items
+            if json.loads(item.payload_json or "{}").get("action")
+        ]
+        if not actionable:
+            continue  # mid-search or structure-only batch — leave it alone
+        if any(item.status not in {ProposalStatus.completed, ProposalStatus.rejected} for item in actionable):
+            continue  # still has open download work
+        if not any(item.status == ProposalStatus.completed for item in actionable):
+            continue  # nothing actually completed — keep it visible
+        finalize_completed_download_batch(session, batch)
+        cleaned += 1
+    return cleaned
+
+
 def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
     """Turn a fully-downloaded, staged batch into a manual "add to library" review task.
 
@@ -5407,7 +5441,15 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
     if downloaded_path and downloaded_path.is_file():
         try:
             settings = get_settings()
-            metadata = read_audio_metadata(downloaded_path)
+            # yt-dlp output is untagged, so the file's own metadata is junk (the
+            # filename/path fallback gave "app" / "ytdlp-...."). Drive the name, tags,
+            # and Artist>Album>Track path from the download request's known fields,
+            # then embed them so Jellyfin and re-scans agree (mirrors the slskd path).
+            metadata = normalize_download_metadata(read_audio_metadata(downloaded_path), request)
+            try:
+                write_audio_metadata(downloaded_path, metadata)
+            except Exception as tag_error:  # noqa: BLE001 - tag failure shouldn't block import.
+                append_task_log(session, task, f"yt-dlp: could not tag '{downloaded_path.name}': {tag_error}", "warning")
             target_path = Path(suggest_library_path(metadata, downloaded_path))
             known_paths = existing_library_and_proposal_paths(session)
             if str(target_path) not in known_paths and not target_path.exists():
@@ -5438,15 +5480,20 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
     else:
         append_task_log(session, task, f"yt-dlp: no audio file found after download for '{query}' — import skipped", "warning")
 
-    # Finalize the parent batch if all items are now done
+    # Finalize the parent batch once nothing actionable remains. The auto-queued yt-dlp
+    # fallback leaves the candidate batch `pending` and its artist/album grouping nodes
+    # (which carry no `action`) never execute — so the old `executing`-only + all-items
+    # check never fired, leaving an empty "Download candidates" batch lingering in the
+    # Task Queue after the import. Finalize on remaining *actionable* leaves instead.
     batch = session.get(ProposalBatch, item.batch_id)
-    if batch and batch.status == ProposalStatus.executing:
-        still_open = any(
-            i.status not in {ProposalStatus.completed, ProposalStatus.rejected}
-            for i in batch.items
+    if batch and batch.status not in {ProposalStatus.completed, ProposalStatus.rejected}:
+        open_work = any(
+            json.loads(other.payload_json or "{}").get("action")
+            and other.status not in {ProposalStatus.completed, ProposalStatus.rejected}
+            for other in batch.items
         )
-        if not still_open:
-            batch.status = ProposalStatus.completed
+        if not open_work:
+            finalize_completed_download_batch(session, batch)
             append_task_log(session, task, f"yt-dlp: batch '{batch.title}' marked complete")
     session.commit()
     return {"query": query, "file": str(downloaded_path) if downloaded_path else None}
@@ -7702,6 +7749,7 @@ async def worker_loop() -> None:
                             )
                             last_download_scan_summary = summary
                             last_download_scan_log = now
+                        cleanup_orphaned_download_batches(session)
                         session.commit()
                     except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
                         session.rollback()
