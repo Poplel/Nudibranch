@@ -1728,6 +1728,33 @@ def verify_track_audio(
     )
 
 
+@router.post("/library/tracks/{track_id}/replace", response_model=TaskOut, tags=["library"], summary="Queue a replacement download for a track")
+def requeue_track_replacement(
+    track_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    track = session.get(Track, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    return serialize_task(enqueue_task(session, "requeue_replacement", {"track_ids": [track.id]}))
+
+
+@router.post("/library/albums/{album_id}/replace", response_model=TaskOut, tags=["library"], summary="Queue replacement downloads for an album's tracks")
+def requeue_album_replacement(
+    album_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_manage)),
+) -> TaskOut:
+    album = session.get(Album, album_id)
+    if not album:
+        raise HTTPException(status_code=404, detail="Album not found")
+    track_ids = [t.id for t in session.scalars(select(Track.id).where(Track.album_id == album.id))]
+    if not track_ids:
+        raise HTTPException(status_code=400, detail="Album has no tracks")
+    return serialize_task(enqueue_task(session, "requeue_replacement", {"track_ids": track_ids}))
+
+
 def musicbrainz_match_track_result(session: Session, track: Track, force: bool = False, album_record: dict | None = None) -> dict:
     result = {
         "track_id": track.id,

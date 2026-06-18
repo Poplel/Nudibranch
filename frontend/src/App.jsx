@@ -1079,6 +1079,31 @@ function App() {
     }
   }
 
+  // Manually queue a replacement download for a track/album (e.g. swap a clean version for
+  // the explicit one). Kicks off a candidate search; the actual swap happens after the user
+  // approves a candidate in the Task Queue (replace_track_id → replace_library_track_file).
+  async function requeueTrackReplacement(track) {
+    try {
+      const task = await api(`/library/tracks/${track.id}/replace`, { method: "POST" });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Replacement queued", body: `Searching for a replacement of "${track.title}" — review candidates in the Task Queue.` });
+      window.setTimeout(() => { refreshApprovals(); refreshTasks(); }, 2500);
+    } catch (replaceError) {
+      notify("Replacement failed", replaceError.message, "ui_error");
+    }
+  }
+
+  async function requeueAlbumReplacement(album) {
+    try {
+      const task = await api(`/library/albums/${album.id}/replace`, { method: "POST" });
+      setTasks((current) => upsertTask(current, task));
+      setToast({ title: "Replacement queued", body: `Searching for replacements for "${album.title}" — review candidates in the Task Queue.` });
+      window.setTimeout(() => { refreshApprovals(); refreshTasks(); }, 2500);
+    } catch (replaceError) {
+      notify("Replacement failed", replaceError.message, "ui_error");
+    }
+  }
+
   async function lookupImportAlbum(artist, album, releaseId = null) {
     setLoading(true);
     try {
@@ -2203,6 +2228,8 @@ function App() {
                 onCheckAlbum={lookupImportAlbum}
                 onCoverSearch={searchAlbumCover}
                 onCheckTrackAudio={checkLibraryTrackAudio}
+                onRequeueTrack={requeueTrackReplacement}
+                onRequeueAlbum={requeueAlbumReplacement}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={applyLibraryMetadata}
                 onQueueRemove={proposeLibraryRemove}
@@ -2636,6 +2663,7 @@ function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
         <QuickLibraryActions
           onPlay={() => ctx.onPlay([hydrateTrack(track, artist, album)])}
           onQueue={() => ctx.onQueue([hydrateTrack(track, artist, album)])}
+          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueTrack ? () => ctx.onRequeueTrack(track) : null}
           onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("track", track.id)) : null}
         />
         {(ctx.canEditMetadata || ctx.canUsePlaylists) && (
@@ -2688,6 +2716,7 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
         <QuickLibraryActions
           onPlay={() => ctx.onPlay(albumTracks(artist, album), { keepLead: false })}
           onQueue={() => ctx.onQueue(albumTracks(artist, album))}
+          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueAlbum ? () => ctx.onRequeueAlbum(album) : null}
         />
         {ctx.onTogglePinAlbum && (
           <button
@@ -2743,7 +2772,7 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload, refreshVersion, onOpenArtist, onPlayArtist, onQueueArtist }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, onRequeueTrack, onRequeueAlbum, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload, refreshVersion, onOpenArtist, onPlayArtist, onQueueArtist }) {
   const [libraryEntity, setLibraryEntity] = useState("artist");
   const [libraryLayout, setLibraryLayout] = useState("tree");
   const [openArtists, setOpenArtists] = useState(() => new Set());
@@ -2806,6 +2835,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, 
     onCheckAlbum, onCoverSearch, onAlbumCoverUpload,
     onSearchAlbums, onQueueMetadata,
     onCheckTrackAudio,
+    onRequeueTrack, onRequeueAlbum,
     pinnedAlbumIds, onTogglePinAlbum,
     onOpenAlbum,
   };
@@ -3109,13 +3139,18 @@ function QueueButton({ onClick, className = "row-icon-button", title = "Add to q
   );
 }
 
-function QuickLibraryActions({ onPlay, onQueue, onRemove }) {
+function QuickLibraryActions({ onPlay, onQueue, onRequeue, onRemove }) {
   return (
     <div className="quick-library-actions">
       <button className="row-icon-button" onClick={onPlay} title="Play">
         <Play size={14} />
       </button>
       <QueueButton onClick={onQueue} title="Add to local queue" />
+      {onRequeue && (
+        <button className="row-icon-button" onClick={onRequeue} title="Queue a replacement download">
+          <RefreshCw size={14} />
+        </button>
+      )}
       {onRemove && (
         <button className="row-icon-button" onClick={onRemove} title="Remove">
           <Trash2 size={14} />

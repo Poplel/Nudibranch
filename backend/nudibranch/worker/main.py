@@ -6835,6 +6835,68 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
     return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
 
 
+def run_requeue_replacement(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Manually queue a replacement download for one or more existing library tracks.
+
+    Builds a wishlist_request candidate batch with `replace_track_id` set so that, once the
+    user approves a candidate in the Task Queue, `replace_library_track_file` swaps the file
+    in place (old file → trash). Backs the per-track / per-album "Replace" buttons (e.g. to
+    swap a clean version for the explicit one). Review-gated like every other download.
+    """
+    track_ids = payload.get("track_ids") or []
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.id.in_(track_ids))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    ) if track_ids else []
+    if not tracks:
+        append_task_log(session, task, "Manual replacement: no matching tracks found", "warning")
+        return {"download_items_created": 0, "batch_id": None}
+    batch = ProposalBatch(title="Manual replacement downloads", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    for track in tracks:
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        add_download_request_item(
+            session,
+            batch,
+            artist_items,
+            album_items,
+            artist_name,
+            album_title,
+            track.title,
+            track_number=track.track_number,
+            disc_number=track.disc_number,
+            duration_ms=track.duration_ms,
+            musicbrainz_album_id=album.musicbrainz_release_id if album else None,
+            musicbrainz_recording_id=track.musicbrainz_recording_id,
+            replace_track_id=track.id,
+            replace_path=track.path,
+            workflow="manual_replacement",
+        )
+        created += 1
+        append_task_log(session, task, f"{artist_name} / {album_title}: queued manual replacement for {track.title}")
+    if created == 0:
+        session.delete(batch)
+        return {"download_items_created": 0, "batch_id": None}
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    create_notification(
+        session,
+        title="Replacement search queued",
+        body=f"Searching for replacement download(s) for {created} track(s) — review candidates in the Task Queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"download_items_created": created, "batch_id": batch.id}
+
+
 def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Replace incorrect audio files", ProposalKind.download)
     from nudibranch.services.metadata_lookup import normalize, text_similarity
@@ -7649,6 +7711,7 @@ TASK_HANDLERS = {
     "check_missing_tracks": run_check_missing_tracks,
     "check_non_lossless": run_check_non_lossless,
     "check_audio_content": run_check_audio_content,
+    "requeue_replacement": run_requeue_replacement,
     "normalize_volume": run_normalize_volume,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
@@ -7850,11 +7913,12 @@ def task_notification_title(task_type: str) -> str:
         "search_candidates": "Searching downloads",
         "consolidate_folders": "Folder consolidation",
         "enrich_imports": "Import enrichment",
+        "requeue_replacement": "Replacement search",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
 def task_target_url(task_type: str) -> str:
-    if task_type in {"execute_proposal_batch", "search_candidates"}:
+    if task_type in {"execute_proposal_batch", "search_candidates", "requeue_replacement"}:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
