@@ -2663,7 +2663,6 @@ function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
         <QuickLibraryActions
           onPlay={() => ctx.onPlay([hydrateTrack(track, artist, album)])}
           onQueue={() => ctx.onQueue([hydrateTrack(track, artist, album)])}
-          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueTrack ? () => ctx.onRequeueTrack(track) : null}
           onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("track", track.id)) : null}
         />
         {(ctx.canEditMetadata || ctx.canUsePlaylists) && (
@@ -2692,6 +2691,7 @@ function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
           targetTrackIds={[track.id]}
           onAddToPlaylist={ctx.onAddToPlaylist}
           onVerifyAudio={ctx.canEditMetadata ? () => ctx.onCheckTrackAudio(track) : null}
+          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueTrack ? () => ctx.onRequeueTrack(track) : null}
           onQueue={ctx.onQueueMetadata}
           onClose={() => toggleSet(ctx.setOpenTrackDetails, track.id)}
         />
@@ -2716,7 +2716,6 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
         <QuickLibraryActions
           onPlay={() => ctx.onPlay(albumTracks(artist, album), { keepLead: false })}
           onQueue={() => ctx.onQueue(albumTracks(artist, album))}
-          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueAlbum ? () => ctx.onRequeueAlbum(album) : null}
         />
         {ctx.onTogglePinAlbum && (
           <button
@@ -2759,6 +2758,7 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
           playlists={ctx.canUsePlaylists ? ctx.playlists : []}
           targetTrackIds={albumTracks(artist, album).map((t) => t.id)}
           onAddToPlaylist={ctx.onAddToPlaylist}
+          onRequeue={ctx.canRemoveLibrary && ctx.onRequeueAlbum ? () => ctx.onRequeueAlbum(album) : null}
           onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("album", album.id)) : null}
           onQueue={ctx.onQueueMetadata}
           onClose={() => toggleSet(ctx.setOpenAlbumDetails, album.id)}
@@ -3139,18 +3139,13 @@ function QueueButton({ onClick, className = "row-icon-button", title = "Add to q
   );
 }
 
-function QuickLibraryActions({ onPlay, onQueue, onRequeue, onRemove }) {
+function QuickLibraryActions({ onPlay, onQueue, onRemove }) {
   return (
     <div className="quick-library-actions">
       <button className="row-icon-button" onClick={onPlay} title="Play">
         <Play size={14} />
       </button>
       <QueueButton onClick={onQueue} title="Add to local queue" />
-      {onRequeue && (
-        <button className="row-icon-button" onClick={onRequeue} title="Queue a replacement download">
-          <RefreshCw size={14} />
-        </button>
-      )}
       {onRemove && (
         <button className="row-icon-button" onClick={onRemove} title="Remove">
           <Trash2 size={14} />
@@ -4726,6 +4721,7 @@ function LibraryMetadataEditor({
   targetTrackIds = [],
   onAddToPlaylist,
   onVerifyAudio,
+  onRequeue,
   onRemove,
   onQueue,
   onClose,
@@ -4847,12 +4843,18 @@ function LibraryMetadataEditor({
             );
           })}
         </div>
-        {(onVerifyAudio || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
+        {(onVerifyAudio || onRequeue || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
           <div className="metadata-menu-actions">
             {onVerifyAudio && (
               <button className="secondary compact" onClick={runAudioCheck} disabled={audioCheckLoading}>
                 <FileAudio size={15} />
                 {audioCheckLoading ? "Checking…" : "Check audio"}
+              </button>
+            )}
+            {onRequeue && (
+              <button className="secondary compact" onClick={onRequeue} title="Queue a replacement download">
+                <RefreshCw size={15} />
+                Replace
               </button>
             )}
             {playlists.length > 0 && targetTrackIds.length > 0 && (
