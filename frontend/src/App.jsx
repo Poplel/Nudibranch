@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import {
   ArrowLeft,
   Bell,
+  Info,
   Check,
   CheckCircle,
   ChevronDown,
@@ -161,7 +162,6 @@ function App() {
   const [favoriteTrackIds, setFavoriteTrackIds] = useState(() => new Set());
   const [integrationSettings, setIntegrationSettings] = useState(null);
   const [backups, setBackups] = useState([]);
-  const [libraryAlbumChecks, setLibraryAlbumChecks] = useState({});
   const [importAlbumSearchOpen, setImportAlbumSearchOpen] = useState(false);
   const [importDownloadRequests, setImportDownloadRequests] = useState([]);
   const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
@@ -1061,44 +1061,6 @@ function App() {
         title: "Album MusicBrainz check complete",
         body: `${matched} matched. ${changed} updated. ${missing} unmatched. ${failed} failed.`,
       });
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function checkLibraryAlbumMusicBrainz(album) {
-    setLoading(true);
-    try {
-      const data = await api(`/library/albums/${album.id}/musicbrainz-match`, { method: "POST" });
-      setLibraryAlbumChecks((current) => ({ ...current, [album.id]: data }));
-      if (data.queued_changes) await refreshApprovals();
-      const counts = countMusicBrainzStatuses(data.tracks || []);
-      setToast({
-        title: "Album MusicBrainz check complete",
-        body: `${counts.matched} matched. ${counts.skipped} skipped. ${counts.changed} changed. ${counts.unmatched} unmatched. ${counts.failed} failed. ${data.queued_changes || 0} fixes queued.`,
-      });
-    } catch (lookupError) {
-      notify("Album MusicBrainz check failed", lookupError.message, "ui_error");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function checkLibraryTrackMusicBrainz(track, album = null) {
-    setLoading(true);
-    try {
-      const result = await api(`/library/tracks/${track.id}/musicbrainz-match`, { method: "POST" });
-      const label = musicBrainzResultMeta(result);
-      setLibraryAlbumChecks((current) => mergeTrackMusicBrainzResult(current, album?.id, album?.title, result));
-      if (result.queued_changes) await refreshApprovals();
-      setToast({
-        title: "Track MusicBrainz check complete",
-        body: `${track.title}: ${label}`,
-      });
-      return result;
-    } catch (lookupError) {
-      notify("Track MusicBrainz check failed", lookupError.message, "ui_error");
-      return null;
     } finally {
       setLoading(false);
     }
@@ -2231,10 +2193,7 @@ function App() {
                 artists={library}
                 onCheckAlbum={lookupImportAlbum}
                 onCoverSearch={searchAlbumCover}
-                onCheckAlbumMusicBrainz={checkLibraryAlbumMusicBrainz}
-                onCheckTrackMusicBrainz={checkLibraryTrackMusicBrainz}
                 onCheckTrackAudio={checkLibraryTrackAudio}
-                albumChecks={libraryAlbumChecks}
                 onSearchAlbums={searchImportAlbums}
                 onQueueMetadata={applyLibraryMetadata}
                 onQueueRemove={proposeLibraryRemove}
@@ -2647,7 +2606,6 @@ function LibraryArtistGrid({ api, apiKey, bucket, pageSize, onPageSizeChange, on
 
 
 function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
-  const musicBrainzResult = (ctx.albumChecks?.[album.id]?.tracks || []).find((result) => result.track_id === track.id);
   // Clicking the row body plays this track and queues the rest of the album after it.
   const playFromHere = () => {
     if (!ctx.onPlay) return;
@@ -2696,29 +2654,10 @@ function LibraryTrackBranch({ ctx, artist, album, track, depth = 2 }) {
           playlists={ctx.canUsePlaylists ? ctx.playlists : []}
           targetTrackIds={[track.id]}
           onAddToPlaylist={ctx.onAddToPlaylist}
-          onMusicBrainzCheck={ctx.canEditMetadata ? () => ctx.onCheckTrackMusicBrainz(track, album) : null}
           onVerifyAudio={ctx.canEditMetadata ? () => ctx.onCheckTrackAudio(track) : null}
           onQueue={ctx.onQueueMetadata}
           onClose={() => toggleSet(ctx.setOpenTrackDetails, track.id)}
         />
-      )}
-      {musicBrainzResult && (
-        <div className="track-musicbrainz-result">
-          <TreeRow
-            depth={depth + 1}
-            icon={Search}
-            title="MusicBrainz"
-            meta={musicBrainzResultMeta(musicBrainzResult)}
-            warning={["changed", "unmatched", "missing_file", "error"].includes(musicBrainzResult.status)}
-          />
-          {musicBrainzResult.changes && Object.keys(musicBrainzResult.changes).length > 0 && (
-            <div className="musicbrainz-change-list">
-              {Object.entries(musicBrainzResult.changes).map(([key, value]) => (
-                <span key={key}>{metadataFieldLabel(key)}: {String(value)}</span>
-              ))}
-            </div>
-          )}
-        </div>
       )}
     </div>
   );
@@ -2782,7 +2721,6 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
           playlists={ctx.canUsePlaylists ? ctx.playlists : []}
           targetTrackIds={albumTracks(artist, album).map((t) => t.id)}
           onAddToPlaylist={ctx.onAddToPlaylist}
-          onMusicBrainzCheck={ctx.canEditMetadata ? () => ctx.onCheckAlbumMusicBrainz(album) : null}
           onRemove={ctx.canRemoveLibrary ? () => ctx.setRemoveTarget(removeKey("album", album.id)) : null}
           onQueue={ctx.onQueueMetadata}
           onClose={() => toggleSet(ctx.setOpenAlbumDetails, album.id)}
@@ -2796,7 +2734,7 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
   );
 }
 
-function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBrainz, onCheckTrackMusicBrainz, onCheckTrackAudio, albumChecks, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload, refreshVersion, onOpenArtist, onPlayArtist, onQueueArtist }) {
+function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, onSearchAlbums, onQueueMetadata, onQueueRemove, playlists, onAddToPlaylist, user, apiKey, api, onPlay, onQueue, onSearchLibrary, onSavePageSize, onPlayAlbum, onQueueAlbum, onOpenAlbum, onTogglePinAlbum, pinnedAlbumIds, onTogglePinArtist, pinnedArtistIds, onArtistCoverSearch, onAlbumCoverUpload, onArtistCoverUpload, refreshVersion, onOpenArtist, onPlayArtist, onQueueArtist }) {
   const [libraryEntity, setLibraryEntity] = useState("artist");
   const [libraryLayout, setLibraryLayout] = useState("tree");
   const [openArtists, setOpenArtists] = useState(() => new Set());
@@ -2856,10 +2794,9 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckAlbumMusicBr
     openAlbums, setOpenAlbums,
     openAlbumDetails, setOpenAlbumDetails,
     openTrackDetails, setOpenTrackDetails,
-    albumChecks,
-    onCheckAlbum, onCoverSearch, onAlbumCoverUpload, onCheckAlbumMusicBrainz,
+    onCheckAlbum, onCoverSearch, onAlbumCoverUpload,
     onSearchAlbums, onQueueMetadata,
-    onCheckTrackMusicBrainz, onCheckTrackAudio,
+    onCheckTrackAudio,
     pinnedAlbumIds, onTogglePinAlbum,
     onOpenAlbum,
   };
@@ -4744,7 +4681,6 @@ function LibraryMetadataEditor({
   playlists = [],
   targetTrackIds = [],
   onAddToPlaylist,
-  onMusicBrainzCheck,
   onVerifyAudio,
   onRemove,
   onQueue,
@@ -4755,6 +4691,7 @@ function LibraryMetadataEditor({
   const [artFailed, setArtFailed] = useState(false);
   const [audioCheckResult, setAudioCheckResult] = useState(null);
   const [audioCheckLoading, setAudioCheckLoading] = useState(false);
+  const [openInfo, setOpenInfo] = useState(() => new Set());
   const coverUploadRef = useRef(null);
 
   useEffect(() => {
@@ -4803,7 +4740,20 @@ function LibraryMetadataEditor({
             const isChanged = String(draft[field.key] ?? "") !== String(baseline[field.key] ?? "");
             return (
               <label className={isChanged ? "changed" : ""} key={field.key}>
-                <span>{field.label}</span>
+                <span>
+                  {field.label}
+                  {field.info && (
+                    <button
+                      type="button"
+                      className="field-info-button"
+                      title={field.info}
+                      aria-label={`About ${field.label}`}
+                      onClick={() => toggleSet(setOpenInfo, field.key)}
+                    >
+                      <Info size={13} />
+                    </button>
+                  )}
+                </span>
                 <div className="metadata-input-action">
                   {field.type === "boolean" ? (
                     <input
@@ -4850,18 +4800,15 @@ function LibraryMetadataEditor({
                     </>
                   )}
                 </div>
+                {field.info && openInfo.has(field.key) && (
+                  <small className="field-info-text">{field.info}</small>
+                )}
               </label>
             );
           })}
         </div>
-        {(onMusicBrainzCheck || onVerifyAudio || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
+        {(onVerifyAudio || onRemove || (playlists.length > 0 && targetTrackIds.length > 0)) && (
           <div className="metadata-menu-actions">
-            {onMusicBrainzCheck && (
-              <button className="secondary compact" onClick={onMusicBrainzCheck}>
-                <Sparkles size={15} />
-                Check MusicBrainz
-              </button>
-            )}
             {onVerifyAudio && (
               <button className="secondary compact" onClick={runAudioCheck} disabled={audioCheckLoading}>
                 <FileAudio size={15} />
@@ -4913,11 +4860,16 @@ function initialFieldValues(fields) {
   return Object.fromEntries(fields.map((field) => [field.key, field.value ?? ""]));
 }
 
+const SORT_NAME_INFO =
+  "An optional alternate spelling used only for alphabetical sorting — e.g. \"Beatles, The\" for \"The Beatles\". Leave blank to sort by the displayed name.";
+const MB_ID_INFO =
+  "MusicBrainz's unique identifier for this record. It links the entry to MusicBrainz so metadata, artwork, and matching stay accurate. Usually filled automatically; only change it if you know the correct ID.";
+
 function artistFields(artist) {
   return [
     { key: "name", label: "Name", value: artist.name },
-    { key: "sort_name", label: "Sort name", value: artist.sort_name },
-    { key: "musicbrainz_id", label: "MusicBrainz ID", value: artist.musicbrainz_id },
+    { key: "sort_name", label: "Sort name", value: artist.sort_name, info: SORT_NAME_INFO },
+    { key: "musicbrainz_id", label: "MusicBrainz ID", value: artist.musicbrainz_id, info: MB_ID_INFO },
     { key: "cover_path", label: "Cover art", value: artist.cover_path },
   ];
 }
@@ -4935,9 +4887,10 @@ async function artistAutoLookup(field, draft, artistId, onCoverSearch) {
 function albumFields(album) {
   return [
     { key: "title", label: "Album", value: album.title },
+    { key: "sort_name", label: "Sort name", value: album.sort_name, info: SORT_NAME_INFO },
     { key: "release_title", label: "Release title", value: album.release_title },
-    { key: "musicbrainz_release_id", label: "MusicBrainz release ID", value: album.musicbrainz_release_id },
-    { key: "musicbrainz_release_group_id", label: "MusicBrainz release group ID", value: album.musicbrainz_release_group_id },
+    { key: "musicbrainz_release_id", label: "MusicBrainz release ID", value: album.musicbrainz_release_id, info: MB_ID_INFO },
+    { key: "musicbrainz_release_group_id", label: "MusicBrainz release group ID", value: album.musicbrainz_release_group_id, info: MB_ID_INFO },
     { key: "cover_path", label: "Cover art", value: album.cover_path },
     { key: "path", label: "Path", value: album.path, readOnly: true },
   ];
@@ -4952,7 +4905,7 @@ function trackFields(track) {
     { key: "format", label: "Format", value: track.format },
     { key: "bitrate", label: "Bitrate", value: track.bitrate, type: "number", readOnly: true },
     { key: "path", label: "Path", value: track.path, readOnly: true },
-    { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id },
+    { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id, info: MB_ID_INFO },
     { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
     { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean", readOnly: true },
     { key: "musicbrainz_verified", label: "MusicBrainz verified", value: track.musicbrainz_verified, type: "boolean", readOnly: true },
@@ -7053,7 +7006,7 @@ function AlbumDetailPage({ detail, api, apiKey, onBack, onPlayAlbum, onQueueAlbu
   }, [api, detail.id]);
   const cover = albumCoverUrl({ id: detail.id, cover_path: detail.cover_path }, apiKey)
     || `${API_BASE}/library/albums/${encodeURIComponent(detail.id)}/cover?api_key=${encodeURIComponent(apiKey)}`;
-  const viewCtx = { onPlay: onPlayTracks, onQueue: onQueueTracks, canEditMetadata: false, canRemoveLibrary: false, canUsePlaylists: false, albumChecks: {} };
+  const viewCtx = { onPlay: onPlayTracks, onQueue: onQueueTracks, canEditMetadata: false, canRemoveLibrary: false, canUsePlaylists: false };
   const albumObj = { id: detail.id, title: detail.title, _coverUrl: cover, tracks: tracks || [] };
   const artistObj = { name: detail.artist_name };
   return (
@@ -7108,7 +7061,6 @@ function ArtistDetailPage({ detail, api, apiKey, onBack, onPlayArtist, onQueueAr
   const viewCtx = {
     onPlay: onPlayTracks, onQueue: onQueueTracks,
     canEditMetadata: false, canRemoveLibrary: false, canUsePlaylists: false,
-    albumChecks: {},
     openAlbums, setOpenAlbums,
     onOpenAlbum,
   };
@@ -9536,48 +9488,6 @@ function wishlistAlbumMeta(album) {
   );
   const label = count === 1 ? "request" : "requests";
   return `${count} ${label}${statuses.size ? ` · ${[...statuses].join(", ")}` : ""}`;
-}
-
-function countMusicBrainzStatuses(results) {
-  return results.reduce(
-    (counts, result) => {
-      if (result.status === "matched") counts.matched += 1;
-      else if (result.status === "skipped_verified") counts.skipped += 1;
-      else if (result.status === "changed") counts.changed += 1;
-      else if (result.status === "unmatched") counts.unmatched += 1;
-      else counts.failed += 1;
-      return counts;
-    },
-    { matched: 0, changed: 0, unmatched: 0, failed: 0, skipped: 0 },
-  );
-}
-
-function musicBrainzResultMeta(result) {
-  if (result.status === "matched") return `Matched${result.score ? ` ${result.score}%` : ""}`;
-  if (result.status === "skipped_verified") return "Already verified";
-  if (result.status === "changed") {
-    const candidateTitle = result.candidate?.title || "different recording";
-    return `Replacement suggested: ${candidateTitle}${result.score ? ` ${result.score}%` : ""}`;
-  }
-  if (result.status === "missing_file") return "Missing file";
-  if (result.status === "error") return result.error || "Lookup failed";
-  return "No match";
-}
-
-function mergeTrackMusicBrainzResult(current, albumId, albumTitle, result) {
-  if (!albumId || !result) return current;
-  const existing = current[albumId] || { album_id: albumId, album: albumTitle || "", tracks: [] };
-  const tracks = [...(existing.tracks || [])];
-  const index = tracks.findIndex((entry) => entry.track_id === result.track_id);
-  if (index >= 0) tracks[index] = result;
-  else tracks.push(result);
-  return { ...current, [albumId]: { ...existing, tracks } };
-}
-
-function metadataFieldLabel(key) {
-  return String(key || "")
-    .replace(/_/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function toggleSet(setter, value) {

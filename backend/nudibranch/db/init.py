@@ -61,6 +61,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "cover_path" not in artist_columns:
         session.execute(text("ALTER TABLE artists ADD COLUMN cover_path TEXT"))
         session.commit()
+    album_columns = {row[1] for row in session.execute(text("PRAGMA table_info(albums)"))}
+    if "sort_name" not in album_columns:
+        session.execute(text("ALTER TABLE albums ADD COLUMN sort_name VARCHAR(255)"))
+        session.commit()
     track_columns = {row[1] for row in session.execute(text("PRAGMA table_info(tracks)"))}
     if "musicbrainz_verified" not in track_columns:
         session.execute(text("ALTER TABLE tracks ADD COLUMN musicbrainz_verified BOOLEAN NOT NULL DEFAULT 0"))

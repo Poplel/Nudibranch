@@ -181,6 +181,7 @@ class Album(Base):
     artist_id: Mapped[str] = mapped_column(ForeignKey("artists.id"), nullable=False)
     title: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     release_title: Mapped[str | None] = mapped_column(String(255))
+    sort_name: Mapped[str | None] = mapped_column(String(255))
     musicbrainz_release_id: Mapped[str | None] = mapped_column(String(64), index=True)
     musicbrainz_release_group_id: Mapped[str | None] = mapped_column(String(64), index=True)
     path: Mapped[str | None] = mapped_column(Text)

@@ -1224,6 +1224,10 @@ def _artist_sort_expr():
     return func.coalesce(func.nullif(func.trim(Artist.sort_name), ""), Artist.name)
 
 
+def _album_sort_expr():
+    return func.coalesce(func.nullif(func.trim(Album.sort_name), ""), Album.title)
+
+
 @router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"], summary="Get library tree")
 def library_tree(
     session: Session = Depends(get_session),
@@ -1242,6 +1246,7 @@ def library_tree(
                 LibraryTreeAlbum(
                     id=album.id,
                     title=album.title,
+                    sort_name=album.sort_name,
                     path=album.path,
                     cover_path=album.cover_path,
                     tracks=[
@@ -1268,7 +1273,7 @@ def library_tree(
                     musicbrainz_release_id=album.musicbrainz_release_id,
                     musicbrainz_release_group_id=album.musicbrainz_release_group_id,
                 )
-                for album in sorted(artist.albums, key=lambda album: album.title.lower())
+                for album in sorted(artist.albums, key=lambda album: ((album.sort_name or album.title) or "").lower())
             ],
             sort_name=artist.sort_name,
             musicbrainz_id=artist.musicbrainz_id,
@@ -1312,22 +1317,23 @@ def library_albums(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_read)),
 ) -> PaginatedAlbums:
+    sort_expr = _album_sort_expr()
     stmt = select(Album)
     if artist_id:
         stmt = stmt.where(Album.artist_id == artist_id)
-    cond = _bucket_condition(Album.title, bucket)
+    cond = _bucket_condition(sort_expr, bucket)
     if cond is not None:
         stmt = stmt.where(cond)
     if q:
         stmt = stmt.where(Album.title.ilike(f"%{q.strip()}%"))
     total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     rows = session.scalars(
-        stmt.order_by(func.lower(Album.title)).offset((page - 1) * page_size).limit(page_size)
+        stmt.order_by(sort_expr, Album.title).offset((page - 1) * page_size).limit(page_size)
         .options(selectinload(Album.artist), selectinload(Album.tracks))
     )
     items = [
         LibraryAlbumRow(
-            id=al.id, title=al.title, artist_id=al.artist_id,
+            id=al.id, title=al.title, sort_name=al.sort_name, artist_id=al.artist_id,
             artist_name=(al.artist.name if al.artist else ""),
             cover_path=al.cover_path, track_count=len(al.tracks),
         )

@@ -108,6 +108,7 @@ class LibraryTreeAlbum(BaseModel):
     id: str
     title: str
     release_title: str | None = None
+    sort_name: str | None = None
     path: str | None = None
     cover_path: str | None = None
     musicbrainz_release_id: str | None = None
@@ -414,6 +415,7 @@ class LibraryArtistRow(BaseModel):
 class LibraryAlbumRow(BaseModel):
     id: str
     title: str
+    sort_name: str | None = None
     artist_id: str
     artist_name: str
     cover_path: str | None = None

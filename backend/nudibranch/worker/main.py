@@ -5132,7 +5132,7 @@ def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
     apply_scalar_changes(
         album,
         changes,
-        {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
+        {"title", "sort_name", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
     )
     title_changed = album.title != old_title
     if not title_changed:
