@@ -1674,7 +1674,7 @@ def musicbrainz_match_library_track(
 def verify_track_audio(
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    current_user: User = Depends(require_permission(Permission.library_manage)),
 ) -> AudioVerifyResult:
     track = session.scalar(
         select(Track)
@@ -1696,6 +1696,24 @@ def verify_track_audio(
         claimed_recording_id=claimed_recording_id,
         api_key=api_key,
     )
+    # Surface the outcome in the Activity log + a notification (never inline in the tree).
+    track_label = f"{claimed_artist} — {claimed_title}" if claimed_artist else (claimed_title or track_id)
+    detected_summary = "; ".join(
+        f"{d['title']} — {d['artist']} ({round((d.get('score') or 0) * 100)}%)" for d in result["detected"][:3]
+    )
+    log_message = f"Audio check: {track_label}: {result['message']}"
+    if detected_summary:
+        log_message = f"{log_message} (detected: {detected_summary})"
+    write_app_log(log_message, level="warning" if result["matched"] is False else "info")
+    create_notification(
+        session,
+        title="Audio check complete",
+        body=f"{track_label}: {result['message']}",
+        event_type="library_audio_check",
+        target_url="/library",
+        user_id=current_user.id,
+    )
+    session.commit()
     return AudioVerifyResult(
         matched=result["matched"],
         confidence=result["confidence"],
@@ -3446,7 +3464,7 @@ async def upload_youtube_cookies(
     values["youtube_cookies_path"] = str(destination)
     result = update_integration_settings(session, values)
     session.commit()
-    return IntegrationSettings(**result)
+    return _integration_settings_out(result)
 
 
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")
@@ -3550,12 +3568,19 @@ def create_task(
     return serialize_task(enqueue_task(session, payload.type, payload.payload))
 
 
+def _integration_settings_out(values: dict) -> IntegrationSettings:
+    """Build the response model, flagging whether a cookies file is actually present."""
+    cookies_path = values.get("youtube_cookies_path") or ""
+    uploaded = bool(cookies_path) and Path(cookies_path).exists()
+    return IntegrationSettings(**values, youtube_cookies_uploaded=uploaded)
+
+
 @router.get("/settings/integrations", response_model=IntegrationSettings, tags=["settings"], summary="Get integration settings")
 def get_integrations(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.settings_manage)),
 ) -> IntegrationSettings:
-    return IntegrationSettings(**integration_settings(session))
+    return _integration_settings_out(integration_settings(session))
 
 
 @router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key", response_model=list[JellyfinUserOut])
@@ -3591,7 +3616,7 @@ def update_integrations(
         session.query(Track).filter(Track.jellyfin_item_id.isnot(None)).update({"jellyfin_item_id": None})
         enqueue_task(session, "sync_favorites_jellyfin", {})
     session.commit()
-    return IntegrationSettings(**integration_settings(session))
+    return _integration_settings_out(integration_settings(session))
 
 
 @router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"], summary="List notifications")

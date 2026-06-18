@@ -2673,6 +2673,14 @@ nav button:hover {
   grid-template-columns: minmax(160px, 1fr) minmax(0, 1.2fr) auto;
 }
 
+.integration-status {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .integration-row input,
 .integration-row select {
   min-width: 0;

@@ -2488,7 +2488,10 @@ def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item
 
 def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:
     payload = json.loads(item.payload_json or "{}")
-    payload["status"] = f"needs attention after {retry_count} automatic retries: {reason}"
+    # Tree rows show only a short status; the detailed reason goes to the log + a
+    # notification (below) and is kept here under a non-displayed key.
+    payload["status"] = "needs attention"
+    payload["retry_reason"] = reason
     payload["auto_retry_exhausted"] = True
     payload["failed_candidates"] = failed_candidates[-25:]
     item.payload_json = json.dumps(payload)
@@ -4818,6 +4821,7 @@ def queue_ytdlp_download(session: Session, request: dict, task: "Task | None" = 
         "--no-playlist",
         "--paths", str(settings.downloads_path),
         "--output", output_template,
+        "--format", "bestaudio/best",
         "--extract-audio",
         "--audio-format", "mp3",
     ]

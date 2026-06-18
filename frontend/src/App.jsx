@@ -1068,7 +1068,11 @@ function App() {
 
   async function checkLibraryTrackAudio(track) {
     try {
-      return await api(`/library/tracks/${track.id}/verify-audio`, { method: "POST" });
+      const result = await api(`/library/tracks/${track.id}/verify-audio`, { method: "POST" });
+      // Result goes to the Activity log + notifications (created server-side); show a
+      // transient toast for immediate feedback — never rendered inline in the tree.
+      if (result) setToast({ title: "Audio check complete", body: result.message });
+      return null;
     } catch (verifyError) {
       notify("Audio verification failed", verifyError.message, "ui_error");
       return null;
@@ -4689,7 +4693,6 @@ function LibraryMetadataEditor({
   const [draft, setDraft] = useState(() => initialFieldValues(fields));
   const [baseline, setBaseline] = useState(() => initialFieldValues(fields));
   const [artFailed, setArtFailed] = useState(false);
-  const [audioCheckResult, setAudioCheckResult] = useState(null);
   const [audioCheckLoading, setAudioCheckLoading] = useState(false);
   const [openInfo, setOpenInfo] = useState(() => new Set());
   const coverUploadRef = useRef(null);
@@ -4698,7 +4701,6 @@ function LibraryMetadataEditor({
     const fresh = initialFieldValues(fields);
     setDraft(fresh);
     setBaseline(fresh);
-    setAudioCheckResult(null);
   }, [targetId]);
 
   // Library metadata edits apply directly when a field loses focus. The committed
@@ -4719,10 +4721,8 @@ function LibraryMetadataEditor({
   async function runAudioCheck() {
     if (!onVerifyAudio) return;
     setAudioCheckLoading(true);
-    setAudioCheckResult(null);
-    const result = await onVerifyAudio();
+    await onVerifyAudio();
     setAudioCheckLoading(false);
-    if (result) setAudioCheckResult(result);
   }
 
   return (
@@ -4838,17 +4838,6 @@ function LibraryMetadataEditor({
                 Remove
               </button>
             )}
-          </div>
-        )}
-        {audioCheckResult && (
-          <div
-            className="musicbrainz-change-list"
-            style={audioCheckResult.matched === true ? { color: "var(--accent)" } : audioCheckResult.matched === false ? { color: "var(--danger)" } : undefined}
-          >
-            <span>{audioCheckResult.message}</span>
-            {(audioCheckResult.detected || []).slice(0, 3).map((rec) => (
-              <span key={rec.recording_id}>{rec.title} — {rec.artist} ({Math.round(rec.score * 100)}%)</span>
-            ))}
           </div>
         )}
       </div>
@@ -6772,6 +6761,7 @@ function SettingsPanel({
   }, [user?.search_min_confidence]);
   const [shownIntegrationKeys, setShownIntegrationKeys] = useState({});
   const [integrationDraft, setIntegrationDraft] = useState(integrationSettings || {});
+  const cookiesUploadRef = useRef(null);
   const canViewApiKey =
     user?.is_admin || user?.permissions?.includes("settings:manage") || user?.permissions?.includes("users:manage");
 
@@ -6864,7 +6854,6 @@ function SettingsPanel({
             ["slskd_album_match_threshold", "slskd album match confidence"],
             ["slskd_album_folder_tries", "Album folder tries"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
-            ["youtube_cookies_path", "YouTube cookies file"],
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
@@ -6899,18 +6888,29 @@ function SettingsPanel({
             </label>
           ))}
           <label className="setting-row integration-row">
-            <span>Upload cookies</span>
+            <span>YouTube cookies file</span>
+            <span className="integration-status">
+              {integrationDraft.youtube_cookies_uploaded ? "Uploaded" : "None"}
+            </span>
+            <button
+              className="row-icon-button"
+              type="button"
+              onClick={() => cookiesUploadRef.current?.click()}
+              title="Upload cookies.txt"
+            >
+              <Upload size={14} />
+            </button>
             <input
+              ref={cookiesUploadRef}
               type="file"
               accept=".txt,text/plain"
+              style={{ display: "none" }}
               onChange={(event) => {
                 const file = event.target.files?.[0];
-                if (!file) return;
-                onUploadYoutubeCookies?.(integrationDraft.youtube_cookies_browser || "", file);
                 event.target.value = "";
+                if (file) onUploadYoutubeCookies?.(integrationDraft.youtube_cookies_browser || "", file);
               }}
             />
-            <Upload size={16} />
           </label>
           <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
             Save integrations
