@@ -1608,16 +1608,21 @@ function App() {
     // start reorders the new queue and remembers the original order so toggling
     // shuffle back off can revert it — identical to the in-place toggle path.
     const wantShuffle = opts.shuffle != null ? Boolean(opts.shuffle) : shuffle;
+    // keepLead (default true): keep the first track playing first — correct when the
+    // user clicked a specific song. Whole-collection plays (Shuffle all / play an
+    // album/artist/playlist) pass keepLead:false so the entire list is shuffled and
+    // each start picks a fresh random order, including a random first track.
+    const keepLead = opts.keepLead !== false;
     let queue = playable;
     if (wantShuffle && playable.length > 1) {
       unshuffledQueueRef.current = [...playable];
-      // Keep the lead track playing first (the clicked/selected song), shuffle the rest.
-      const [first, ...rest] = playable;
+      const head = keepLead ? [playable[0]] : [];
+      const rest = keepLead ? playable.slice(1) : [...playable];
       for (let i = rest.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [rest[i], rest[j]] = [rest[j], rest[i]];
       }
-      queue = [first, ...rest];
+      queue = [...head, ...rest];
     } else {
       unshuffledQueueRef.current = null;
     }
@@ -1677,7 +1682,7 @@ function App() {
     try {
       const tracks = await loadAlbumPlayables(album);
       if (tracks.length === 0) { notify("Playback", "No tracks found for this album.", "ui_error"); return; }
-      await playTracks(tracks);
+      await playTracks(tracks, { keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -1735,7 +1740,7 @@ function App() {
         tracks = tracks.concat(await loadAlbumPlayables(al));
       }
       if (tracks.length === 0) { notify("Playback", "No tracks found for this artist.", "ui_error"); return; }
-      await playTracks(tracks);
+      await playTracks(tracks, { keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -1757,7 +1762,7 @@ function App() {
     try {
       const tracks = await resolvePlaylistTracks(playlistId);
       if (tracks.length === 0) { notify("Playback", "This playlist has no tracks.", "ui_error"); return; }
-      await playTracks(tracks);
+      await playTracks(tracks, { keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -1779,7 +1784,7 @@ function App() {
         page += 1;
       }
       if (tracks.length === 0) { notify("Playback", "Your library has no tracks.", "ui_error"); return; }
-      await playTracks(tracks, { shuffle: shuffleAll });
+      await playTracks(tracks, { shuffle: shuffleAll, keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -2681,7 +2686,7 @@ function LibraryAlbumBranch({ ctx, artist, album, depth = 1 }) {
         />
         <AlbumResultArt src={album._coverUrl} />
         <QuickLibraryActions
-          onPlay={() => ctx.onPlay(albumTracks(artist, album))}
+          onPlay={() => ctx.onPlay(albumTracks(artist, album), { keepLead: false })}
           onQueue={() => ctx.onQueue(albumTracks(artist, album))}
         />
         {ctx.onTogglePinAlbum && (
@@ -2958,7 +2963,7 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, 
                 onToggle={() => toggleSet(setOpenArtists, artist.id)}
               />
               <QuickLibraryActions
-                onPlay={() => onPlay(artistTracks(artist))}
+                onPlay={() => onPlay(artistTracks(artist), { keepLead: false })}
                 onQueue={() => onQueue(artistTracks(artist))}
                 onRemove={canRemoveLibrary ? () => setRemoveTarget(removeKey("artist", artist.id)) : null}
               />
@@ -4059,7 +4064,7 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
               />
               <PlaylistPlayActions
                 disabled={playableTracks.length === 0}
-                onPlay={() => onPlay(playableTracks)}
+                onPlay={() => onPlay(playableTracks, { keepLead: false })}
                 onQueue={() => onQueue(playableTracks)}
               />
               {!playlist.protected && (
