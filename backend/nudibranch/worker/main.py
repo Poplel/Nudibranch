@@ -4834,8 +4834,16 @@ def queue_ytdlp_download(session: Session, request: dict, task: "Task | None" = 
         "--extractor-args", "youtube:player_client=tv,web_embedded,android_vr,default",
     ]
     cookies_path = integration.get("youtube_cookies_path") or ""
-    if cookies_path and Path(cookies_path).exists():
-        command.extend(["--cookies", cookies_path])
+    cookies_file = Path(cookies_path) if cookies_path else None
+    if cookies_file and cookies_file.exists() and cookies_file.stat().st_size > 0:
+        command.extend(["--cookies", str(cookies_file)])
+        append_task_log(session, task, f"yt-dlp: using cookies file {cookies_file} ({cookies_file.stat().st_size} bytes)")
+    elif cookies_file and cookies_file.exists():
+        append_task_log(session, task, f"yt-dlp: cookies file {cookies_file} is empty — not passing --cookies; re-upload a valid cookies.txt", "warning")
+    elif cookies_path:
+        append_task_log(session, task, f"yt-dlp: cookies file configured but not found at {cookies_path} — not passing --cookies", "warning")
+    else:
+        append_task_log(session, task, "yt-dlp: no cookies file configured (Settings → Integrations → YouTube cookies file)")
     append_task_log(session, task, f"yt-dlp: searching YouTube for '{query}' and downloading to {settings.downloads_path}")
     try:
         result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
