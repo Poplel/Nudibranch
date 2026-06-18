@@ -7929,6 +7929,16 @@ function AudioPlayer({
     el.play?.().catch(() => {});
   }, [audioUrl, activeKey]);
 
+  // After a gapless promotion (activeKey swap on track advance) the newly-active element
+  // is often already playing — e.g. crossfade started it early — so it emits no `play`
+  // event and the `playing` state (which drives the play/pause icon) would stay stuck on
+  // "paused" while audio keeps going. Re-sync `playing` to the active element's real state.
+  useEffect(() => {
+    const audio = activeAudio();
+    if (audio) setPlaying(!audio.paused);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeKey]);
+
   // Keep the inactive element preloading the upcoming track.
   useEffect(() => {
     const inactive = inactiveAudio();
