@@ -2984,13 +2984,78 @@ def _jf_playlist_out(session: Session, client: httpx.Client, jf_user_id: str, pl
     return _build_playlist_out(pl_id, pl_name, items, session)
 
 
+# ── Native (DB-backed) playlist fallback — used only when Jellyfin is not connected ──
+# These mirror the Jellyfin path's FavoritesOut shape using the Playlist/PlaylistTrack
+# tables so playlists keep working without a Jellyfin server. The Jellyfin path above is
+# untouched; routes fall back here only when `_jf_client` returns no client.
+
+def _jellyfin_configured(session: Session) -> bool:
+    """Instance-level Jellyfin config (url + key). When False, playlists fall back to the
+    native DB store. A user merely lacking a linked Jellyfin account does NOT trigger the
+    native fallback — only an instance with no Jellyfin at all does."""
+    s = integration_settings(session)
+    return bool(s.get("jellyfin_url") and s.get("jellyfin_api_key"))
+
+
+def _native_playlist_out(session: Session, playlist: Playlist) -> FavoritesOut:
+    entries = sorted(playlist.tracks, key=lambda pt: (pt.position if pt.position is not None else 0))
+    tracks_out: list[PlaylistTrackOut] = []
+    track_ids: list[str] = []
+    for i, entry in enumerate(entries):
+        track = entry.track
+        if not track:
+            continue
+        track_ids.append(track.id)
+        artist_name = track.album.artist.name if track.album and track.album.artist else ""
+        album_title = track.album.title if track.album else ""
+        tracks_out.append(PlaylistTrackOut(
+            id=entry.id,
+            track_id=track.id,
+            position=i + 1,
+            title=track.title,
+            artist=artist_name,
+            album=album_title,
+            album_id=track.album_id,
+            format=track.format,
+        ))
+    pid = "favorites" if playlist.protected else playlist.id
+    return FavoritesOut(id=pid, name=playlist.name, protected=playlist.protected, track_ids=track_ids, tracks=tracks_out, track_count=len(track_ids))
+
+
+def _native_playlist_query(session: Session, user_id: str, playlist_id: str) -> Playlist | None:
+    if playlist_id == "favorites":
+        return get_or_create_favorites(session, user_id)
+    return session.scalar(
+        select(Playlist)
+        .where(Playlist.id == playlist_id, Playlist.user_id == user_id)
+        .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+    )
+
+
+def _add_tracks_to_native_playlist(session: Session, playlist: Playlist, track_ids: list[str]) -> None:
+    existing_track_ids = {pt.track_id for pt in playlist.tracks}
+    next_position = max((pt.position or 0) for pt in playlist.tracks) + 1 if playlist.tracks else 1
+    # Preserve the requested order; skip tracks already present and unknown ids.
+    valid_ids = {t.id for t in session.scalars(select(Track).where(Track.id.in_(track_ids)))}
+    for track_id in track_ids:
+        if track_id in existing_track_ids or track_id not in valid_ids:
+            continue
+        session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=next_position))
+        existing_track_ids.add(track_id)
+        next_position += 1
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/playlists/favorites", response_model=FavoritesOut, tags=["playlists"], summary="Get Favorites")
 def favorites_playlist(session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
     client, jf_user_id = _jf_client(session, user)
     if not client:
-        return FavoritesOut(id="favorites", name="Favorites", protected=True, track_ids=[], tracks=[], track_count=0)
+        if _jellyfin_configured(session):
+            return FavoritesOut(id="favorites", name="Favorites", protected=True, track_ids=[], tracks=[], track_count=0)
+        favorites = get_or_create_favorites(session, user.id)
+        session.commit()
+        return _native_playlist_out(session, favorites)
     with client:
         return _jf_favorites_out(session, client, jf_user_id)
 
@@ -2999,7 +3064,19 @@ def favorites_playlist(session: Session = Depends(get_session), user: User = Dep
 def list_playlists(session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> list[FavoritesOut]:
     client, jf_user_id = _jf_client(session, user)
     if not client:
-        return []
+        if _jellyfin_configured(session):
+            return []
+        favorites = get_or_create_favorites(session, user.id)
+        session.commit()
+        native: list[FavoritesOut] = [_native_playlist_out(session, favorites)]
+        others = session.scalars(
+            select(Playlist)
+            .where(Playlist.user_id == user.id, Playlist.protected.is_(False))
+            .order_by(Playlist.name.asc())
+            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track).selectinload(Track.album).selectinload(Album.artist))
+        )
+        native.extend(_native_playlist_out(session, pl) for pl in others)
+        return native
     with client:
         result: list[FavoritesOut] = [_jf_favorites_out(session, client, jf_user_id)]
         try:
@@ -3017,11 +3094,19 @@ def list_playlists(session: Session = Depends(get_session), user: User = Depends
 @router.post("/playlists", response_model=FavoritesOut, tags=["playlists"], summary="Create playlist")
 def create_playlist(payload: PlaylistCreate, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
     client, jf_user_id = _jf_client(session, user)
-    if not client:
-        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
+    if not client:
+        if _jellyfin_configured(session):
+            raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        existing = session.scalar(select(Playlist).where(Playlist.user_id == user.id, func.lower(Playlist.name) == name.lower()))
+        if existing:
+            raise HTTPException(status_code=409, detail="A playlist with that name already exists")
+        playlist = Playlist(name=name, user_id=user.id, protected=False)
+        session.add(playlist)
+        session.commit()
+        return _native_playlist_out(session, playlist)
     with client:
         try:
             resp = client.post("/Playlists", json={"Name": name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": []})
@@ -3035,11 +3120,21 @@ def create_playlist(payload: PlaylistCreate, session: Session = Depends(get_sess
 @router.patch("/playlists/{playlist_id}", response_model=FavoritesOut, tags=["playlists"], summary="Rename playlist")
 def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
     client, jf_user_id = _jf_client(session, user)
-    if not client:
-        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
     name = payload.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Playlist name is required")
+    if not client:
+        if _jellyfin_configured(session):
+            raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        playlist = _native_playlist_query(session, user.id, playlist_id)
+        if not playlist or playlist.protected:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        conflict = session.scalar(select(Playlist).where(Playlist.user_id == user.id, func.lower(Playlist.name) == name.lower(), Playlist.id != playlist.id))
+        if conflict:
+            raise HTTPException(status_code=409, detail="A playlist with that name already exists")
+        playlist.name = name
+        session.commit()
+        return _native_playlist_out(session, playlist)
     with client:
         # Fetch the current item metadata, update Name, POST back in-place
         try:
@@ -3061,6 +3156,11 @@ def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session 
 def delete_playlist(playlist_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     client, _ = _jf_client(session, user)
     if not client:
+        if not _jellyfin_configured(session):
+            playlist = session.scalar(select(Playlist).where(Playlist.id == playlist_id, Playlist.user_id == user.id))
+            if playlist and not playlist.protected:
+                session.delete(playlist)
+                session.commit()
         return {}
     with client:
         client.delete(f"/Items/{playlist_id}")
@@ -3071,7 +3171,15 @@ def delete_playlist(playlist_id: str, session: Session = Depends(get_session), u
 def add_playlist_tracks(playlist_id: str, payload: PlaylistAddTracks, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
     client, jf_user_id = _jf_client(session, user)
     if not client:
-        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        if _jellyfin_configured(session):
+            raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        playlist = _native_playlist_query(session, user.id, playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        _add_tracks_to_native_playlist(session, playlist, payload.track_ids)
+        session.commit()
+        session.refresh(playlist)
+        return _native_playlist_out(session, playlist)
     tracks = list(session.scalars(select(Track).where(Track.id.in_(payload.track_ids))))
     with client:
         if playlist_id == "favorites":
@@ -3096,7 +3204,17 @@ def add_playlist_tracks(playlist_id: str, payload: PlaylistAddTracks, session: S
 def remove_playlist_track(playlist_id: str, track_id: str, session: Session = Depends(get_session), user: User = Depends(require_permission(Permission.playlists_manage))) -> FavoritesOut:
     client, jf_user_id = _jf_client(session, user)
     if not client:
-        raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        if _jellyfin_configured(session):
+            raise HTTPException(status_code=412, detail="Jellyfin not configured or no Jellyfin account linked")
+        playlist = _native_playlist_query(session, user.id, playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        for entry in list(playlist.tracks):
+            if entry.track_id == track_id:
+                session.delete(entry)
+        session.commit()
+        session.refresh(playlist)
+        return _native_playlist_out(session, playlist)
     track = session.get(Track, track_id)
     with client:
         if playlist_id == "favorites":

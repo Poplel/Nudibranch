@@ -5651,6 +5651,78 @@ def _try_create_pending_playlists(session: Session) -> None:
     session.commit()
 
 
+def create_pending_native_playlists(session: Session) -> None:
+    """Native (DB-backed) fallback for playlist imports when Jellyfin is NOT connected.
+
+    Resolves a pending playlist's original tracks against the local library by title+artist
+    (no Jellyfin mapping needed) and creates/extends a Nudibranch Playlist. Called from
+    run_enrich_imports (i.e. right after tracks land), so async downloads get added on their
+    own import-completion pass. Only runs when Jellyfin is unconfigured, so it never competes
+    with the Jellyfin path (_try_create_pending_playlists)."""
+    settings = integration_settings(session)
+    if settings.get("jellyfin_url") and settings.get("jellyfin_api_key"):
+        return
+    pending_settings = list(session.scalars(select(AppSetting).where(AppSetting.key.like("pending_playlist:%"))))
+    for setting in pending_settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            session.delete(setting)
+            continue
+        playlist_name = data.get("playlist_name") or ""
+        original_tracks = data.get("original_tracks") or []
+        stored_user_id = data.get("user_id")
+        attempts = int(data.get("native_attempts", 0)) + 1
+        if not playlist_name or not original_tracks or not stored_user_id:
+            session.delete(setting)
+            continue
+        resolved_ids: list[str] = []
+        for entry in original_tracks:
+            title = entry.get("title") or ""
+            artist = entry.get("artist") or ""
+            if not title:
+                continue
+            track = session.scalars(
+                select(Track)
+                .join(Album, Album.id == Track.album_id)
+                .join(Artist, Artist.id == Album.artist_id)
+                .where(
+                    func.lower(Track.title) == normalize_match_text(title),
+                    func.lower(Artist.name) == normalize_match_text(artist),
+                )
+                .limit(1)
+            ).first()
+            if track:
+                resolved_ids.append(track.id)
+        playlist = session.scalar(
+            select(Playlist).where(Playlist.user_id == stored_user_id, func.lower(Playlist.name) == playlist_name.lower())
+        )
+        if resolved_ids and not playlist:
+            playlist = Playlist(name=playlist_name, user_id=stored_user_id, protected=False)
+            session.add(playlist)
+            session.flush()
+            create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added with {len(resolved_ids)} track(s).", event_type="playlist_import_done")
+            write_app_log(f"Created Nudibranch playlist '{playlist_name}' with {len(resolved_ids)} track(s)")
+        if playlist and resolved_ids:
+            existing_ids = {pt.track_id for pt in playlist.tracks}
+            next_position = max((pt.position or 0) for pt in playlist.tracks) + 1 if playlist.tracks else 1
+            for track_id in resolved_ids:
+                if track_id in existing_ids:
+                    continue
+                session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=next_position))
+                existing_ids.add(track_id)
+                next_position += 1
+        # Stop once every original track is in, or after a generous number of import-completion
+        # passes (attempts only advance on real imports, so a long review never expires it).
+        if len(resolved_ids) >= len(original_tracks) or attempts >= _PENDING_PLAYLIST_MAX_RETRIES:
+            if not resolved_ids and stored_user_id:
+                create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created — no imported tracks were found.", event_type="playlist_import_failed")
+            session.delete(setting)
+        else:
+            data["native_attempts"] = attempts
+            setting.value = json.dumps(data)
+
+
 def _fetch_all_jellyfin_audio(client: httpx.Client, user_id: str) -> list[dict]:
     """Fetch all Jellyfin audio items in one request for local matching (no per-track API calls)."""
     fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
@@ -6560,6 +6632,9 @@ def run_enrich_imports(session: Session, payload: dict, task: Task | None = None
             event_type="tool_completed",
             target_url="/activity",
         )
+    # Native playlist fallback: if a playlist import is pending and Jellyfin isn't
+    # connected, create/extend the Nudibranch playlist now that these tracks exist.
+    create_pending_native_playlists(session)
     session.commit()
     return {"tracks": total, "lyrics_found": lyrics_found, "lyrics_missing": len(missing)}
 
