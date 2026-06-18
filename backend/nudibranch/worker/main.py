@@ -1565,8 +1565,9 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
 
     transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
     if transfer_error_message:
+        append_task_log(session, None, f"slskd transfer lookup: {transfer_error_message}", "warning")
         for entry in entries:
-            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), f"{transfer_error_message}; searching transfer state")
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "searching transfer state")
     for entry in entries:
         item = session.get(ProposalItem, entry.get("item_id"))
         if download_item_retry_exhausted(item):
@@ -1590,7 +1591,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 failed_count += 1
                 if item:
                     item.status = ProposalStatus.failed
-                set_download_item_status(item, f"failed to move download to staging: {error}")
+                set_download_item_status(item, "needs attention")
                 update_download_manifest_entry(entry, "failed", retry_reason=f"staging failed: {error}")
                 append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
                 delete_stale_download_file(entry)
@@ -1816,7 +1817,8 @@ def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item
     except Exception as error:  # noqa: BLE001 - try a different candidate without creating another row.
         request = download_request_from_item(item)
         if not request:
-            set_download_item_status(item, f"queue record missing and could not be recreated: {error}")
+            set_download_item_status(item, "needs attention")
+            append_task_log(session, None, f"{item.title}: queue record missing and could not be recreated: {error}", "error")
             return False
         candidate = payload.get("candidate") or {}
         return retry_download_entry(
@@ -2355,7 +2357,8 @@ def retry_download_entry(
         return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
-    set_download_item_status(item, f"{reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+    append_task_log(session, None, f"{item.title}: {reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", "warning")
+    set_download_item_status(item, f"trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
     payload = json.loads(item.payload_json or "{}")
     payload["auto_retry_exhausted"] = False
     item.payload_json = json.dumps(payload)
@@ -2742,7 +2745,8 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
         verification["message"] = f"{verification['message']} Could not remove {file_path.name}: {error}"
     item = session.get(ProposalItem, entry.get("item_id"))
     if item:
-        set_download_item_status(item, f"{verification['message']}; retrying another candidate")
+        append_task_log(session, None, f"{item.title}: {verification['message']}; retrying another candidate", "warning")
+        set_download_item_status(item, "retrying another candidate")
         retry_started = retry_download_entry(
             session,
             batch,
@@ -2765,7 +2769,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
     update_download_manifest_entry(entry, "failed", path=str(file_path), metadata=verification.get("metadata"), retry_reason=verification["message"])
     if item:
         item.status = ProposalStatus.failed
-        set_download_item_status(item, f"needs attention: {verification['message']}")
+        set_download_item_status(item, "needs attention")
     batch.status = ProposalStatus.failed
     create_notification(session, title="Downloaded track did not match", body=verification["message"], event_type="task_failed", target_url="/downloads")
     session.commit()
@@ -4824,6 +4828,10 @@ def queue_ytdlp_download(session: Session, request: dict, task: "Task | None" = 
         "--format", "bestaudio/best",
         "--extract-audio",
         "--audio-format", "mp3",
+        # YouTube's web client now requires a PO token (else HTTP 403 on the media
+        # download). Prefer clients that don't need one — `tv` works with the uploaded
+        # cookies, `web_embedded`/`android_vr` need no token at all.
+        "--extractor-args", "youtube:player_client=tv,web_embedded,android_vr,default",
     ]
     cookies_path = integration.get("youtube_cookies_path") or ""
     if cookies_path and Path(cookies_path).exists():
@@ -5364,7 +5372,12 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
         downloaded_path = queue_ytdlp_download(session, request, task=task)
     except Exception as error:
         item.status = ProposalStatus.failed
-        set_download_item_status(item, f"yt-dlp failed: {error}")
+        # Tree rows show only a short status; the detail goes to the log + notification
+        # (below) and is kept in the payload under a non-displayed key.
+        set_download_item_status(item, "needs attention")
+        failed_payload = json.loads(item.payload_json or "{}")
+        failed_payload["error"] = str(error)
+        item.payload_json = json.dumps(failed_payload)
         append_task_log(session, task, f"yt-dlp: download failed for '{query}': {error}", "error")
         create_notification(
             session,
