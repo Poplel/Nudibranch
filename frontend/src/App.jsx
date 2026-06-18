@@ -88,19 +88,19 @@ const navItems = [
 ];
 
 const pageDescriptions = {
-  Home: "Your library at a glance — recently added, recent plays, favorites, and pinned playlists.",
-  Library: "Browse artists, albums, and tracks in the managed library.",
-  Discover: "Search MusicBrainz for artists, albums, and tracks to request or queue.",
+  Home: "Your library at a glance.",
+  Library: "Browse artists, albums, and tracks in the library.",
+  Discover: "Search for artists, albums, and tracks to request or download.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
-  Wishlist: "Request music and track each item through approval and download.",
-  "Wishlist Approvals": "Review user wishlist requests and choose what moves to the task queue.",
+  Wishlist: "Request music for dowload.",
+  "Wishlist Approvals": "Review user wishlist requests.",
   "Task Queue": "Review requested changes before they run.",
   Playlists: "Create, import, and manage playlists.",
   Activity: "Track queued, running, completed, and failed work.",
-  Tools: "Run maintenance checks and library actions.",
-  Automations: "Run tools or play music automatically on a schedule, webhook, or event.",
-  Users: "Manage users, PINs, API access, and permissions.",
-  Settings: "Manage appearance, integrations, and system status.",
+  Tools: "Run tools to manage your library.",
+  Automations: "Run tools or other actions automatically when triggered or on a schedule.",
+  Users: "Manage users, passwords, API keys, and permissions.",
+  Settings: "Manage settings.",
 };
 
 // Pages that render full-width with no Inspector aside.
@@ -5412,21 +5412,21 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
-    ["Scan Jellyfin", "Request Jellyfin to refresh the managed library.", "jellyfin-scan", "jellyfin:manage"],
-    ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs so playlist add/remove operations can resolve correctly.", "remap-tracks", "jellyfin:manage"],
+    ["Scan Jellyfin", "Request Jellyfin re-scans filles.", "jellyfin-scan", "jellyfin:manage"],
+    ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs if playlists are not working.", "remap-tracks", "jellyfin:manage"],
     ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "downloads:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
-    ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash on approval.", "check-duplicates", "library:manage"],
-    ["Check album covers", "Find albums without cover art and prepare cover changes.", "check-album-covers", "library:manage"],
-    ["Check artist covers", "Find artists without cover art and fetch images (Deezer) for review.", "check-artist-covers", "library:manage"],
-    ["Check lyrics", "Find tracks without .lrc files and prepare lyric downloads.", "check-lyrics", "library:manage"],
+    ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash.", "check-duplicates", "library:manage"],
+    ["Check album covers", "Find albums without cover art and prepare images for review.", "check-album-covers", "library:manage"],
+    ["Check artist covers", "Find artists without cover art and prepare images for review.", "check-artist-covers", "library:manage"],
+    ["Check lyrics", "Find tracks without lyrics and", "check-lyrics", "library:manage"],
     ["Check MusicBrainz IDs", "Scan the library for missing MusicBrainz IDs and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
     ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
-    ["Check lossy tracks", "Find lossy or suspicious low-bitrate files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
-    ["Normalize volume", "Prepare approved per-file volume normalization actions for the library.", "normalize-volume", "library:manage"],
-    ["Consolidate album folders", "Find albums whose tracks are split across folders and move them into one folder per album.", "consolidate-folders", "library:manage"],
-    ["Clear downloads folder", "Remove leftover files from /app/downloads.", "clear-downloads", "downloads:manage"],
-    ["Backup now", "Create a manual SQLite backup.", "backup", "backups:manage"],
+    ["Check lossy tracks", "Find fake lossless or less than lossless files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
+    ["Normalize volume", "Normalize volume for all tracks.", "normalize-volume", "library:manage"],
+    ["Consolidate album folders", "Find albums whose tracks are split across folders and consolidate.", "consolidate-folders", "library:manage"],
+    ["Clear downloads folder", "Remove all files from /app/downloads.", "clear-downloads", "downloads:manage"],
+    ["Backup now", "Create a database backup.", "backup", "backups:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, appLogs).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
