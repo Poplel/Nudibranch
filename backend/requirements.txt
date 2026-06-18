@@ -11,6 +11,6 @@ bcrypt==4.2.1
 rapidfuzz==3.10.1
 croniter==3.0.3
 mutagen==1.47.0
-yt-dlp==2026.6.9
+yt-dlp[default]==2026.6.9
 spotifyscraper==2.1.5
 beautifulsoup4==4.13.4
