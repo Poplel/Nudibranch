@@ -7824,12 +7824,12 @@ function parseLrc(text) {
   return lines.sort((a, b) => a.time - b.time);
 }
 
-// ReplayGain applied at playback as an attenuate-only volume multiplier (<=1) so the audio
-// element never needs to boost (which it can't) and can never clip. NULL gain = no change.
-function replayGainVolume(track) {
+// ReplayGain as a linear multiplier (can exceed 1 to boost quiet tracks). NULL = 1 (no change).
+// A master limiter downstream catches any clipping the boost would cause.
+function replayGainLinear(track) {
   const gain = track?.replaygain_track_gain;
   if (gain == null || Number.isNaN(Number(gain))) return 1;
-  return Math.min(1, Math.pow(10, Number(gain) / 20));
+  return Math.pow(10, Number(gain) / 20);
 }
 
 function AudioPlayer({
@@ -7871,10 +7871,65 @@ function AudioPlayer({
   const loadedUrlRef = useRef({ a: null, b: null });
   const activeAudio = () => (activeKeyRef.current === "a" ? audioARef.current : audioBRef.current);
   const inactiveAudio = () => (activeKeyRef.current === "a" ? audioBRef.current : audioARef.current);
-  // Per-track ReplayGain multipliers — applied wherever we set element volume so each track
-  // plays at a consistent loudness. `nextGain` is for the preloaded/crossfade target.
-  const currentGain = replayGainVolume(currentTrack);
-  const nextGain = replayGainVolume(queue && currentIndex >= 0 ? queue[currentIndex + 1] : null);
+
+  // Build the Web Audio graph once (both <audio> elements → per-element GainNode →
+  // master limiter → output). Must run under user activation so the context can resume —
+  // a one-time gesture listener (below) drives this; resume() on later gestures too.
+  function ensureAudioGraph() {
+    if (audioGraphReadyRef.current) {
+      const ctx = audioCtxRef.current;
+      if (ctx && ctx.state === "suspended") ctx.resume().catch(() => {});
+      return;
+    }
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      const elA = audioARef.current;
+      const elB = audioBRef.current;
+      if (!Ctx || !elA || !elB) return;
+      const ctx = new Ctx();
+      const limiter = ctx.createDynamicsCompressor();
+      // Brickwall-ish limiter so boosting quiet tracks never hard-clips the output.
+      limiter.threshold.value = -1.0;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 20;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.1;
+      limiter.connect(ctx.destination);
+      for (const [key, el] of [["a", elA], ["b", elB]]) {
+        const source = ctx.createMediaElementSource(el);
+        const gain = ctx.createGain();
+        gain.gain.value = 1;
+        source.connect(gain);
+        gain.connect(limiter);
+        gainNodesRef.current[key] = gain;
+      }
+      audioCtxRef.current = ctx;
+      audioGraphReadyRef.current = true;
+      ctx.resume().catch(() => {});
+    } catch {
+      audioGraphReadyRef.current = false;
+    }
+  }
+
+  // Apply a track's ReplayGain to its element's GainNode (boost or attenuate; 1 = no change).
+  function applyReplayGain(key, track) {
+    const node = gainNodesRef.current[key];
+    if (!node) return;
+    const value = replayGainLinear(track);
+    const ctx = audioCtxRef.current;
+    try {
+      if (ctx) node.gain.setTargetAtTime(value, ctx.currentTime, 0.01);
+      else node.gain.value = value;
+    } catch {
+      try { node.gain.value = value; } catch { /* ignore */ }
+    }
+  }
+  // ReplayGain is applied via the Web Audio graph (per-element GainNode → master limiter)
+  // so quiet tracks can be BOOSTED above 1.0 to a consistent loudness without clipping.
+  // element.volume is left to the crossfade; the GainNode carries the per-track gain.
+  const audioCtxRef = useRef(null);
+  const gainNodesRef = useRef({ a: null, b: null });
+  const audioGraphReadyRef = useRef(false);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const trackCopyRef = useRef(null);
@@ -7945,8 +8000,10 @@ function AudioPlayer({
       loaded[key] = audioUrl;
       try { el.currentTime = 0; } catch { /* not seekable yet */ }
     }
-    el.volume = currentGain;
+    el.volume = 1;
     if (el.duration) setDuration(el.duration);
+    ensureAudioGraph();
+    applyReplayGain(key, currentTrack);
     el.play?.().catch(() => {});
   }, [audioUrl, activeKey]);
 
@@ -7975,6 +8032,7 @@ function AudioPlayer({
         inactive.src = nextAudioUrl;
         loaded[otherKey] = nextAudioUrl;
         inactive.volume = 0;
+        applyReplayGain(otherKey, nextTrack);
         try { inactive.load(); } catch { /* ignore */ }
       }
     } else if (loaded[otherKey] !== null) {
@@ -8221,6 +8279,20 @@ function AudioPlayer({
     return () => document.removeEventListener("pointerdown", handleClickOutside);
   }, [queueOpen, setQueueOpen]);
 
+  // Build/resume the Web Audio graph on the first user gesture (autoplay policy needs a
+  // gesture to resume the context; building it here avoids ever routing audio into a
+  // suspended graph, which would silence playback).
+  useEffect(() => {
+    const handler = () => ensureAudioGraph();
+    document.addEventListener("pointerdown", handler);
+    document.addEventListener("keydown", handler);
+    return () => {
+      document.removeEventListener("pointerdown", handler);
+      document.removeEventListener("keydown", handler);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onEndedRef = useRef(onEnded);
   onEndedRef.current = onEnded;
 
@@ -8238,13 +8310,14 @@ function AudioPlayer({
     crossfading.current = true;
     try { next.currentTime = 0; } catch { /* ignore */ }
     next.volume = 0;
+    applyReplayGain(otherKey, nextTrack);
     next.play().catch(() => {});
     const startTime = performance.now();
     crossfadeIntervalRef.current = setInterval(() => {
       const elapsed = (performance.now() - startTime) / 1000;
       const frac = Math.min(elapsed / fadeSec, 1);
-      if (active) active.volume = currentGain * Math.max(0, 1 - frac);
-      if (next) next.volume = nextGain * Math.min(1, frac);
+      if (active) active.volume = Math.max(0, 1 - frac);
+      if (next) next.volume = Math.min(1, frac);
       if (frac >= 1) {
         clearInterval(crossfadeIntervalRef.current);
         crossfadeIntervalRef.current = null;
