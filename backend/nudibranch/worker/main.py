@@ -6445,7 +6445,7 @@ def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None)
 
 
 def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | None = None) -> dict:
-    discard_pending_batches(session, "Fill MusicBrainz IDs", ProposalKind.metadata)
+    discard_pending_batches(session, "Fill MusicBrainz info", ProposalKind.metadata)
     artists = list(
         session.scalars(
             select(Artist)
@@ -6453,7 +6453,7 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
             .order_by(Artist.name.asc())
         )
     )
-    batch = ProposalBatch(title="Fill MusicBrainz IDs", kind=ProposalKind.metadata, tree_path="/library")
+    batch = ProposalBatch(title="Fill MusicBrainz info", kind=ProposalKind.metadata, tree_path="/library")
     session.add(batch)
     session.flush()
 
@@ -6486,10 +6486,10 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
         for album in artist.albums:
             album_index += 1
             if task is not None:
-                update_task_progress(session, task, album_index, total_albums, f"Checking MusicBrainz IDs: {artist.name} – {album.title}")
+                update_task_progress(session, task, album_index, total_albums, f"Checking MusicBrainz info: {artist.name} – {album.title}")
             album_needs_release = not album.musicbrainz_release_id
             album_needs_rg = not album.musicbrainz_release_group_id
-            tracks_needing = [t for t in album.tracks if not t.musicbrainz_recording_id]
+            tracks_needing = [t for t in album.tracks if not t.musicbrainz_recording_id or t.track_number is None or t.disc_number is None]
 
             if not artist_needs and not album_needs_release and not album_needs_rg and not tracks_needing:
                 continue
@@ -6557,12 +6557,20 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
                     if title_sim < 0.5:
                         continue
                 mb_recording_id = chosen.get("musicbrainz_recording_id")
-                if not mb_recording_id:
-                    continue
                 track_uncertain = not is_high_confidence_track(track.title, chosen)
-                track_changes: dict = {"musicbrainz_recording_id": mb_recording_id}
-                if not track_uncertain and not album_uncertain:
-                    track_changes["musicbrainz_verified"] = True
+                track_changes: dict = {}
+                if not track.musicbrainz_recording_id and mb_recording_id:
+                    track_changes["musicbrainz_recording_id"] = mb_recording_id
+                    if not track_uncertain and not album_uncertain:
+                        track_changes["musicbrainz_verified"] = True
+                # Fill missing disc/track numbers (disc = MB medium position, so single-disc
+                # albums get disc 1 — fixes mixed NULL/1 disc ordering).
+                if track.track_number is None and chosen.get("track_number") is not None:
+                    track_changes["track_number"] = chosen["track_number"]
+                if track.disc_number is None and chosen.get("disc_number") is not None:
+                    track_changes["disc_number"] = chosen["disc_number"]
+                if not track_changes:
+                    continue
                 track_proposals.append((track, chosen, track_changes, track_uncertain))
 
             if not album_changes and not track_proposals:
@@ -8124,7 +8132,7 @@ def task_notification_title(task_type: str) -> str:
         "check_artist_covers": "Artist cover check",
         "check_missing_tracks": "Missing tracks check",
         "check_non_lossless": "Lossless check",
-        "check_musicbrainz_ids": "MusicBrainz ID check",
+        "check_musicbrainz_ids": "MusicBrainz info check",
         "check_audio_content": "Audio content check",
         "apply_replaygain": "ReplayGain",
         "backup_now": "Backup",
