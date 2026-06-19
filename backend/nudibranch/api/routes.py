@@ -1364,7 +1364,9 @@ def library_tracks(
     total = session.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = stmt.options(selectinload(Track.album).selectinload(Album.artist))
     if album_id:
-        ordered = stmt.order_by(Track.disc_number, Track.track_number)
+        # Treat a missing disc as disc 1 (mixed NULL/1 disc_number otherwise splits the
+        # album into two groups, since SQLite sorts NULLs first); untracked tracks last.
+        ordered = stmt.order_by(func.coalesce(Track.disc_number, 1), func.coalesce(Track.track_number, 9999), func.lower(Track.title))
     else:
         ordered = stmt.order_by(func.lower(Track.title))
     rows = session.scalars(ordered.offset((page - 1) * page_size).limit(page_size))
