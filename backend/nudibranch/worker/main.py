@@ -253,8 +253,13 @@ def add_download_candidate_review_items(
         album = request.get("album") or "Unknown Album"
         title = request.get("track") or request.get("title") or "Unknown Track"
         existing = find_library_track(session, artist, album, title)
+        # Playlist imports carry an unreliable album hint, so also skip the download if the
+        # song already exists under any album (it still gets added to the playlist from the
+        # library copy via the pending-playlist resolver, which matches on artist+title).
+        if not existing and request.get("playlist_name"):
+            existing = library_track_by_artist_title(session, artist, title)
         if existing:
-            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping", "info")
+            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping download", "info")
             continue
         artist_item = artist_items.get(artist)
         if not artist_item:
@@ -895,6 +900,33 @@ def find_library_track(session: Session, artist_name: str, album_title: str, tit
         if (
             normalize_match_text(album.artist.name) == artist_key
             and normalize_match_text(album.title) == album_key
+            and normalize_match_text(track.title) == title_key
+        ):
+            return track
+    return None
+
+
+def library_track_by_artist_title(session: Session, artist_name: str, title: str):
+    """Return any library Track matching artist + title (album-agnostic), else None.
+
+    Used for playlist imports, where the album hint is unreliable — we just want to know
+    'do I already have this song?' so we add it to the playlist instead of re-downloading it.
+    """
+    artist_key = normalize_match_text(artist_name)
+    title_key = normalize_match_text(title)
+    if not (artist_key and title_key):
+        return None
+    for track in session.scalars(
+        select(Track)
+        .join(Album, Album.id == Track.album_id)
+        .join(Artist, Artist.id == Album.artist_id)
+        .where(func.lower(Track.title) == title.lower())
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    ):
+        if (
+            track.album
+            and track.album.artist
+            and normalize_match_text(track.album.artist.name) == artist_key
             and normalize_match_text(track.title) == title_key
         ):
             return track
@@ -5599,20 +5631,7 @@ def _try_create_pending_playlists(session: Session) -> None:
             if track and track.jellyfin_item_id:
                 jf_ids.append(track.jellyfin_item_id)
 
-        if not jf_ids:
-            retry_count += 1
-            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
-                write_app_log(f"Pending playlist '{playlist_name}': giving up after {retry_count} retries with no tracks mapped", level="warning")
-                if stored_user_id:
-                    create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created in Jellyfin — no imported tracks were found after several sync attempts.", event_type="playlist_import_failed")
-                session.delete(setting)
-            else:
-                write_app_log(f"Pending playlist '{playlist_name}': no tracks mapped yet (attempt {retry_count}/{_PENDING_PLAYLIST_MAX_RETRIES}); will retry next sync", level="info")
-                data["retry_count"] = retry_count
-                setting.value = json.dumps(data)
-            continue
-
-        # Find the Jellyfin user ID: prefer the user who initiated the import
+        # Find the Jellyfin user ID: prefer the user who initiated the import.
         jf_user_id = None
         if stored_user_id:
             initiating_user = session.scalar(select(User).where(User.id == stored_user_id))
@@ -5622,27 +5641,75 @@ def _try_create_pending_playlists(session: Session) -> None:
             fallback = session.scalar(select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != ""))
             if fallback:
                 jf_user_id = fallback.jellyfin_user_id
-        if not jf_user_id:
-            write_app_log(f"Pending playlist '{playlist_name}': no linked Jellyfin user found; skipping", level="warning")
+
+        playlist_id = data.get("jellyfin_playlist_id") or ""
+        added_ids = set(data.get("added_ids") or [])
+        new_ids = [jf_id for jf_id in jf_ids if jf_id not in added_ids]
+        total_titled = len([t for t in original_tracks if t.get("title")])
+
+        # Nothing mapped yet and no playlist created — wait for tracks to finish downloading.
+        if not jf_ids and not playlist_id:
+            retry_count += 1
+            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
+                write_app_log(f"Pending playlist '{playlist_name}': giving up after {retry_count} retries with no tracks mapped", level="warning")
+                if stored_user_id:
+                    create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created in Jellyfin — no imported tracks were found after several sync attempts.", event_type="playlist_import_failed")
+                session.delete(setting)
+            else:
+                data["retry_count"] = retry_count
+                setting.value = json.dumps(data)
             continue
 
+        if not jf_user_id:
+            write_app_log(f"Pending playlist '{playlist_name}': no linked Jellyfin user found; will retry", level="warning")
+            continue
+
+        # Create the playlist once, then ADD newly-imported tracks on later syncs — a big
+        # playlist downloads over time (slskd is slow + staged review), so don't finalize on
+        # the first batch or the rest of the tracks never get added.
         try:
             with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
-                resp = client.post("/Playlists", json={
-                    "Name": playlist_name,
-                    "UserId": jf_user_id,
-                    "MediaType": "Audio",
-                    "Ids": jf_ids,
-                })
-                resp.raise_for_status()
-            write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(jf_ids)} track(s)")
-            if stored_user_id:
-                create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library with {len(jf_ids)} track(s).", event_type="playlist_import_done")
+                if not playlist_id:
+                    # Re-import with the same name UPDATES the existing playlist instead of
+                    # creating a duplicate.
+                    try:
+                        playlist_id = find_jellyfin_playlist(client, jf_user_id, playlist_name) or ""
+                    except Exception:  # noqa: BLE001
+                        playlist_id = ""
+                    if playlist_id:
+                        data["jellyfin_playlist_id"] = playlist_id
+                        if new_ids:
+                            client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
+                        write_app_log(f"Updated existing Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
+                    else:
+                        resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
+                        resp.raise_for_status()
+                        playlist_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
+                        data["jellyfin_playlist_id"] = playlist_id
+                        write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
+                        if stored_user_id:
+                            create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
+                elif new_ids:
+                    client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
+                    write_app_log(f"Added {len(new_ids)} newly-imported track(s) to Jellyfin playlist '{playlist_name}'")
         except Exception as error:  # noqa: BLE001
-            write_app_log(f"Failed to create Jellyfin playlist '{playlist_name}': {error}", level="warning")
+            write_app_log(f"Failed to update Jellyfin playlist '{playlist_name}': {error}", level="warning")
             continue
 
-        session.delete(setting)
+        added_ids.update(new_ids)
+        data["added_ids"] = list(added_ids)
+        # Done once every original track is in. Otherwise keep the pending record so late
+        # downloads are added later; give up only after several syncs add nothing new.
+        if len(added_ids) >= total_titled:
+            session.delete(setting)
+        else:
+            retry_count = 0 if new_ids else retry_count + 1
+            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
+                write_app_log(f"Pending playlist '{playlist_name}': added {len(added_ids)} of {total_titled}; no new tracks after {retry_count} syncs — finalizing", level="warning")
+                session.delete(setting)
+            else:
+                data["retry_count"] = retry_count
+                setting.value = json.dumps(data)
 
     session.commit()
 
@@ -7908,20 +7975,17 @@ async def worker_loop() -> None:
                         scan_result = import_completed_downloads(session)
                         if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
                             summary = f"{scan_result.get('waiting', 0)}:{scan_result.get('ready', 0)}:{scan_result.get('failed', 0)}"
-                            now = time.time()
-                            if summary == last_download_scan_summary and now - last_download_scan_log < 120:
-                                session.commit()
-                                last_download_scan = now
-                                await deliver_apns_notifications(session)
-                                await asyncio.sleep(2)
-                                continue
-                            append_task_log(
-                                session,
-                                None,
-                                f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
-                            )
-                            last_download_scan_summary = summary
-                            last_download_scan_log = now
+                            # Log only when the picture changes — otherwise a persistent
+                            # "1 needing attention" logs every scan tick (every ~2 min) forever.
+                            if summary != last_download_scan_summary:
+                                append_task_log(
+                                    session,
+                                    None,
+                                    f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
+                                )
+                                last_download_scan_summary = summary
+                        else:
+                            last_download_scan_summary = ""
                         cleanup_orphaned_download_batches(session)
                         session.commit()
                     except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
