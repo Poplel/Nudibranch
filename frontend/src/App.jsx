@@ -7818,6 +7818,14 @@ function parseLrc(text) {
   return lines.sort((a, b) => a.time - b.time);
 }
 
+// ReplayGain applied at playback as an attenuate-only volume multiplier (<=1) so the audio
+// element never needs to boost (which it can't) and can never clip. NULL gain = no change.
+function replayGainVolume(track) {
+  const gain = track?.replaygain_track_gain;
+  if (gain == null || Number.isNaN(Number(gain))) return 1;
+  return Math.min(1, Math.pow(10, Number(gain) / 20));
+}
+
 function AudioPlayer({
   controlRef,
   currentTrack,
@@ -7857,6 +7865,10 @@ function AudioPlayer({
   const loadedUrlRef = useRef({ a: null, b: null });
   const activeAudio = () => (activeKeyRef.current === "a" ? audioARef.current : audioBRef.current);
   const inactiveAudio = () => (activeKeyRef.current === "a" ? audioBRef.current : audioARef.current);
+  // Per-track ReplayGain multipliers — applied wherever we set element volume so each track
+  // plays at a consistent loudness. `nextGain` is for the preloaded/crossfade target.
+  const currentGain = replayGainVolume(currentTrack);
+  const nextGain = replayGainVolume(queue && currentIndex >= 0 ? queue[currentIndex + 1] : null);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const trackCopyRef = useRef(null);
@@ -7927,7 +7939,7 @@ function AudioPlayer({
       loaded[key] = audioUrl;
       try { el.currentTime = 0; } catch { /* not seekable yet */ }
     }
-    el.volume = 1;
+    el.volume = currentGain;
     if (el.duration) setDuration(el.duration);
     el.play?.().catch(() => {});
   }, [audioUrl, activeKey]);
@@ -8225,8 +8237,8 @@ function AudioPlayer({
     crossfadeIntervalRef.current = setInterval(() => {
       const elapsed = (performance.now() - startTime) / 1000;
       const frac = Math.min(elapsed / fadeSec, 1);
-      if (active) active.volume = Math.max(0, 1 - frac);
-      if (next) next.volume = Math.min(1, frac);
+      if (active) active.volume = currentGain * Math.max(0, 1 - frac);
+      if (next) next.volume = nextGain * Math.min(1, frac);
       if (frac >= 1) {
         clearInterval(crossfadeIntervalRef.current);
         crossfadeIntervalRef.current = null;
