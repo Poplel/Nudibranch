@@ -3302,6 +3302,8 @@ function ApprovalNode({
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
   const statusMeta = itemStatusMeta(item);
+  // file_move / delete leaves carry old_value (from) + new_value (to) — show the move.
+  const isFileMoveLeaf = (item.kind === "file_move" || item.kind === "delete") && children.length === 0 && Boolean(item.new_value);
   const hasDownloadCandidateChildren = children.some((child) => {
     const grandchildren = childrenById.get(child.id) || [];
     return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
@@ -3346,7 +3348,11 @@ function ApprovalNode({
             <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} compact />
           )}
         </span>
-        <small>{metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}</small>
+        <small title={isFileMoveLeaf ? `${item.old_value || "?"} → ${item.new_value || "?"}` : undefined}>
+          {isFileMoveLeaf
+            ? `${shortPath(item.old_value)} → ${shortPath(item.new_value)}`
+            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}
+        </small>
         {leafDownloadCandidate && hasAlternateCandidates && (
           <button
             className="row-icon-button"
@@ -8838,6 +8844,14 @@ function isDownloadActionItem(item) {
 function lowestLevelItems(items) {
   const parentIds = new Set(items.map((item) => item.parent_id).filter(Boolean));
   return items.filter((item) => !parentIds.has(item.id));
+}
+
+// Last two path segments — enough to show a file move's source/destination folder
+// without overflowing the row; the full paths are in the row's title (hover).
+function shortPath(value) {
+  if (!value) return "?";
+  const parts = String(value).split("/").filter(Boolean);
+  return parts.slice(-2).join("/") || String(value);
 }
 
 function candidateMeta(item) {
