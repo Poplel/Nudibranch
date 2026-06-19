@@ -110,14 +110,26 @@ def metadata_number(value: object) -> str | None:
 
 def metadata_from_path(file_path: Path) -> dict:
     settings = get_settings()
-    try:
-        relative_parts = file_path.resolve().relative_to(settings.import_path.resolve()).parts
-    except ValueError:
-        relative_parts = file_path.parts
-
+    resolved = file_path.resolve()
     title = clean_name(file_path.stem) or UNKNOWN_TITLE
-    album = clean_name(relative_parts[-2]) if len(relative_parts) >= 2 else UNKNOWN_ALBUM
-    artist = clean_name(relative_parts[-3]) if len(relative_parts) >= 3 else UNKNOWN_ARTIST
+    album = UNKNOWN_ALBUM
+    artist = UNKNOWN_ARTIST
+    relative_parts = None
+    try:
+        relative_parts = resolved.relative_to(settings.import_path.resolve()).parts
+    except ValueError:
+        # Not under the import folder. Derive artist/album from the path ONLY if it's not a
+        # staging/downloads temp folder — those parents are batch-id UUIDs, not albums (this is
+        # what produced UUID-named albums for untagged Singles downloads).
+        in_temp = any(
+            resolved.is_relative_to(base.resolve()) for base in (settings.staging_path, settings.downloads_path)
+        )
+        if not in_temp:
+            relative_parts = file_path.parts
+
+    if relative_parts is not None:
+        album = clean_name(relative_parts[-2]) if len(relative_parts) >= 2 else UNKNOWN_ALBUM
+        artist = clean_name(relative_parts[-3]) if len(relative_parts) >= 3 else UNKNOWN_ARTIST
     return {
         "artist": artist or UNKNOWN_ARTIST,
         "album": album or UNKNOWN_ALBUM,
