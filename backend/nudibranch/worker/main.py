@@ -2513,6 +2513,21 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
     )
     label = entry_download_label(entry)
     append_task_log(session, None, f"{label}: could not download from Soulseek after {retry_count} candidate(s): {reason}", "error")
+    # Don't dead-end: auto re-queue this track via YouTube so the rest of the batch/playlist
+    # isn't held up. The request carries wishlist_item_id, so when yt-dlp imports it the
+    # wishlist item completes and it joins any pending playlist. (yt-dlp failing is terminal
+    # — run_ytdlp_download marks its own item "needs attention", so no retry loop.)
+    request = download_request_from_item(item)
+    query = download_query(request) if request else ""
+    if request and query:
+        try:
+            create_ytdlp_fallback_batch(session, request, query)
+            payload["status"] = "Soulseek failed — retrying via YouTube"
+            item.payload_json = json.dumps(payload)
+            append_task_log(session, None, f"{label}: Soulseek exhausted — auto-queued YouTube fallback", "warning")
+            return False
+        except Exception as error:  # noqa: BLE001 - fall through to a needs-attention notice.
+            append_task_log(session, None, f"{label}: could not queue YouTube fallback: {error}", "error")
     create_notification(
         session,
         title="Download needs attention",

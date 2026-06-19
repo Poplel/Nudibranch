@@ -4257,7 +4257,9 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
             if item.kind != ProposalKind.download or item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed}:
                 continue
             payload = json.loads(item.payload_json or "{}")
-            if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
+            # queue_download = slskd; queue_ytdlp_download = the YouTube fallback retry. Both
+            # keep the wishlist item "active" so it isn't demoted to wanted while downloading.
+            if payload.get("action") not in {"queue_download", "queue_ytdlp_download"} or payload.get("auto_retry_exhausted"):
                 continue
             request = payload.get("request") or {}
             wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
