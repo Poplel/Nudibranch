@@ -248,6 +248,9 @@ class Playlist(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     protected: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     jellyfin_playlist_id: Mapped[str | None] = mapped_column(String(128))
+    # Source the playlist was imported from (e.g. a Spotify/Apple Music URL) so re-importing
+    # the same playlist updates this record instead of creating a duplicate.
+    origin: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
     user: Mapped["User | None"] = relationship()

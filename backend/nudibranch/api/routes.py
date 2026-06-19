@@ -2351,6 +2351,7 @@ def propose_import(
             "playlist_name": payload.playlist_name,
             "original_tracks": payload.playlist_original_tracks,
             "user_id": current_user.id,
+            "origin": (payload.playlist_origin or "").strip() or None,
             "retry_count": 0,
         }))
         session.add(setting)

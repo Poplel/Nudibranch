@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import re
 import shutil
@@ -5581,6 +5582,37 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
 _PENDING_PLAYLIST_MAX_RETRIES = 8
 
 
+def _origin_registry_key(user_id: str, origin: str) -> str:
+    """AppSetting key mapping an import origin (source URL) → the created Jellyfin playlist id,
+    so re-importing the same playlist updates it instead of duplicating. Hashed to fit the key
+    column and avoid the Playlist(user_id, name) unique constraint."""
+    digest = hashlib.sha1(origin.encode("utf-8")).hexdigest()[:24]
+    return f"playlist_origin:{user_id}:{digest}"
+
+
+def _jellyfin_playlist_for_origin(session: Session, user_id: str, origin: str | None) -> str | None:
+    if not origin or not user_id:
+        return None
+    row = session.get(AppSetting, _origin_registry_key(user_id, origin))
+    return row.value if row and row.value else None
+
+
+def _record_jellyfin_playlist_origin(session: Session, user_id: str, origin: str | None, playlist_id: str) -> None:
+    if not origin or not user_id or not playlist_id:
+        return
+    _upsert_setting(session, _origin_registry_key(user_id, origin), playlist_id)
+
+
+def _jellyfin_playlist_item_ids(client: httpx.Client, playlist_id: str, jf_user_id: str) -> set[str]:
+    """Jellyfin item ids currently in a playlist — used to avoid adding duplicates on re-import."""
+    try:
+        resp = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id})
+        resp.raise_for_status()
+        return {item.get("Id") for item in resp.json().get("Items", []) if item.get("Id")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def _try_create_pending_playlists(session: Session) -> None:
     """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
     pending_settings = list(session.scalars(
@@ -5644,10 +5676,17 @@ def _try_create_pending_playlists(session: Session) -> None:
 
         playlist_id = data.get("jellyfin_playlist_id") or ""
         added_ids = set(data.get("added_ids") or [])
-        new_ids = [jf_id for jf_id in jf_ids if jf_id not in added_ids]
         total_titled = len([t for t in original_tracks if t.get("title")])
+        origin = data.get("origin")
 
-        # Nothing mapped yet and no playlist created — wait for tracks to finish downloading.
+        # Reuse the playlist this origin was imported into before (re-import → update, not a
+        # duplicate). Falls back to find-by-name below for playlists created before origin tracking.
+        if not playlist_id and origin:
+            playlist_id = _jellyfin_playlist_for_origin(session, stored_user_id, origin) or ""
+            if playlist_id:
+                data["jellyfin_playlist_id"] = playlist_id
+
+        # Nothing mapped yet and no playlist — wait for tracks to finish downloading.
         if not jf_ids and not playlist_id:
             retry_count += 1
             if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
@@ -5664,39 +5703,40 @@ def _try_create_pending_playlists(session: Session) -> None:
             write_app_log(f"Pending playlist '{playlist_name}': no linked Jellyfin user found; will retry", level="warning")
             continue
 
-        # Create the playlist once, then ADD newly-imported tracks on later syncs — a big
-        # playlist downloads over time (slskd is slow + staged review), so don't finalize on
-        # the first batch or the rest of the tracks never get added.
+        # Create the playlist once, then ADD newly-imported tracks on later syncs (a big playlist
+        # downloads over time). Always de-dup against the playlist's REAL contents so re-imports
+        # never add duplicates.
+        new_ids: list[str] = []
         try:
             with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
                 if not playlist_id:
-                    # Re-import with the same name UPDATES the existing playlist instead of
-                    # creating a duplicate.
                     try:
                         playlist_id = find_jellyfin_playlist(client, jf_user_id, playlist_name) or ""
                     except Exception:  # noqa: BLE001
                         playlist_id = ""
-                    if playlist_id:
-                        data["jellyfin_playlist_id"] = playlist_id
-                        if new_ids:
-                            client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
-                        write_app_log(f"Updated existing Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
-                    else:
-                        resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
-                        resp.raise_for_status()
-                        playlist_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
-                        data["jellyfin_playlist_id"] = playlist_id
-                        write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
-                        if stored_user_id:
-                            create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
-                elif new_ids:
-                    client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
-                    write_app_log(f"Added {len(new_ids)} newly-imported track(s) to Jellyfin playlist '{playlist_name}'")
+                if playlist_id:
+                    current = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
+                    new_ids = [jf_id for jf_id in jf_ids if jf_id not in current]
+                    if new_ids:
+                        client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
+                        write_app_log(f"Added {len(new_ids)} track(s) to Jellyfin playlist '{playlist_name}'")
+                    data["jellyfin_playlist_id"] = playlist_id
+                    added_ids = current | set(jf_ids)
+                else:
+                    new_ids = list(jf_ids)
+                    resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
+                    resp.raise_for_status()
+                    playlist_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
+                    data["jellyfin_playlist_id"] = playlist_id
+                    added_ids = set(new_ids)
+                    write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
+                    if stored_user_id:
+                        create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
+                _record_jellyfin_playlist_origin(session, stored_user_id, origin, playlist_id)
         except Exception as error:  # noqa: BLE001
             write_app_log(f"Failed to update Jellyfin playlist '{playlist_name}': {error}", level="warning")
             continue
 
-        added_ids.update(new_ids)
         data["added_ids"] = list(added_ids)
         # Done once every original track is in. Otherwise keep the pending record so late
         # downloads are added later; give up only after several syncs add nothing new.
@@ -5757,15 +5797,22 @@ def create_pending_native_playlists(session: Session) -> None:
             ).first()
             if track:
                 resolved_ids.append(track.id)
-        playlist = session.scalar(
-            select(Playlist).where(Playlist.user_id == stored_user_id, func.lower(Playlist.name) == playlist_name.lower())
-        )
+        # Reuse the playlist this origin was imported into before (re-import → update); fall
+        # back to name for playlists created before origin tracking.
+        origin = data.get("origin")
+        playlist = None
+        if origin:
+            playlist = session.scalar(select(Playlist).where(Playlist.user_id == stored_user_id, Playlist.origin == origin))
+        if not playlist:
+            playlist = session.scalar(select(Playlist).where(Playlist.user_id == stored_user_id, func.lower(Playlist.name) == playlist_name.lower()))
         if resolved_ids and not playlist:
-            playlist = Playlist(name=playlist_name, user_id=stored_user_id, protected=False)
+            playlist = Playlist(name=playlist_name, user_id=stored_user_id, protected=False, origin=origin)
             session.add(playlist)
             session.flush()
             create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added with {len(resolved_ids)} track(s).", event_type="playlist_import_done")
             write_app_log(f"Created Nudibranch playlist '{playlist_name}' with {len(resolved_ids)} track(s)")
+        if playlist and origin and not playlist.origin:
+            playlist.origin = origin
         if playlist and resolved_ids:
             existing_ids = {pt.track_id for pt in playlist.tracks}
             next_position = max((pt.position or 0) for pt in playlist.tracks) + 1 if playlist.tracks else 1

@@ -76,6 +76,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
     if "replaygain_track_gain" not in track_columns:
         session.execute(text("ALTER TABLE tracks ADD COLUMN replaygain_track_gain FLOAT NULL"))
         session.commit()
+    playlist_columns = {row[1] for row in session.execute(text("PRAGMA table_info(playlists)"))}
+    if "origin" not in playlist_columns:
+        session.execute(text("ALTER TABLE playlists ADD COLUMN origin TEXT NULL"))
+        session.commit()
     user_columns = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
     if "theme" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'light'"))

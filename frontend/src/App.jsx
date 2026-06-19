@@ -173,6 +173,9 @@ function App() {
   const [playlistImportLoading, setPlaylistImportLoading] = useState(false);
     const [pendingPlaylistName, setPendingPlaylistName] = useState(null);
   const [pendingPlaylistOriginalTracks, setPendingPlaylistOriginalTracks] = useState(null);
+  // Source playlist URL — the "origin" so re-importing the same playlist updates the
+  // existing Nudibranch/Jellyfin playlist instead of creating a duplicate.
+  const [pendingPlaylistOrigin, setPendingPlaylistOrigin] = useState(null);
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
@@ -976,6 +979,7 @@ function App() {
           download_requests: downloadRequests,
           playlist_name: pendingPlaylistName || null,
           playlist_original_tracks: pendingPlaylistOriginalTracks || null,
+          playlist_origin: pendingPlaylistOrigin || null,
         }),
       });
       setTasks((current) => upsertTask(current, task));
@@ -985,6 +989,7 @@ function App() {
       setImportSeedDownloads([]);
       setPendingPlaylistName(null);
       setPendingPlaylistOriginalTracks(null);
+      setPendingPlaylistOrigin(null);
       setPage("Task Queue");
       window.setTimeout(() => {
         refreshApprovals();
@@ -1356,6 +1361,7 @@ function App() {
         addToTree(incoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
+        setPendingPlaylistOrigin(url);
         setPlaylistImportUrl("");
         setToast({ title: "Added to import", body: `${tracks.length} track${tracks.length === 1 ? "" : "s"} added to the import tree.` });
       } else {
@@ -1404,6 +1410,7 @@ function App() {
         addToTree(allIncoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
+        setPendingPlaylistOrigin(url);
         setPlaylistImportUrl("");
         setToast({ title: "Added to import", body: `${allIncoming.length} track${allIncoming.length === 1 ? "" : "s"} from ${albumsResolved} album${albumsResolved === 1 ? "" : "s"} added to the import tree.` });
       }

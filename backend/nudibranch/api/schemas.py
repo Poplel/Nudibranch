@@ -325,6 +325,7 @@ class ImportScanRequest(BaseModel):
     download_requests: list[dict[str, Any]] | None = None
     playlist_name: str | None = None
     playlist_original_tracks: list[dict[str, Any]] | None = None
+    playlist_origin: str | None = None
 
 
 class ImportMusicBrainzLookupRequest(BaseModel):
