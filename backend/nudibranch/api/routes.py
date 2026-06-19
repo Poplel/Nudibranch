@@ -4180,23 +4180,60 @@ def expire_old_terminal_wishlist_items(session: Session, items: list[WishlistIte
 
 
 def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> None:
-    query = select(WishlistItem).where(WishlistItem.status == "approved")
+    # Look at non-terminal items: complete any whose download finished, and demote stale
+    # "approved" ones (abandoned downloads) back to "wanted".
+    query = select(WishlistItem).where(WishlistItem.status.in_(["approved", "wanted", "review"]))
     if not user_has_permission(user, Permission.wishlist_manage_all):
         query = query.where(WishlistItem.user_id == user.id)
-    approved_items = list(session.scalars(query))
-    if not approved_items:
+    items = list(session.scalars(query))
+    if not items:
         return
     active_ids = active_wishlist_download_ids(session)
+    # A download that finished is no longer "active", so an item whose download COMPLETED must
+    # be marked completed — otherwise an item that downloaded + imported reverts to "Awaiting
+    # Approval" (the queue_download item went terminal, reconcile then demoted approved→wanted).
+    # Keyed on the exact wishlist_item_id carried by the download item, so it works even when
+    # mark_matching_wishlist_completed missed it on fuzzy metadata (deluxe titles, feat., quotes).
+    completed_ids = completed_wishlist_download_ids(session)
     changed = False
     now = datetime.now(timezone.utc)
-    for item in approved_items:
-        if item.id in active_ids:
+    for item in items:
+        if item.id in completed_ids:
+            if item.status != "completed":
+                item.status = "completed"
+                item.status_changed_at = now
+                changed = True
             continue
-        item.status = "wanted"
-        item.status_changed_at = now
-        changed = True
+        # Only "approved" (a download was queued) demotes when its download is gone; genuine
+        # "wanted"/"review" items are left untouched.
+        if item.status == "approved" and item.id not in active_ids:
+            item.status = "wanted"
+            item.status_changed_at = now
+            changed = True
     if changed:
         session.commit()
+
+
+def completed_wishlist_download_ids(session: Session) -> set[str]:
+    """Wishlist item ids whose linked download ProposalItem has completed (downloaded+imported)."""
+    ids: set[str] = set()
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.kind == ProposalKind.download)
+        )
+    )
+    for batch in batches:
+        for item in batch.items:
+            if item.kind != ProposalKind.download or item.status != ProposalStatus.completed:
+                continue
+            payload = json.loads(item.payload_json or "{}")
+            request = payload.get("request") or {}
+            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
+            if wishlist_item_id:
+                ids.add(wishlist_item_id)
+    return ids
 
 
 def active_wishlist_download_ids(session: Session) -> set[str]:
