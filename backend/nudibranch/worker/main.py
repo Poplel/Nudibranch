@@ -254,10 +254,12 @@ def add_download_candidate_review_items(
         album = request.get("album") or "Unknown Album"
         title = request.get("track") or request.get("title") or "Unknown Track"
         existing = find_library_track(session, artist, album, title)
-        # Playlist imports carry an unreliable album hint, so also skip the download if the
-        # song already exists under any album (it still gets added to the playlist from the
-        # library copy via the pending-playlist resolver, which matches on artist+title).
-        if not existing and request.get("playlist_name"):
+        # A request with no specific album (playlist track / Singles / unknown) just wants the
+        # SONG, so skip the download if it already exists under ANY album (matched on
+        # artist+title). It still gets added to a playlist from the library copy via the
+        # pending-playlist resolver. (Real album downloads keep the album-strict check above.)
+        req_album = (request.get("album") or "").strip().lower()
+        if not existing and (request.get("playlist_name") or req_album in {"", "singles", "unknown album"}):
             existing = library_track_by_artist_title(session, artist, title)
         if existing:
             append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping download", "info")
