@@ -4895,6 +4895,8 @@ const SORT_NAME_INFO =
   "An optional alternate spelling used only for alphabetical sorting — e.g. \"Beatles, The\" for \"The Beatles\". Leave blank to sort by the displayed name.";
 const MB_ID_INFO =
   "MusicBrainz's unique identifier for this record. It links the entry to MusicBrainz so metadata, artwork, and matching stay accurate. Usually filled automatically; only change it if you know the correct ID.";
+const REPLAYGAIN_INFO =
+  "Volume adjustment in dB applied at playback so tracks sound equally loud (ReplayGain, -18 LUFS reference). Negative values quieten loud tracks. Non-destructive — the audio file isn't changed. Measured by the \"Apply ReplayGain\" tool; clear to disable for this track.";
 
 function artistFields(artist) {
   return [
@@ -4937,6 +4939,7 @@ function trackFields(track) {
     { key: "bitrate", label: "Bitrate", value: track.bitrate, type: "number", readOnly: true },
     { key: "path", label: "Path", value: track.path, readOnly: true },
     { key: "musicbrainz_recording_id", label: "MusicBrainz recording ID", value: track.musicbrainz_recording_id, info: MB_ID_INFO },
+    { key: "replaygain_track_gain", label: "ReplayGain (dB)", value: track.replaygain_track_gain, type: "number", info: REPLAYGAIN_INFO },
     { key: "explicit", label: "Explicit", value: track.explicit, type: "boolean" },
     { key: "is_lossless", label: "Lossless", value: track.is_lossless, type: "boolean", readOnly: true },
     { key: "musicbrainz_verified", label: "MusicBrainz verified", value: track.musicbrainz_verified, type: "boolean", readOnly: true },
@@ -5413,7 +5416,7 @@ function taskDisplayName(task) {
     check_missing_tracks: "Checking missing tracks",
     check_non_lossless: "Checking audio quality",
     check_audio_content: "Verifying audio content",
-    normalize_volume: "Normalizing volume",
+    apply_replaygain: "Measuring ReplayGain",
     propose_import: "Preparing import",
     ytdlp_download: "Downloading",
     jellyfin_scan: "Scanning Jellyfin",
@@ -5454,7 +5457,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
     ["Check MusicBrainz IDs", "Scan the library for missing MusicBrainz IDs and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
     ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
     ["Check lossy tracks", "Find fake lossless or less than lossless files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
-    ["Normalize volume", "Normalize volume for all tracks.", "normalize-volume", "library:manage"],
+    ["Apply ReplayGain", "Measure loudness and propose ReplayGain for all tracks (non-destructive; review-gated).", "apply-replaygain", "library:manage"],
     ["Consolidate album folders", "Find albums whose tracks are split across folders and consolidate.", "consolidate-folders", "library:manage"],
     ["Clear downloads folder", "Remove all files from /app/downloads.", "clear-downloads", "downloads:manage"],
     ["Backup now", "Create a database backup.", "backup", "backups:manage"],
@@ -5555,7 +5558,7 @@ const TOOL_OPTIONS = [
   ["Check MusicBrainz IDs", "check-musicbrainz-ids"],
   ["Check audio content", "check-audio-content"],
   ["Check lossy tracks", "check-non-lossless"],
-  ["Normalize volume", "normalize-volume"],
+  ["Apply ReplayGain", "apply-replaygain"],
   ["Consolidate folders", "consolidate-folders"],
   ["Clear downloads", "clear-downloads"],
   ["Backup now", "backup"],

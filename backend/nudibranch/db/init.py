@@ -73,6 +73,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE tracks ADD COLUMN jellyfin_item_id VARCHAR(128) NULL"))
         session.execute(text("CREATE INDEX IF NOT EXISTS ix_tracks_jellyfin_item_id ON tracks(jellyfin_item_id)"))
         session.commit()
+    if "replaygain_track_gain" not in track_columns:
+        session.execute(text("ALTER TABLE tracks ADD COLUMN replaygain_track_gain FLOAT NULL"))
+        session.commit()
     user_columns = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
     if "theme" not in user_columns:
         session.execute(text("ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'light'"))

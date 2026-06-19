@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -207,6 +207,10 @@ class Track(Base):
     path: Mapped[str | None] = mapped_column(Text, index=True)
     musicbrainz_recording_id: Mapped[str | None] = mapped_column(String(64), index=True)
     jellyfin_item_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # ReplayGain track gain in dB (ReplayGain 2.0, -18 LUFS reference). NULL = not measured.
+    # Non-destructive volume normalization: the player applies it at playback; the tool also
+    # writes it to the file's REPLAYGAIN_TRACK_GAIN tag.
+    replaygain_track_gain: Mapped[float | None] = mapped_column(Float)
     explicit: Mapped[bool | None] = mapped_column(Boolean)
     is_lossless: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     musicbrainz_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

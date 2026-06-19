@@ -1266,6 +1266,7 @@ def library_tree(
                             metadata_locked=track.metadata_locked,
                             artwork_locked=track.artwork_locked,
                             filename_locked=track.filename_locked,
+                            replaygain_track_gain=track.replaygain_track_gain,
                         )
                         for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999))
                     ],
@@ -1375,6 +1376,7 @@ def library_tracks(
             artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
             track_number=t.track_number, disc_number=t.disc_number,
             duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
+            replaygain_track_gain=t.replaygain_track_gain,
         )
         for t in rows
     ]
@@ -2953,6 +2955,7 @@ def _build_playlist_out(pl_id: str, pl_name: str, items: list[dict], session: Se
                 album=item.get("Album") or album_title,
                 album_id=track.album_id,
                 format=track.format,
+                replaygain_track_gain=track.replaygain_track_gain,
             ))
     return FavoritesOut(id=pl_id, name=pl_name, protected=protected, track_ids=track_ids, tracks=playlist_tracks, track_count=len(items))
 
@@ -3017,6 +3020,7 @@ def _native_playlist_out(session: Session, playlist: Playlist) -> FavoritesOut:
             album=album_title,
             album_id=track.album_id,
             format=track.format,
+            replaygain_track_gain=track.replaygain_track_gain,
         ))
     pid = "favorites" if playlist.protected else playlist.id
     return FavoritesOut(id=pid, name=playlist.name, protected=playlist.protected, track_ids=track_ids, tracks=tracks_out, track_count=len(track_ids))
@@ -3528,12 +3532,12 @@ def tool_check_non_lossless(
     return serialize_task(enqueue_task(session, "check_non_lossless", {}))
 
 
-@router.post("/tools/normalize-volume", response_model=TaskOut, tags=["tools"], summary="Normalize volume (ReplayGain)")
-def tool_normalize_volume(
+@router.post("/tools/apply-replaygain", response_model=TaskOut, tags=["tools"], summary="Measure + apply ReplayGain (review-gated)")
+def tool_apply_replaygain(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "normalize_volume", {}))
+    return serialize_task(enqueue_task(session, "apply_replaygain", {}))
 
 
 @router.post("/tools/consolidate-folders", response_model=TaskOut, tags=["tools"], summary="Consolidate album folders")
@@ -4011,6 +4015,7 @@ def serialize_favorites(session: Session, playlist: Playlist) -> FavoritesOut:
             album=entry.track.album.title,
             album_id=entry.track.album_id,
             format=entry.track.format,
+            replaygain_track_gain=entry.track.replaygain_track_gain,
         )
         for entry in entries
     ]

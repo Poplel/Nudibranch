@@ -19,6 +19,7 @@ from nudibranch.db.init import init_db
 from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
+from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
@@ -995,6 +996,10 @@ def apply_metadata_item(session: Session, item: ProposalItem) -> None:
         if not target:
             raise ValueError("Track no longer exists")
         apply_scalar_changes(target, changes, editable_track_fields())
+        # ReplayGain is non-destructive: besides the DB value (the player reads it), write
+        # the standard REPLAYGAIN_TRACK_GAIN tag so Jellyfin/other players honour it too.
+        if "replaygain_track_gain" in changes and target.path and Path(target.path).exists():
+            write_replaygain_tag(Path(target.path), target.replaygain_track_gain)
     else:
         raise ValueError("Unsupported metadata target")
 
@@ -5235,6 +5240,7 @@ def editable_track_fields() -> set[str]:
         "metadata_locked",
         "artwork_locked",
         "filename_locked",
+        "replaygain_track_gain",
     }
 
 
@@ -5242,9 +5248,6 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
     payload = json.loads(item.payload_json or "{}")
     source_path = Path(item.old_value or "")
     track = session.get(Track, payload.get("track_id"))
-    if payload.get("action") == "normalize_volume":
-        normalize_audio_file_volume(source_path)
-        return
     if payload.get("action") == "remove_empty_album":
         # Record-only deletion of an orphan 0-track album row. Never touches files —
         # an empty duplicate often shares its folder/cover.jpg with the real album.
@@ -5313,28 +5316,6 @@ def apply_file_action_item(session: Session, item: ProposalItem) -> None:
         session.delete(track)
         session.flush()
         cleanup_empty_album_artist(session, album)
-
-
-def normalize_audio_file_volume(source_path: Path) -> None:
-    if not source_path.exists():
-        raise FileNotFoundError(f"{source_path} no longer exists")
-    temp_path = source_path.with_name(f".nudibranch-normalized-{source_path.name}")
-    command = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        str(source_path),
-        "-af",
-        "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-map_metadata",
-        "0",
-        str(temp_path),
-    ]
-    subprocess.run(command, check=True, capture_output=True, text=True, timeout=3600)
-    backup_path = unique_destination(get_settings().trash_path / source_path.name)
-    backup_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(source_path), str(backup_path))
-    shutil.move(str(temp_path), str(source_path))
 
 
 def delete_stale_download_file(entry: dict) -> None:
@@ -7141,35 +7122,74 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": created, "batch_id": batch.id}
 
 
-def run_normalize_volume(session: Session, _payload: dict) -> dict:
-    discard_pending_batches(session, "Normalize library volume", ProposalKind.file_move)
-    tracks = list(session.scalars(select(Track).where(Track.path.is_not(None)).order_by(Track.title.asc())))
-    batch = ProposalBatch(title="Normalize library volume", kind=ProposalKind.file_move, tree_path="/library")
+def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Measure each track's loudness (ffmpeg ebur128) and propose its ReplayGain track gain
+    as a reviewable metadata change (Artist>Album>Track tree). Non-destructive — apply only
+    writes the DB value + the REPLAYGAIN_TRACK_GAIN tag; samples are never touched."""
+    discard_pending_batches(session, "Apply ReplayGain", ProposalKind.metadata)
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+            .order_by(Track.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Apply ReplayGain", kind=ProposalKind.metadata, tree_path="/library")
     session.add(batch)
     session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
     created = 0
+    checked = 0
+    total = max(1, len(tracks))
     for track in tracks:
+        checked += 1
+        if task is not None and checked % 5 == 0:
+            update_task_progress(session, task, checked, total, f"Measuring loudness for {track.title}")
         if not track.path or not Path(track.path).exists():
             continue
+        gain = measure_track_gain(Path(track.path))
+        if gain is None:
+            continue
+        # Skip tracks already at this gain (idempotent re-runs).
+        if track.replaygain_track_gain is not None and abs(track.replaygain_track_gain - gain) < 0.01:
+            continue
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        if artist_name not in artist_items:
+            artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.metadata, payload_json=json.dumps({"artist": artist_name}))
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        album_key = (artist_name, album_title)
+        if album_key not in album_items:
+            album_item = ProposalItem(batch_id=batch.id, parent_id=artist_items[artist_name].id, title=album_title, kind=ProposalKind.metadata, payload_json=json.dumps({"artist": artist_name, "album": album_title}))
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        changes = {"replaygain_track_gain": gain}
         session.add(
             ProposalItem(
                 batch_id=batch.id,
+                parent_id=album_items[album_key].id,
                 title=track.title,
-                kind=ProposalKind.file_move,
-                old_value=track.path,
-                new_value=track.path,
-                payload_json=json.dumps({"action": "normalize_volume", "track_id": track.id, "path": track.path}),
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"replaygain_track_gain": track.replaygain_track_gain}),
+                new_value=json.dumps(changes),
+                payload_json=json.dumps({"target_type": "track", "target_id": track.id, "changes": changes}),
             )
         )
         created += 1
     if created == 0:
         session.delete(batch)
-        write_app_log("Volume check complete: no library files were found to normalize", level="info", event_type="tool_completed")
+        write_app_log("ReplayGain scan complete: every track already has up-to-date gain", level="info", event_type="tool_completed")
         return {"tracks_checked": len(tracks), "items_created": 0, "batch_id": None}
     create_notification(
         session,
-        title="Volume normalization review ready",
-        body=f"{created} files were added to the task queue.",
+        title="ReplayGain review ready",
+        body=f"ReplayGain measured for {created} track(s) — review and approve in the Task Queue.",
         event_type="approval_needed",
         target_url="/task-queue",
     )
@@ -7787,7 +7807,7 @@ TASK_HANDLERS = {
     "check_non_lossless": run_check_non_lossless,
     "check_audio_content": run_check_audio_content,
     "requeue_replacement": run_requeue_replacement,
-    "normalize_volume": run_normalize_volume,
+    "apply_replaygain": run_apply_replaygain,
     "backup_now": run_backup_now,
     "restore_default": run_restore_default,
     "restore_backup": run_restore_backup,
@@ -7926,7 +7946,7 @@ async def worker_loop() -> None:
                     deliver_apns=False,
                 )
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders", "enrich_imports"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -7980,7 +8000,7 @@ def task_notification_title(task_type: str) -> str:
         "check_non_lossless": "Lossless check",
         "check_musicbrainz_ids": "MusicBrainz ID check",
         "check_audio_content": "Audio content check",
-        "normalize_volume": "Volume normalization",
+        "apply_replaygain": "ReplayGain",
         "backup_now": "Backup",
         "restore_default": "Restore",
         "restore_backup": "Restore",
@@ -7997,7 +8017,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "normalize_volume", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "apply_replaygain", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
         return "/tools"
     if task_type == "enrich_imports":
         return "/library"

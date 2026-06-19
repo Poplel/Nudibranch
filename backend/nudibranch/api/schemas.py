@@ -102,6 +102,7 @@ class LibraryTreeTrack(BaseModel):
     metadata_locked: bool = False
     artwork_locked: bool = False
     filename_locked: bool = False
+    replaygain_track_gain: float | None = None
 
 
 class LibraryTreeAlbum(BaseModel):
@@ -260,6 +261,7 @@ class PlaylistTrackOut(BaseModel):
     album: str
     album_id: str | None = None
     format: str | None = None
+    replaygain_track_gain: float | None = None
 
 
 class FavoritesOut(BaseModel):
@@ -435,6 +437,7 @@ class LibraryTrackRow(BaseModel):
     duration_ms: int | None = None
     format: str | None = None
     is_lossless: bool = False
+    replaygain_track_gain: float | None = None
 
 
 class PaginatedArtists(BaseModel):
