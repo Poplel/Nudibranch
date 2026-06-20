@@ -4226,7 +4226,15 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
 
 
 def completed_wishlist_download_ids(session: Session) -> set[str]:
-    """Wishlist item ids whose linked download ProposalItem has completed (downloaded+imported)."""
+    """Wishlist item ids whose linked download ProposalItem has completed (downloaded+imported).
+
+    Only count ACTUAL download leaves (queue_download / queue_ytdlp_download). A completed
+    `wishlist_request` item just means the candidate search ran — search_candidates marks the
+    intent batch (and its per-track leaves, which carry wishlist_item_id) completed once the
+    search finishes, NOT once anything is fetched. Counting those wrongly marked every album
+    "completed" the moment its search ended, so albums slskd couldn't seed (whose yt-dlp
+    fallback was never selected/downloaded) silently vanished from the wishlist with 0 tracks.
+    """
     ids: set[str] = set()
     batches = list(
         session.scalars(
@@ -4240,6 +4248,8 @@ def completed_wishlist_download_ids(session: Session) -> set[str]:
             if item.kind != ProposalKind.download or item.status != ProposalStatus.completed:
                 continue
             payload = json.loads(item.payload_json or "{}")
+            if payload.get("action") not in {"queue_download", "queue_ytdlp_download"}:
+                continue
             request = payload.get("request") or {}
             wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
             if wishlist_item_id:

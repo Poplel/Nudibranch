@@ -344,15 +344,15 @@ def add_download_candidate_review_items(
                 append_task_log(session, task, f"{track_title}: {len(candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s)")
             elif pools:
                 set_item_payload_status(track_item, "no album-folder track match")
-                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_title}: no lossless match in {min(len(pools), folder_try_limit)} Soulseek folder(s) — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
+                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
+                append_task_log(session, task, f"{track_title}: no lossless match in {min(len(pools), folder_try_limit)} Soulseek folder(s) — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
             elif should_use_track_search_fallback(album, requests):
                 set_item_payload_status(track_item, "searching track candidates")
                 missing_track_jobs.append((request, track_item, query, 5))
             else:
                 set_item_payload_status(track_item, "no album folder candidates found")
-                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                append_task_log(session, task, f"{track_title}: no lossless Soulseek folders matched — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
+                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
+                append_task_log(session, task, f"{track_title}: no lossless Soulseek folders matched — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
             completed += 1
             if task is not None:
                 update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
@@ -434,8 +434,8 @@ def add_track_search_candidate_items(
                 if rate_limited:
                     append_task_log(session, task, f"{track_title}: {status}", "warning")
                 else:
-                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-                    append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
+                    append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
             session.commit()
     return added
 
