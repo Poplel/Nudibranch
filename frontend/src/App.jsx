@@ -4292,7 +4292,7 @@ function ImportTree({
       artist.albums.forEach((album) => {
         if (!album.manual) return;
         album.slots.forEach((slot) => {
-          if (!slot.file && !dismissedGhosts.has(slot.id)) manualSlotIds.add(slot.id);
+          if (!slot.file && !slot.in_library && !dismissedGhosts.has(slot.id)) manualSlotIds.add(slot.id);
         });
       });
     });
@@ -5252,7 +5252,7 @@ function buildImportDownloadRequests(grouped, downloadSelections, dismissedGhost
   grouped.forEach((artist) => {
     artist.albums.forEach((album) => {
       album.slots.forEach((slot) => {
-        if (slot.file || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
+        if (slot.file || slot.in_library || !downloadSelections.has(slot.id) || dismissedGhosts.has(slot.id)) return;
         if (isGenericTrackTitle(slot.title)) return;
         requests.push({ artist: artist.name, album: album.name, track: slot.title, track_number: slot.track_number, disc_number: slot.disc_number, duration_ms: slot.length || slot.duration_ms });
       });
