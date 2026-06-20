@@ -314,13 +314,19 @@ def add_download_candidate_review_items(
     candidates_added = 0
     for (artist, album), track_items in grouped.items():
         requests = [request for request, _track_item_id, _track_title in track_items]
-        append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
         folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
-        pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit)
-        if pools:
-            append_task_log(session, task, f"{artist} / {album}: using {len(pools)} ranked album folder(s) for candidates")
+        # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
+        # matches arbitrary same-artist folders for the wrong songs) and search per-track directly.
+        if is_singles_pseudo_album(album):
+            append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+            pools = []
         else:
-            append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; track searches skipped for album workflow", "warning")
+            append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
+            pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit)
+            if pools:
+                append_task_log(session, task, f"{artist} / {album}: using {len(pools)} ranked album folder(s) for candidates")
+            else:
+                append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; track searches skipped for album workflow", "warning")
         missing_track_jobs: list[tuple[dict, ProposalItem, str, int]] = []
         for request, track_item_id, track_title in track_items:
             track_item = session.get(ProposalItem, track_item_id)
@@ -433,13 +439,19 @@ def add_track_search_candidate_items(
     return added
 
 
+def is_singles_pseudo_album(album: str) -> bool:
+    """A 'Singles'/empty/unknown album isn't a real album folder. Searching slskd for an album
+    folder named that matches arbitrary same-artist folders (wrong songs), so these go straight to
+    per-track search."""
+    return fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
+
+
 def should_use_track_search_fallback(album: str, requests: list[dict]) -> bool:
     if any(request.get("workflow") in {"missing_tracks", "lossless_replacement"} for request in requests):
         return False
     if any(request.get("require_lossless") for request in requests) and len(requests) > 1:
         return False
-    normalized_album = fuzzy_text(album)
-    if normalized_album in {"", "singles", "unknown album", "unknown"}:
+    if is_singles_pseudo_album(album):
         return True
     return len(requests) <= 1
 
@@ -3776,34 +3788,44 @@ def create_album_download_candidate_batch(
     slskd_tracks = 0
     retry_tracks = 0
     diagnostic_lines = []
-    append_task_log(session, task, f"{artist} / {album}: searching slskd for lossless album folders")
     folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
-    album_queries = album_search_query_variants(artist, album, requests)
-    # Report progress across the whole prepare phase: one step per album-search query, then one
-    # per track, so the "x of n" counter keeps climbing during the (slow) album search too.
-    total_tracks = max(1, len(album_queries) + len(track_items))
+    # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
+    # matches arbitrary same-artist folders for the wrong songs) and go straight to per-track search.
+    skip_album_folder_search = is_singles_pseudo_album(album)
     search_progress = {"done": 0}
-
-    def album_search_progress(message: str) -> None:
-        search_progress["done"] = min(search_progress["done"] + 1, len(album_queries))
-        if task is not None:
-            update_task_progress(session, task, search_progress["done"], total_tracks, message)
-
-    folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit, progress_callback=album_search_progress)
-    # Credit any queries skipped by an early exit so the counter flows into the per-track phase.
-    search_progress["done"] = len(album_queries)
-    folder_pool = folder_pools[0] if folder_pools else None
-    if folder_pool:
-        diagnostic_lines.append(
-            f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
-        )
-        append_task_log(
-            session,
-            task,
-            f"{artist} / {album}: matched {len(folder_pools)} lossless album folder(s); trying up to {folder_try_limit} folder(s), best is from {folder_pool.get('username')} with {folder_pool.get('matched_tracks', 0)} track(s) already matched",
-        )
+    if skip_album_folder_search:
+        append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+        album_queries: list[str] = []
+        total_tracks = max(1, len(track_items))
+        folder_pools = []
+        folder_pool = None
     else:
-        append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
+        append_task_log(session, task, f"{artist} / {album}: searching slskd for lossless album folders")
+        album_queries = album_search_query_variants(artist, album, requests)
+        # Report progress across the whole prepare phase: one step per album-search query, then one
+        # per track, so the "x of n" counter keeps climbing during the (slow) album search too.
+        total_tracks = max(1, len(album_queries) + len(track_items))
+
+        def album_search_progress(message: str) -> None:
+            search_progress["done"] = min(search_progress["done"] + 1, len(album_queries))
+            if task is not None:
+                update_task_progress(session, task, search_progress["done"], total_tracks, message)
+
+        folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit, progress_callback=album_search_progress)
+        # Credit any queries skipped by an early exit so the counter flows into the per-track phase.
+        search_progress["done"] = len(album_queries)
+        folder_pool = folder_pools[0] if folder_pools else None
+        if folder_pool:
+            diagnostic_lines.append(
+                f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
+            )
+            append_task_log(
+                session,
+                task,
+                f"{artist} / {album}: matched {len(folder_pools)} lossless album folder(s); trying up to {folder_try_limit} folder(s), best is from {folder_pool.get('username')} with {folder_pool.get('matched_tracks', 0)} track(s) already matched",
+            )
+        else:
+            append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
     search_jobs = []
     completed_tracks = search_progress["done"]
     integration = integration_settings(session)
