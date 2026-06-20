@@ -928,9 +928,9 @@ def library_track_by_artist_title(session: Session, artist_name: str, title: str
     Used for playlist imports, where the album hint is unreliable — we just want to know
     'do I already have this song?' so we add it to the playlist instead of re-downloading it.
     """
-    artist_key = normalize_match_text(artist_name)
+    artist_keys = artist_match_candidates(artist_name)
     title_key = normalize_match_text(title)
-    if not (artist_key and title_key):
+    if not (artist_keys and title_key):
         return None
     for track in session.scalars(
         select(Track)
@@ -942,7 +942,7 @@ def library_track_by_artist_title(session: Session, artist_name: str, title: str
         if (
             track.album
             and track.album.artist
-            and normalize_match_text(track.album.artist.name) == artist_key
+            and normalize_match_text(track.album.artist.name) in artist_keys
             and normalize_match_text(track.title) == title_key
         ):
             return track
@@ -3637,6 +3637,19 @@ def normalize_match_text(value: str | None) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
+def artist_match_candidates(artist: str | None) -> list[str]:
+    """Normalized artist names to match a library track against. Spotify joins collaborators with
+    commas ("A, B, C"), but the library usually files the song under just the primary artist — so
+    also try the first comma-separated name, else a multi-artist playlist track never resolves."""
+    full = normalize_match_text(artist)
+    candidates = [full] if full else []
+    if artist and "," in artist:
+        primary = normalize_match_text(artist.split(",")[0])
+        if primary and primary not in candidates:
+            candidates.append(primary)
+    return candidates
+
+
 def existing_library_and_proposal_paths(session: Session) -> set[str]:
     paths = {
         str(path)
@@ -5692,7 +5705,7 @@ def _try_create_pending_playlists(session: Session) -> None:
                 .join(Artist, Artist.id == Album.artist_id)
                 .where(
                     func.lower(Track.title) == normalize_match_text(title),
-                    func.lower(Artist.name) == normalize_match_text(artist),
+                    func.lower(Artist.name).in_(artist_match_candidates(artist)),
                     Track.jellyfin_item_id.isnot(None),
                 )
                 .limit(1)
@@ -5837,7 +5850,7 @@ def create_pending_native_playlists(session: Session) -> None:
                 .join(Artist, Artist.id == Album.artist_id)
                 .where(
                     func.lower(Track.title) == normalize_match_text(title),
-                    func.lower(Artist.name) == normalize_match_text(artist),
+                    func.lower(Artist.name).in_(artist_match_candidates(artist)),
                 )
                 .limit(1)
             ).first()
