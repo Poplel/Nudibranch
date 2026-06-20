@@ -5663,6 +5663,50 @@ def _jellyfin_playlist_exists(client: httpx.Client, playlist_id: str, jf_user_id
         return True
 
 
+def _merge_duplicate_pending_playlists(session: Session, settings: list[AppSetting]) -> list[AppSetting]:
+    """Collapse pending-playlist records that point at the same playlist (same user+origin, else
+    same user+name) into the earliest one, unioning their original_tracks. Returns the surviving
+    records. Prevents two records racing to create duplicate Jellyfin/native playlists."""
+    groups: dict[tuple, list[tuple[AppSetting, dict]]] = {}
+    survivors: list[AppSetting] = []
+    for setting in settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            continue
+        user_id = data.get("user_id")
+        origin = (data.get("origin") or "").strip()
+        name = normalize_match_text(data.get("playlist_name"))
+        if not user_id or not name:
+            survivors.append(setting)
+            continue
+        key = (user_id, "origin:" + origin) if origin else (user_id, "name:" + name)
+        groups.setdefault(key, []).append((setting, data))
+    for key, members in groups.items():
+        primary_setting, primary_data = members[0]
+        if len(members) == 1:
+            survivors.append(primary_setting)
+            continue
+        seen = {(normalize_match_text(t.get("artist")), normalize_match_text(t.get("title")))
+                for t in primary_data.get("original_tracks") or []}
+        merged = list(primary_data.get("original_tracks") or [])
+        for extra_setting, extra_data in members[1:]:
+            for t in extra_data.get("original_tracks") or []:
+                sig = (normalize_match_text(t.get("artist")), normalize_match_text(t.get("title")))
+                if sig not in seen:
+                    seen.add(sig)
+                    merged.append(t)
+            # Carry over a real playlist id / added_ids if the primary lacks one.
+            if not primary_data.get("jellyfin_playlist_id") and extra_data.get("jellyfin_playlist_id"):
+                primary_data["jellyfin_playlist_id"] = extra_data["jellyfin_playlist_id"]
+            session.delete(extra_setting)
+        primary_data["original_tracks"] = merged
+        primary_setting.value = json.dumps(primary_data)
+        write_app_log(f"Pending playlist '{primary_data.get('playlist_name')}': merged {len(members)} duplicate import record(s)")
+        survivors.append(primary_setting)
+    return survivors
+
+
 def _try_create_pending_playlists(session: Session) -> None:
     """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
     pending_settings = list(session.scalars(
@@ -5676,6 +5720,12 @@ def _try_create_pending_playlists(session: Session) -> None:
     jellyfin_api_key = settings.get("jellyfin_api_key", "")
     if not jellyfin_url or not jellyfin_api_key:
         return
+
+    # Collapse pending records that target the same playlist (same user + origin, else same name)
+    # into one. Two records for one playlist each create/extend independently — with Jellyfin's
+    # create indexing lag they miss each other and make DUPLICATE playlists. Merge their original
+    # tracks into the earliest record and drop the rest so only one create path runs.
+    pending_settings = _merge_duplicate_pending_playlists(session, pending_settings)
 
     headers = {"X-Emby-Token": jellyfin_api_key}
     for setting in pending_settings:
@@ -5759,20 +5809,30 @@ def _try_create_pending_playlists(session: Session) -> None:
         new_ids: list[str] = []
         try:
             with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
-                if not playlist_id:
-                    try:
-                        playlist_id = find_jellyfin_playlist(client, jf_user_id, playlist_name) or ""
-                    except Exception:  # noqa: BLE001
-                        playlist_id = ""
-                # A resolved id (from the origin registry / pending record / find-by-name) may point
-                # at a playlist that was since deleted in Jellyfin. Trusting it makes every add 404
-                # and the pending record retries forever without ever recreating. Drop the stale id
-                # so the create branch below runs and re-records a fresh id.
+                # A resolved id (from the origin registry / pending record) may point at a playlist
+                # that was since deleted in Jellyfin. Trusting it makes every add 404 and the pending
+                # record retries forever without ever recreating. Drop the stale id so we re-resolve.
                 if playlist_id and not _jellyfin_playlist_exists(client, playlist_id, jf_user_id):
                     write_app_log(f"Jellyfin playlist '{playlist_name}' id {playlist_id} no longer exists; recreating", level="warning")
                     playlist_id = ""
                     data.pop("jellyfin_playlist_id", None)
                     added_ids = set()
+                # Find existing playlist(s) by name and COLLAPSE duplicates to one canonical id.
+                # Jellyfin's create has an indexing lag, so a prior run / sibling record can leave
+                # more than one playlist with this name; keep the one we already track (else the
+                # first) and delete the rest, then add into it — never create alongside duplicates.
+                try:
+                    named_ids = list_jellyfin_playlist_ids_by_name(client, jf_user_id, playlist_name)
+                except Exception:  # noqa: BLE001
+                    named_ids = []
+                if named_ids:
+                    canonical = playlist_id if playlist_id in named_ids else named_ids[0]
+                    for dup in named_ids:
+                        if dup != canonical:
+                            _delete_jellyfin_item(client, dup)
+                    if len(named_ids) > 1:
+                        write_app_log(f"Playlist sync: collapsed {len(named_ids) - 1} duplicate Jellyfin playlist(s) named '{playlist_name}'", level="warning")
+                    playlist_id = canonical
                 if playlist_id:
                     current = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
                     new_ids = [jf_id for jf_id in jf_ids if jf_id not in current]
@@ -7588,6 +7648,16 @@ def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str
         if item.get("Name") == name:
             return item.get("Id")
     return None
+
+
+def list_jellyfin_playlist_ids_by_name(client: httpx.Client, user_id: str, name: str) -> list[str]:
+    """ALL Jellyfin playlist ids with this exact name — used to collapse duplicate playlists."""
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+    )
+    response.raise_for_status()
+    return [item["Id"] for item in response.json().get("Items", []) if item.get("Name") == name and item.get("Id")]
 
 
 def ensure_favorites_playlist(session: Session, user_id: str) -> Playlist:
