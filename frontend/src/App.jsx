@@ -4910,6 +4910,10 @@ const MB_ID_INFO =
   "MusicBrainz's unique identifier for this record. It links the entry to MusicBrainz so metadata, artwork, and matching stay accurate. Usually filled automatically; only change it if you know the correct ID.";
 const REPLAYGAIN_INFO =
   "Volume adjustment in dB applied at playback so tracks sound equally loud (ReplayGain, -18 LUFS reference). Negative values quieten loud tracks. Non-destructive — the audio file isn't changed. Measured by the \"Apply ReplayGain\" tool; clear to disable for this track.";
+const ALBUM_ARTIST_MOVE_INFO =
+  "Type a different artist name to move this whole album to that artist. The artist is created if it doesn't exist, the files are moved into its folder, and the old artist is removed if it ends up empty. Use this to fix a mis-attributed album.";
+const TRACK_ARTIST_MOVE_INFO =
+  "Type a different artist name to move just this track to that artist (under an album of the same title, created if needed). The file is moved and any emptied album/artist is removed. Use this to fix a single mis-filed song.";
 
 function artistFields(artist) {
   return [
@@ -4933,6 +4937,7 @@ async function artistAutoLookup(field, draft, artistId, onCoverSearch) {
 function albumFields(album) {
   return [
     { key: "title", label: "Album", value: album.title },
+    { key: "artist", label: "Artist", value: album.artist_name, info: ALBUM_ARTIST_MOVE_INFO },
     { key: "sort_name", label: "Sort name", value: album.sort_name, info: SORT_NAME_INFO },
     { key: "release_title", label: "Release title", value: album.release_title },
     { key: "musicbrainz_release_id", label: "MusicBrainz release ID", value: album.musicbrainz_release_id, info: MB_ID_INFO },
@@ -4945,6 +4950,7 @@ function albumFields(album) {
 function trackFields(track) {
   return [
     { key: "title", label: "Title", value: track.title },
+    { key: "artist", label: "Artist", value: track.artist_name, info: TRACK_ARTIST_MOVE_INFO },
     { key: "track_number", label: "Track number", value: track.track_number, type: "number" },
     { key: "disc_number", label: "Disc number", value: track.disc_number, type: "number" },
     { key: "duration_ms", label: "Duration ms", value: track.duration_ms, type: "number", readOnly: true },

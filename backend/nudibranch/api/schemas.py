@@ -103,6 +103,7 @@ class LibraryTreeTrack(BaseModel):
     artwork_locked: bool = False
     filename_locked: bool = False
     replaygain_track_gain: float | None = None
+    artist_name: str | None = None
 
 
 class LibraryTreeAlbum(BaseModel):
@@ -114,6 +115,7 @@ class LibraryTreeAlbum(BaseModel):
     cover_path: str | None = None
     musicbrainz_release_id: str | None = None
     musicbrainz_release_group_id: str | None = None
+    artist_name: str | None = None
     tracks: list[LibraryTreeTrack] = Field(default_factory=list)
 
 

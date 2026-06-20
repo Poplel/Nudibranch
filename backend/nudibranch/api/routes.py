@@ -1267,12 +1267,14 @@ def library_tree(
                             artwork_locked=track.artwork_locked,
                             filename_locked=track.filename_locked,
                             replaygain_track_gain=track.replaygain_track_gain,
+                            artist_name=artist.name,
                         )
                         for track in sorted(album.tracks, key=lambda track: (track.disc_number or 1, track.track_number or 9999))
                     ],
                     release_title=album.release_title,
                     musicbrainz_release_id=album.musicbrainz_release_id,
                     musicbrainz_release_group_id=album.musicbrainz_release_group_id,
+                    artist_name=artist.name,
                 )
                 for album in sorted(artist.albums, key=lambda album: ((album.sort_name or album.title) or "").lower())
             ],
@@ -3879,27 +3881,28 @@ def clear_notifications(
 
 
 def editable_fields(target_type: str) -> set[str]:
+    # "artist" is a virtual field (not a column): on album/track it reassigns the owning
+    # artist — see apply_album_changes / apply_metadata_item track branch in the worker.
     if target_type == "artist":
-        return {"name", "sort_name", "musicbrainz_id"}
+        return {"name", "sort_name", "musicbrainz_id", "cover_path"}
     if target_type == "album":
-        return {"title", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"}
-    if target_type == "track":
         return {
             "title",
-            "track_number",
-            "disc_number",
-            "duration_ms",
-            "format",
-            "bitrate",
+            "sort_name",
+            "release_title",
             "path",
-            "musicbrainz_recording_id",
-            "explicit",
-            "is_lossless",
-            "musicbrainz_verified",
-            "metadata_locked",
-            "artwork_locked",
-            "filename_locked",
+            "cover_path",
+            "musicbrainz_release_id",
+            "musicbrainz_release_group_id",
+            "artist",
         }
+    if target_type == "track":
+        # Mirror the worker's canonical apply-side set so the two never drift — a field
+        # missing here is filtered to an empty changeset → spurious 400 (this is exactly
+        # how the ReplayGain field silently 400'd before). Lazy import dodges the cycle.
+        from nudibranch.worker.main import editable_track_fields
+
+        return editable_track_fields() | {"artist"}
     return set()
 
 

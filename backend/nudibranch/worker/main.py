@@ -1043,11 +1043,19 @@ def apply_metadata_item(session: Session, item: ProposalItem) -> None:
         target = session.get(Track, target_id)
         if not target:
             raise ValueError("Track no longer exists")
+        # "artist" is a virtual reassignment field, not a column — handle it separately
+        # (re-homes the track under a different artist) so apply_scalar_changes never sees it.
+        new_artist_name = None
+        if "artist" in changes:
+            changes = dict(changes)
+            new_artist_name = (changes.pop("artist") or "").strip()
         apply_scalar_changes(target, changes, editable_track_fields())
         # ReplayGain is non-destructive: besides the DB value (the player reads it), write
         # the standard REPLAYGAIN_TRACK_GAIN tag so Jellyfin/other players honour it too.
         if "replaygain_track_gain" in changes and target.path and Path(target.path).exists():
             write_replaygain_tag(Path(target.path), target.replaygain_track_gain)
+        if new_artist_name:
+            reassign_track_to_artist(session, target, new_artist_name)
     else:
         raise ValueError("Unsupported metadata target")
 
@@ -5215,6 +5223,85 @@ def sync_album_folder(session: Session, album: Album) -> None:
             pass
 
 
+def get_or_create_artist(session: Session, name: str) -> Artist:
+    """Find an Artist by exact name, creating one if absent (artist-reassign edits)."""
+    artist = session.scalar(select(Artist).where(Artist.name == name))
+    if artist is None:
+        artist = Artist(name=name)
+        session.add(artist)
+        session.flush()
+    return artist
+
+
+def reassign_album_to_artist(session: Session, album: Album, new_artist_name: str) -> None:
+    """Move a whole album to a different artist (the album editor's "Artist" field).
+
+    Reassigns via the relationship, relocates files, merges into a same-titled album under
+    the target artist if one already exists, and prunes the old album/artist when emptied.
+    """
+    old_artist = album.artist
+    target_artist = get_or_create_artist(session, new_artist_name)
+    if old_artist is not None and target_artist.id == old_artist.id:
+        return
+    existing = session.scalar(
+        select(Album).where(
+            Album.artist_id == target_artist.id, Album.title == album.title, Album.id != album.id
+        )
+    )
+    if existing is not None:
+        for track in list(album.tracks):
+            # Reassign through the relationship so album.tracks empties in-session; a raw FK
+            # set would cascade album_id=NULL when the now-empty album is deleted (NOT NULL).
+            track.album = existing
+        session.flush()
+        session.refresh(existing)
+        sync_album_folder(session, existing)
+        cleanup_empty_album_artist(session, album)
+        return
+    album.artist = target_artist
+    session.flush()
+    session.refresh(album)
+    sync_album_folder(session, album)
+    if old_artist is not None:
+        remaining = session.scalar(
+            select(func.count()).select_from(Album).where(Album.artist_id == old_artist.id)
+        )
+        if remaining == 0:
+            session.delete(old_artist)
+
+
+def reassign_track_to_artist(session: Session, track: Track, new_artist_name: str) -> None:
+    """Move a single track to a different artist (the track editor's "Artist" field).
+
+    The track keeps its album title but is re-homed under a same-titled album owned by the
+    target artist (created if needed); the file moves and any emptied source is pruned.
+    """
+    old_album = track.album
+    if old_album is None:
+        return
+    if old_album.artist is not None and old_album.artist.name == new_artist_name:
+        return
+    target_artist = get_or_create_artist(session, new_artist_name)
+    target_album = session.scalar(
+        select(Album).where(Album.artist_id == target_artist.id, Album.title == old_album.title)
+    )
+    if target_album is None:
+        target_album = Album(artist=target_artist, title=old_album.title, sort_name=old_album.sort_name)
+        session.add(target_album)
+        session.flush()
+    track.album = target_album
+    session.flush()
+    canonical = (
+        get_settings().library_path
+        / safe_path_part(target_artist.name, "Unknown Artist")
+        / safe_path_part(target_album.title, "Unknown Album")
+    )
+    relocate_track_to_dir(track, canonical)
+    target_album.path = str(canonical)
+    session.flush()
+    cleanup_empty_album_artist(session, old_album)
+
+
 def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
     # A remote cover_path URL (artist editor "Auto lookup" / Check Artist Covers)
     # is downloaded into the artist folder so GET /library/artists/{id}/cover serves
@@ -5273,12 +5360,21 @@ def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
             changes["cover_path"] = local_cover
         else:
             changes.pop("cover_path", None)
+    # "artist" is a virtual reassignment field, not a column — pull it out before the
+    # scalar apply (Album has no `artist` string attr) and move the album afterwards.
+    new_artist_name = None
+    if "artist" in changes:
+        changes = dict(changes)
+        new_artist_name = (changes.pop("artist") or "").strip()
     old_title = album.title
     apply_scalar_changes(
         album,
         changes,
         {"title", "sort_name", "release_title", "path", "cover_path", "musicbrainz_release_id", "musicbrainz_release_group_id"},
     )
+    if new_artist_name and (album.artist is None or new_artist_name != album.artist.name):
+        reassign_album_to_artist(session, album, new_artist_name)
+        return
     title_changed = album.title != old_title
     if not title_changed:
         # Cover-art / mbid / path-only edits must not trigger a merge: the merge below
