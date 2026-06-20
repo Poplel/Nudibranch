@@ -658,8 +658,14 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         if skip_unchanged(item):
             continue
         try:
-            is_slskd_download = keeps_download_batch_open(item)
-            if is_slskd_download and not download_slot_available(download_slot_tracker):
+            # Only slskd transfers consume the single download slot. yt-dlp fallbacks run as
+            # independent background tasks (the single worker already runs them one at a time),
+            # so they must NOT be slot-gated — otherwise every fallback past the first is parked
+            # "waiting to download" + executing with NO task enqueued, and nothing re-dispatches
+            # them (the slskd re-dispatch path doesn't cover yt-dlp). A batch of yt-dlp fallbacks
+            # then silently stalls after one download.
+            uses_download_slot = json.loads(item.payload_json or "{}").get("action") == "queue_download"
+            if uses_download_slot and not download_slot_available(download_slot_tracker):
                 note_progress(f"Waiting for download slot for {item.title}", item)
                 set_download_item_status(item, "waiting to download")
                 item.status = ProposalStatus.executing
@@ -670,7 +676,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             apply_download_item(session, item, task)
             item.status = ProposalStatus.executing if keeps_download_batch_open(item) else ProposalStatus.completed
             download_changes += 1
-            if is_slskd_download:
+            if uses_download_slot:
                 consume_download_slot(download_slot_tracker)
             finish_progress_step(f"Queued download for {item.title}")
         except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
