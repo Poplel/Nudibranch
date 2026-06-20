@@ -9248,7 +9248,9 @@ function buildImportAlbum(album, artistName, library, albumRecords) {
     const discNumber = track.disc_number || 1;
     const file = trackMap.get(`${discNumber}:${trackNumber}`);
     if (file) usedPaths.add(file.path);
-    const inLibrary = libraryAlbum != null && libraryTrackTitles.has(normalizeName(track.title));
+    const inLibrary =
+      (libraryAlbum != null && libraryTrackTitles.has(normalizeName(track.title))) ||
+      (album.manual && libraryHasArtistTitle(library, artistName, track.title));
     return file
       ? { id: file.path, track_number: trackNumber, disc_number: discNumber, title: file.metadata?.title || track.title, file, in_library: inLibrary }
       : {
@@ -9313,6 +9315,21 @@ function findLibraryAlbum(library, artistName, albumName) {
   return (
     artist.albums.find((album) => normalizeName(album.title) === normalizedAlbum) ||
     artist.albums.find((album) => normalizeName(album.title).includes(normalizedAlbum) || normalizedAlbum.includes(normalizeName(album.title)))
+  );
+}
+
+// Album-agnostic: does the artist already own a track with this title under ANY album?
+// Used for Singles/playlist imports whose library copy lives under a different album name.
+function libraryHasArtistTitle(library, artistName, title) {
+  const normalizedArtist = normalizeName(artistName);
+  const normalizedTitle = normalizeName(title);
+  if (!normalizedTitle) return false;
+  const artist =
+    library.find((entry) => normalizeName(entry.name) === normalizedArtist) ||
+    library.find((entry) => normalizeName(entry.name).includes(normalizedArtist) || normalizedArtist.includes(normalizeName(entry.name)));
+  if (!artist) return false;
+  return (artist.albums || []).some((album) =>
+    (album.tracks || []).some((t) => normalizeName(t.title) === normalizedTitle),
   );
 }
 
