@@ -2798,7 +2798,7 @@ def list_wishlist_approvals(
         .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
         .order_by(ProposalBatch.created_at.desc())
     )
-    batches = list(session.scalars(query))
+    batches = prune_settled_batches(session, list(session.scalars(query)))
     if user_has_permission(user, Permission.wishlist_manage_all):
         return [serialize_batch(batch) for batch in batches]
     visible_batches = []
@@ -3621,6 +3621,42 @@ async def upload_youtube_cookies(
     return _integration_settings_out(result)
 
 
+# A batch whose items are all in non-UI-actionable states (completed/rejected/…) renders as
+# NOTHING in the frontend (groupApprovalBatches keeps only items whose status is in this set),
+# yet /approvals + /wishlist/approvals select on BATCH status — so a batch left
+# "pending"/"approved"/"failed" after every item settled lingers in the API while invisible in
+# the UI, with no way for the user to clear it (the stale-batch mismatch). Reconcile-on-read
+# marks such settled batches completed so the API matches what the UI shows.
+_UI_ACTIVE_ITEM_STATUSES = {
+    ProposalStatus.pending,
+    ProposalStatus.approved,
+    ProposalStatus.failed,
+    ProposalStatus.executing,
+}
+
+
+def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> list[ProposalBatch]:
+    settled: set[str] = set()
+    for batch in batches:
+        if batch.items:
+            if not any(item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
+                batch.status = ProposalStatus.completed
+                settled.add(batch.id)
+        elif batch.kind != ProposalKind.download:
+            # An empty non-download batch is an abandoned/failed tool run — safe to retire.
+            batch.status = ProposalStatus.completed
+            settled.add(batch.id)
+        elif batch.created_at and as_utc(batch.created_at) < datetime.now(timezone.utc) - timedelta(minutes=10):
+            # An empty DOWNLOAD batch is left alone while fresh — a candidate search commits its
+            # batch before attaching items and must not be finalized mid-search — but one older
+            # than any plausible in-flight search is a dead leftover and can be retired too.
+            batch.status = ProposalStatus.completed
+            settled.add(batch.id)
+    if settled:
+        session.commit()
+    return [batch for batch in batches if batch.id not in settled]
+
+
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")
 def list_approvals(
     session: Session = Depends(get_session),
@@ -3638,6 +3674,7 @@ def list_approvals(
             .order_by(ProposalBatch.created_at.desc())
         )
     )
+    batches = prune_settled_batches(session, batches)
     return [serialize_batch(batch) for batch in batches]
 
 
