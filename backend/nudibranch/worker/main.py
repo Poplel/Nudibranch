@@ -42,6 +42,7 @@ REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 MAX_TASK_ATTEMPTS = 4
 AUTOMATION_TICK_SECONDS = 30
+PENDING_PLAYLIST_TICK_SECONDS = 45
 
 
 
@@ -5637,6 +5638,18 @@ def _jellyfin_playlist_item_ids(client: httpx.Client, playlist_id: str, jf_user_
         return set()
 
 
+def _jellyfin_playlist_exists(client: httpx.Client, playlist_id: str, jf_user_id: str) -> bool:
+    """Whether a Jellyfin playlist id still resolves. Returns False ONLY on a definitive 404 —
+    a stale id (the playlist was deleted in Jellyfin but its id lingers in our origin registry /
+    pending record) otherwise makes every add return 404 and the import never completes. Transient
+    errors return True so we never recreate (and duplicate) a playlist over a network blip."""
+    try:
+        resp = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id, "limit": 0})
+        return resp.status_code != 404
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _try_create_pending_playlists(session: Session) -> None:
     """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
     pending_settings = list(session.scalars(
@@ -5738,6 +5751,15 @@ def _try_create_pending_playlists(session: Session) -> None:
                         playlist_id = find_jellyfin_playlist(client, jf_user_id, playlist_name) or ""
                     except Exception:  # noqa: BLE001
                         playlist_id = ""
+                # A resolved id (from the origin registry / pending record / find-by-name) may point
+                # at a playlist that was since deleted in Jellyfin. Trusting it makes every add 404
+                # and the pending record retries forever without ever recreating. Drop the stale id
+                # so the create branch below runs and re-records a fresh id.
+                if playlist_id and not _jellyfin_playlist_exists(client, playlist_id, jf_user_id):
+                    write_app_log(f"Jellyfin playlist '{playlist_name}' id {playlist_id} no longer exists; recreating", level="warning")
+                    playlist_id = ""
+                    data.pop("jellyfin_playlist_id", None)
+                    added_ids = set()
                 if playlist_id:
                     current = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
                     new_ids = [jf_id for jf_id in jf_ids if jf_id not in current]
@@ -8045,6 +8067,7 @@ async def worker_loop() -> None:
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
     last_automation_tick = 0.0
+    last_pending_playlist_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -8079,6 +8102,17 @@ async def worker_loop() -> None:
                     except Exception:  # noqa: BLE001 - scheduler must never stop the worker.
                         session.rollback()
                     last_automation_tick = time.time()
+                if time.time() - last_pending_playlist_tick > PENDING_PLAYLIST_TICK_SECONDS:
+                    # A playlist import whose tracks are all already in the library never imports
+                    # anything, so nothing triggers a sync_favorites run to create the playlist.
+                    # Process any deferred playlist here too (cheap: only touches Jellyfin when a
+                    # pending_playlist setting actually exists, and only for that playlist).
+                    try:
+                        if session.scalar(select(AppSetting.key).where(AppSetting.key.like("pending_playlist:%")).limit(1)):
+                            _try_create_pending_playlists(session)
+                    except Exception:  # noqa: BLE001 - never let pending-playlist work stop the worker.
+                        session.rollback()
+                    last_pending_playlist_tick = time.time()
                 try:
                     await deliver_apns_notifications(session)
                 except Exception:  # noqa: BLE001
