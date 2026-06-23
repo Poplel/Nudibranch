@@ -129,6 +129,7 @@ from nudibranch.services.metadata_lookup import album_cover_candidate_urls, arti
 from nudibranch.services.notifications import create_notification, push_identity
 from nudibranch.services.proposals import approve_batch, reject_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
+from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
@@ -3808,6 +3809,26 @@ def update_integrations(
         enqueue_task(session, "sync_favorites_jellyfin", {})
     session.commit()
     return _integration_settings_out(integration_settings(session))
+
+
+@router.get("/settings/match-tuning", tags=["settings"], summary="Get download (slskd) match tuning")
+def get_match_tuning(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> dict:
+    return {"schema": match_tuning_schema(), "values": match_tuning(session)}
+
+
+@router.put("/settings/match-tuning", tags=["settings"], summary="Update download (slskd) match tuning")
+def put_match_tuning(
+    payload: dict,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> dict:
+    values = payload.get("values") if isinstance(payload.get("values"), dict) else payload
+    updated = update_match_tuning(session, values or {})
+    session.commit()
+    return {"schema": match_tuning_schema(), "values": updated}
 
 
 @router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"], summary="List notifications")

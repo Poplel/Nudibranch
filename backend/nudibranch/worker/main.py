@@ -25,6 +25,7 @@ from nudibranch.services.notifications import create_notification, deliver_apns_
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
+from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
@@ -60,13 +61,20 @@ DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
 DOWNLOAD_SLOT_STATUSES = {"queued", "downloading"}
 DOWNLOAD_SLOT_STALE_SECONDS = 75
 DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
-MIN_SLSKD_TRACK_CONFIDENCE = 0.60
+# Recall-favoring matching: every candidate is reviewed before anything downloads, so we surface
+# more and let the user reject. Trust is anchored on title + duration, not on the artist appearing in
+# the (often artist-less) remote folder path. The exact numbers live in services/match_tuning.py and
+# are admin-editable in Settings → Download matching.
 SLSKD_TRACK_SEARCH_WORKERS = 1
 SLSKD_TRACK_QUERY_LIMIT = 6
 SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 15
 SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 8
 SLSKD_ALBUM_SEARCH_POLL_INTERVAL = 1.0
 LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
+# Live match tuning (weights, floors, penalties), refreshed from the admin-editable match_tuning
+# config at each search entry point (single worker, sequential tasks → safe as module state). The
+# scorer reads these without threading a session. See services/match_tuning.py.
+_match_tuning: dict[str, float] = dict(MATCH_TUNING_DEFAULTS)
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
     "acoustic",
@@ -3758,6 +3766,7 @@ def create_album_download_candidate_batch(
     artist_items: dict[str, ProposalItem] | None = None,
     album_items: dict[tuple[str, str], ProposalItem] | None = None,
 ) -> ProposalBatch:
+    configure_match_tuning(session)
     if existing_batch is None:
         title_prefix = batch_title or {
             "lossless_replacement": "Lossless replacement candidates",
@@ -3981,6 +3990,21 @@ def add_download_candidate_items(session: Session, batch: ProposalBatch, track_i
         )
 
 
+def candidate_format_label(candidate: dict) -> str:
+    """Terse format/quality label shown on each candidate row (e.g. "FLAC", "MP3 320")."""
+    name = str(candidate.get("filename") or "")
+    ext = Path(name.replace("\\", "/")).suffix.lower().lstrip(".")
+    label = ext.upper() if ext else str(candidate.get("quality") or "").upper()
+    if not is_lossless_filename(name):
+        try:
+            bitrate = int(candidate.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        if bitrate:
+            label = f"{label} {bitrate}".strip()
+    return label
+
+
 def candidate_status_label(candidate: dict) -> str:
     confidence = candidate.get("confidence")
     parts = []
@@ -3988,9 +4012,9 @@ def candidate_status_label(candidate: dict) -> str:
         parts.append(f"{confidence}% match")
     if candidate.get("same_album_folder"):
         parts.append("same album folder")
-    quality = candidate.get("quality")
-    if quality:
-        parts.append(str(quality))
+    fmt = candidate_format_label(candidate)
+    if fmt:
+        parts.append(fmt)
     return " · ".join(parts) if parts else "candidate"
 
 
@@ -4241,7 +4265,7 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
             pool = download_folder_pool(candidate)
             if not pool:
                 continue
-            pool = lossless_folder_pool(pool)
+            pool = audio_folder_pool(pool)
             if not pool:
                 continue
             key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
@@ -4327,23 +4351,26 @@ ALBUM_FOLDER_FULL_SCORE_LIMIT = 16
 def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list[dict], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
     expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
     expected_album = str(requests[0].get("album") or "") if requests else ""
-    # Phase 1: cheap pre-rank using only folder-name signals (no per-track file matching).
-    prelim: list[tuple[float, float, int, dict]] = []
+    # Phase 1: cheap pre-rank using only folder-name signals (no per-track file matching). Count all
+    # audio files (lossless preferred via the sort key, but lossy folders stay eligible so a lossy
+    # album still surfaces candidates).
+    prelim: list[tuple[float, float, int, int, dict]] = []
     for pool in pools.values():
-        files = lossless_folder_files(pool.get("files") or [])
+        files = audio_folder_files(pool.get("files") or [])
+        lossless_count = len(lossless_folder_files(files))
         folder_segments = album_folder_segments(pool)
         artist_score = best_segment_score(expected_artist, folder_segments)
         album_score = album_folder_name_score(expected_album, pool)
-        prelim.append((album_score, artist_score, len(files), pool))
-    prelim.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+        prelim.append((album_score, artist_score, len(files), lossless_count, pool))
+    prelim.sort(key=lambda item: (item[0], item[1], item[3], item[2]), reverse=True)
     # Phase 2: fully score only the most promising folders; the rest keep their cheap scores so
     # they remain available but rank below the fully-scored matches.
     scored: list[tuple[tuple[int, float, float, float, int, int], dict]] = []
-    for index, (album_score, artist_score, lossless, pool) in enumerate(prelim):
-        if index < ALBUM_FOLDER_FULL_SCORE_LIMIT and lossless and album_score >= threshold:
+    for index, (album_score, artist_score, audio_count, lossless_count, pool) in enumerate(prelim):
+        if index < ALBUM_FOLDER_FULL_SCORE_LIMIT and audio_count and album_score >= threshold:
             scored.append((score_album_folder_pool(pool, requests, threshold), pool))
         else:
-            scored.append(((0, 0.0, artist_score, album_score, lossless, lossless), pool))
+            scored.append(((0, 0.0, artist_score, album_score, lossless_count, audio_count), pool))
     return sorted(scored, key=album_folder_pool_sort_key, reverse=True)
 
 
@@ -4372,7 +4399,7 @@ def add_seed_track_folder_pools(
             append_task_log(session, task, line)
         added = 0
         for candidate in result.get("candidates") or []:
-            pool = lossless_folder_pool(download_folder_pool(candidate))
+            pool = audio_folder_pool(download_folder_pool(candidate))
             if not pool:
                 continue
             key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
@@ -4411,10 +4438,12 @@ def representative_album_seed_requests(requests: list[dict], limit: int) -> list
 
 
 def accepted_album_folder_pools(ranked: list[tuple[tuple[int, float, float, float, int, int], dict]], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
+    # Accept any folder that has audio files (score[5]) and clears the album-name threshold; lossless
+    # is preferred via the sort key, not required, so lossy albums are still offered for review.
     return [
         (score, pool)
         for score, pool in ranked
-        if score[4] > 0 and score[3] >= threshold and (score[2] >= 0.25 or score[3] >= 0.92)
+        if score[5] > 0 and score[3] >= threshold and (score[2] >= 0.25 or score[3] >= 0.92)
     ]
 
 
@@ -4441,12 +4470,21 @@ def slskd_album_folder_try_limit(settings: dict[str, str]) -> int:
     return max(1, min(12, value))
 
 
+def configure_match_tuning(session: Session) -> None:
+    """Refresh the module-level match tuning from the admin-editable match_tuning config.
+
+    Called at every slskd search entry point so the scorer (which has no session) honours the
+    instance's configured weights, floors, and penalties. See services/match_tuning.py.
+    """
+    _match_tuning.update(match_tuning(session))
+
+
 def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int]:
     matched = 0
     confidence_total = 0.0
     artist_scores = []
-    files = lossless_folder_files(pool.get("files") or [])
-    lossless = len(files)
+    files = audio_folder_files(pool.get("files") or [])
+    lossless = len(lossless_folder_files(files))
     folder_segments = album_folder_segments(pool)
     artist_score = best_segment_score(fuzzy_text(requests[0].get("artist") if requests else ""), folder_segments)
     album_score = album_folder_name_score(str(requests[0].get("album") or "") if requests else "", pool)
@@ -4463,10 +4501,12 @@ def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) 
     return (matched, confidence_total, artist_score, album_score, lossless, len(files))
 
 
-def lossless_folder_pool(pool: dict | None) -> dict | None:
+def audio_folder_pool(pool: dict | None) -> dict | None:
+    # Keep every audio file (lossless and lossy). Lossless is preferred at ranking time, but lossy
+    # files are retained so a lossy album surfaces candidates instead of dead-ending to YouTube.
     if not pool:
         return None
-    files = lossless_folder_files(pool.get("files") or [])
+    files = audio_folder_files(pool.get("files") or [])
     if not files:
         return None
     return {**pool, "files": files}
@@ -4476,8 +4516,16 @@ def lossless_folder_files(files: list[dict]) -> list[dict]:
     return [file_info for file_info in files if is_lossless_filename(str(file_info.get("filename") or ""))]
 
 
+def audio_folder_files(files: list[dict]) -> list[dict]:
+    return [file_info for file_info in files if is_audio_filename(str(file_info.get("filename") or ""))]
+
+
 def is_lossless_filename(filename: str) -> bool:
     return str(filename or "").lower().endswith(LOSSLESS_AUDIO_EXTENSIONS)
+
+
+def is_audio_filename(filename: str) -> bool:
+    return Path(str(filename or "").replace("\\", "/")).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
 
 
 def album_folder_segments(pool: dict) -> list[str]:
@@ -4508,7 +4556,7 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
     track = request.get("track") or request.get("title")
     if not track:
         return None
-    files = lossless_folder_files(pool.get("files") or [])
+    files = audio_folder_files(pool.get("files") or [])
     ranked = sorted(
         (
             (download_file_match_score(file_info, request, username=pool.get("username"), folder=pool.get("folder")), file_info)
@@ -4516,7 +4564,11 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
         ),
         key=lambda item: folder_file_score(item[1], item[0].get("confidence", 0.0)),
     )
-    ranked = [(score, file_info) for score, file_info in ranked if score.get("confidence", 0.0) >= threshold and not score.get("rejected")]
+    # Use the recall floor for per-file acceptance inside an already-matched folder (the album-level
+    # threshold governs which folders are accepted, not which files within them), so a correct track
+    # with a messy filename in the right folder still becomes a candidate.
+    file_floor = min(float(threshold), float(_match_tuning["min_confidence"]))
+    ranked = [(score, file_info) for score, file_info in ranked if score.get("confidence", 0.0) >= file_floor and not score.get("rejected")]
     if not ranked:
         return None
     score, file_info = ranked[0]
@@ -4532,7 +4584,7 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
         "free_upload_slots": pool.get("free_upload_slots"),
         "upload_speed": pool.get("upload_speed"),
         "queue_length": pool.get("queue_length"),
-        "quality": "lossless" if is_lossless_filename(str(file_info.get("filename") or "")) else "unknown",
+        "quality": "lossless" if is_lossless_filename(str(file_info.get("filename") or "")) else "lossy",
         "confidence": round(confidence * 100),
         "artist_score": round(float(score.get("artist_score") or 0.0), 3),
         "album_score": round(float(score.get("album_score") or 0.0), 3),
@@ -4590,42 +4642,26 @@ def download_file_match_score(file_info: dict, request: dict, username: object |
     title_score = max(fuzzy_similarity(title, variant) for variant in variants)
     artist_score = best_segment_score(artist, segments)
     album_score = best_segment_score(album, folder_segments or path_segments[:-1])
-    if artist and artist_score < 0.25:
+    duration_score = duration_match_score(request_duration_ms(request), candidate_duration_ms(file_info))
+    # Required gate (recall-favoring): only a present, plausible title is mandatory. A missing artist
+    # in the (frequently artist-less) folder path and a non-lossless format NEVER reject here — they
+    # only lower the ranking — so a correct file in a generically named folder still surfaces.
+    tuning = _match_tuning
+    if title_score < float(tuning["title_floor"]):
         return {
             "confidence": 0.0,
             "title_score": title_score,
             "artist_score": artist_score,
             "album_score": album_score,
-            "duration_score": 0.0,
-            "rejected": True,
-            "reason": "artist not present in candidate path",
-        }
-    candidate_version_words = version_words_for_text(stem)
-    expected_version_words = version_words_for_text(str(request.get("track") or request.get("title") or ""))
-    extra_version_words = candidate_version_words - expected_version_words
-    if extra_version_words:
-        return {
-            "confidence": 0.0,
-            "title_score": title_score,
-            "artist_score": artist_score,
-            "album_score": album_score,
-            "duration_score": 0.0,
-            "rejected": True,
-            "reason": f"wrong version marker: {', '.join(sorted(extra_version_words))}",
-        }
-    if title_score < 0.30:
-        return {
-            "confidence": 0.0,
-            "title_score": title_score,
-            "artist_score": artist_score,
-            "album_score": album_score,
-            "duration_score": 0.0,
+            "duration_score": duration_score,
             "rejected": True,
             "reason": "title match too weak",
         }
     if any(fuzzy_text(segment) in JUNK_ARTIST_SEGMENTS for segment in segments):
         artist_score *= 0.4
-    duration_score = duration_match_score(request_duration_ms(request), candidate_duration_ms(file_info))
+    candidate_version_words = version_words_for_text(stem)
+    expected_version_words = version_words_for_text(str(request.get("track") or request.get("title") or ""))
+    extra_version_words = candidate_version_words - expected_version_words
     number = leading_track_number(stem)
     request_number = request.get("track_number")
     try:
@@ -4634,11 +4670,32 @@ def download_file_match_score(file_info: dict, request: dict, username: object |
         request_number_int = None
     track_number_bonus = 0.0
     if number is not None and request_number_int is not None:
-        track_number_bonus = 0.08 if number == request_number_int else -0.18
-    album_bonus = 0.08 if album and album_score >= 0.85 else 0.03 if album and album_score >= 0.60 else 0.0
-    confidence = (title_score * 0.45) + (artist_score * 0.38) + (duration_score * 0.12) + album_bonus + track_number_bonus
-    if title_score < 0.55 and artist_score < 0.75:
-        confidence *= 0.7
+        track_number_bonus = float(tuning["track_number_bonus"]) if number == request_number_int else -float(tuning["track_number_penalty"])
+    album_bonus = (
+        float(tuning["album_bonus_strong"]) if album and album_score >= 0.85
+        else float(tuning["album_bonus_weak"]) if album and album_score >= 0.60
+        else 0.0
+    )
+    # Duration is the single strongest signal that two files are the same recording, so it carries the
+    # most weight after the title and can rescue a file whose folder omits the artist. Artist is a
+    # ranking signal, not a gate.
+    artist_component = artist_score if artist else 0.5
+    confidence = (
+        (title_score * float(tuning["weight_title"]))
+        + (duration_score * float(tuning["weight_duration"]))
+        + (artist_component * float(tuning["weight_artist"]))
+        + album_bonus
+        + track_number_bonus
+    )
+    # A wrong version (remix/live/instrumental the request didn't ask for) is demoted hard, not
+    # rejected, so it only wins when nothing better exists.
+    if extra_version_words:
+        confidence *= float(tuning["penalty_wrong_version"])
+    # No/different artist AND no duration corroboration → very likely a same-titled wrong song; drop
+    # it well below anything an actual artist or duration match can confirm. A tight duration match
+    # (>=0.75, i.e. within tolerance) is trusted as proof and skips this penalty.
+    if artist and artist_score < 0.5 and duration_score < 0.75:
+        confidence *= float(tuning["penalty_artist_mismatch"])
     return {
         "confidence": max(0.0, min(1.0, confidence)),
         "title_score": title_score,
@@ -4662,13 +4719,18 @@ def candidate_duration_ms(file_info: dict) -> int | None:
     return int(value if value > 10000 else value * 1000)
 
 
-def duration_match_score(expected_ms: int | None, candidate_ms: int | None) -> float:
+def duration_match_score(expected_ms: int | None, candidate_ms: int | None, tolerance_ms: int | None = None) -> float:
+    # Unknown duration is neutral (0.5), never a penalty — a missing expected/candidate length must
+    # not silently kill an otherwise-good match (soft gate).
     if not expected_ms or not candidate_ms:
         return 0.5
+    tolerance_ms = tolerance_ms or int(float(_match_tuning["duration_tolerance_seconds"]) * 1000)
     delta = abs(expected_ms - candidate_ms)
-    if delta <= 5000:
+    if delta <= tolerance_ms:
         return 1.0
-    return max(0.0, 1.0 - (delta / max(expected_ms, 1)) * 5)
+    # Linear decay to 0 over ~4× the tolerance beyond the window, so a far-off length is heavily
+    # penalised (but still not hard-rejected).
+    return max(0.0, 1.0 - (delta - tolerance_ms) / (tolerance_ms * 4))
 
 
 def best_segment_score(expected: str, segments: list[str]) -> float:
@@ -4755,6 +4817,7 @@ def folder_file_score(file_info: dict, confidence: float) -> tuple[int, float, s
 
 
 def search_slskd_for_request(session: Session, request: dict, limit: int = 1, task: Task | None = None) -> dict:
+    configure_match_tuning(session)
     settings = integration_settings(session)
     result = search_slskd_for_request_with_settings(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), request, limit)
     for line in result.get("diagnostics", {}).get("query_logs") or []:
@@ -4784,19 +4847,18 @@ def rank_slskd_candidates_for_request(candidates: list[dict], request: dict, ign
             "duration_score": round(float(score.get("duration_score") or 0.0), 3),
             "match_reason": reason,
         }
-        if request.get("require_lossless") and enriched.get("quality") != "lossless":
-            if len(rejected_reasons) < 4:
-                rejected_reasons.append(f"{candidate.get('filename') or 'unknown'} ({round(confidence * 100)}%): not lossless")
-            continue
-        if not score.get("rejected") and confidence >= MIN_SLSKD_TRACK_CONFIDENCE:
+        # Don't exclude lossy results when lossless is requested: surface both (lossless ranks above
+        # lossy via slskd_candidate_sort_key) so the user can take a lossy match when no lossless
+        # exists rather than dead-ending to YouTube. The format is shown on each candidate row.
+        if not score.get("rejected") and confidence >= _match_tuning["min_confidence"]:
             accepted.append(enriched)
         elif len(rejected_reasons) < 4:
             rejected_reasons.append(f"{candidate.get('filename') or 'unknown'} ({round(confidence * 100)}%): {reason}")
-    accepted.sort(key=slskd_candidate_sort_key, reverse=True)
+    accepted.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
     return accepted[:limit], rejected_reasons
 
 
-def slskd_candidate_sort_key(candidate: dict) -> tuple[int, int, int, float, int, int]:
+def slskd_candidate_sort_key(candidate: dict, require_lossless: bool = False) -> tuple:
     quality = candidate.get("quality")
     quality_score = 2 if quality == "lossless" else 1 if quality == "lossy" else 0
     free_slots = 1 if candidate.get("free_upload_slots") else 0
@@ -4812,7 +4874,13 @@ def slskd_candidate_sort_key(candidate: dict) -> tuple[int, int, int, float, int
         size = int(candidate.get("size") or 0)
     except (TypeError, ValueError):
         size = 0
-    return (int(candidate.get("confidence") or 0), quality_score, free_slots, upload_speed, -queue_length, size)
+    confidence = int(candidate.get("confidence") or 0)
+    # When lossless is requested, any lossless match outranks every lossy one (so the auto-selected
+    # top candidate is lossless if one exists) while lossy stays available below it. Otherwise rank
+    # by confidence first with quality as a tiebreak.
+    if require_lossless:
+        return (quality_score, confidence, free_slots, upload_speed, -queue_length, size)
+    return (confidence, quality_score, free_slots, upload_speed, -queue_length, size)
 
 
 def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
@@ -5096,16 +5164,10 @@ def album_search_query_variants(artist: str, album: str, requests: list[dict]) -
     primary_artist = artist_values[0] if artist_values else artist
     primary_album = album_values[0] if album_values else album
     years = release_year_values(requests)
-    require_lossless = any(request.get("require_lossless") for request in requests)
-    flac_variants = [
-        " ".join(part for part in [primary_artist, primary_album, "flac"] if part),
-        " ".join(part for part in [primary_album, primary_artist, "flac"] if part),
-    ]
     variants: list[str] = []
-    # For lossless requests the FLAC-qualified queries narrow straight to the target folders, so
-    # try them first; otherwise they go last as a fallback.
-    if require_lossless:
-        variants.extend(flac_variants)
+    # Search broad; format is enforced locally by extension, never by a "flac" keyword (which only
+    # matches folders literally named "FLAC" and silently returned zero results for FLAC albums in
+    # plainly named folders).
     variants.append(" ".join(part for part in [primary_artist, primary_album] if part))
     variants.append(" ".join(part for part in [primary_album, primary_artist] if part))
     for year in years[:2]:
@@ -5116,8 +5178,6 @@ def album_search_query_variants(artist: str, album: str, requests: list[dict]) -
         variants.append(" ".join(part for part in [album_value, primary_artist] if part))
     for artist_value in artist_values[1:]:
         variants.append(" ".join(part for part in [artist_value, primary_album] if part))
-    if not require_lossless:
-        variants.extend(flac_variants)
     return unique_nonempty(variants)
 
 
@@ -5140,17 +5200,20 @@ def download_query_variants(request: dict) -> list[str]:
     variants = []
     primary_album = album_values[0] if album_values else album
     primary_track = track_values[0] if track_values else track
-    variants.append(" ".join(part for part in [artist, primary_album, primary_track] if part))
+    # Search broad, filter locally. "artist title" is the canonical Soulseek query and returns the
+    # most focused result set; the album-qualified query helps disambiguate; title-only is the
+    # desperate last resort that still catches files in artist-less folders. The format is enforced
+    # by local extension filtering, never by a "flac" keyword (that only matches folders literally
+    # named "FLAC" and was silently returning zero results).
     variants.append(" ".join(part for part in [artist, primary_track] if part))
     variants.append(f"{artist} - {primary_track}".strip(" -"))
+    variants.append(" ".join(part for part in [artist, primary_album, primary_track] if part))
     variants.append(" ".join(part for part in [primary_album, primary_track] if part))
     variants.append(primary_track)
     for album_value in album_values[1:]:
         variants.append(" ".join(part for part in [artist, album_value, primary_track] if part))
-    if request.get("require_lossless"):
-        variants.append(" ".join(part for part in [artist, primary_album, primary_track, "flac"] if part))
     variants.extend(
-        " ".join(part for part in [artist, primary_album, track_value] if part)
+        " ".join(part for part in [artist, track_value] if part)
         for track_value in track_values[1:]
     )
     return unique_nonempty(variants)

@@ -6981,11 +6981,100 @@ function SettingsPanel({
           </button>
         </section>
       )}
+      {canManageSettings(user) && <MatchTuningSettings api={api} notify={notify} />}
       <SecuritySettings api={api} notify={notify} />
       <footer className="settings-footer">
         Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
       </footer>
     </div>
+  );
+}
+
+function MatchTuningSettings({ api, notify }) {
+  const [schema, setSchema] = useState([]);
+  const [draft, setDraft] = useState({});
+  const [open, setOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    api("/settings/match-tuning")
+      .then((data) => {
+        if (!active || !data) return;
+        setSchema(data.schema || []);
+        setDraft(data.values || {});
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  async function save() {
+    setSaving(true);
+    try {
+      const values = {};
+      for (const field of schema) {
+        const raw = draft[field.name];
+        const num = Number(raw);
+        values[field.name] = Number.isFinite(num) ? num : field.default;
+      }
+      const data = await api("/settings/match-tuning", { method: "PUT", body: JSON.stringify({ values }) });
+      if (data) {
+        setSchema(data.schema || schema);
+        setDraft(data.values || values);
+      }
+      notify?.("Matching saved", "Download matching settings updated.");
+    } catch (error) {
+      notify?.("Matching failed", error?.message || "Could not save matching settings", "ui_error");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function resetDefaults() {
+    setDraft((current) => {
+      const next = { ...current };
+      for (const field of schema) next[field.name] = field.default;
+      return next;
+    });
+  }
+
+  return (
+    <section className="settings-section">
+      <h2 className="settings-collapse-header" onClick={() => setOpen((value) => !value)} style={{ cursor: "pointer" }}>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />} Download matching
+      </h2>
+      {open && (
+        <>
+          <p className="settings-hint">
+            How Soulseek results are scored and ranked. Higher recall surfaces more candidates for review; everything still goes through the
+            approval queue before downloading. Leave at defaults unless you know what you're tuning.
+          </p>
+          {schema.map((field) => (
+            <label className="setting-row integration-row" key={field.name} title={field.help}>
+              <span>{field.label}</span>
+              <input
+                type="number"
+                min={field.min}
+                max={field.max}
+                step={field.step}
+                value={draft[field.name] ?? field.default}
+                onChange={(event) => setDraft((current) => ({ ...current, [field.name]: event.target.value }))}
+              />
+            </label>
+          ))}
+          <div className="settings-button-row">
+            <button className="secondary compact-button" type="button" onClick={resetDefaults} disabled={saving}>
+              Reset to defaults
+            </button>
+            <button className="primary compact-button" type="button" onClick={save} disabled={saving || !schema.length}>
+              {saving ? "Saving…" : "Save matching"}
+            </button>
+          </div>
+        </>
+      )}
+    </section>
   );
 }
 
