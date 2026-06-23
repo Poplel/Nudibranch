@@ -456,8 +456,14 @@ def is_singles_pseudo_album(album: str) -> bool:
 
 
 def should_use_track_search_fallback(album: str, requests: list[dict]) -> bool:
-    if any(request.get("workflow") in {"missing_tracks", "lossless_replacement"} for request in requests):
+    # Lossless replacement exists to UPGRADE to lossless — never pull lossy per-track for it.
+    if any(request.get("workflow") == "lossless_replacement" for request in requests):
         return False
+    # Missing-track fills MAY fall back to per-track search (which now surfaces lossy as an option,
+    # lossless still ranked first) when no lossless album folder is found, rather than dead-ending to
+    # YouTube. Checked before the require_lossless guard so it isn't blocked by it.
+    if any(request.get("workflow") == "missing_tracks" for request in requests):
+        return True
     if any(request.get("require_lossless") for request in requests) and len(requests) > 1:
         return False
     if is_singles_pseudo_album(album):
