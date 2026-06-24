@@ -5203,6 +5203,14 @@ def album_search_query_variants(artist: str, album: str, requests: list[dict]) -
     # plainly named folders).
     variants.append(" ".join(part for part in [primary_artist, primary_album] if part))
     variants.append(" ".join(part for part in [primary_album, primary_artist] if part))
+    # Album-name-only fallback. Some artist names return ZERO results on the Soulseek network even
+    # though the files (with the artist in their folder path) are abundantly shared — e.g. every
+    # "Lady Gaga ..." query returns 0, but "The Fame" returns hundreds of FLAC folders that DO contain
+    # "Lady Gaga" in their paths. The local folder scorer filters by artist (folder-path match), so a
+    # broad album-only query is safe; the early-exit on a complete folder keeps it from running for
+    # albums whose artist+album query already matched.
+    if primary_album:
+        variants.append(primary_album)
     for year in years[:2]:
         variants.append(" ".join(part for part in [primary_album, year] if part))
         variants.append(" ".join(part for part in [primary_artist, primary_album, year] if part))
