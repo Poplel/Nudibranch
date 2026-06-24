@@ -19,23 +19,19 @@ class Base(DeclarativeBase):
 
 
 class Permission(str, enum.Enum):
-    library_read = "library:read"
-    library_write = "library:write"
-    library_manage = "library:manage"
-    import_run = "import:run"
-    approvals_manage = "approvals:manage"
-    wishlist_manage_own = "wishlist:manage_own"
-    wishlist_manage_all = "wishlist:manage_all"
-    downloads_manage = "downloads:manage"
-    metadata_edit = "metadata:edit"
-    playlists_manage = "playlists:manage"
-    activity_read = "activity:read"
-    notifications_read = "notifications:read"
-    settings_manage = "settings:manage"
-    users_manage = "users:manage"
-    backups_manage = "backups:manage"
-    jellyfin_manage = "jellyfin:manage"
-    automations_manage = "automations:manage"
+    # Flow/menu-level permissions: one per menu, each carries the whole flow.
+    library_view = "library:view"            # Library: browse + play
+    library_edit = "library:edit"            # Library: edit metadata, covers, remove, MB match, verify, replace, reindex
+    discover = "discover"                     # Discover + Wishlist menus: search, request, queue downloads
+    wishlist_approve_all = "wishlist:approve_all"  # Approve other users' wishlist requests
+    import_run = "import:run"                # Import/Add menu
+    approvals_manage = "approvals:manage"    # Task Queue menu: see + approve/reject everything
+    playlists_manage = "playlists:manage"    # Playlists menu
+    activity_read = "activity:read"          # Activity menu + tasks/logs + activity notifications
+    tools_manage = "tools:manage"            # Tools menu: maintenance, backups/restore, Jellyfin, clear-downloads
+    automations_manage = "automations:manage"  # Automations menu
+    users_manage = "users:manage"            # Users menu
+    settings_manage = "settings:manage"      # Settings menu
 
 
 class ProposalKind(str, enum.Enum):

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import text
@@ -123,7 +124,53 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
     _migrate_library_timestamps(session)
+    _migrate_permissions(session)
     move_task_result_logs_to_app_log(session)
+
+
+# Old fine-grained permission -> new flow/menu permission(s). notifications:read is
+# dropped (notifications now route by the flow they belong to). Unlisted values are
+# kept as-is (identity), which also makes this migration idempotent: after it runs,
+# no stored value is a key here, so a second pass is a no-op.
+_PERMISSION_REMAP = {
+    "library:read": ["library:view"],
+    "library:write": ["library:edit"],
+    "metadata:edit": ["library:edit"],
+    "library:manage": ["tools:manage", "library:edit"],
+    "wishlist:manage_own": ["discover"],
+    "wishlist:manage_all": ["wishlist:approve_all"],
+    "downloads:manage": ["discover"],
+    "backups:manage": ["tools:manage"],
+    "jellyfin:manage": ["tools:manage"],
+    "notifications:read": [],
+}
+
+
+def _migrate_permissions(session: Session) -> None:
+    """Collapse the old 18 fine-grained permissions into the new flow/menu set.
+
+    Rewrites user_permissions rows in place. Idempotent: only runs when at least one
+    stored value is an old (remapped) key. Dedupes because several old permissions
+    map onto the same new one (e.g. backups+jellyfin -> tools:manage).
+    """
+    rows = list(session.execute(text("SELECT user_id, permission FROM user_permissions")))
+    if not rows or not any(perm in _PERMISSION_REMAP for _, perm in rows):
+        return
+    new_by_user: dict[str, set[str]] = {}
+    for user_id, perm in rows:
+        bucket = new_by_user.setdefault(user_id, set())
+        if perm in _PERMISSION_REMAP:
+            bucket.update(_PERMISSION_REMAP[perm])
+        else:
+            bucket.add(perm)
+    session.execute(text("DELETE FROM user_permissions"))
+    for user_id, perms in new_by_user.items():
+        for perm in sorted(perms):
+            session.execute(
+                text("INSERT INTO user_permissions (id, user_id, permission) VALUES (:id, :uid, :perm)"),
+                {"id": uuid.uuid4().hex, "uid": user_id, "perm": perm},
+            )
+    session.commit()
 
 
 def _migrate_library_timestamps(session: Session) -> None:

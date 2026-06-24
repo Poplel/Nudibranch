@@ -106,6 +106,27 @@ def _canonical_push_message(
     ).encode()
 
 
+# Broadcast notifications route to the people who own the menu/flow the notification
+# is about (decided by its target_url's first path segment), plus admins. A notification
+# with no/unknown target goes to admins only.
+_NOTIFICATION_AUDIENCE: dict[str, Permission] = {
+    "activity": Permission.activity_read,
+    "task-queue": Permission.approvals_manage,
+    "downloads": Permission.approvals_manage,
+    "tools": Permission.tools_manage,
+    "library": Permission.library_view,
+    "automations": Permission.automations_manage,
+    "wishlist": Permission.discover,
+}
+
+
+def _audience_permission(target_url: str | None) -> Permission | None:
+    if not target_url:
+        return None
+    segment = target_url.split("?", 1)[0].strip("/").split("/", 1)[0]
+    return _NOTIFICATION_AUDIENCE.get(segment)
+
+
 def create_notification(
     session: Session,
     title: str,
@@ -116,11 +137,13 @@ def create_notification(
     deliver_apns: bool = True,
 ) -> Notification:
     if user_id is None:
+        audience = _audience_permission(target_url)
         users = list(session.scalars(select(User)))
         target_user_ids = [
             user.id
             for user in users
-            if user.is_admin or any(permission.permission == Permission.notifications_read for permission in user.permissions)
+            if user.is_admin
+            or (audience is not None and any(permission.permission == audience for permission in user.permissions))
         ]
         if target_user_ids:
             created: Notification | None = None

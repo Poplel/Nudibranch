@@ -6,18 +6,18 @@ import shutil
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch import __version__
 from nudibranch.core.config import get_settings
 from nudibranch.db.init import init_db
-from nudibranch.db.models import Album, AppSetting, Artist, Playlist, PlaylistTrack, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
+from nudibranch.db.models import Album, AppSetting, Artist, AuthSession, Playlist, PlaylistTrack, PlayerState, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
@@ -44,6 +44,23 @@ DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 MAX_TASK_ATTEMPTS = 4
 AUTOMATION_TICK_SECONDS = 30
 PENDING_PLAYLIST_TICK_SECONDS = 45
+# Presence: a user is "online" while a session of theirs was used within this window
+# (open clients poll every ~4s, so a closed tab/app goes stale quickly). When they go
+# offline we clear their "now playing" so closed clients stop showing as playing.
+PRESENCE_WINDOW_SECONDS = 60
+PRESENCE_SWEEP_SECONDS = 30
+
+
+def clear_offline_playback(session: Session) -> int:
+    """Mark PlayerState stopped for users with no recently-used session (they closed the app)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=PRESENCE_WINDOW_SECONDS)
+    online_user_ids = select(AuthSession.user_id).where(AuthSession.last_used_at >= cutoff)
+    result = session.execute(
+        update(PlayerState)
+        .where(PlayerState.status != "stopped", PlayerState.user_id.not_in(online_user_ids))
+        .values(status="stopped")
+    )
+    return result.rowcount or 0
 
 
 
@@ -8430,6 +8447,7 @@ async def worker_loop() -> None:
     last_download_scan_log = 0.0
     last_automation_tick = 0.0
     last_pending_playlist_tick = 0.0
+    last_presence_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -8475,6 +8493,13 @@ async def worker_loop() -> None:
                     except Exception:  # noqa: BLE001 - never let pending-playlist work stop the worker.
                         session.rollback()
                     last_pending_playlist_tick = time.time()
+                if time.time() - last_presence_tick > PRESENCE_SWEEP_SECONDS:
+                    try:
+                        if clear_offline_playback(session):
+                            session.commit()
+                    except Exception:  # noqa: BLE001 - presence sweep must never stop the worker.
+                        session.rollback()
+                    last_presence_tick = time.time()
                 try:
                     await deliver_apns_notifications(session)
                 except Exception:  # noqa: BLE001

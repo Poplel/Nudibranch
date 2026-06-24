@@ -14,7 +14,7 @@ import httpx
 from sqlalchemy import case, delete, func, literal, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from nudibranch.api.deps import SESSION_TTL, get_current_user, require_permission, resolve_media_user
+from nudibranch.api.deps import SESSION_TTL, get_current_user, require_admin, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
     AlbumLookupRequest,
     AutomationCreate,
@@ -73,6 +73,7 @@ from nudibranch.api.schemas import (
     ProposalSelectionUpdate,
     SearchResponse,
     SearchResultItem,
+    AdminSessionOut,
     SessionOut,
     StaticKeyCreate,
     StaticKeyOut,
@@ -138,23 +139,29 @@ from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_P
 router = APIRouter(prefix="/api/v1")
 
 
+PRESENCE_WINDOW = timedelta(seconds=60)
+
+
+def _is_online(last_used_at: datetime | None) -> bool:
+    if not last_used_at:
+        return False
+    ts = last_used_at if last_used_at.tzinfo is not None else last_used_at.replace(tzinfo=timezone.utc)
+    return ts >= datetime.now(timezone.utc) - PRESENCE_WINDOW
+
+
 PERMISSION_SECTIONS = {
-    Permission.library_read: "Library",
-    Permission.library_write: "Library",
-    Permission.library_manage: "Library",
-    Permission.metadata_edit: "Metadata",
+    Permission.library_view: "Library",
+    Permission.library_edit: "Library",
+    Permission.discover: "Discover & Wishlist",
+    Permission.wishlist_approve_all: "Discover & Wishlist",
     Permission.import_run: "Import",
     Permission.approvals_manage: "Task Queue",
-    Permission.wishlist_manage_own: "Wishlist",
-    Permission.wishlist_manage_all: "Wishlist",
-    Permission.downloads_manage: "Downloads",
     Permission.playlists_manage: "Playlists",
     Permission.activity_read: "Activity",
-    Permission.notifications_read: "Notifications",
-    Permission.settings_manage: "Settings",
+    Permission.tools_manage: "Tools",
+    Permission.automations_manage: "Automations",
     Permission.users_manage: "Users",
-    Permission.backups_manage: "Tools",
-    Permission.jellyfin_manage: "Tools",
+    Permission.settings_manage: "Settings",
 }
 
 
@@ -290,10 +297,47 @@ def revoke_session(
     return {"ok": True}
 
 
+@router.get("/sessions", response_model=list[AdminSessionOut], tags=["auth"], summary="List all users' sessions (admin/tools)")
+def list_all_sessions(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.tools_manage)),
+) -> list[AdminSessionOut]:
+    rows = session.scalars(
+        select(AuthSession).options(selectinload(AuthSession.user)).order_by(AuthSession.last_used_at.desc())
+    )
+    return [
+        AdminSessionOut(
+            id=s.id,
+            user_id=s.user_id,
+            user_name=s.user.display_name,
+            username=s.user.username,
+            device_label=s.device_label,
+            created_at=s.created_at,
+            last_used_at=s.last_used_at,
+            expires_at=s.expires_at,
+            online=_is_online(s.last_used_at),
+        )
+        for s in rows
+    ]
+
+
+@router.delete("/sessions/{session_id}", tags=["auth"], summary="Revoke any user's session (admin/tools)")
+def revoke_any_session(
+    session_id: str,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.tools_manage)),
+) -> dict:
+    existing = session.scalar(select(AuthSession).where(AuthSession.id == session_id))
+    if existing:
+        session.delete(existing)
+        session.commit()
+    return {"ok": True}
+
+
 @router.get("/me/api-keys", response_model=list[StaticKeyOut], tags=["auth"], summary="List my static API keys")
 def list_api_keys(
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_admin),
 ) -> list[StaticKeyOut]:
     rows = session.scalars(
         select(StaticApiKey).where(StaticApiKey.user_id == user.id).order_by(StaticApiKey.created_at.desc())
@@ -308,7 +352,7 @@ def list_api_keys(
 def create_api_key(
     payload: StaticKeyCreate,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_admin),
 ) -> StaticKeyCreated:
     token = generate_token()
     key = StaticApiKey(user_id=user.id, name=payload.name.strip(), key_hash=hash_token(token), prefix=token_prefix(token))
@@ -323,7 +367,7 @@ def create_api_key(
 def revoke_api_key(
     key_id: str,
     session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_admin),
 ) -> dict:
     key = session.scalar(select(StaticApiKey).where(StaticApiKey.id == key_id, StaticApiKey.user_id == user.id))
     if key:
@@ -350,7 +394,7 @@ def list_users(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.users_manage)),
 ) -> list[UserOut]:
-    users = list(session.scalars(select(User).options(selectinload(User.permissions)).order_by(User.created_at.asc())))
+    users = list(session.scalars(select(User).options(selectinload(User.permissions), selectinload(User.auth_sessions)).order_by(User.created_at.asc())))
     return [serialize_user(user) for user in users]
 
 
@@ -740,7 +784,7 @@ def library_top(
 def library_changes(
     since: str | None = None,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> dict:
     since_dt = None
     if since:
@@ -1181,7 +1225,7 @@ def users_playback(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.activity_read)),
 ) -> dict:
-    users = list(session.scalars(select(User).options(selectinload(User.player_state)).order_by(User.created_at.asc())))
+    users = list(session.scalars(select(User).options(selectinload(User.player_state), selectinload(User.auth_sessions)).order_by(User.created_at.asc())))
     return {
         "app": [serialize_player_state(user) for user in users],
         "jellyfin": jellyfin_now_playing(session),
@@ -1232,7 +1276,7 @@ def _album_sort_expr():
 @router.get("/library/tree", response_model=list[LibraryTreeArtist], tags=["library"], summary="Get library tree")
 def library_tree(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> list[LibraryTreeArtist]:
     artists = list(
         session.scalars(
@@ -1294,7 +1338,7 @@ def library_artists(
     page_size: int = Query(100, ge=1, le=500),
     q: str | None = Query(None),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> PaginatedArtists:
     sort_expr = _artist_sort_expr()
     stmt = select(Artist)
@@ -1319,7 +1363,7 @@ def library_albums(
     artist_id: str | None = Query(None),
     q: str | None = Query(None),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> PaginatedAlbums:
     sort_expr = _album_sort_expr()
     stmt = select(Album)
@@ -1354,7 +1398,7 @@ def library_tracks(
     album_id: str | None = Query(None),
     q: str | None = Query(None),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> PaginatedTracks:
     stmt = select(Track)
     if album_id:
@@ -1394,7 +1438,7 @@ def library_buckets(
     artist_id: str | None = Query(None),
     album_id: str | None = Query(None),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_read)),
+    _: User = Depends(require_permission(Permission.library_view)),
 ) -> list[BucketCount]:
     if type == "albums":
         sort_expr = Album.title
@@ -1422,7 +1466,7 @@ def library_search(
     min_confidence: float | None = Query(None, ge=0.0, le=1.0),
     limit: int = Query(50, ge=1, le=200),
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.library_read)),
+    user: User = Depends(require_permission(Permission.library_view)),
 ) -> SearchResponse:
     kinds = [t.strip() for t in types.split(",") if t.strip()] if types else None
     threshold = min_confidence if min_confidence is not None else (
@@ -1435,7 +1479,7 @@ def library_search(
 @router.post("/library/search/reindex", tags=["library"], summary="Rebuild the search index")
 def library_search_reindex(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     return {"indexed": rebuild_search_index(session)}
 
@@ -1458,7 +1502,7 @@ def update_search_settings(
 def propose_library_metadata(
     payload: LibraryMetadataProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> ProposalBatchOut:
     changes = {key: value for key, value in payload.changes.items() if key in editable_fields(payload.target_type)}
     if not changes:
@@ -1501,7 +1545,7 @@ def propose_library_metadata(
 def apply_library_metadata(
     payload: LibraryMetadataProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     # Direct apply (no review queue): library metadata edits commit on field blur.
     # Reuses the exact apply path the approved-batch executor runs, so behavior
@@ -1541,7 +1585,7 @@ def apply_library_metadata(
 def propose_library_remove(
     payload: LibraryRemoveProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_write)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> ProposalBatchOut:
     target = metadata_target(session, payload.target_type, payload.target_id)
     if not target:
@@ -1629,7 +1673,7 @@ def propose_library_remove(
 def musicbrainz_match_library_album(
     album_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     album = session.get(Album, album_id)
     if not album:
@@ -1662,7 +1706,7 @@ def musicbrainz_match_library_album(
 def musicbrainz_match_library_track(
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     track = session.get(Track, track_id)
     if not track:
@@ -1681,7 +1725,7 @@ def musicbrainz_match_library_track(
 def verify_track_audio(
     track_id: str,
     session: Session = Depends(get_session),
-    current_user: User = Depends(require_permission(Permission.library_manage)),
+    current_user: User = Depends(require_permission(Permission.library_edit)),
 ) -> AudioVerifyResult:
     track = session.scalar(
         select(Track)
@@ -1739,7 +1783,7 @@ def verify_track_audio(
 def requeue_track_replacement(
     track_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> TaskOut:
     track = session.get(Track, track_id)
     if not track:
@@ -1751,7 +1795,7 @@ def requeue_track_replacement(
 def requeue_album_replacement(
     album_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> TaskOut:
     album = session.get(Album, album_id)
     if not album:
@@ -2035,7 +2079,7 @@ def stream_track(
 ) -> FileResponse:
     user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
-    if not user or (not user.is_admin and Permission.library_read not in permissions):
+    if not user or (not user.is_admin and Permission.library_view not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
     track = session.get(Track, track_id)
     if not track or not track.path:
@@ -2056,7 +2100,7 @@ def get_track_lyrics(
 ) -> dict:
     user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
-    if not user or (not user.is_admin and Permission.library_read not in permissions):
+    if not user or (not user.is_admin and Permission.library_view not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
     track = session.get(Track, track_id)
     if not track or not track.path:
@@ -2077,7 +2121,7 @@ def album_cover(
 ) -> FileResponse:
     user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
-    if not user or (not user.is_admin and Permission.library_read not in permissions):
+    if not user or (not user.is_admin and Permission.library_view not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
     album = session.get(Album, album_id)
     if not album or not album.cover_path:
@@ -2096,7 +2140,7 @@ def album_cover(
 def album_cover_candidates(
     album_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     album = session.get(Album, album_id)
     if not album:
@@ -2118,7 +2162,7 @@ def artist_cover(
 ) -> FileResponse:
     user = resolve_media_user(session, api_key)
     permissions = {permission.permission for permission in user.permissions} if user else set()
-    if not user or (not user.is_admin and Permission.library_read not in permissions):
+    if not user or (not user.is_admin and Permission.library_view not in permissions):
         raise HTTPException(status_code=401, detail="Invalid API key")
     artist = session.get(Artist, artist_id)
     if not artist or not artist.cover_path:
@@ -2137,7 +2181,7 @@ def artist_cover(
 def artist_cover_candidates(
     artist_id: str,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     artist = session.get(Artist, artist_id)
     if not artist:
@@ -2165,7 +2209,7 @@ async def upload_artist_cover(
     artist_id: str,
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     artist = session.get(Artist, artist_id)
     if not artist:
@@ -2196,7 +2240,7 @@ async def upload_album_cover(
     album_id: str,
     file: UploadFile = File(...),
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.metadata_edit)),
+    _: User = Depends(require_permission(Permission.library_edit)),
 ) -> dict:
     album = session.get(Album, album_id)
     if not album:
@@ -2656,7 +2700,7 @@ def _scrape_playlist_url(url: str) -> dict:
 def discover_search(
     q: str = Query(min_length=1, max_length=180),
     background_tasks: BackgroundTasks = None,
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> dict:
     write_app_log("Discover API search requested", feature="discover", query=q, user_id=user.id)
     try:
@@ -2682,7 +2726,7 @@ def discover_search(
 @router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)
 def discover_album_tracks(
     album_id: str,
-    _: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    _: User = Depends(require_permission(Permission.discover)),
 ) -> dict:
     tracks = itunes_album_tracks(album_id)
     return {"tracks": tracks}
@@ -2692,7 +2736,7 @@ def discover_album_tracks(
 def discover_task_queue(
     payload: DiscoverTaskQueueRequest,
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.downloads_manage)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> TaskOut:
     write_app_log("Discover task queue requested", feature="discover", user_id=user.id, downloads=len(payload.download_requests))
     task = enqueue_task(session, "propose_import", {"path": None, "files": [], "download_requests": payload.download_requests})
@@ -2703,11 +2747,11 @@ def discover_task_queue(
 @router.get("/wishlist", response_model=list[WishlistOut], tags=["wishlist"], summary="List wishlist")
 def list_wishlist(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> list[WishlistOut]:
     reconcile_stale_approved_wishlist_items(session, user)
     query = select(WishlistItem).options(selectinload(WishlistItem.user))
-    if not user_has_permission(user, Permission.wishlist_manage_all):
+    if not user_has_permission(user, Permission.wishlist_approve_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
     expire_old_terminal_wishlist_items(session, items)
@@ -2720,7 +2764,7 @@ def list_wishlist(
 def create_wishlist_item(
     payload: WishlistCreate,
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> WishlistOut:
     write_app_log(
         "Wishlist add requested",
@@ -2775,10 +2819,10 @@ def create_wishlist_item(
 def remove_wishlist_item(
     item_id: str,
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> WishlistOut:
     item = session.get(WishlistItem, item_id)
-    if not item or (not user_has_permission(user, Permission.wishlist_manage_all) and item.user_id != user.id):
+    if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     item.status = "removed"
     item.status_changed_at = datetime.now(timezone.utc)
@@ -2790,7 +2834,7 @@ def remove_wishlist_item(
 @router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="Get wishlist items pending approval")
 def list_wishlist_approvals(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> list[ProposalBatchOut]:
     query = (
         select(ProposalBatch)
@@ -2800,7 +2844,7 @@ def list_wishlist_approvals(
         .order_by(ProposalBatch.created_at.desc())
     )
     batches = prune_settled_batches(session, list(session.scalars(query)))
-    if user_has_permission(user, Permission.wishlist_manage_all):
+    if user_has_permission(user, Permission.wishlist_approve_all):
         return [serialize_batch(batch) for batch in batches]
     visible_batches = []
     for batch in batches:
@@ -2813,18 +2857,18 @@ def list_wishlist_approvals(
 def propose_wishlist_items(
     payload: WishlistApprovalRequest | None = None,
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.wishlist_manage_own)),
+    user: User = Depends(require_permission(Permission.discover)),
 ) -> ProposalBatchOut:
     reconcile_stale_approved_wishlist_items(session, user)
     query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
-    if not user_has_permission(user, Permission.wishlist_manage_all):
+    if not user_has_permission(user, Permission.wishlist_approve_all):
         query = query.where(WishlistItem.user_id == user.id)
     all_wanted_items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
     denied_items: list[WishlistItem] = []
     if payload and payload.item_ids:
         selected_ids = set(payload.item_ids)
         items = [item for item in all_wanted_items if item.id in selected_ids]
-        if payload.deny_unselected and user_has_permission(user, Permission.wishlist_manage_all):
+        if payload.deny_unselected and user_has_permission(user, Permission.wishlist_approve_all):
             denied_items = [item for item in all_wanted_items if item.id not in selected_ids]
     else:
         items = all_wanted_items
@@ -3354,7 +3398,7 @@ def propose_playlist_position(
 @router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"], summary="Trigger Jellyfin library scan")
 def tool_jellyfin_scan(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.jellyfin_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
 
@@ -3362,7 +3406,7 @@ def tool_jellyfin_scan(
 @router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
 def tool_remap_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.jellyfin_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
 
@@ -3370,7 +3414,7 @@ def tool_remap_tracks(
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"], summary="Check library files for issues")
 def tool_check_files(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_files", {}))
 
@@ -3378,7 +3422,7 @@ def tool_check_files(
 @router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"], summary="Check for duplicate files")
 def tool_check_duplicates(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_duplicates", {}))
 
@@ -3386,7 +3430,7 @@ def tool_check_duplicates(
 @router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"], summary="Check for missing lyrics")
 def tool_check_lyrics(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_lyrics", {}))
 
@@ -3394,7 +3438,7 @@ def tool_check_lyrics(
 @router.post("/tools/check-musicbrainz-ids", response_model=TaskOut, tags=["tools"], summary="Fill missing MusicBrainz IDs")
 def tool_check_musicbrainz_ids(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {}))
 
@@ -3402,7 +3446,7 @@ def tool_check_musicbrainz_ids(
 @router.post("/tools/check-audio-content", response_model=TaskOut, tags=["tools"], summary="Verify audio matches metadata")
 def tool_check_audio_content(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_audio_content", {}))
 
@@ -3410,7 +3454,7 @@ def tool_check_audio_content(
 @router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")
 def tool_check_album_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_album_covers", {}))
 
@@ -3418,7 +3462,7 @@ def tool_check_album_covers(
 @router.post("/tools/check-artist-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing artist art")
 def tool_check_artist_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_artist_covers", {}))
 
@@ -3427,7 +3471,7 @@ def tool_check_artist_covers(
 def propose_check_file_fix(
     payload: CheckFileFixRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> ProposalBatchOut:
     if payload.action in {"remove_record", "download_record"}:
         if not payload.track_id:
@@ -3525,7 +3569,7 @@ def propose_check_file_fix(
 @router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"], summary="Check for missing tracks")
 def tool_check_missing_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.downloads_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
 
@@ -3533,7 +3577,7 @@ def tool_check_missing_tracks(
 @router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"], summary="Check for non-lossless files")
 def tool_check_non_lossless(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "check_non_lossless", {}))
 
@@ -3541,7 +3585,7 @@ def tool_check_non_lossless(
 @router.post("/tools/apply-replaygain", response_model=TaskOut, tags=["tools"], summary="Measure + apply ReplayGain (review-gated)")
 def tool_apply_replaygain(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "apply_replaygain", {}))
 
@@ -3549,7 +3593,7 @@ def tool_apply_replaygain(
 @router.post("/tools/consolidate-folders", response_model=TaskOut, tags=["tools"], summary="Consolidate album folders")
 def tool_consolidate_folders(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.library_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "consolidate_folders", {}))
 
@@ -3557,7 +3601,7 @@ def tool_consolidate_folders(
 @router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"], summary="Clear completed downloads")
 def tool_clear_downloads(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.downloads_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "clear_downloads", {}))
 
@@ -3565,14 +3609,14 @@ def tool_clear_downloads(
 @router.post("/tools/backup", response_model=TaskOut, tags=["tools"], summary="Create library backup")
 def tool_backup(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.backups_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "backup_now", {}))
 
 
 @router.get("/tools/backups", tags=["tools"], summary="List available backups", response_model=dict)
 def list_backups(
-    _: User = Depends(require_permission(Permission.backups_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> dict:
     settings = get_settings()
     settings.backups_path.mkdir(parents=True, exist_ok=True)
@@ -3583,7 +3627,7 @@ def list_backups(
 @router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"], summary="Restore from latest backup")
 def tool_restore_default(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.backups_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "restore_default", {}))
 
@@ -3592,7 +3636,7 @@ def tool_restore_default(
 def tool_restore_backup(
     payload: BackupRestoreRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.backups_manage)),
+    _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     settings = get_settings()
     backup_path = Path(payload.backup_path).resolve()
@@ -3834,7 +3878,7 @@ def put_match_tuning(
 @router.get("/notifications", response_model=list[NotificationOut], tags=["notifications"], summary="List notifications")
 def list_notifications(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.notifications_read)),
+    user: User = Depends(get_current_user),
 ) -> list[NotificationOut]:
     query = select(Notification).where(
         (Notification.user_id == user.id)
@@ -3916,7 +3960,7 @@ def deregister_device(
 @router.post("/notifications/read", tags=["notifications"], summary="Mark notifications as read", response_model=list[NotificationOut])
 def mark_notifications_read(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.notifications_read)),
+    user: User = Depends(get_current_user),
 ) -> dict:
     notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
     for notification in notifications:
@@ -3929,7 +3973,7 @@ def mark_notifications_read(
 @router.delete("/notifications", tags=["notifications"], summary="Dismiss all notifications", response_model=dict)
 def clear_notifications(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.notifications_read)),
+    user: User = Depends(get_current_user),
 ) -> dict:
     notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
     for notification in notifications:
@@ -4126,13 +4170,15 @@ def serialize_user(user: User) -> UserOut:
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,
         jellyfin_user_id=user.jellyfin_user_id or None,
+        online=any(_is_online(s.last_used_at) for s in user.auth_sessions),
     )
 
 
 def serialize_player_state(user: User) -> dict:
     state = user.player_state
+    online = any(_is_online(s.last_used_at) for s in user.auth_sessions)
     if not state:
-        return {"user_id": user.id, "user_name": user.display_name, "status": "stopped", "source": "Nudibranch"}
+        return {"user_id": user.id, "user_name": user.display_name, "status": "stopped", "source": "Nudibranch", "online": online}
     updated_at = state.updated_at
     if updated_at and updated_at.tzinfo is None:
         updated_at = updated_at.replace(tzinfo=timezone.utc)
@@ -4144,7 +4190,7 @@ def serialize_player_state(user: User) -> dict:
         "title": state.title,
         "artist": state.artist,
         "album": state.album,
-        "status": "stopped" if stale else state.status,
+        "status": "stopped" if (stale or not online) else state.status,
         "source": "Nudibranch",
         "queue_length": state.queue_length,
         "current_index": state.current_index,
@@ -4153,6 +4199,7 @@ def serialize_player_state(user: User) -> dict:
         "shuffle": state.shuffle,
         "repeat": state.repeat,
         "updated_at": updated_at.isoformat() if updated_at else None,
+        "online": online,
     }
 
 
@@ -4252,7 +4299,7 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
     # Look at non-terminal items: complete any whose download finished, and demote stale
     # "approved" ones (abandoned downloads) back to "wanted".
     query = select(WishlistItem).where(WishlistItem.status.in_(["approved", "wanted", "review"]))
-    if not user_has_permission(user, Permission.wishlist_manage_all):
+    if not user_has_permission(user, Permission.wishlist_approve_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query))
     if not items:
@@ -4410,18 +4457,33 @@ def user_has_permission(user: User, permission: Permission) -> bool:
 def require_album_lookup_access(user: User) -> None:
     allowed = {
         Permission.import_run,
-        Permission.wishlist_manage_own,
-        Permission.wishlist_manage_all,
-        Permission.library_read,
-        Permission.downloads_manage,
+        Permission.discover,
+        Permission.wishlist_approve_all,
+        Permission.library_view,
     }
     if user.is_admin or any(user_permission.permission in allowed for user_permission in user.permissions):
         return
     raise HTTPException(status_code=403, detail="Not enough permissions")
 
 
+PERMISSION_LABELS = {
+    Permission.library_view: "Browse & play",
+    Permission.library_edit: "Edit & manage",
+    Permission.discover: "Discover & Wishlist",
+    Permission.wishlist_approve_all: "Approve others' requests",
+    Permission.import_run: "Import & add",
+    Permission.approvals_manage: "Task Queue (approve)",
+    Permission.playlists_manage: "Playlists",
+    Permission.activity_read: "Activity & logs",
+    Permission.tools_manage: "Tools & maintenance",
+    Permission.automations_manage: "Automations",
+    Permission.users_manage: "Users",
+    Permission.settings_manage: "Settings",
+}
+
+
 def permission_label(permission: Permission) -> str:
-    return permission.value.replace(":", " ").replace("_", " ").title()
+    return PERMISSION_LABELS.get(permission, permission.value.replace(":", " ").replace("_", " ").title())
 
 
 def parse_permissions(permission_values: list[str]) -> list[Permission]:

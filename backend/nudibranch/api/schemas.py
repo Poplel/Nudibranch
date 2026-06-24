@@ -34,6 +34,7 @@ class UserOut(BaseModel):
     search_min_confidence: float = 0.4
     library_page_size: int = 100
     jellyfin_user_id: str | None = None
+    online: bool = False
 
 
 class PermissionOut(BaseModel):
@@ -481,6 +482,18 @@ class SessionOut(BaseModel):
     last_used_at: datetime
     expires_at: datetime
     current: bool = False
+
+
+class AdminSessionOut(BaseModel):
+    id: str
+    user_id: str
+    user_name: str
+    username: str | None = None
+    device_label: str | None = None
+    created_at: datetime
+    last_used_at: datetime
+    expires_at: datetime
+    online: bool = False
 
 
 class StaticKeyCreate(BaseModel):

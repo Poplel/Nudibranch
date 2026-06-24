@@ -90,6 +90,12 @@ def resolve_media_user(session: Session, token: str) -> User | None:
     return session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
 
 
+def require_admin(user: User = Depends(get_current_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    return user
+
+
 def require_permission(permission: Permission):
     def dependency(user: User = Depends(get_current_user)) -> User:
         if user.is_admin:

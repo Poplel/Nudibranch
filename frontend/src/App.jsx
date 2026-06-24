@@ -280,13 +280,13 @@ function App() {
     if (!token) return;
     refreshAll();
     const interval = window.setInterval(() => {
-      if (hasPermission(user, "library:read")) refreshLibrary();
+      if (hasPermission(user, "library:view")) refreshLibrary();
       if (hasPermission(user, "activity:read")) refreshTasks();
       if (hasPermission(user, "activity:read")) refreshLogs();
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
-      if (hasPermission(user, "notifications:read")) refreshNotifications();
+      refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
-      if (hasPermission(user, "wishlist:manage_own")) {
+      if (hasPermission(user, "discover")) {
         refreshWishlist();
         refreshWishlistApprovals();
       }
@@ -421,15 +421,15 @@ function App() {
       setUser(me);
       const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
         api("/permissions"),
-        hasPermission(me, "library:read") ? api("/library/tree") : Promise.resolve([]),
+        hasPermission(me, "library:view") ? api("/library/tree") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
-        hasPermission(me, "notifications:read") ? api("/notifications") : Promise.resolve([]),
-        hasPermission(me, "wishlist:manage_own") ? api("/wishlist") : Promise.resolve([]),
-        hasPermission(me, "wishlist:manage_own") ? api("/wishlist/approvals") : Promise.resolve([]),
+        api("/notifications"),
+        hasPermission(me, "discover") ? api("/wishlist") : Promise.resolve([]),
+        hasPermission(me, "discover") ? api("/wishlist/approvals") : Promise.resolve([]),
         hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
         hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
-        hasPermission(me, "backups:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
+        hasPermission(me, "tools:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
       ]);
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
@@ -2177,7 +2177,7 @@ function App() {
             <button className="icon-button" onClick={refreshAll} title="Refresh">
               <RefreshCw size={18} />
             </button>
-            {hasPermission(user, "notifications:read") && (
+            {user && (
               <div className="notification-anchor" ref={trayRef}>
                 <button className="icon-button" onClick={openNotificationTray} title="Notifications">
                   <Bell size={18} />
@@ -2225,7 +2225,7 @@ function App() {
               />
             ) : (
             <>
-            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:manage_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
+            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:approve_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
               <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} />
             )}
@@ -2817,8 +2817,8 @@ function LibraryTree({ artists, onCheckAlbum, onCoverSearch, onCheckTrackAudio, 
   }, [user?.library_page_size]);
   const pagedArtists = useMemo(() => bucketedArtists.slice(0, pageSize), [bucketedArtists, pageSize]);
   const changePageSize = (v) => { setPageSize(v); if (onSavePageSize) onSavePageSize(v); };
-  const canEditMetadata = hasPermission(user, "metadata:edit");
-  const canRemoveLibrary = hasPermission(user, "library:write");
+  const canEditMetadata = hasPermission(user, "library:edit");
+  const canRemoveLibrary = hasPermission(user, "library:edit");
   const canUsePlaylists = hasPermission(user, "playlists:manage");
   const albumRows = useMemo(() => {
     const rows = [];
@@ -3628,8 +3628,8 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
   const [expandedAllAlbums, setExpandedAllAlbums] = useState(() => new Set());
   const [albumTracksCache, setAlbumTracksCache] = useState(() => new Map());
   const [albumTracksLoading, setAlbumTracksLoading] = useState(() => new Set());
-  const canWishlist = hasPermission(user, "wishlist:manage_own");
-  const canQueue = hasPermission(user, "downloads:manage");
+  const canWishlist = hasPermission(user, "discover");
+  const canQueue = hasPermission(user, "discover");
 
   function artUrl(src) {
     // Discover art comes straight from iTunes as an external URL — no auth needed.
@@ -3846,7 +3846,7 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
   const [openOwners, setOpenOwners] = useState(() => new Set());
   const [selectedItems, setSelectedItems] = useState(() => new Set());
-  const canApproveAll = hasPermission(user, "wishlist:manage_all");
+  const canApproveAll = hasPermission(user, "wishlist:approve_all");
   const tree = useMemo(() => buildWishlistTree(wishlist), [wishlist]);
   const ownerTree = useMemo(() => buildWishlistOwnerTree(wishlist), [wishlist]);
   const wantedItems = useMemo(() => wishlist.filter((item) => item.status === "wanted"), [wishlist]);
@@ -5142,21 +5142,17 @@ function hasPermission(user, permission) {
 
 function canViewPage(user, page) {
   if (!user) return page === "Settings";
-  if (page === "Library") return hasPermission(user, "library:read");
-  if (page === "Discover") return hasPermission(user, "wishlist:manage_own");
+  if (page === "Home") return true;
+  if (page === "Library") return hasPermission(user, "library:view") || hasPermission(user, "library:edit");
+  if (page === "Discover") return hasPermission(user, "discover");
   if (page === "Import/Add") return hasPermission(user, "import:run");
-  if (page === "Wishlist") return hasPermission(user, "wishlist:manage_own");
+  if (page === "Wishlist") return hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all");
   if (page === "Task Queue") return hasPermission(user, "approvals:manage");
   if (page === "Playlists") return hasPermission(user, "playlists:manage");
   if (page === "Activity") return hasPermission(user, "activity:read");
-  if (page === "Tools") {
-    return ["jellyfin:manage", "downloads:manage", "library:manage", "backups:manage", "activity:read", "settings:manage"].some((permission) =>
-      hasPermission(user, permission),
-    );
-  }
+  if (page === "Tools") return hasPermission(user, "tools:manage");
   if (page === "Automations") return hasPermission(user, "automations:manage");
-  if (page === "Home") return true;
-  if (page === "Users") return true;
+  if (page === "Users") return hasPermission(user, "users:manage");
   if (page === "Settings") return true;
   return false;
 }
@@ -5465,21 +5461,21 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
   const [query, setQuery] = useState("");
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
-    ["Scan Jellyfin", "Request Jellyfin re-scans filles.", "jellyfin-scan", "jellyfin:manage"],
-    ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs if playlists are not working.", "remap-tracks", "jellyfin:manage"],
-    ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "downloads:manage"],
-    ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "library:manage"],
-    ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash.", "check-duplicates", "library:manage"],
-    ["Check album covers", "Find albums without cover art and prepare images for review.", "check-album-covers", "library:manage"],
-    ["Check artist covers", "Find artists without cover art and prepare images for review.", "check-artist-covers", "library:manage"],
-    ["Check lyrics", "Find tracks without lyrics and", "check-lyrics", "library:manage"],
-    ["Check MusicBrainz info", "Scan the library for missing MusicBrainz IDs, disc/track numbers, and prepare metadata updates.", "check-musicbrainz-ids", "library:manage"],
-    ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "library:manage"],
-    ["Check lossy tracks", "Find fake lossless or less than lossless files and prepare lossless replacement downloads.", "check-non-lossless", "library:manage"],
-    ["Apply ReplayGain", "Measure loudness and propose ReplayGain for all tracks (non-destructive; review-gated).", "apply-replaygain", "library:manage"],
-    ["Consolidate album folders", "Find albums whose tracks are split across folders and consolidate.", "consolidate-folders", "library:manage"],
-    ["Clear downloads folder", "Remove all files from /app/downloads.", "clear-downloads", "downloads:manage"],
-    ["Backup now", "Create a database backup.", "backup", "backups:manage"],
+    ["Scan Jellyfin", "Request Jellyfin re-scans filles.", "jellyfin-scan", "tools:manage"],
+    ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs if playlists are not working.", "remap-tracks", "tools:manage"],
+    ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "tools:manage"],
+    ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "tools:manage"],
+    ["Find duplicate files", "Find tracks with the same artist + album + title in multiple files; queue the extras to be moved to trash.", "check-duplicates", "tools:manage"],
+    ["Check album covers", "Find albums without cover art and prepare images for review.", "check-album-covers", "tools:manage"],
+    ["Check artist covers", "Find artists without cover art and prepare images for review.", "check-artist-covers", "tools:manage"],
+    ["Check lyrics", "Find tracks without lyrics and", "check-lyrics", "tools:manage"],
+    ["Check MusicBrainz info", "Scan the library for missing MusicBrainz IDs, disc/track numbers, and prepare metadata updates.", "check-musicbrainz-ids", "tools:manage"],
+    ["Check audio content", "Verify each track's audio actually matches its album slot (duration + AcoustID) and queue replacements for incorrect files.", "check-audio-content", "tools:manage"],
+    ["Check lossy tracks", "Find fake lossless or less than lossless files and prepare lossless replacement downloads.", "check-non-lossless", "tools:manage"],
+    ["Apply ReplayGain", "Measure loudness and propose ReplayGain for all tracks (non-destructive; review-gated).", "apply-replaygain", "tools:manage"],
+    ["Consolidate album folders", "Find albums whose tracks are split across folders and consolidate.", "consolidate-folders", "tools:manage"],
+    ["Clear downloads folder", "Remove all files from /app/downloads.", "clear-downloads", "tools:manage"],
+    ["Backup now", "Create a database backup.", "backup", "tools:manage"],
   ].filter(([, , , permission]) => hasPermission(user, permission));
 
   const logs = buildLiveLog(tasks, appLogs).filter((entry) => entry.text.toLowerCase().includes(query.toLowerCase()));
@@ -5498,7 +5494,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
           ))}
         </div>
       )}
-      {hasPermission(user, "backups:manage") && (
+      {hasPermission(user, "tools:manage") && (
         <section className="restore-panel">
           <h2>Restore</h2>
           <div className="restore-actions">
@@ -5521,7 +5517,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
           </div>
         </section>
       )}
-      <SessionsPanel api={api} notify={notify} />
+      <AllSessionsPanel api={api} notify={notify} />
       {hasPermission(user, "activity:read") && (
         <section className="log-panel">
           <div className="log-header">
@@ -6327,6 +6323,23 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
   const [newUser, setNewUser] = useState({ display_name: "", username: "", password: "", is_admin: false, permissions: [] });
   const permissionGroups = useMemo(() => groupBy(permissions, (permission) => permission.section), [permissions]);
   const visibleUsers = canManage ? users : currentUser ? [currentUser] : [];
+  const [presence, setPresence] = useState({});
+  useEffect(() => {
+    let active = true;
+    async function poll() {
+      try {
+        const fresh = await api("/users");
+        if (active) setPresence(Object.fromEntries(fresh.map((u) => [u.id, !!u.online])));
+      } catch {
+        /* ignore presence poll errors */
+      }
+    }
+    const timer = setInterval(poll, 20000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [api]);
 
   function toggleNewPermission(value) {
     setNewUser((current) => ({
@@ -6380,7 +6393,7 @@ function UsersView({ users, permissions, currentUser, canManage, onCreate, onUpd
         {visibleUsers.map((managedUser) => (
           <UserCard
             key={managedUser.id}
-            user={managedUser}
+            user={{ ...managedUser, online: presence[managedUser.id] ?? managedUser.online }}
             currentUser={currentUser}
             permissionGroups={permissionGroups}
             canManage={canManage}
@@ -6438,6 +6451,10 @@ function UserCard({ user, currentUser, permissionGroups, canManage, onUpdate, on
   return (
     <section className="user-card">
       <div className="user-card-header">
+        <span
+          title={user.online ? "Online" : "Offline"}
+          style={{ display: "inline-block", width: 9, height: 9, borderRadius: "50%", marginRight: 8, alignSelf: "center", background: user.online ? "#37c871" : "#9aa0a6" }}
+        />
         <label>
           Name
           <input value={draft.display_name} onChange={(event) => setDraft((current) => ({ ...current, display_name: event.target.value }))} disabled={!canManage} />
@@ -6561,6 +6578,89 @@ function Placeholder({ page }) {
       <h2>{page}</h2>
       <p>{pageDescriptions[page] ?? "Manage this section of Nudibranch."}</p>
     </div>
+  );
+}
+
+function AllSessionsPanel({ api, notify }) {
+  const [sessions, setSessions] = useState(null);
+  const [open, setOpen] = useState(false);
+  const [loadingRevoke, setLoadingRevoke] = useState({});
+
+  async function loadSessions() {
+    try {
+      setSessions(await api("/sessions"));
+    } catch (err) {
+      notify("Sessions error", err.message, "ui_error");
+    }
+  }
+
+  useEffect(() => {
+    loadSessions();
+    const timer = setInterval(loadSessions, 20000);
+    return () => clearInterval(timer);
+  }, []);
+
+  async function revokeSession(id) {
+    setLoadingRevoke((prev) => ({ ...prev, [id]: true }));
+    try {
+      await api(`/sessions/${id}`, { method: "DELETE" });
+      notify("Session revoked", "The session has been signed out.", "ui_notice");
+      loadSessions();
+    } catch (err) {
+      notify("Revoke failed", err.message, "ui_error");
+    } finally {
+      setLoadingRevoke((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  const onlineCount = (sessions || []).filter((s) => s.online).length;
+  return (
+    <section className="settings-section sessions-panel">
+      <button type="button" className="sessions-tree-header" onClick={() => setOpen((o) => !o)}>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        <h2>All sessions</h2>
+        <span className="muted-label">{onlineCount} online · {sessions ? sessions.length : 0} total</span>
+      </button>
+      {open &&
+        (sessions === null ? (
+          <p className="muted-label">Loading…</p>
+        ) : sessions.length === 0 ? (
+          <p className="muted-label">No active sessions found.</p>
+        ) : (
+          <div className="security-list sessions-list">
+            {sessions.map((session) => (
+              <div key={session.id} className="security-row session-row">
+                <div className="security-row-info">
+                  <span className="security-row-label">
+                    <span
+                      title={session.online ? "Online" : "Offline"}
+                      style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", marginRight: 6, background: session.online ? "#37c871" : "#9aa0a6" }}
+                    />
+                    {session.user_name || session.username || "User"}
+                    {" — "}
+                    {session.device_label || "Unknown device"}
+                  </span>
+                  <small className="muted-label">
+                    Last used: {session.last_used_at ? new Date(session.last_used_at).toLocaleString() : "never"}
+                    {" · "}
+                    Expires: {session.expires_at ? new Date(session.expires_at).toLocaleString() : "never"}
+                  </small>
+                </div>
+                <div className="session-row-actions">
+                  <button
+                    className="icon-button session-revoke"
+                    title="Revoke session"
+                    disabled={loadingRevoke[session.id]}
+                    onClick={() => revokeSession(session.id)}
+                  >
+                    <X size={15} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+    </section>
   );
 }
 
@@ -6982,7 +7082,8 @@ function SettingsPanel({
         </section>
       )}
       {canManageSettings(user) && <MatchTuningSettings api={api} notify={notify} />}
-      <SecuritySettings api={api} notify={notify} />
+      <SessionsPanel api={api} notify={notify} />
+      {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
         Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
       </footer>
