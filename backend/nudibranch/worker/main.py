@@ -3885,7 +3885,9 @@ def create_album_download_candidate_batch(
         query = download_query(request)
         set_item_payload_status(track_item, f"searching {track_title}")
         folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
-        if folder_candidates:
+        require_lossless = bool(request.get("require_lossless"))
+        has_lossless = any(candidate.get("quality") == "lossless" for candidate in folder_candidates)
+        if folder_candidates and (has_lossless or not require_lossless):
             confidence = folder_candidates[0].get("confidence")
             diagnostic_lines.append(f"{query}: reused {folder_candidates[0].get('folder') or 'the same folder'} from {folder_candidates[0].get('username')} at {confidence}% confidence.")
             append_task_log(session, task, f"{track_title}: {len(folder_candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s); best {folder_candidates[0].get('filename')} at {confidence}% confidence")
@@ -3896,14 +3898,16 @@ def create_album_download_candidate_batch(
             if task is not None:
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
         else:
-            # The track wasn't matched inside the album-folder search results — search for it on its
-            # own. The per-track search loop below attaches candidates, and only falls back to YouTube
-            # if that individual search also comes up empty. (Album folders are tried first; standalone
-            # track search is the safety net so a single un-co-located track never sinks the album.)
+            # No candidate at all, OR a lossless-required request that only found lossy in the album
+            # folders — search for the track by its NAME ALONE (we can't rely on the artist/album in the
+            # path) and try to match a FLAC. Any lossy album-folder candidate is carried as a fallback,
+            # so we keep it if the standalone search turns up nothing better; the search loop merges the
+            # results FLAC-first and only drops to YouTube when nothing is found at all.
             in_folders = " in any album folder" if folder_pools else ""
+            need = "no lossless match" if (folder_candidates and require_lossless) else f"no match{in_folders}"
             set_item_payload_status(track_item, "searching individual track")
-            append_task_log(session, task, f"{track_title}: no match{in_folders}; searching for the individual track")
-            search_jobs.append((request, track_item.id, track_title, query, 5))
+            append_task_log(session, task, f"{track_title}: {need}; searching for the individual track by name")
+            search_jobs.append((request, track_item.id, track_title, query, 5, folder_candidates))
         session.commit()
 
     if search_jobs:
@@ -3913,11 +3917,11 @@ def create_album_download_candidate_batch(
             update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item_id, track_title, query)
-                for request, track_item_id, track_title, query, candidate_limit in search_jobs
+                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item_id, track_title, query, fallback_candidates)
+                for request, track_item_id, track_title, query, candidate_limit, fallback_candidates in search_jobs
             }
             for future in as_completed(futures):
-                request, track_item_id, track_title, query = futures[future]
+                request, track_item_id, track_title, query, fallback_candidates = futures[future]
                 try:
                     search_result = future.result()
                 except Exception as error:  # noqa: BLE001 - keep creating candidates for the rest of the album.
@@ -3932,7 +3936,13 @@ def create_album_download_candidate_batch(
                     append_task_log(session, task, f"{track_title}: skipped candidate results because the review row was removed", "warning")
                     completed_tracks += 1
                     continue
-                candidates = search_result["candidates"]
+                # Merge the standalone (name-only) search results with any lossy album-folder fallback,
+                # then rank FLAC-first: a FLAC found by the title search wins, but a lossy album copy is
+                # kept if the search found nothing better.
+                known = {candidate_identity(candidate) for candidate in (search_result["candidates"] or [])}
+                merged = list(search_result["candidates"] or []) + [c for c in (fallback_candidates or []) if candidate_identity(c) not in known]
+                merged.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+                candidates = merged[:5]
                 diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
                 if candidates and not request.get("multiple_candidates") and not folder_pool:
                     folder_pool = download_folder_pool(candidates[0])
