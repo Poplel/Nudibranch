@@ -344,7 +344,7 @@ def add_download_candidate_review_items(
                 completed += 1
                 continue
             query = download_query(request)
-            candidates = candidates_from_folder_pools(pools, request, limit=5, max_pools=folder_try_limit)
+            candidates = candidates_from_folder_pools(pools, request, limit=5)
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates)
                 candidates_added += len(candidates)
@@ -3884,7 +3884,7 @@ def create_album_download_candidate_batch(
             continue
         query = download_query(request)
         set_item_payload_status(track_item, f"searching {track_title}")
-        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5, max_pools=folder_try_limit) if folder_pools else []
+        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
         if folder_candidates:
             confidence = folder_candidates[0].get("confidence")
             diagnostic_lines.append(f"{query}: reused {folder_candidates[0].get('folder') or 'the same folder'} from {folder_candidates[0].get('username')} at {confidence}% confidence.")
@@ -4314,7 +4314,7 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
             )
         return []
     result_pools = []
-    for score, pool in accepted[:folder_try_limit]:
+    for score, pool in accepted[:max(folder_try_limit, ALBUM_FOLDER_COVERAGE_LIMIT)]:
         prepared = {**pool}
         prepared["matched_tracks"] = score[0]
         prepared["match_threshold"] = match_threshold
@@ -4350,6 +4350,10 @@ ALBUM_FOLDER_FULL_SCORE_LIMIT = 16
 # artist scores album=1.0, so the by-name ranking is dominated by huge discography folders and the
 # actual 12-track album folder never gets evaluated).
 ALBUM_FOLDER_FIT_SCORE_LIMIT = 8
+# How many accepted folders to keep for per-track candidate collection. The download still prefers the
+# best folder, but a track missing from the top folders (e.g. a bonus track only some rips include)
+# can be picked up from a lower-ranked folder, so keep well more than the download try-limit.
+ALBUM_FOLDER_COVERAGE_LIMIT = 20
 
 
 def _album_folder_fit(audio_count: int, requested: int) -> int:
@@ -4644,7 +4648,12 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
 
 
 def candidates_from_folder_pools(pools: list[dict], request: dict, limit: int = 5, max_pools: int | None = None) -> list[dict]:
-    candidates: list[dict] = []
+    # Gather this track's best candidate from EVERY folder (not just the top few by album rank): a
+    # track can be missing from the best folder but present in a lower-ranked one (e.g. a complete
+    # FLAC rip, or an MP3 folder). Then rank the collected candidates by quality (FLAC first) and
+    # confidence so the lossless copy is selected even when it came from a lower-ranked folder, with
+    # MP3 retained as a fallback.
+    collected: list[dict] = []
     seen: set[tuple[str, str]] = set()
     pool_limit = max_pools if max_pools is not None else len(pools)
     for pool_index, pool in enumerate(pools[:pool_limit], start=1):
@@ -4657,10 +4666,9 @@ def candidates_from_folder_pools(pools: list[dict], request: dict, limit: int = 
         seen.add(identity)
         candidate["same_album_folder"] = True
         candidate["album_folder_rank"] = pool_index
-        candidates.append(candidate)
-        if len(candidates) >= limit:
-            break
-    return candidates
+        collected.append(candidate)
+    collected.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+    return collected[:limit]
 
 
 def folder_file_confidence(file_info: dict, request: dict) -> float:
