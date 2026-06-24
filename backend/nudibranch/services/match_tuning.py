@@ -25,6 +25,9 @@ MATCH_TUNING_DEFAULTS: dict[str, float] = {
                                        # same-artist, similar-length file maxes those), so keep it
                                        # firm enough to reject coincidental short-title overlaps
     "duration_tolerance_seconds": 12,  # ± window counted as a perfect duration match
+    "strong_title": 0.85,              # a title at/above this is trusted enough to pass without the
+                                       # artist (artist-less folder); below it, a different-artist
+                                       # match is demoted even if the duration coincidentally lines up
     # Ranking weights (relative contributions to the 0-1 confidence)
     "weight_title": 0.40,
     "weight_duration": 0.38,
@@ -45,6 +48,7 @@ MATCH_TUNING_META: dict[str, dict] = {
     "min_confidence": {"label": "Minimum match confidence", "help": "Drop candidates scoring below this. Lower = more results surface for review.", "min": 0.1, "max": 0.9, "step": 0.01},
     "title_floor": {"label": "Title match floor", "help": "A file's title must be at least this similar to be considered at all.", "min": 0.1, "max": 0.9, "step": 0.01},
     "duration_tolerance_seconds": {"label": "Duration tolerance (seconds)", "help": "Length difference still counted as a perfect duration match.", "min": 3, "max": 60, "step": 1},
+    "strong_title": {"label": "Strong-title threshold", "help": "Title similarity trusted enough to accept a file without an artist match. Below it, a different-artist file is demoted even if the duration matches (stops same-word wrong songs).", "min": 0.5, "max": 1.0, "step": 0.01},
     "weight_title": {"label": "Title weight", "help": "How much the filename-vs-title match contributes.", "min": 0.0, "max": 1.0, "step": 0.01},
     "weight_duration": {"label": "Duration weight", "help": "How much a matching length contributes (strongest proof two files are the same recording).", "min": 0.0, "max": 1.0, "step": 0.01},
     "weight_artist": {"label": "Artist weight", "help": "How much the artist appearing in the folder path contributes (ranking only — never required).", "min": 0.0, "max": 1.0, "step": 0.01},

@@ -4739,10 +4739,12 @@ def download_file_match_score(file_info: dict, request: dict, username: object |
     # rejected, so it only wins when nothing better exists.
     if extra_version_words:
         confidence *= float(tuning["penalty_wrong_version"])
-    # No/different artist AND no duration corroboration → very likely a same-titled wrong song; drop
-    # it well below anything an actual artist or duration match can confirm. A tight duration match
-    # (>=0.75, i.e. within tolerance) is trusted as proof and skips this penalty.
-    if artist and artist_score < 0.5 and duration_score < 0.75:
+    # Different/absent artist → likely a same-word wrong song. A wrong-artist file escapes the demotion
+    # only when BOTH a strong title (>= strong_title — the filename really is this track, just in an
+    # artist-less folder) AND a tight duration vouch for it. A coincidental duration alone must NOT
+    # rescue a weak-title wrong-artist file (e.g. Kanye's "New Again" for Lady Gaga's "Again Again":
+    # title 0.7, artist 0.32, duration 1.0).
+    if artist and artist_score < 0.5 and (title_score < float(tuning["strong_title"]) or duration_score < 0.75):
         confidence *= float(tuning["penalty_artist_mismatch"])
     return {
         "confidence": max(0.0, min(1.0, confidence)),
