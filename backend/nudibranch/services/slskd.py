@@ -172,8 +172,10 @@ def search_payload(client: httpx.Client, search_id: str) -> Any:
             responses_payload = search_responses_payload(client, str(alternate_id))
             if responses_payload:
                 return {**state_payload, **responses_payload}
-    if isinstance(state_payload, dict):
-        return {**state_payload, "responses": []}
+    # The dedicated /responses endpoint returned nothing usable. Do NOT overwrite "responses" with []
+    # here: slskd can return the response bodies inline on the search-state object itself, and the old
+    # `{**state, "responses": []}` discarded them — yielding "0 responses" while the same state object
+    # reported hundreds of responses/files. Returning the state as-is lets response_list() find them.
     return state_payload
 
 
@@ -603,6 +605,9 @@ def payload_shape(payload: Any) -> str:
         return f"list[{len(payload)}]"
     if isinstance(payload, dict):
         parts = [f"keys={','.join(list(payload.keys())[:10])}"]
+        reported = payload.get("responseCount") or payload.get("ResponseCount")
+        if reported is not None:
+            parts.append(f"responseCount={reported}")
         for key in ("responses", "Responses", "results", "Results", "data", "Data", "items", "Items"):
             value = payload.get(key)
             if isinstance(value, list):
