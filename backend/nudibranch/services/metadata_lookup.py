@@ -392,17 +392,10 @@ def dedupe_tracks(tracks: list[dict]) -> list[dict]:
 
 
 def lookup_musicbrainz_ids(artist: str, album: str) -> dict | None:
-    releases = find_releases(artist, album, limit=5)
+    releases = find_releases(artist, album, limit=15)
     if not releases:
         return None
-    normalized_album = normalize(album)
-    best = sorted(
-        releases,
-        key=lambda release: (
-            normalize(release.get("title")) != normalized_album,
-            -(release.get("score") or 0),
-        ),
-    )[0]
+    best = rank_releases(album, releases)[0]
     release_id = best.get("id")
     if not release_id:
         return None
@@ -474,14 +467,50 @@ def lookup_album_tracks(artist: str, album: str, release_id: str | None = None) 
     }
 
 
-def find_releases(artist: str, album: str, limit: int = 5) -> list[dict]:
-    query = f'artist:"{escape_query(artist)}" AND release:"{escape_query(album)}"'
+def relaxed_release_terms(value: str) -> str:
+    """Strip Lucene operators so the album can go in an UNQUOTED `release:(…)` clause.
+
+    A strict phrase query (`release:"The E.N.D."`) misses titles MusicBrainz stores with different
+    punctuation — e.g. the real album is "The E•N•D" (bullets, not periods), so the phrase matched
+    only the compilation "The Beginning & The Best of the E.N.D.". Token matching finds the real
+    release; ranking (see rank_releases) then picks the right one.
+    """
+    cleaned = re.sub(r'[+\-&|!(){}\[\]^"~*?:\\/]', " ", value or "")
+    return " ".join(cleaned.split())
+
+
+def find_releases(artist: str, album: str, limit: int = 15) -> list[dict]:
+    terms = relaxed_release_terms(album)
+    release_clause = f"release:({terms})" if terms else f'release:"{escape_query(album)}"'
+    query = f'artist:"{escape_query(artist)}" AND {release_clause}'
     response = musicbrainz_get(
         "https://musicbrainz.org/ws/2/release/",
         params={"fmt": "json", "query": query, "limit": limit},
     )
     response.raise_for_status()
     return response.json().get("releases", [])
+
+
+_DOWNRANK_SECONDARY_TYPES = {"compilation", "live", "dj-mix", "mixtape/street", "remix", "interview"}
+
+
+def rank_releases(album: str, releases: list[dict]) -> list[dict]:
+    """Order release search hits best-first: exact normalized title, then closest title, then a
+    studio album over a compilation/live set, then MusicBrainz's own relevance score."""
+    normalized_album = normalize(album)
+
+    def key(release: dict) -> tuple:
+        title = release.get("title") or ""
+        secondary = (release.get("release-group") or {}).get("secondary-types") or []
+        is_downranked = any(str(s).lower() in _DOWNRANK_SECONDARY_TYPES for s in secondary)
+        return (
+            normalize(title) != normalized_album,        # exact normalized-title match first
+            -text_similarity(album, title),              # then the most similar title
+            is_downranked,                               # prefer studio albums over comps/live
+            -(release.get("score") or 0),                # then MusicBrainz relevance
+        )
+
+    return sorted(releases, key=key)
 
 
 def musicbrainz_get(url: str, params: dict | None = None) -> httpx.Response:
@@ -507,17 +536,10 @@ def musicbrainz_get(url: str, params: dict | None = None) -> httpx.Response:
 
 
 def find_release(artist: str, album: str) -> dict | None:
-    releases = find_releases(artist, album, limit=5)
+    releases = find_releases(artist, album, limit=15)
     if not releases:
         return None
-    normalized_album = normalize(album)
-    return sorted(
-        releases,
-        key=lambda release: (
-            normalize(release.get("title")) != normalized_album,
-            -(release.get("score") or 0),
-        ),
-    )[0]
+    return rank_releases(album, releases)[0]
 
 
 def first_release(recording: dict) -> dict:
