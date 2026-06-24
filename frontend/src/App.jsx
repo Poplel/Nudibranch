@@ -2129,7 +2129,7 @@ function App() {
           {visibleNavItems.map(([label, Icon]) => (
             <button className={page === label ? "active" : ""} key={label} onClick={() => { setAlbumDetail(null); setArtistDetail(null); setPage(label); }}>
               <Icon size={17} />
-              {label === "Wishlist" && !user?.is_admin ? "Wishlist Approvals" : label}
+              {label}
             </button>
           ))}
         </nav>
@@ -2225,7 +2225,7 @@ function App() {
               />
             ) : (
             <>
-            <PanelHeader page={page === "Wishlist" && hasPermission(user, "wishlist:approve_all") ? "Wishlist Approvals" : page} queueSummary={queueSummary} displayName={user?.display_name} />
+            <PanelHeader page={page} queueSummary={queueSummary} displayName={user?.display_name} />
             {page === "Home" && (
               <HomeView api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} />
             )}
