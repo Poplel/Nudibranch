@@ -4352,31 +4352,55 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
 # hundreds of valid folders from slskd; fully scoring every one against every requested track is
 # what made candidate preparation take minutes. We only need a handful of folders to try.
 ALBUM_FOLDER_FULL_SCORE_LIMIT = 16
+# Additionally force-score the folders whose size best fits the requested track count. This rescues
+# the real album folder for self-titled albums (album name == artist name → every folder by the
+# artist scores album=1.0, so the by-name ranking is dominated by huge discography folders and the
+# actual 12-track album folder never gets evaluated).
+ALBUM_FOLDER_FIT_SCORE_LIMIT = 8
+
+
+def _album_folder_fit(audio_count: int, requested: int) -> int:
+    # 0 when the folder has exactly the requested number of tracks; missing tracks are penalised
+    # twice as hard as surplus (a too-small partial folder is worse than a slightly-too-big one).
+    if requested <= 0:
+        return 0
+    return -(audio_count - requested) if audio_count >= requested else (audio_count - requested) * 2
 
 
 def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list[dict], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
     expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
     expected_album = str(requests[0].get("album") or "") if requests else ""
-    # Phase 1: cheap pre-rank using only folder-name signals (no per-track file matching). Count all
-    # audio files (lossless preferred via the sort key, but lossy folders stay eligible so a lossy
-    # album still surfaces candidates).
-    prelim: list[tuple[float, float, int, int, dict]] = []
+    requested = len(requests)
+    # Phase 1: cheap pre-rank using only folder-name + size signals (no per-track file matching).
+    prelim: list[dict] = []
     for pool in pools.values():
         files = audio_folder_files(pool.get("files") or [])
-        lossless_count = len(lossless_folder_files(files))
         folder_segments = album_folder_segments(pool)
-        artist_score = best_segment_score(expected_artist, folder_segments)
-        album_score = album_folder_name_score(expected_album, pool)
-        prelim.append((album_score, artist_score, len(files), lossless_count, pool))
-    prelim.sort(key=lambda item: (item[0], item[1], item[3], item[2]), reverse=True)
-    # Phase 2: fully score only the most promising folders; the rest keep their cheap scores so
-    # they remain available but rank below the fully-scored matches.
+        prelim.append({
+            "album": album_folder_name_score(expected_album, pool),
+            "artist": best_segment_score(expected_artist, folder_segments),
+            "audio": len(files),
+            "lossless": len(lossless_folder_files(files)),
+            "fit": _album_folder_fit(len(files), requested),
+            "pool": pool,
+        })
+    # Pick which folders get full per-track scoring: the most promising by folder name + size, UNION
+    # the best size-fit folders (so the real album folder is scored even when album==artist makes the
+    # name score useless and giant discography folders would otherwise crowd out the top slots).
+    by_name = sorted(prelim, key=lambda e: (e["album"], e["artist"], e["lossless"], e["audio"]), reverse=True)
+    by_fit = sorted(prelim, key=lambda e: (e["fit"], e["album"], e["artist"], e["lossless"]), reverse=True)
+    full_score_ids: set[int] = set()
+    for entry in (*by_name[:ALBUM_FOLDER_FULL_SCORE_LIMIT], *by_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT]):
+        full_score_ids.add(id(entry["pool"]))
+    # Phase 2: fully score the chosen folders; the rest keep cheap scores so they remain available but
+    # rank below the fully-scored matches.
     scored: list[tuple[tuple[int, float, float, float, int, int], dict]] = []
-    for index, (album_score, artist_score, audio_count, lossless_count, pool) in enumerate(prelim):
-        if index < ALBUM_FOLDER_FULL_SCORE_LIMIT and audio_count and album_score >= threshold:
+    for entry in prelim:
+        pool = entry["pool"]
+        if id(pool) in full_score_ids and entry["audio"] and entry["album"] >= threshold:
             scored.append((score_album_folder_pool(pool, requests, threshold), pool))
         else:
-            scored.append(((0, 0.0, artist_score, album_score, lossless_count, audio_count), pool))
+            scored.append(((0, 0.0, entry["artist"], entry["album"], entry["lossless"], entry["audio"]), pool))
     return sorted(scored, key=album_folder_pool_sort_key, reverse=True)
 
 
@@ -4453,11 +4477,15 @@ def accepted_album_folder_pools(ranked: list[tuple[tuple[int, float, float, floa
     ]
 
 
-def album_folder_pool_sort_key(item: tuple[tuple[int, float, float, float, int, int], dict]) -> tuple[float, float, int, int, float, int]:
+def album_folder_pool_sort_key(item: tuple[tuple[int, float, float, float, int, int], dict]) -> tuple[float, float, int, float, int, int]:
     score, _pool = item
     matched, confidence_total, artist_score, album_score, lossless, files = score
     average_track_confidence = confidence_total / max(matched, 1)
-    return (album_score, artist_score, lossless, matched, average_track_confidence, -files)
+    # Coverage (how many requested tracks the folder actually contains) ranks above raw lossless file
+    # count, so the folder that holds THIS album beats a bigger discography/other-album folder that
+    # merely has more FLAC files — decisive for self-titled albums where the name score can't tell
+    # them apart.
+    return (album_score, artist_score, matched, average_track_confidence, lossless, -files)
 
 
 def slskd_album_match_threshold(settings: dict[str, str]) -> float:
