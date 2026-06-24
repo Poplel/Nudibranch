@@ -12,6 +12,10 @@ SLSKD_SEARCH_CREATE_INTERVAL_SECONDS = 1.25
 # re-polling for up to this many polls when the state claims responses we haven't retrieved yet, so
 # an album search doesn't spuriously conclude "no results" and dump the whole album to YouTube.
 SLSKD_RESPONSE_WAIT_POLLS = 8
+# Inactivity timeout sent to slskd (ms). slskd completes a search this long after the last response,
+# and only serves the response bodies once Completed — so keep it short enough that searches finish
+# well inside our poll window, but long enough to gather responses (slskd's own default is 15000).
+SLSKD_SEARCH_TIMEOUT_MS = 5000
 _search_create_lock = Lock()
 _last_search_created_at = 0.0
 
@@ -122,11 +126,17 @@ def search_slskd_detailed(
 
 def create_search(client: httpx.Client, query: str, timeout_seconds: int, search_id: str, filter_responses: bool = False) -> httpx.Response:
     global _last_search_created_at
+    # slskd's `searchTimeout` is the INACTIVITY timeout — slskd marks the search Completed this many
+    # ms AFTER the last response arrives, and (in 0.25.x) only serves GET /searches/{id}/responses
+    # once Completed. Tying it to our long poll budget (15000) meant slow-trickling popular albums
+    # never completed inside our window, so we always read 0 responses. A short, fixed value lets the
+    # search complete promptly (a few seconds after responses settle) while still collecting plenty.
+    # `timeout_seconds` is kept only for sizing our own poll window (must comfortably exceed this).
     payload = {
         "searchText": query,
         "id": search_id,
-        "searchTimeout": timeout_seconds * 1000,
-        "timeout": timeout_seconds * 1000,
+        "searchTimeout": SLSKD_SEARCH_TIMEOUT_MS,
+        "timeout": SLSKD_SEARCH_TIMEOUT_MS,
         "fileLimit": 10000,
         "responseLimit": 250,
         "filterResponses": filter_responses,

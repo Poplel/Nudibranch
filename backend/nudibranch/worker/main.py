@@ -3895,25 +3895,15 @@ def create_album_download_candidate_batch(
             completed_tracks += 1
             if task is not None:
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
-        elif folder_pools:
-            retry_tracks += 1
-            set_item_payload_status(track_item, "no album-folder track match")
-            add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-            append_task_log(session, task, f"{track_title}: no lossless track match in {min(len(folder_pools), folder_try_limit)} album folder(s); YouTube fallback left unselected", "warning")
-            completed_tracks += 1
-            if task is not None:
-                update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared fallback for {track_title}")
-        elif should_use_track_search_fallback(album, requests):
-            candidate_limit = 5
-            search_jobs.append((request, track_item.id, track_title, query, candidate_limit))
         else:
-            retry_tracks += 1
-            set_item_payload_status(track_item, "no album folder candidates found")
-            add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
-            append_task_log(session, task, f"{track_title}: no matching lossless album folders found; YouTube fallback left unselected", "warning")
-            completed_tracks += 1
-            if task is not None:
-                update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared fallback for {track_title}")
+            # The track wasn't matched inside the album-folder search results — search for it on its
+            # own. The per-track search loop below attaches candidates, and only falls back to YouTube
+            # if that individual search also comes up empty. (Album folders are tried first; standalone
+            # track search is the safety net so a single un-co-located track never sinks the album.)
+            in_folders = " in any album folder" if folder_pools else ""
+            set_item_payload_status(track_item, "searching individual track")
+            append_task_log(session, task, f"{track_title}: no match{in_folders}; searching for the individual track")
+            search_jobs.append((request, track_item.id, track_title, query, 5))
         session.commit()
 
     if search_jobs:
