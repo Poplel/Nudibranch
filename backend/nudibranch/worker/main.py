@@ -4338,6 +4338,25 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
             f"{best_score[4]} lossless file(s)"
         ),
     )
+    # Supplementary per-track sources: every OTHER folder by this artist that has lossless files, even
+    # if it isn't a full album folder. Per-track candidate collection scans these too (FLAC-first), so
+    # a track that's missing from / only-lossy in the album folders is still grabbed as FLAC from
+    # wherever it exists (a single, a partial rip, a compilation).
+    expected_artist = fuzzy_text(artist)
+    result_keys = {(str(p.get("username") or ""), str(p.get("folder") or "")) for p in result_pools}
+    supplementary = 0
+    for pool in pools.values():
+        if supplementary >= SUPPLEMENTARY_FOLDER_LIMIT:
+            break
+        key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+        if key in result_keys or not lossless_folder_files(pool.get("files") or []):
+            continue
+        if best_segment_score(expected_artist, album_folder_segments(pool)) < 0.5:
+            continue
+        result_pools.append({**pool, "match_threshold": match_threshold, "supplementary": True})
+        supplementary += 1
+    if supplementary:
+        append_task_log(session, task, f"{artist} / {album}: also keeping {supplementary} supplementary artist folder(s) as per-track FLAC sources")
     return result_pools
 
 
@@ -4354,6 +4373,10 @@ ALBUM_FOLDER_FIT_SCORE_LIMIT = 8
 # best folder, but a track missing from the top folders (e.g. a bonus track only some rips include)
 # can be picked up from a lower-ranked folder, so keep well more than the download try-limit.
 ALBUM_FOLDER_COVERAGE_LIMIT = 20
+# Extra by-this-artist folders (not full album folders — singles, partial rips, compilations) kept as
+# per-track sources so a track missing from the album folders can still be grabbed as FLAC from
+# wherever it lives. "If a file for this track exists, even in another folder, grab it."
+SUPPLEMENTARY_FOLDER_LIMIT = 50
 
 
 def _album_folder_fit(audio_count: int, requested: int) -> int:
