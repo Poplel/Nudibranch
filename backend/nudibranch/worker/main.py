@@ -4494,10 +4494,11 @@ def album_folder_pool_sort_key(item: tuple[tuple, dict]) -> tuple:
     matched, confidence_total, artist_score, album_score, lossless, files = score[:6]
     lossless_matched = score[6] if len(score) > 6 else 0
     average_track_confidence = confidence_total / max(matched, 1)
-    # FLAC coverage (lossless_matched) ranks first so a FLAC folder beats an equally-complete MP3
-    # folder (FLAC over MP3, MP3 kept as a fallback); then total coverage so the folder that holds
-    # THIS album beats a bigger discography/other-album folder; then confidence and raw lossless count.
-    return (album_score, artist_score, lossless_matched, matched, average_track_confidence, lossless, -files)
+    # Rank by what the folder actually DELIVERS, not by how well its name matches: FLAC coverage
+    # (how many requested tracks it supplies as FLAC) first, then total coverage, so a complete FLAC
+    # folder named "2008 - The Fame" beats an exactly-named "The Fame" folder that only has 14 of 16
+    # (or only MP3). Folder name / artist are tiebreakers among equal coverage.
+    return (lossless_matched, matched, album_score, artist_score, average_track_confidence, lossless, -files)
 
 
 def slskd_album_match_threshold(settings: dict[str, str]) -> float:
