@@ -7,6 +7,11 @@ from urllib.parse import quote
 import httpx
 
 SLSKD_SEARCH_CREATE_INTERVAL_SECONDS = 1.25
+# slskd can flip a search to "complete" and report a response count in the search STATE before
+# GET /searches/{id}/responses actually serves the response bodies (eventual consistency). Keep
+# re-polling for up to this many polls when the state claims responses we haven't retrieved yet, so
+# an album search doesn't spuriously conclude "no results" and dump the whole album to YouTube.
+SLSKD_RESPONSE_WAIT_POLLS = 8
 _search_create_lock = Lock()
 _last_search_created_at = 0.0
 
@@ -89,7 +94,11 @@ def search_slskd_detailed(
                 settled_polls = 0
             last_response_count = len(responses)
             search_done = bool(diagnostics.get("is_complete")) or search_state_is_complete(diagnostics.get("state"))
-            if wait_for_settled_results and (len(responses) >= 250 or (responses and settled_polls >= 2) or (search_done and diagnostics["polls"] >= 2)):
+            # If slskd's state reports responses but GET /responses hasn't served them yet, don't
+            # conclude "complete, no results" — keep polling (bounded) so the bodies can arrive.
+            reported_responses = int_value(diagnostics.get("response_count")) or 0
+            awaiting_responses = reported_responses > 0 and not responses and diagnostics["polls"] < SLSKD_RESPONSE_WAIT_POLLS
+            if wait_for_settled_results and not awaiting_responses and (len(responses) >= 250 or (responses and settled_polls >= 2) or (search_done and diagnostics["polls"] >= 2)):
                 ranked = rank_candidates(candidates)[:limit]
                 diagnostics["candidates"] = len(ranked)
                 return {"candidates": ranked, "folder_candidates": folder_candidates, "diagnostics": diagnostics}
