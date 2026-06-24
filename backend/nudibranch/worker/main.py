@@ -4275,23 +4275,26 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                     known_filenames.add(filename)
                     added_from_query += 1
         ranked_after_query = ranked_album_folder_pools(pools, requests, match_threshold)
-        accepted_after_query = accepted_album_folder_pools(ranked_after_query, match_threshold)
+        accepted_after_query = accepted_album_folder_pools(ranked_after_query, match_threshold, requested_track_count)
         append_task_log(
             session,
             task,
             f"{artist} / {album}: {query} added {added_from_query} lossless file(s); {len(accepted_after_query)} folder(s) now meet album confidence",
         )
         best_matched = max((score[0] for score, _pool in accepted_after_query), default=0)
-        # Stop as soon as a single folder already covers the whole album — more query variants
-        # won't improve on a complete, confident match and just cost time.
-        if best_matched >= requested_track_count:
-            append_task_log(session, task, f"{artist} / {album}: found a complete album folder ({best_matched}/{requested_track_count} tracks); stopping album search early")
+        best_lossless_matched = max((score[6] if len(score) > 6 else 0 for score, _pool in accepted_after_query), default=0)
+        # Stop early only once a single FLAC folder covers the whole album — keep searching past an
+        # MP3-complete folder in case a lossless one turns up (FLAC over MP3; MP3 kept as a fallback).
+        if best_lossless_matched >= requested_track_count:
+            append_task_log(session, task, f"{artist} / {album}: found a complete lossless album folder ({best_lossless_matched}/{requested_track_count} tracks); stopping album search early")
             break
-        if len(accepted_after_query) >= folder_try_limit:
-            append_task_log(session, task, f"{artist} / {album}: found {len(accepted_after_query)} matching lossless folder(s); stopping album search at configured try limit {folder_try_limit}")
+        # No complete FLAC folder yet, but we have enough candidate folders AND a complete (MP3)
+        # album — stop and use them; FLAC still ranks first if any partial-lossless folder exists.
+        if len(accepted_after_query) >= folder_try_limit and best_matched >= requested_track_count:
+            append_task_log(session, task, f"{artist} / {album}: found {len(accepted_after_query)} matching folder(s) (no complete lossless folder); stopping at try limit {folder_try_limit}")
             break
     ranked = ranked_album_folder_pools(pools, requests, match_threshold)
-    accepted = accepted_album_folder_pools(ranked, match_threshold)
+    accepted = accepted_album_folder_pools(ranked, match_threshold, requested_track_count)
     if not accepted:
         append_task_log(session, task, f"{artist} / {album}: album queries did not locate enough confident folders; skipping individual track seed searches", "warning")
     if not pools:
@@ -4361,39 +4364,44 @@ def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list
     expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
     expected_album = str(requests[0].get("album") or "") if requests else ""
     requested = len(requests)
-    require_lossless = requests_require_lossless(requests)
     # Phase 1: cheap pre-rank using only folder-name + size signals (no per-track file matching).
-    # "audio" is the count of files eligible to match (lossless-only when the request requires it), so
-    # an MP3-only folder reads as empty for a lossless replacement and won't crowd out a FLAC folder.
     prelim: list[dict] = []
     for pool in pools.values():
-        files = folder_match_files(pool.get("files") or [], require_lossless)
+        files = audio_folder_files(pool.get("files") or [])
+        lossless_count = len(lossless_folder_files(files))
         folder_segments = album_folder_segments(pool)
         prelim.append({
             "album": album_folder_name_score(expected_album, pool),
             "artist": best_segment_score(expected_artist, folder_segments),
             "audio": len(files),
-            "lossless": len(lossless_folder_files(pool.get("files") or [])),
+            "lossless": lossless_count,
             "fit": _album_folder_fit(len(files), requested),
+            "lossless_fit": _album_folder_fit(lossless_count, requested),
             "pool": pool,
         })
     # Pick which folders get full per-track scoring: the most promising by folder name + size, UNION
     # the best size-fit folders (so the real album folder is scored even when album==artist makes the
-    # name score useless and giant discography folders would otherwise crowd out the top slots).
+    # name score useless and giant discography folders would crowd out the top slots), UNION the best
+    # LOSSLESS-size-fit folders so a FLAC album folder is always evaluated and can win over an MP3 one
+    # (FLAC over MP3; MP3 kept as fallback).
     by_name = sorted(prelim, key=lambda e: (e["album"], e["artist"], e["lossless"], e["audio"]), reverse=True)
     by_fit = sorted(prelim, key=lambda e: (e["fit"], e["album"], e["artist"], e["lossless"]), reverse=True)
+    by_lossless_fit = sorted((e for e in prelim if e["lossless"]), key=lambda e: (e["lossless_fit"], e["album"], e["artist"]), reverse=True)
     full_score_ids: set[int] = set()
-    for entry in (*by_name[:ALBUM_FOLDER_FULL_SCORE_LIMIT], *by_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT]):
+    for entry in (*by_name[:ALBUM_FOLDER_FULL_SCORE_LIMIT], *by_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT], *by_lossless_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT]):
         full_score_ids.add(id(entry["pool"]))
     # Phase 2: fully score the chosen folders; the rest keep cheap scores so they remain available but
-    # rank below the fully-scored matches.
-    scored: list[tuple[tuple[int, float, float, float, int, int], dict]] = []
+    # rank below the fully-scored matches. Cheap score's trailing 0 = unknown lossless_matched.
+    scored: list[tuple[tuple, dict]] = []
     for entry in prelim:
         pool = entry["pool"]
-        if id(pool) in full_score_ids and entry["audio"] and entry["album"] >= threshold:
+        # Score the selected folders even if the folder NAME is a weak album match — coverage (the
+        # tracks it actually contains) decides acceptance, which is how a differently-named FLAC folder
+        # gets in. The full_score_ids set is bounded, so this stays cheap.
+        if id(pool) in full_score_ids and entry["audio"]:
             scored.append((score_album_folder_pool(pool, requests, threshold), pool))
         else:
-            scored.append(((0, 0.0, entry["artist"], entry["album"], entry["lossless"], entry["audio"]), pool))
+            scored.append(((0, 0.0, entry["artist"], entry["album"], entry["lossless"], entry["audio"], 0), pool))
     return sorted(scored, key=album_folder_pool_sort_key, reverse=True)
 
 
@@ -4436,7 +4444,7 @@ def add_seed_track_folder_pools(
                     known_filenames.add(filename)
                     added += 1
         ranked = ranked_album_folder_pools(pools, requests, match_threshold)
-        accepted = accepted_album_folder_pools(ranked, match_threshold)
+        accepted = accepted_album_folder_pools(ranked, match_threshold, len(requests))
         append_task_log(session, task, f"{artist} / {album}: seed search from {track_title} added {added} lossless file(s); {len(accepted)} folder(s) now meet album confidence")
         if accepted:
             break
@@ -4460,25 +4468,32 @@ def representative_album_seed_requests(requests: list[dict], limit: int) -> list
     return chosen
 
 
-def accepted_album_folder_pools(ranked: list[tuple[tuple[int, float, float, float, int, int], dict]], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
-    # Accept any folder that has audio files (score[5]) and clears the album-name threshold; lossless
-    # is preferred via the sort key, not required, so lossy albums are still offered for review.
-    return [
-        (score, pool)
-        for score, pool in ranked
-        if score[5] > 0 and score[3] >= threshold and (score[2] >= 0.25 or score[3] >= 0.92)
-    ]
+def accepted_album_folder_pools(ranked: list[tuple[tuple, dict]], threshold: float, requested: int = 0) -> list[tuple[tuple, dict]]:
+    # Accept a folder either by NAME (clears the album-name threshold) OR by COVERAGE — it actually
+    # contains most of the requested tracks as confident per-file matches. Coverage is what lets a
+    # differently-named FLAC folder ("The Fame Monster (Deluxe)" / "Fame, The (2008)" for "The Fame")
+    # be used instead of only the exactly-named MP3 folder. Lossless is preferred via the sort key.
+    accepted = []
+    for score, pool in ranked:
+        matched, artist_score, album_score, files = score[0], score[2], score[3], score[5]
+        if files <= 0:
+            continue
+        name_ok = album_score >= threshold and (artist_score >= 0.25 or album_score >= 0.92)
+        coverage_ok = requested > 0 and matched >= max(2, int(0.6 * requested)) and artist_score >= 0.25
+        if name_ok or coverage_ok:
+            accepted.append((score, pool))
+    return accepted
 
 
-def album_folder_pool_sort_key(item: tuple[tuple[int, float, float, float, int, int], dict]) -> tuple[float, float, int, float, int, int]:
+def album_folder_pool_sort_key(item: tuple[tuple, dict]) -> tuple:
     score, _pool = item
-    matched, confidence_total, artist_score, album_score, lossless, files = score
+    matched, confidence_total, artist_score, album_score, lossless, files = score[:6]
+    lossless_matched = score[6] if len(score) > 6 else 0
     average_track_confidence = confidence_total / max(matched, 1)
-    # Coverage (how many requested tracks the folder actually contains) ranks above raw lossless file
-    # count, so the folder that holds THIS album beats a bigger discography/other-album folder that
-    # merely has more FLAC files — decisive for self-titled albums where the name score can't tell
-    # them apart.
-    return (album_score, artist_score, matched, average_track_confidence, lossless, -files)
+    # FLAC coverage (lossless_matched) ranks first so a FLAC folder beats an equally-complete MP3
+    # folder (FLAC over MP3, MP3 kept as a fallback); then total coverage so the folder that holds
+    # THIS album beats a bigger discography/other-album folder; then confidence and raw lossless count.
+    return (album_score, artist_score, lossless_matched, matched, average_track_confidence, lossless, -files)
 
 
 def slskd_album_match_threshold(settings: dict[str, str]) -> float:
@@ -4506,11 +4521,12 @@ def configure_match_tuning(session: Session) -> None:
     _match_tuning.update(match_tuning(session))
 
 
-def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int]:
+def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int, int]:
     matched = 0
+    lossless_matched = 0
     confidence_total = 0.0
     artist_scores = []
-    files = folder_match_files(pool.get("files") or [], requests_require_lossless(requests))
+    files = audio_folder_files(pool.get("files") or [])
     lossless = len(lossless_folder_files(pool.get("files") or []))
     folder_segments = album_folder_segments(pool)
     artist_score = best_segment_score(fuzzy_text(requests[0].get("artist") if requests else ""), folder_segments)
@@ -4521,11 +4537,16 @@ def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) 
         if not candidate:
             continue
         matched += 1
+        if candidate.get("quality") == "lossless":
+            lossless_matched += 1
         confidence_total += float(candidate.get("confidence") or 0)
         artist_scores.append(float(candidate.get("artist_score") or 0))
     if artist_scores:
         artist_score = max(artist_score, sum(artist_scores) / max(1, len(artist_scores)))
-    return (matched, confidence_total, artist_score, album_score, lossless, len(files))
+    # lossless_matched (last) = how many requested tracks this folder supplies as FLAC. The sort key
+    # ranks it above total coverage so a FLAC folder beats an equally-complete MP3 folder, while MP3
+    # folders are still retained as second-rate fallbacks.
+    return (matched, confidence_total, artist_score, album_score, lossless, len(files), lossless_matched)
 
 
 def audio_folder_pool(pool: dict | None) -> dict | None:
@@ -4545,18 +4566,6 @@ def lossless_folder_files(files: list[dict]) -> list[dict]:
 
 def audio_folder_files(files: list[dict]) -> list[dict]:
     return [file_info for file_info in files if is_audio_filename(str(file_info.get("filename") or ""))]
-
-
-def folder_match_files(files: list[dict], require_lossless: bool) -> list[dict]:
-    """Files eligible for matching a request inside a folder. A lossless-required request (e.g. a
-    non-lossless replacement) only considers lossless files, so an MP3 album folder can't satisfy it
-    and the search keeps looking for a FLAC folder; normal requests consider all audio (lossless is
-    still preferred at ranking time)."""
-    return lossless_folder_files(files) if require_lossless else audio_folder_files(files)
-
-
-def requests_require_lossless(requests: list[dict]) -> bool:
-    return any(request.get("require_lossless") for request in (requests or []))
 
 
 def is_lossless_filename(filename: str) -> bool:
@@ -4595,7 +4604,7 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
     track = request.get("track") or request.get("title")
     if not track:
         return None
-    files = folder_match_files(pool.get("files") or [], bool(request.get("require_lossless")))
+    files = audio_folder_files(pool.get("files") or [])
     ranked = sorted(
         (
             (download_file_match_score(file_info, request, username=pool.get("username"), folder=pool.get("folder")), file_info)
