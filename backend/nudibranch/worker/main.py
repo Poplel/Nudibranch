@@ -1713,9 +1713,12 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     update_download_container_statuses(batch)
     session.flush()
 
-    # Add the album to the library as a unit: wait until the whole batch has settled (nothing
-    # still downloading or retrying) before presenting it, so tracks aren't reviewed piecemeal.
-    if waiting_count > 0:
+    # Whole-album imports (wishlist / plain album downloads) wait until the entire batch has settled
+    # before presenting, so an album isn't reviewed piecemeal. Per-track imports (lossless replacement
+    # / missing-track / manual replacement) instead present each downloaded track AS IT LANDS, so one
+    # finished single-track replacement doesn't wait on the hundreds of unrelated ones bundled into the
+    # same bulk batch (the "Check non-lossless" tool makes one batch of 100s of independent tracks).
+    if download_entries_import_per_album(entries) and waiting_count > 0:
         for entry, _staged_path in staged_entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for the rest of the album", stage="staging", progress=100)
         return {"imported": 0, "errors": errors, "waiting": waiting_count + ready_count, "ready": 0, "failed": failed_count}
@@ -1726,7 +1729,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     # Downloads have settled. Instead of MusicBrainz auto-verification + auto-import, present a
     # review task the user approves to add the staged files to the library.
     try:
-        present_staged_downloads_for_library_review(session, batch, staged_entries, finalize=(failed_count == 0 and not blocking_items))
+        present_staged_downloads_for_library_review(session, batch, staged_entries, finalize=(failed_count == 0 and not blocking_items and waiting_count == 0))
     except Exception as error:  # noqa: BLE001 - keep the batch visible if the review can't be built.
         batch.status = ProposalStatus.failed
         message = describe_import_error(error)
@@ -1853,11 +1856,13 @@ def download_item_retry_exhausted(item: ProposalItem | None) -> bool:
 def download_entries_import_per_album(entries: list[dict]) -> bool:
     """Whether a batch's downloads should import a whole album at a time.
 
-    Wishlist and plain album downloads import the album as a unit; missing-track and
-    lossless-replacement downloads fill individual gaps and import each track as it lands.
+    Wishlist and plain album downloads import the album as a unit; missing-track, lossless-replacement
+    and manual single-track/album replacement downloads fill individual gaps and import each track as it
+    lands (a bulk "Check non-lossless" run is one batch of hundreds of independent single-track
+    replacements — they must not all wait on each other).
     """
     for entry in entries:
-        if (entry.get("request") or {}).get("workflow") in {"missing_tracks", "lossless_replacement"}:
+        if (entry.get("request") or {}).get("workflow") in {"missing_tracks", "lossless_replacement", "manual_replacement"}:
             return False
     return True
 
