@@ -4361,16 +4361,19 @@ def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list
     expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
     expected_album = str(requests[0].get("album") or "") if requests else ""
     requested = len(requests)
+    require_lossless = requests_require_lossless(requests)
     # Phase 1: cheap pre-rank using only folder-name + size signals (no per-track file matching).
+    # "audio" is the count of files eligible to match (lossless-only when the request requires it), so
+    # an MP3-only folder reads as empty for a lossless replacement and won't crowd out a FLAC folder.
     prelim: list[dict] = []
     for pool in pools.values():
-        files = audio_folder_files(pool.get("files") or [])
+        files = folder_match_files(pool.get("files") or [], require_lossless)
         folder_segments = album_folder_segments(pool)
         prelim.append({
             "album": album_folder_name_score(expected_album, pool),
             "artist": best_segment_score(expected_artist, folder_segments),
             "audio": len(files),
-            "lossless": len(lossless_folder_files(files)),
+            "lossless": len(lossless_folder_files(pool.get("files") or [])),
             "fit": _album_folder_fit(len(files), requested),
             "pool": pool,
         })
@@ -4507,8 +4510,8 @@ def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) 
     matched = 0
     confidence_total = 0.0
     artist_scores = []
-    files = audio_folder_files(pool.get("files") or [])
-    lossless = len(lossless_folder_files(files))
+    files = folder_match_files(pool.get("files") or [], requests_require_lossless(requests))
+    lossless = len(lossless_folder_files(pool.get("files") or []))
     folder_segments = album_folder_segments(pool)
     artist_score = best_segment_score(fuzzy_text(requests[0].get("artist") if requests else ""), folder_segments)
     album_score = album_folder_name_score(str(requests[0].get("album") or "") if requests else "", pool)
@@ -4542,6 +4545,18 @@ def lossless_folder_files(files: list[dict]) -> list[dict]:
 
 def audio_folder_files(files: list[dict]) -> list[dict]:
     return [file_info for file_info in files if is_audio_filename(str(file_info.get("filename") or ""))]
+
+
+def folder_match_files(files: list[dict], require_lossless: bool) -> list[dict]:
+    """Files eligible for matching a request inside a folder. A lossless-required request (e.g. a
+    non-lossless replacement) only considers lossless files, so an MP3 album folder can't satisfy it
+    and the search keeps looking for a FLAC folder; normal requests consider all audio (lossless is
+    still preferred at ranking time)."""
+    return lossless_folder_files(files) if require_lossless else audio_folder_files(files)
+
+
+def requests_require_lossless(requests: list[dict]) -> bool:
+    return any(request.get("require_lossless") for request in (requests or []))
 
 
 def is_lossless_filename(filename: str) -> bool:
@@ -4580,7 +4595,7 @@ def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: floa
     track = request.get("track") or request.get("title")
     if not track:
         return None
-    files = audio_folder_files(pool.get("files") or [])
+    files = folder_match_files(pool.get("files") or [], bool(request.get("require_lossless")))
     ranked = sorted(
         (
             (download_file_match_score(file_info, request, username=pool.get("username"), folder=pool.get("folder")), file_info)
