@@ -4770,9 +4770,18 @@ def fuzzy_similarity(left: str, right: str) -> float:
     sequence_score = SequenceMatcher(None, left, right).ratio()
     left_tokens = set(left.split())
     right_tokens = set(right.split())
-    overlap_score = len(left_tokens & right_tokens) / max(1, len(left_tokens))
-    containment_score = 1.0 if left in right or right in left else 0.0
-    return max(sequence_score, overlap_score * 0.92, containment_score)
+    # Symmetric token overlap (Jaccard): a short query whose every token happens to appear in a
+    # longer, *different* title no longer scores ~1.0 just because all of its own tokens are present
+    # (e.g. "the time" vs "party all the time").
+    overlap_score = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+    # Substring containment scaled by length ratio: a near-equal substring still scores ~1.0, but a
+    # short fragment inside a longer different title scores only its length fraction.
+    if left in right or right in left:
+        shorter, longer = sorted((left, right), key=len)
+        containment_score = len(shorter) / max(1, len(longer))
+    else:
+        containment_score = 0.0
+    return max(sequence_score, overlap_score, containment_score)
 
 
 def fuzzy_text(value: object) -> str:

@@ -20,7 +20,10 @@ PREFIX = "match_tuning:"
 MATCH_TUNING_DEFAULTS: dict[str, float] = {
     # Acceptance / gating
     "min_confidence": 0.45,            # candidates below this 0-1 confidence are dropped (recall floor)
-    "title_floor": 0.45,               # required title similarity to consider a file at all
+    "title_floor": 0.60,               # required title similarity — the title is the only real
+                                       # discriminator once artist/duration/album corroborate (any
+                                       # same-artist, similar-length file maxes those), so keep it
+                                       # firm enough to reject coincidental short-title overlaps
     "duration_tolerance_seconds": 12,  # ± window counted as a perfect duration match
     # Ranking weights (relative contributions to the 0-1 confidence)
     "weight_title": 0.40,
