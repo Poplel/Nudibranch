@@ -1756,7 +1756,7 @@ def requeue_album_replacement(
     album = session.get(Album, album_id)
     if not album:
         raise HTTPException(status_code=404, detail="Album not found")
-    track_ids = [t.id for t in session.scalars(select(Track.id).where(Track.album_id == album.id))]
+    track_ids = list(session.scalars(select(Track.id).where(Track.album_id == album.id)))
     if not track_ids:
         raise HTTPException(status_code=400, detail="Album has no tracks")
     return serialize_task(enqueue_task(session, "requeue_replacement", {"track_ids": track_ids}))
