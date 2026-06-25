@@ -3835,6 +3835,7 @@ nav button:hover {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  min-width: 0;
 }
 .album-card-art {
   position: relative;
