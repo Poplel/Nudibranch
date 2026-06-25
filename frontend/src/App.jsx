@@ -2428,7 +2428,15 @@ function App() {
               loading,
               activeImportTask,
               downloadCount: importDownloadRequests.length,
-              disabled: loading || activeImportTask || (importFiles.length === 0 && importDownloadRequests.length === 0),
+              hasPendingPlaylist: !!(pendingPlaylistName && pendingPlaylistOriginalTracks && pendingPlaylistOriginalTracks.length > 0),
+              // Allow submitting even with nothing to download/import when a playlist is pending —
+              // the playlist still gets created/updated from the songs already in the library.
+              disabled:
+                loading ||
+                activeImportTask ||
+                (importFiles.length === 0 &&
+                  importDownloadRequests.length === 0 &&
+                  !(pendingPlaylistName && pendingPlaylistOriginalTracks && pendingPlaylistOriginalTracks.length > 0)),
             }}
             wishlistActions={wishlistInspectorActions}
             playlistActions={playlistInspectorActions}
@@ -7748,7 +7756,11 @@ function Inspector({
             Add album
           </button>
           <button className="secondary" onClick={importActions.onPropose} disabled={importActions.disabled}>
-            {importActions.activeImportTask ? "Import review running" : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
+            {importActions.activeImportTask
+              ? "Import review running"
+              : !importActions.downloadCount && !importActions.hasFiles && importActions.hasPendingPlaylist
+              ? "Create playlist"
+              : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
           </button>
           {confirmClearImport ? (
             <button className="secondary danger" type="button" disabled={importActions.loading} onClick={() => { setConfirmClearImport(false); importActions.onClearFolder?.(); }}>
