@@ -165,19 +165,28 @@ def _migrate_permissions(session: Session) -> None:
         return
     by_name = {permission.name: permission for permission in Permission}
     by_value = {permission.value: permission for permission in Permission}
+    # Old fine-grained permissions were stored by the ORM as the member NAME ("library_read").
+    # _PERMISSION_REMAP is keyed by the old VALUE ("library:read"); accept the old name form too
+    # (member name == value with ':' -> '_'), so rows the ORM wrote directly are remapped, not
+    # dropped. This is why the original collapse never fired — it only matched the value form.
+    remap: dict[str, list[Permission]] = {}
+    for old_value, targets in _PERMISSION_REMAP.items():
+        members = [by_value[value] for value in targets]
+        remap[old_value] = members
+        remap[old_value.replace(":", "_")] = members
     # Clean row = already a current member name and not an old remap key. Skip the whole pass
     # only when every row is clean.
-    if all(perm in by_name and perm not in _PERMISSION_REMAP for _, perm in rows):
+    if all(perm in by_name and perm not in remap for _, perm in rows):
         return
 
     def resolve(perm: str) -> list[Permission]:
-        if perm in _PERMISSION_REMAP:
-            return [by_value[value] for value in _PERMISSION_REMAP[perm]]
-        if perm in by_name:
+        if perm in remap:
+            return remap[perm]
+        if perm in by_name:   # already a current member name
             return [by_name[perm]]
-        if perm in by_value:  # mis-stored value form, e.g. "library:view"
+        if perm in by_value:  # mis-stored current value form, e.g. "library:view"
             return [by_value[perm]]
-        return []  # unknown / dropped permission
+        return []             # unknown / dropped permission
 
     new_by_user: dict[str, set[Permission]] = {}
     for user_id, perm in rows:

@@ -6131,12 +6131,17 @@ def _try_create_pending_playlists(session: Session) -> None:
                     playlist_id = canonical
                 if playlist_id:
                     current = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
-                    new_ids = [jf_id for jf_id in jf_ids if jf_id not in current]
+                    # Dedup against BOTH the playlist's current items AND the ids we already added on
+                    # prior syncs (persisted in the record). Jellyfin's item read-back can come back
+                    # empty or in a different id-space; without our own memory the dedup never matches,
+                    # so we re-add the same tracks every tick forever — and never finalize, since
+                    # retry_count resets whenever new_ids is non-empty.
+                    new_ids = [jf_id for jf_id in jf_ids if jf_id not in current and jf_id not in added_ids]
                     if new_ids:
                         client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
                         write_app_log(f"Added {len(new_ids)} track(s) to Jellyfin playlist '{playlist_name}'")
                     data["jellyfin_playlist_id"] = playlist_id
-                    added_ids = current | set(jf_ids)
+                    added_ids = added_ids | set(jf_ids)
                 else:
                     new_ids = list(jf_ids)
                     resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
