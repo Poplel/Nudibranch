@@ -6089,6 +6089,17 @@ def _try_create_pending_playlists(session: Session) -> None:
                 f"but not yet indexed by Jellyfin, {dup_count} duplicate)",
                 level="info",
             )
+        # Some songs are in the library but Jellyfin hasn't indexed them yet — kick ONE Jellyfin scan
+        # (bounded by a flag) so it indexes them. Jellyfin scans asynchronously, so they won't appear
+        # this pass; the record stays open and a later sync/re-import maps and adds them.
+        if resolved_no_jf and not data.get("index_scan_requested"):
+            data["index_scan_requested"] = True
+            enqueue_task(session, "jellyfin_scan", {})
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {resolved_no_jf} song(s) in the library but not "
+                f"indexed by Jellyfin — queued a Jellyfin scan; re-import once it finishes to add them",
+                level="info",
+            )
 
         # Find the Jellyfin user ID: prefer the user who initiated the import.
         jf_user_id = None
@@ -6302,9 +6313,15 @@ def run_create_pending_playlists(session: Session, _payload: dict) -> dict:
     no-ops when it doesn't apply (native only when Jellyfin is unconfigured; the Jellyfin path only
     when it is), so this is safe to call unconditionally. The native path leaves its commit to the
     caller, so commit here to cover the Jellyfin-unconfigured case.
+
+    Refreshes the Jellyfin track mapping FIRST (run_sync_favorites_jellyfin re-validates every id,
+    maps anything Jellyfin has since indexed, then calls _try_create_pending_playlists itself), so a
+    re-import picks up tracks that finished indexing since the last attempt.
     """
     create_pending_native_playlists(session)
-    _try_create_pending_playlists(session)
+    settings = integration_settings(session)
+    if settings.get("jellyfin_url") and settings.get("jellyfin_api_key"):
+        run_sync_favorites_jellyfin(session, {})  # re-maps + calls _try_create_pending_playlists
     session.commit()
     return {"created": True}
 
