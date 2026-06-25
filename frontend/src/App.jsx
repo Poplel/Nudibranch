@@ -122,6 +122,13 @@ function App() {
   const initialAppearance = readInitialAppearance();
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || "");
   const [user, setUser] = useState(null);
+  const [playerDiagnostics, setPlayerDiagnostics] = useState(() => {
+    try { return localStorage.getItem("nudibranch:playerDiagnostics") === "1"; } catch { return false; }
+  });
+  const togglePlayerDiagnostics = (next) => {
+    setPlayerDiagnostics(next);
+    try { localStorage.setItem("nudibranch:playerDiagnostics", next ? "1" : "0"); } catch { /* ignore */ }
+  };
   const [page, setPage] = useState("Library");
   const [albumDetail, setAlbumDetail] = useState(null);
   const [artistDetail, setArtistDetail] = useState(null);
@@ -2167,6 +2174,7 @@ function App() {
               onRemoveFromQueue={removeFromQueue}
               crossfadeDuration={crossfadeDuration}
               apiKey={token}
+              diagnostics={playerDiagnostics && !!user?.is_admin}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
                 setPlayerOpen(false);
@@ -2325,6 +2333,8 @@ function App() {
                 onUploadYoutubeCookies={uploadYoutubeCookies}
                 api={api}
                 notify={notify}
+                playerDiagnostics={playerDiagnostics}
+                onTogglePlayerDiagnostics={togglePlayerDiagnostics}
               />
             )}
             {page === "Tools" && (
@@ -6917,6 +6927,8 @@ function SettingsPanel({
   onUploadYoutubeCookies,
   api,
   notify,
+  playerDiagnostics,
+  onTogglePlayerDiagnostics,
 }) {
   const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
   // Resync if the user object loads/changes after mount.
@@ -6994,6 +7006,15 @@ function SettingsPanel({
             onTouchEnd={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
           />
         </label>
+        {user?.is_admin && (
+          <label className="setting-row">
+            <span>
+              Player diagnostics
+              <small>Live performance + network overlay on the player to diagnose buffering. Admin only.</small>
+            </span>
+            <input type="checkbox" checked={!!playerDiagnostics} onChange={(event) => onTogglePlayerDiagnostics?.(event.target.checked)} />
+          </label>
+        )}
       </section>
       <section className="settings-section">
         <h2>Status</h2>
@@ -8035,6 +8056,233 @@ function replayGainLinear(track) {
   return Math.pow(10, Number(gain) / 20);
 }
 
+const DIAG_READY_STATES = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"];
+const DIAG_NETWORK_STATES = ["EMPTY", "IDLE", "LOADING", "NO_SOURCE"];
+
+function diagBufferedAhead(el) {
+  if (!el || !el.buffered || el.buffered.length === 0) return 0;
+  const t = el.currentTime;
+  for (let i = 0; i < el.buffered.length; i++) {
+    if (t >= el.buffered.start(i) - 0.25 && t <= el.buffered.end(i) + 0.25) return Math.max(0, el.buffered.end(i) - t);
+  }
+  return 0;
+}
+function diagBufferedTotal(el) {
+  if (!el || !el.buffered) return 0;
+  let s = 0;
+  for (let i = 0; i < el.buffered.length; i++) s += el.buffered.end(i) - el.buffered.start(i);
+  return s;
+}
+function diagTail(url) {
+  if (!url) return "—";
+  return url.split("?")[0].split("/").slice(-2).join("/");
+}
+
+function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, gainNodesRef, limiterRef, loadedUrlRef, crossfadingRef, currentTrack, audioUrl, nextAudioUrl, crossfadeDuration }) {
+  const [m, setM] = useState({});
+  const [collapsed, setCollapsed] = useState(false);
+  const stallsRef = useRef({ count: 0, totalMs: 0, lastStallStart: 0, inStall: false, startupMs: null, loadStart: 0, lastUrl: null });
+  const fpsRef = useRef({ frames: 0, last: performance.now(), fps: 0 });
+
+  useEffect(() => {
+    let raf;
+    const tick = () => {
+      const f = fpsRef.current;
+      f.frames += 1;
+      const now = performance.now();
+      if (now - f.last >= 1000) { f.fps = Math.round((f.frames * 1000) / (now - f.last)); f.frames = 0; f.last = now; }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    const els = [audioARef.current, audioBRef.current].filter(Boolean);
+    const onWaiting = () => { const s = stallsRef.current; if (!s.inStall) { s.inStall = true; s.lastStallStart = performance.now(); s.count += 1; } };
+    const onPlaying = () => {
+      const s = stallsRef.current;
+      if (s.inStall) { s.totalMs += performance.now() - s.lastStallStart; s.inStall = false; }
+      if (s.startupMs == null && s.loadStart) s.startupMs = performance.now() - s.loadStart;
+    };
+    const onLoadStart = () => { const s = stallsRef.current; s.loadStart = performance.now(); s.startupMs = null; };
+    for (const el of els) {
+      el.addEventListener("waiting", onWaiting);
+      el.addEventListener("stalled", onWaiting);
+      el.addEventListener("playing", onPlaying);
+      el.addEventListener("loadstart", onLoadStart);
+    }
+    return () => {
+      for (const el of els) {
+        el.removeEventListener("waiting", onWaiting);
+        el.removeEventListener("stalled", onWaiting);
+        el.removeEventListener("playing", onPlaying);
+        el.removeEventListener("loadstart", onLoadStart);
+      }
+    };
+  }, [audioARef, audioBRef]);
+
+  useEffect(() => {
+    const s = stallsRef.current;
+    if (audioUrl && audioUrl !== s.lastUrl) { s.lastUrl = audioUrl; s.loadStart = performance.now(); s.startupMs = null; }
+  }, [audioUrl]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const activeKey = activeKeyRef.current;
+      const el = activeKey === "a" ? audioARef.current : audioBRef.current;
+      const ctx = audioCtxRef.current;
+      const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+      const s = stallsRef.current;
+
+      let kbps = null, bytes = 0, ttfb = null, reqCount = 0;
+      try {
+        const base = (audioUrl || "").split("?")[0];
+        if (base) {
+          const ents = performance.getEntriesByType("resource").filter((e) => e.name.split("?")[0] === base);
+          reqCount = ents.length;
+          let totDur = 0;
+          for (const e of ents) { bytes += e.transferSize || e.encodedBodySize || 0; totDur += e.duration || 0; }
+          if (totDur > 0 && bytes > 0) kbps = Math.round((bytes * 8) / totDur);
+          const last = ents[ents.length - 1];
+          if (last && last.responseStart && last.requestStart) ttfb = Math.round(last.responseStart - last.requestStart);
+        }
+      } catch { /* ignore */ }
+
+      const gainNode = gainNodesRef.current ? gainNodesRef.current[activeKey] : null;
+      const playTime = el ? el.currentTime : 0;
+      let decoded = null;
+      try { if (el && typeof el.webkitAudioDecodedByteCount === "number") decoded = el.webkitAudioDecodedByteCount; } catch { /* ignore */ }
+      setM({
+        playing: el ? !el.paused : false,
+        readyState: el ? DIAG_READY_STATES[el.readyState] : "—",
+        networkState: el ? DIAG_NETWORK_STATES[el.networkState] : "—",
+        currentTime: playTime,
+        duration: el && isFinite(el.duration) ? el.duration : 0,
+        playbackRate: el ? el.playbackRate : 1,
+        bufferAhead: diagBufferedAhead(el),
+        bufferedTotal: diagBufferedTotal(el),
+        bufferedRanges: el && el.buffered ? el.buffered.length : 0,
+        seekableEnd: el && el.seekable && el.seekable.length ? el.seekable.end(el.seekable.length - 1) : 0,
+        volume: el ? el.volume : 0,
+        mediaError: el && el.error ? `code ${el.error.code}` : "none",
+        rebuffers: s.count,
+        stalledMs: Math.round(s.totalMs + (s.inStall ? performance.now() - s.lastStallStart : 0)),
+        inStall: s.inStall,
+        startupMs: s.startupMs != null ? Math.round(s.startupMs) : null,
+        underrun: playTime > 0 ? (s.totalMs / 1000) / playTime : 0,
+        kbps, bytes, ttfb, reqCount,
+        connType: conn && conn.effectiveType ? conn.effectiveType : "—",
+        downlink: conn && conn.downlink != null ? conn.downlink : null,
+        rtt: conn && conn.rtt != null ? conn.rtt : null,
+        saveData: !!(conn && conn.saveData),
+        online: navigator.onLine,
+        ctxState: ctx ? ctx.state : "—",
+        sampleRate: ctx ? ctx.sampleRate : null,
+        baseLatency: ctx && ctx.baseLatency != null ? ctx.baseLatency : null,
+        outputLatency: ctx && ctx.outputLatency != null ? ctx.outputLatency : null,
+        gain: gainNode ? gainNode.gain.value : null,
+        limiterDb: limiterRef.current ? limiterRef.current.reduction : null,
+        replayGainDb: currentTrack && currentTrack.replaygain_track_gain != null ? currentTrack.replaygain_track_gain : null,
+        activeKey,
+        crossfading: !!(crossfadingRef && crossfadingRef.current),
+        nextPreloaded: !!nextAudioUrl,
+        crossfadeDuration,
+        format: (currentTrack && currentTrack.format) || "—",
+        bitrate: currentTrack && currentTrack.bitrate ? currentTrack.bitrate : null,
+        lossless: currentTrack ? !!currentTrack.is_lossless : false,
+        trackId: (currentTrack && currentTrack.id) || "—",
+        decodedBytes: decoded,
+        heapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
+        fps: fpsRef.current.fps,
+        dpr: window.devicePixelRatio,
+      });
+    }, 250);
+    return () => clearInterval(id);
+  }, [audioUrl, currentTrack, nextAudioUrl, crossfadeDuration]);
+
+  const num = (v, d = 1) => (typeof v === "number" && isFinite(v) ? v.toFixed(d) : "—");
+  const sections = [
+    ["Playback", [
+      ["State", m.inStall ? "STALLING" : (m.playing ? "playing" : "paused"), m.inStall ? "#ff5a5a" : (m.playing ? "#37c871" : undefined)],
+      ["Ready", m.readyState],
+      ["Network", m.networkState],
+      ["Buffer ahead", `${num(m.bufferAhead)}s`, m.bufferAhead < 2 ? "#ff5a5a" : m.bufferAhead < 5 ? "#ffb454" : "#37c871"],
+      ["Buffered", `${num(m.bufferedTotal)}s · ${m.bufferedRanges || 0} rng`],
+      ["Position", `${num(m.currentTime)} / ${num(m.duration)}s`],
+      ["Rate", `${m.playbackRate || 1}x`],
+      ["Seekable", `${num(m.seekableEnd, 0)}s`],
+      ["Media error", m.mediaError, m.mediaError && m.mediaError !== "none" ? "#ff5a5a" : undefined],
+    ]],
+    ["Rebuffering", [
+      ["Rebuffers", String(m.rebuffers ?? 0), m.rebuffers > 0 ? "#ffb454" : "#37c871"],
+      ["Stalled time", `${num((m.stalledMs || 0) / 1000)}s`, m.stalledMs > 0 ? "#ffb454" : undefined],
+      ["Underrun", `${num((m.underrun || 0) * 100)}%`],
+      ["Startup", m.startupMs != null ? `${m.startupMs}ms` : "—"],
+    ]],
+    ["Network", [
+      ["Throughput", m.kbps != null ? `${m.kbps} kbps` : "—"],
+      ["Downloaded", m.bytes ? `${num(m.bytes / 1048576, 2)} MB` : "—"],
+      ["TTFB", m.ttfb != null ? `${m.ttfb}ms` : "—"],
+      ["Requests", String(m.reqCount ?? 0)],
+      ["Conn type", m.connType],
+      ["Downlink", m.downlink != null ? `${m.downlink} Mbps` : "—"],
+      ["RTT", m.rtt != null ? `${m.rtt}ms` : "—"],
+      ["Save-Data", m.saveData ? "ON" : "off"],
+      ["Online", m.online ? "yes" : "no", m.online ? undefined : "#ff5a5a"],
+    ]],
+    ["Web Audio", [
+      ["Context", m.ctxState, m.ctxState === "running" ? "#37c871" : "#ffb454"],
+      ["Sample rate", m.sampleRate ? `${m.sampleRate} Hz` : "—"],
+      ["Base latency", m.baseLatency != null ? `${num(m.baseLatency * 1000)}ms` : "—"],
+      ["Output latency", m.outputLatency != null ? `${num(m.outputLatency * 1000)}ms` : "—"],
+      ["Gain", m.gain != null ? `${num(m.gain, 3)}x` : "—"],
+      ["ReplayGain", m.replayGainDb != null ? `${m.replayGainDb} dB` : "—"],
+      ["Limiter", m.limiterDb != null ? `${num(m.limiterDb)} dB` : "—"],
+      ["Active buffer", String(m.activeKey || "").toUpperCase() || "—"],
+      ["Crossfade", `${m.crossfading ? "active" : "idle"} (${num(m.crossfadeDuration, 1)}s)`],
+      ["Next preloaded", m.nextPreloaded ? "yes" : "no"],
+    ]],
+    ["Track", [
+      ["Format", m.format],
+      ["Bitrate", m.bitrate ? `${m.bitrate} kbps` : "—"],
+      ["Lossless", m.lossless ? "yes" : "no"],
+      ["Decoded", m.decodedBytes != null ? `${num(m.decodedBytes / 1048576)} MB` : "n/a"],
+      ["Track id", String(m.trackId || "—")],
+    ]],
+    ["Runtime", [
+      ["JS heap", m.heapMB != null ? `${m.heapMB} MB` : "n/a"],
+      ["FPS", String(m.fps ?? 0)],
+      ["DPR", String(m.dpr ?? 1)],
+    ]],
+  ];
+
+  return (
+    <div style={{ position: "fixed", top: 64, right: 12, width: 286, maxHeight: "76vh", overflowY: "auto", zIndex: 9998, background: "rgba(12,14,18,0.92)", color: "#e8eaed", border: "1px solid rgba(255,255,255,0.14)", borderRadius: 10, font: "11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace", boxShadow: "0 8px 28px rgba(0,0,0,0.45)", backdropFilter: "blur(6px)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: collapsed ? "none" : "1px solid rgba(255,255,255,0.12)", position: "sticky", top: 0, background: "rgba(12,14,18,0.96)", borderRadius: "10px 10px 0 0" }}>
+        <strong style={{ fontSize: 11, letterSpacing: 0.3, flex: 1 }}>Player diagnostics</strong>
+        <button title="Reset counters" onClick={() => { stallsRef.current = { count: 0, totalMs: 0, lastStallStart: 0, inStall: false, startupMs: null, loadStart: performance.now(), lastUrl: stallsRef.current.lastUrl }; }} style={{ cursor: "pointer", background: "transparent", color: "#9aa0a6", border: "1px solid rgba(255,255,255,0.18)", borderRadius: 5, padding: "1px 6px", font: "inherit" }}>reset</button>
+        <button title={collapsed ? "Expand" : "Collapse"} onClick={() => setCollapsed((c) => !c)} style={{ cursor: "pointer", background: "transparent", color: "#9aa0a6", border: "1px solid rgba(255,255,255,0.18)", borderRadius: 5, padding: "1px 6px", font: "inherit" }}>{collapsed ? "+" : "–"}</button>
+      </div>
+      {!collapsed && (
+        <div style={{ padding: "4px 10px 10px" }}>
+          {sections.map(([heading, rows]) => (
+            <div key={heading} style={{ marginTop: 8 }}>
+              <div style={{ color: "#8ab4f8", textTransform: "uppercase", fontSize: 9.5, letterSpacing: 0.6, marginBottom: 3 }}>{heading}</div>
+              {rows.map(([label, value, color]) => (
+                <div key={label} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "1px 0" }}>
+                  <span style={{ color: "#9aa0a6" }}>{label}</span>
+                  <span style={{ color: color || "#e8eaed", textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{value}</span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function AudioPlayer({
   controlRef,
   currentTrack,
@@ -8061,6 +8309,7 @@ function AudioPlayer({
   onClose,
   crossfadeDuration = 0.5,
   apiKey,
+  diagnostics = false,
 }) {
   // Double-buffer: two audio elements. One is "active" (audible); the other
   // preloads the upcoming track so the next song is already buffered and we can
@@ -8098,6 +8347,7 @@ function AudioPlayer({
       limiter.attack.value = 0.003;
       limiter.release.value = 0.1;
       limiter.connect(ctx.destination);
+      limiterRef.current = limiter;
       for (const [key, el] of [["a", elA], ["b", elB]]) {
         const source = ctx.createMediaElementSource(el);
         const gain = ctx.createGain();
@@ -8133,6 +8383,7 @@ function AudioPlayer({
   const audioCtxRef = useRef(null);
   const gainNodesRef = useRef({ a: null, b: null });
   const audioGraphReadyRef = useRef(false);
+  const limiterRef = useRef(null);
   const dockRef = useRef(null);
   const coreRef = useRef(null);
   const trackCopyRef = useRef(null);
@@ -8912,6 +9163,22 @@ function AudioPlayer({
       {!pipContainer ? surface() : null}
       {renderAudioElement("a", audioARef)}
       {renderAudioElement("b", audioBRef)}
+      {diagnostics && (
+        <PlayerDiagnostics
+          audioARef={audioARef}
+          audioBRef={audioBRef}
+          activeKeyRef={activeKeyRef}
+          audioCtxRef={audioCtxRef}
+          gainNodesRef={gainNodesRef}
+          limiterRef={limiterRef}
+          loadedUrlRef={loadedUrlRef}
+          crossfadingRef={crossfading}
+          currentTrack={currentTrack}
+          audioUrl={audioUrl}
+          nextAudioUrl={nextAudioUrl}
+          crossfadeDuration={crossfadeDuration}
+        />
+      )}
       {pipContainer ? createPortal(surface({ popped: true }), pipContainer) : null}
     </>
   );
