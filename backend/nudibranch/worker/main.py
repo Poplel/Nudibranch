@@ -6045,13 +6045,32 @@ def _try_create_pending_playlists(session: Session) -> None:
         # stray whitespace silently failed to match and were dropped — the playlist consistently
         # ended up short of its real track count.
         jf_ids: list[str] = []
+        unresolved = 0       # not found in the library at all
+        resolved_no_jf = 0   # in the library but not yet mapped to a Jellyfin item
         for entry in original_tracks:
             title = entry.get("title") or ""
             if not title:
                 continue
             track = library_track_by_artist_title(session, entry.get("artist") or "", title)
-            if track and track.jellyfin_item_id:
+            if not track:
+                unresolved += 1
+            elif not track.jellyfin_item_id:
+                resolved_no_jf += 1
+            else:
                 jf_ids.append(track.jellyfin_item_id)
+        # Drop duplicate ids (duplicate playlist entries, or two library rows sharing one Jellyfin
+        # item). Jellyfin collapses dupes on add anyway, and keeping them inflates the count so the
+        # playlist looks "complete" while holding fewer real tracks.
+        deduped_jf_ids = list(dict.fromkeys(jf_ids))
+        dup_count = len(jf_ids) - len(deduped_jf_ids)
+        jf_ids = deduped_jf_ids
+        if unresolved or resolved_no_jf or dup_count:
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {len(original_tracks)} originals → {len(jf_ids)} "
+                f"distinct Jellyfin item(s) ({unresolved} not in library, {resolved_no_jf} in library "
+                f"but not yet indexed by Jellyfin, {dup_count} duplicate)",
+                level="info",
+            )
 
         # Find the Jellyfin user ID: prefer the user who initiated the import.
         jf_user_id = None
@@ -6146,6 +6165,19 @@ def _try_create_pending_playlists(session: Session) -> None:
                     write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
                     if stored_user_id:
                         create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
+                # Verify what actually landed. A shortfall vs the distinct ids we tried to ensure means
+                # Jellyfin rejected some item ids — a stale jellyfin_item_id (the track was re-indexed
+                # or replaced, so our stored id is out of date). Surfaces the real "fewer than expected"
+                # cause; the read-back is in media-item-id space, same as jellyfin_item_id.
+                present = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
+                not_accepted = [jf_id for jf_id in jf_ids if jf_id not in present]
+                if not_accepted:
+                    write_app_log(
+                        f"Pending playlist '{playlist_name}': tried to ensure {len(jf_ids)} track(s) but "
+                        f"Jellyfin playlist holds {len(present)} — {len(not_accepted)} item id(s) not "
+                        f"accepted (stale jellyfin_item_id; run a Jellyfin scan/remap to refresh, then re-import)",
+                        level="warning",
+                    )
                 _record_jellyfin_playlist_origin(session, stored_user_id, origin, playlist_id)
         except Exception as error:  # noqa: BLE001
             write_app_log(f"Failed to update Jellyfin playlist '{playlist_name}': {error}", level="warning")
