@@ -5891,19 +5891,37 @@ def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
         audio_index = _fetch_all_jellyfin_audio(client, user_id)
         append_task_log(session, None, f"Track mapping: fetched {len(audio_index)} Jellyfin audio items")
 
-        # Map unmatched Nudibranch tracks → Jellyfin audio items and save jellyfin_item_id
-        unmatched_tracks = list(session.scalars(select(Track).where(Track.jellyfin_item_id.is_(None))))
+        # Re-validate EVERY track against the current Jellyfin index, not just the unmapped ones. A
+        # stored jellyfin_item_id goes STALE when Jellyfin re-indexes a file (e.g. after a track
+        # replacement, or a Jellyfin library rescan) and reissues the item id — and a stale id is
+        # silently rejected on playlist add, so the track vanishes from playlists. Fast path: skip
+        # tracks whose id is still present in the index. Otherwise re-match: refresh to the current id,
+        # or clear it when the item is genuinely gone (so a later scan can remap and it isn't used as
+        # a dead id). Mapping only-the-NULL tracks left stale ids unfixable forever.
+        current_ids = {item.get("Id") for item in audio_index if item.get("Id")}
+        all_tracks = list(session.scalars(select(Track)))
         newly_mapped = 0
-        for track in unmatched_tracks:
+        refreshed = 0
+        cleared = 0
+        for track in all_tracks:
+            stored = track.jellyfin_item_id
+            if stored and stored in current_ids:
+                continue  # still valid
             jf_id = _find_in_audio_index(audio_index, track)
             if jf_id:
                 track.jellyfin_item_id = jf_id
-                newly_mapped += 1
-        if newly_mapped:
+                if stored is None:
+                    newly_mapped += 1
+                elif jf_id != stored:
+                    refreshed += 1
+            elif stored is not None:
+                track.jellyfin_item_id = None
+                cleared += 1
+        if newly_mapped or refreshed or cleared:
             session.commit()
         total_mapped = session.scalar(select(func.count(Track.id)).where(Track.jellyfin_item_id.isnot(None))) or 0
         total_tracks = session.scalar(select(func.count(Track.id))) or 0
-        append_task_log(session, None, f"Track mapping: {newly_mapped} newly mapped; {total_mapped}/{total_tracks} total mapped to Jellyfin")
+        append_task_log(session, None, f"Track mapping: {newly_mapped} newly mapped, {refreshed} refreshed (stale), {cleared} cleared (gone); {total_mapped}/{total_tracks} total mapped to Jellyfin")
     count_row = session.get(AppSetting, "mapping_run_count")
     new_count = (int(count_row.value) if count_row else 0) + 1
     _upsert_setting(session, "mapping_last_run_at", datetime.now(timezone.utc).isoformat())
@@ -6154,30 +6172,35 @@ def _try_create_pending_playlists(session: Session) -> None:
                         client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
                         write_app_log(f"Added {len(new_ids)} track(s) to Jellyfin playlist '{playlist_name}'")
                     data["jellyfin_playlist_id"] = playlist_id
-                    added_ids = added_ids | set(jf_ids)
                 else:
                     new_ids = list(jf_ids)
                     resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
                     resp.raise_for_status()
                     playlist_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
                     data["jellyfin_playlist_id"] = playlist_id
-                    added_ids = set(new_ids)
                     write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
                     if stored_user_id:
                         create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
-                # Verify what actually landed. A shortfall vs the distinct ids we tried to ensure means
-                # Jellyfin rejected some item ids — a stale jellyfin_item_id (the track was re-indexed
-                # or replaced, so our stored id is out of date). Surfaces the real "fewer than expected"
-                # cause; the read-back is in media-item-id space, same as jellyfin_item_id.
+                # Credit only what ACTUALLY landed. Jellyfin silently rejects stale item ids, so the old
+                # `added_ids |= jf_ids` counted ids that never made it — the record then reached
+                # total_titled and deleted itself while the playlist was short, with no retry.
                 present = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
+                added_ids = added_ids | (set(jf_ids) & present)
                 not_accepted = [jf_id for jf_id in jf_ids if jf_id not in present]
                 if not_accepted:
                     write_app_log(
                         f"Pending playlist '{playlist_name}': tried to ensure {len(jf_ids)} track(s) but "
-                        f"Jellyfin playlist holds {len(present)} — {len(not_accepted)} item id(s) not "
-                        f"accepted (stale jellyfin_item_id; run a Jellyfin scan/remap to refresh, then re-import)",
+                        f"Jellyfin playlist holds {len(present)} — {len(not_accepted)} item id(s) not accepted "
+                        f"(stale jellyfin_item_id)",
                         level="warning",
                     )
+                    # Self-heal: queue ONE Jellyfin remap (run_sync_favorites_jellyfin re-validates every
+                    # track's id, then re-runs this creation). Bounded by a flag so we don't remap on
+                    # every tick; the record is kept (added_ids < total) so the refreshed ids land next pass.
+                    if not data.get("stale_remap_requested"):
+                        data["stale_remap_requested"] = True
+                        enqueue_task(session, "sync_favorites_jellyfin", {})
+                        write_app_log(f"Pending playlist '{playlist_name}': queued a Jellyfin remap to refresh {len(not_accepted)} stale id(s)")
                 _record_jellyfin_playlist_origin(session, stored_user_id, origin, playlist_id)
         except Exception as error:  # noqa: BLE001
             write_app_log(f"Failed to update Jellyfin playlist '{playlist_name}': {error}", level="warning")
