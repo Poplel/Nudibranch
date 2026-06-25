@@ -8328,9 +8328,25 @@ def jellyfin_duration_matches(track: Track, item: dict) -> bool:
     return abs(track.duration_ms - item_duration) <= 10000
 
 
+def _path_tail(value: str | None, segments: int = 3) -> str:
+    """Last few path segments, lowercased — a mount-root-agnostic file identity."""
+    parts = [p for p in re.split(r"[\\/]+", str(value or "").lower()) if p]
+    return "/".join(parts[-segments:])
+
+
 def jellyfin_audio_match_score(track: Track, item: dict) -> float:
-    if track.path and str(item.get("Path") or "").lower() == str(track.path).lower():
-        return 1.0
+    item_path = str(item.get("Path") or "")
+    if track.path and item_path:
+        if item_path.lower() == str(track.path).lower():
+            return 1.0
+        # Mount-agnostic: Jellyfin and Nudibranch often mount the SAME library at different roots
+        # (e.g. Jellyfin /media/... vs Nudibranch /app/library/...), so the absolute paths never
+        # match and matching falls back to the brittle exact-title rule below — which leaves tracks
+        # whose Jellyfin title differs (feat./punctuation/remaster) permanently unmapped. Compare the
+        # trailing Artist/Album/file segments instead; identical across the shared volume.
+        track_tail = _path_tail(track.path)
+        if track_tail and track_tail == _path_tail(item_path):
+            return 0.97
     provider_ids = jellyfin_provider_ids(item)
     recording_id = normalize_match_text(track.musicbrainz_recording_id)
     if recording_id and recording_id in {
