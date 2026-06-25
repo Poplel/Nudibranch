@@ -147,28 +147,47 @@ _PERMISSION_REMAP = {
 
 
 def _migrate_permissions(session: Session) -> None:
-    """Collapse the old 18 fine-grained permissions into the new flow/menu set.
+    """Normalize user_permissions rows to the current flow/menu permission set.
 
-    Rewrites user_permissions rows in place. Idempotent: only runs when at least one
-    stored value is an old (remapped) key. Dedupes because several old permissions
-    map onto the same new one (e.g. backups+jellyfin -> tools:manage).
+    Does two jobs, idempotently, in one pass:
+      1. Collapses the old 18 fine-grained permissions into the new set (_PERMISSION_REMAP).
+      2. Repairs rows stored in the wrong serialization form. SQLAlchemy's ``Enum(Permission)``
+         column persists/reads the enum MEMBER NAME ("library_view"), but an earlier version of
+         this migration inserted the enum VALUE ("library:view") via raw SQL — those rows raise
+         LookupError on ORM load and 500 every endpoint that serializes a user's permissions.
+         We resolve each stored string back to a real Permission and rewrite it as the name.
+
+    Only runs when at least one row is not already a clean member-name value (so it is a no-op on
+    an already-correct DB). Dedupes because several old permissions map onto the same new one.
     """
     rows = list(session.execute(text("SELECT user_id, permission FROM user_permissions")))
-    if not rows or not any(perm in _PERMISSION_REMAP for _, perm in rows):
+    if not rows:
         return
-    new_by_user: dict[str, set[str]] = {}
-    for user_id, perm in rows:
-        bucket = new_by_user.setdefault(user_id, set())
+    by_name = {permission.name: permission for permission in Permission}
+    by_value = {permission.value: permission for permission in Permission}
+    # Clean row = already a current member name and not an old remap key. Skip the whole pass
+    # only when every row is clean.
+    if all(perm in by_name and perm not in _PERMISSION_REMAP for _, perm in rows):
+        return
+
+    def resolve(perm: str) -> list[Permission]:
         if perm in _PERMISSION_REMAP:
-            bucket.update(_PERMISSION_REMAP[perm])
-        else:
-            bucket.add(perm)
+            return [by_value[value] for value in _PERMISSION_REMAP[perm]]
+        if perm in by_name:
+            return [by_name[perm]]
+        if perm in by_value:  # mis-stored value form, e.g. "library:view"
+            return [by_value[perm]]
+        return []  # unknown / dropped permission
+
+    new_by_user: dict[str, set[Permission]] = {}
+    for user_id, perm in rows:
+        new_by_user.setdefault(user_id, set()).update(resolve(perm))
     session.execute(text("DELETE FROM user_permissions"))
     for user_id, perms in new_by_user.items():
-        for perm in sorted(perms):
+        for permission in sorted(perms, key=lambda item: item.name):
             session.execute(
                 text("INSERT INTO user_permissions (id, user_id, permission) VALUES (:id, :uid, :perm)"),
-                {"id": uuid.uuid4().hex, "uid": user_id, "perm": perm},
+                {"id": uuid.uuid4().hex, "uid": user_id, "perm": permission.name},
             )
     session.commit()
 
