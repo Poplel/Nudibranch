@@ -6239,6 +6239,21 @@ def create_pending_native_playlists(session: Session) -> None:
             setting.value = json.dumps(data)
 
 
+def run_create_pending_playlists(session: Session, _payload: dict) -> dict:
+    """Build any deferred playlists right now from tracks already in the library.
+
+    Used when a playlist is imported but nothing needs downloading (every song is already owned),
+    so no import/sync ever fires to trigger the usual creation path. Runs both backends — each
+    no-ops when it doesn't apply (native only when Jellyfin is unconfigured; the Jellyfin path only
+    when it is), so this is safe to call unconditionally. The native path leaves its commit to the
+    caller, so commit here to cover the Jellyfin-unconfigured case.
+    """
+    create_pending_native_playlists(session)
+    _try_create_pending_playlists(session)
+    session.commit()
+    return {"created": True}
+
+
 def _fetch_all_jellyfin_audio(client: httpx.Client, user_id: str) -> list[dict]:
     """Fetch all Jellyfin audio items in one request for local matching (no per-track API calls)."""
     fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
@@ -8368,6 +8383,7 @@ TASK_HANDLERS = {
     "search_candidates": run_search_candidates,
     "consolidate_folders": run_consolidate_folders,
     "enrich_imports": run_enrich_imports,
+    "create_pending_playlists": run_create_pending_playlists,
 }
 
 
@@ -8579,6 +8595,7 @@ def task_notification_title(task_type: str) -> str:
         "consolidate_folders": "Folder consolidation",
         "enrich_imports": "Import enrichment",
         "requeue_replacement": "Replacement search",
+        "create_pending_playlists": "Create playlist",
     }.get(task_type, task_type.replace("_", " ").title())
 
 
@@ -8591,6 +8608,8 @@ def task_target_url(task_type: str) -> str:
         return "/tools"
     if task_type == "enrich_imports":
         return "/library"
+    if task_type == "create_pending_playlists":
+        return "/playlists"
     return "/activity"
 
 

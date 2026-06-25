@@ -2384,16 +2384,8 @@ def propose_import(
     session: Session = Depends(get_session),
     current_user: User = Depends(require_permission(Permission.import_run)),
 ) -> TaskOut:
-    task = enqueue_task(
-        session,
-        "propose_import",
-        {
-            "path": payload.path,
-            "files": payload.files,
-            "download_requests": payload.download_requests or [],
-        },
-    )
-    if payload.playlist_name and payload.playlist_original_tracks:
+    has_playlist = bool(payload.playlist_name and payload.playlist_original_tracks)
+    if has_playlist:
         import uuid as _uuid
         pending_key = f"pending_playlist:{_uuid.uuid4()}"
         setting = AppSetting(key=pending_key, value=json.dumps({
@@ -2406,6 +2398,25 @@ def propose_import(
         session.add(setting)
         session.commit()
         write_app_log(f"Playlist import: stored pending playlist '{payload.playlist_name}' ({len(payload.playlist_original_tracks)} original tracks)")
+
+    has_import_work = bool(payload.files) or bool(payload.download_requests)
+    if has_import_work:
+        task = enqueue_task(
+            session,
+            "propose_import",
+            {
+                "path": payload.path,
+                "files": payload.files,
+                "download_requests": payload.download_requests or [],
+            },
+        )
+    elif has_playlist:
+        # Nothing to download/import (every song is already in the library) — don't fire an empty
+        # propose_import (it raises "No import files or downloads were selected"); build the playlist
+        # now from the owned tracks instead.
+        task = enqueue_task(session, "create_pending_playlists", {})
+    else:
+        raise HTTPException(status_code=400, detail="No import files or downloads were selected")
     return serialize_task(task)
 
 

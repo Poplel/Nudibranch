@@ -5454,6 +5454,7 @@ function taskDisplayName(task) {
     ytdlp_download: "Downloading",
     jellyfin_scan: "Scanning Jellyfin",
     enrich_imports: "Enriching imports",
+    create_pending_playlists: "Creating playlist",
   };
   return names[task.type] || task.type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
