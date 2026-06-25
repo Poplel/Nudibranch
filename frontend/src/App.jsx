@@ -7756,11 +7756,15 @@ function Inspector({
             <Plus size={16} />
             Add album
           </button>
-          <button className="secondary" onClick={importActions.onPropose} disabled={importActions.disabled}>
+          <button
+            className={`secondary${!importActions.disabled && !importActions.activeImportTask ? " action-ready" : ""}`}
+            onClick={importActions.onPropose}
+            disabled={importActions.disabled}
+          >
             {importActions.activeImportTask
               ? "Import review running"
               : !importActions.downloadCount && !importActions.hasFiles && importActions.hasPendingPlaylist
-              ? "Create playlist"
+              ? "Create/Update playlist"
               : `Add to task queue${importActions.downloadCount ? ` (${importActions.downloadCount} downloads)` : ""}`}
           </button>
           {confirmClearImport ? (

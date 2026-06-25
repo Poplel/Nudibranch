@@ -400,6 +400,18 @@ nav button:hover {
   color: var(--text);
 }
 
+/* Subtle accent highlight for an enabled action button that's waiting to be pressed
+   (e.g. the import "Create/Update playlist" submit) so it stands out from siblings. */
+.secondary.action-ready {
+  border-color: var(--accent-strong);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.secondary.action-ready:hover {
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel-strong));
+}
+
 .tree,
 .approval-tree,
 .wizard {
