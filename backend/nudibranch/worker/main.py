@@ -6065,6 +6065,7 @@ def _try_create_pending_playlists(session: Session) -> None:
         jf_ids: list[str] = []
         unresolved = 0       # not found in the library at all
         resolved_no_jf = 0   # in the library but not yet mapped to a Jellyfin item
+        unindexed: list[str] = []  # names of the in-library-but-unmapped tracks (+ file presence)
         for entry in original_tracks:
             title = entry.get("title") or ""
             if not title:
@@ -6074,6 +6075,8 @@ def _try_create_pending_playlists(session: Session) -> None:
                 unresolved += 1
             elif not track.jellyfin_item_id:
                 resolved_no_jf += 1
+                file_present = bool(track.path and Path(track.path).exists())
+                unindexed.append(f"{track.title} [{'file present' if file_present else 'FILE MISSING'}]")
             else:
                 jf_ids.append(track.jellyfin_item_id)
         # Drop duplicate ids (duplicate playlist entries, or two library rows sharing one Jellyfin
@@ -6087,6 +6090,11 @@ def _try_create_pending_playlists(session: Session) -> None:
                 f"Pending playlist '{playlist_name}': {len(original_tracks)} originals → {len(jf_ids)} "
                 f"distinct Jellyfin item(s) ({unresolved} not in library, {resolved_no_jf} in library "
                 f"but not yet indexed by Jellyfin, {dup_count} duplicate)",
+                level="info",
+            )
+        if unindexed:
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {len(unindexed)} not in Jellyfin → " + "; ".join(unindexed[:25]),
                 level="info",
             )
         # Some songs are in the library but Jellyfin hasn't indexed them yet — kick ONE Jellyfin scan
