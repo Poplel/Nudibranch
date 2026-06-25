@@ -973,7 +973,7 @@ def library_track_by_artist_title(session: Session, artist_name: str, title: str
         select(Track)
         .join(Album, Album.id == Track.album_id)
         .join(Artist, Artist.id == Album.artist_id)
-        .where(func.lower(Track.title) == title.lower())
+        .where(func.lower(func.trim(Track.title)) == title.strip().lower())
         .options(selectinload(Track.album).selectinload(Album.artist))
     ):
         if (
@@ -6038,24 +6038,18 @@ def _try_create_pending_playlists(session: Session) -> None:
             session.delete(setting)
             continue
 
-        # Resolve original tracks → jellyfin_item_id
+        # Resolve original tracks → jellyfin_item_id. Use the canonical album-agnostic resolver,
+        # which re-checks artist+title with symmetric normalize_match_text on BOTH sides. The old
+        # inline query compared the casefolded/whitespace-collapsed request against a bare SQLite
+        # lower(column) (ASCII-only, no trim/collapse) for title AND artist, so names with accents or
+        # stray whitespace silently failed to match and were dropped — the playlist consistently
+        # ended up short of its real track count.
         jf_ids: list[str] = []
         for entry in original_tracks:
-            artist = entry.get("artist") or ""
             title = entry.get("title") or ""
             if not title:
                 continue
-            track = session.scalars(
-                select(Track)
-                .join(Album, Album.id == Track.album_id)
-                .join(Artist, Artist.id == Album.artist_id)
-                .where(
-                    func.lower(Track.title) == normalize_match_text(title),
-                    func.lower(Artist.name).in_(artist_match_candidates(artist)),
-                    Track.jellyfin_item_id.isnot(None),
-                )
-                .limit(1)
-            ).first()
+            track = library_track_by_artist_title(session, entry.get("artist") or "", title)
             if track and track.jellyfin_item_id:
                 jf_ids.append(track.jellyfin_item_id)
 
@@ -6202,19 +6196,11 @@ def create_pending_native_playlists(session: Session) -> None:
         resolved_ids: list[str] = []
         for entry in original_tracks:
             title = entry.get("title") or ""
-            artist = entry.get("artist") or ""
             if not title:
                 continue
-            track = session.scalars(
-                select(Track)
-                .join(Album, Album.id == Track.album_id)
-                .join(Artist, Artist.id == Album.artist_id)
-                .where(
-                    func.lower(Track.title) == normalize_match_text(title),
-                    func.lower(Artist.name).in_(artist_match_candidates(artist)),
-                )
-                .limit(1)
-            ).first()
+            # Same canonical resolver as the Jellyfin path — symmetric artist+title normalization,
+            # so accented/odd-whitespace names aren't silently dropped (see _try_create_pending_playlists).
+            track = library_track_by_artist_title(session, entry.get("artist") or "", title)
             if track:
                 resolved_ids.append(track.id)
         # Reuse the playlist this origin was imported into before (re-import → update); fall
