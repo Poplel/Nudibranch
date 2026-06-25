@@ -2556,6 +2556,53 @@ def _spotify_api_fetch(playlist_id: str) -> dict | None:
     return {"name": playlist_name, "tracks": tracks}
 
 
+def _spotify_embed_fetch(playlist_id: str) -> dict | None:
+    """Fetch a public Spotify playlist's track list from the embed page's __NEXT_DATA__ JSON.
+
+    Credential-free: Spotify's anonymous token endpoint now returns 403, so when no client
+    credentials are configured this is how we get the FULL track list — the rendered embed and the
+    spotifyscraper library only expose ~20-30 of the tracks, while the embed's embedded JSON carries
+    them all. The embed caps very large playlists at ~100 tracks and carries no album name (title +
+    artist only), which is fine here: 'songs' mode groups under Singles and 'albums' mode resolves
+    albums via MusicBrainz. Returns None on any failure so the caller can fall through.
+    """
+    import json as _json
+    import re as _re
+
+    try:
+        resp = httpx.get(
+            f"https://open.spotify.com/embed/playlist/{playlist_id}",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=15,
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError as exc:
+        write_app_log(f"Spotify embed fetch error: {exc}", level="warning", playlist_id=playlist_id)
+        return None
+
+    match = _re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', resp.text, _re.S)
+    if not match:
+        return None
+    try:
+        entity = _json.loads(match.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+    except (KeyError, TypeError, _json.JSONDecodeError):
+        return None
+
+    tracks: list[dict] = []
+    for item in entity.get("trackList", []):
+        title = (item.get("title") or "").strip()
+        if not title:
+            continue
+        tracks.append({"title": title, "artist": (item.get("subtitle") or "").strip(), "album": None})
+    if not tracks:
+        return None
+    return {"name": entity.get("name") or entity.get("title"), "tracks": tracks}
+
+
 def _scrape_playlist_url(url: str) -> dict:
     import json as _json
     import re as _re
@@ -2571,14 +2618,18 @@ def _scrape_playlist_url(url: str) -> dict:
     if source == "Spotify":
         m = _re.search(r"playlist/([A-Za-z0-9]+)", url)
         if m:
-            # Try Spotify Web API first (when credentials configured)
+            # 1) Spotify Web API first (when credentials configured): full list + album info.
             api_result = _spotify_api_fetch(m.group(1))
-            if api_result is not None:
-                if not api_result["tracks"]:
-                    raise HTTPException(status_code=422, detail="Could not extract any tracks from this Spotify URL. Make sure the playlist is public and the link points directly to a playlist.")
+            if api_result is not None and api_result["tracks"]:
                 return {"source": source, "name": api_result["name"], "tracks": api_result["tracks"], "count": len(api_result["tracks"])}
 
-            # Fall back to spotifyscraper (embed-page scraping, no credentials needed)
+            # 2) Credential-free: parse the embed page's __NEXT_DATA__ (full track list, up to ~100).
+            #    Spotify's anonymous token endpoint is now blocked (403), so this is the no-creds path.
+            embed_result = _spotify_embed_fetch(m.group(1))
+            if embed_result is not None and embed_result["tracks"]:
+                return {"source": source, "name": embed_result["name"], "tracks": embed_result["tracks"], "count": len(embed_result["tracks"])}
+
+            # 3) Last resort: spotifyscraper (embed-page scraping; often truncates to ~20-30).
             try:
                 from spotify_scraper import SpotifyClient as _SpotifyClient  # type: ignore[import]
                 _sc = _SpotifyClient(log_level="WARNING")
