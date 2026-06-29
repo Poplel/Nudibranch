@@ -129,20 +129,13 @@ function App() {
     setPlayerDiagnostics(next);
     try { localStorage.setItem("nudibranch:playerDiagnostics", next ? "1" : "0"); } catch { /* ignore */ }
   };
-  // Hidden toggle for the player diagnostics overlay: hold Ctrl and click the "N" brand mark 3 times.
-  // On macOS a Ctrl+click fires `contextmenu` (not always `click`), so we listen to both, suppress the
-  // menu, and de-dupe events that fire close together from one physical click.
+  // Hidden toggle for the "Stats for geeks" overlay: hold Shift and click the "Nudibranch" title 3 times.
   const diagTapRef = useRef({ count: 0, last: 0 });
   const handleBrandTap = (event) => {
-    if (!event.ctrlKey) {
-      if (event.type === "click") diagTapRef.current = { count: 0, last: 0 };
-      return;
-    }
-    if (event.type === "contextmenu") event.preventDefault();
+    if (!event.shiftKey) { diagTapRef.current = { count: 0, last: 0 }; return; }
+    event.preventDefault();
     const now = Date.now();
-    const since = now - diagTapRef.current.last;
-    if (since < 60) return; // ignore the second of a click+contextmenu pair from one Ctrl-click
-    const count = since < 1500 ? diagTapRef.current.count + 1 : 1;
+    const count = now - diagTapRef.current.last < 1500 ? diagTapRef.current.count + 1 : 1;
     diagTapRef.current = { count, last: now };
     if (count >= 3) {
       diagTapRef.current = { count: 0, last: 0 };
@@ -2147,9 +2140,9 @@ function App() {
     >
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark" onClick={handleBrandTap} onContextMenu={handleBrandTap}>N</div>
+          <div className="brand-mark">N</div>
           <div>
-            <strong>Nudibranch</strong>
+            <strong onClick={handleBrandTap} style={{ userSelect: "none", WebkitUserSelect: "none", cursor: "default" }}>Nudibranch</strong>
           </div>
         </div>
         <nav>
@@ -8224,9 +8217,14 @@ function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, ga
 
       let kbps = null, bytes = 0, ttfb = null, reqCount = 0;
       try {
-        const base = (audioUrl || "").split("?")[0];
-        if (base) {
-          const ents = performance.getEntriesByType("resource").filter((e) => e.name.split("?")[0] === base);
+        // audioUrl is relative (/api/v1/...) but Resource Timing entry names are absolute, so match
+        // on pathname (the stream path is unique per track) rather than the raw string.
+        let basePath = "";
+        try { basePath = audioUrl ? new URL(audioUrl, window.location.origin).pathname : ""; } catch { basePath = ""; }
+        if (basePath) {
+          const ents = performance.getEntriesByType("resource").filter((e) => {
+            try { return new URL(e.name).pathname === basePath; } catch { return false; }
+          });
           reqCount = ents.length;
           let totDur = 0;
           for (const e of ents) { bytes += e.transferSize || e.encodedBodySize || 0; totDur += e.duration || 0; }
@@ -8347,7 +8345,7 @@ function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, ga
   return (
     <div style={{ position: "fixed", top: 64, right: 12, width: 286, maxHeight: "76vh", overflowY: "auto", zIndex: 9998, background: "rgba(12,14,18,0.92)", color: "#e8eaed", border: "1px solid rgba(255,255,255,0.14)", borderRadius: 10, font: "11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace", boxShadow: "0 8px 28px rgba(0,0,0,0.45)", backdropFilter: "blur(6px)" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", borderBottom: collapsed ? "none" : "1px solid rgba(255,255,255,0.12)", position: "sticky", top: 0, background: "rgba(12,14,18,0.96)", borderRadius: "10px 10px 0 0" }}>
-        <strong style={{ fontSize: 11, letterSpacing: 0.3, flex: 1 }}>Player diagnostics</strong>
+        <strong style={{ fontSize: 11, letterSpacing: 0.3, flex: 1 }}>Stats for geeks</strong>
         <button title="Reset counters" onClick={() => { stallsRef.current = { count: 0, totalMs: 0, lastStallStart: 0, inStall: false, startupMs: null, loadStart: performance.now(), lastUrl: stallsRef.current.lastUrl }; }} style={{ cursor: "pointer", background: "transparent", color: "#9aa0a6", border: "1px solid rgba(255,255,255,0.18)", borderRadius: 5, padding: "1px 6px", font: "inherit" }}>reset</button>
         <button title={collapsed ? "Expand" : "Collapse"} onClick={() => setCollapsed((c) => !c)} style={{ cursor: "pointer", background: "transparent", color: "#9aa0a6", border: "1px solid rgba(255,255,255,0.18)", borderRadius: 5, padding: "1px 6px", font: "inherit" }}>{collapsed ? "+" : "–"}</button>
       </div>
