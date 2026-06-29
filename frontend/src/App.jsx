@@ -2166,6 +2166,7 @@ function App() {
               onFavorite={toggleFavoriteTrack}
               favoriteTrackIds={favoriteTrackIds}
               onPlaybackState={(status, details) => reportPlayerStatus(currentTrack, status, details)}
+              onPlaybackError={(track, reason) => notify("Can't play track", `${track?.title || "This track"} couldn't be played — ${reason}.`, "ui_error")}
               onDockChange={({ popped, compactHeight, fullHeight }) => {
                 setPlayerPopped(popped);
                 setPlayerDockHeight(compactHeight || 0);
@@ -8322,6 +8323,7 @@ function AudioPlayer({
   onFavorite,
   favoriteTrackIds,
   onPlaybackState,
+  onPlaybackError,
   onDockChange,
   onClose,
   crossfadeDuration = 0.5,
@@ -8875,6 +8877,22 @@ function AudioPlayer({
     onEnded?.();
   }
 
+  // The media element couldn't load/decode the track. Only the ACTIVE element should
+  // surface — the inactive one fires the same event while preloading the next track.
+  function handleTrackError(key) {
+    if (key !== activeKeyRef.current) return;
+    const el = activeAudio();
+    const code = el?.error?.code;
+    // MediaError: 2=network, 3=decode, 4=src not supported (missing file / unplayable format)
+    const reason =
+      code === 4 ? "the file is missing, or its format can't be played in this browser"
+      : code === 3 ? "the audio couldn't be decoded"
+      : code === 2 ? "a network error interrupted playback"
+      : "it couldn't be loaded";
+    setPlaying(false);
+    onPlaybackError?.(currentTrack, reason);
+  }
+
   // Both buffers render the same element; handlers no-op unless this is the active one.
   function renderAudioElement(key, ref) {
     return (
@@ -8896,6 +8914,7 @@ function AudioPlayer({
         }}
         onLoadedMetadata={(event) => { if (key !== activeKeyRef.current) return; setDuration(event.currentTarget.duration || 0); }}
         onEnded={() => handleTrackEnded(key)}
+        onError={() => handleTrackError(key)}
       />
     );
   }
