@@ -367,17 +367,22 @@ def add_download_candidate_review_items(
                 candidates_added += len(candidates)
                 set_item_payload_status(track_item, f"{len(candidates)} candidates ready")
                 append_task_log(session, task, f"{track_title}: {len(candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s)")
-            elif pools:
-                set_item_payload_status(track_item, "no album-folder track match")
+            elif any(r.get("workflow") == "lossless_replacement" for r in requests):
+                # Lossless replacement exists to UPGRADE to lossless — never pull a lossy per-track
+                # copy for it. If no lossless album folder matched, dead-end to the YouTube fallback.
+                set_item_payload_status(track_item, "no album-folder track match" if pools else "no album folder candidates found")
                 add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
-                append_task_log(session, task, f"{track_title}: no lossless match in {min(len(pools), folder_try_limit)} Soulseek folder(s) — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
-            elif should_use_track_search_fallback(album, requests):
+                append_task_log(session, task, f"{track_title}: no lossless match in the album folder(s) — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
+            else:
+                # Not matched inside an album folder — whether the album-folder search found folders but
+                # not THIS track, or found no folders at all — run the per-track search that works in
+                # isolation (FLAC-first). add_track_search_candidate_items only drops to YouTube when the
+                # individual search also finds nothing. This is why "Queen St" found 5 FLAC candidates on
+                # its own while the album-level pass reported "no candidates". Every unmatched track gets
+                # its own search now (was gated to single-track / non-lossless albums and dead-ended the
+                # rest straight to YouTube).
                 set_item_payload_status(track_item, "searching track candidates")
                 missing_track_jobs.append((request, track_item, query, 5))
-            else:
-                set_item_payload_status(track_item, "no album folder candidates found")
-                add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
-                append_task_log(session, task, f"{track_title}: no lossless Soulseek folders matched — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
             completed += 1
             if task is not None:
                 update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
@@ -470,22 +475,6 @@ def is_singles_pseudo_album(album: str) -> bool:
     folder named that matches arbitrary same-artist folders (wrong songs), so these go straight to
     per-track search."""
     return fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
-
-
-def should_use_track_search_fallback(album: str, requests: list[dict]) -> bool:
-    # Lossless replacement exists to UPGRADE to lossless — never pull lossy per-track for it.
-    if any(request.get("workflow") == "lossless_replacement" for request in requests):
-        return False
-    # Missing-track fills MAY fall back to per-track search (which now surfaces lossy as an option,
-    # lossless still ranked first) when no lossless album folder is found, rather than dead-ending to
-    # YouTube. Checked before the require_lossless guard so it isn't blocked by it.
-    if any(request.get("workflow") == "missing_tracks" for request in requests):
-        return True
-    if any(request.get("require_lossless") for request in requests) and len(requests) > 1:
-        return False
-    if is_singles_pseudo_album(album):
-        return True
-    return len(requests) <= 1
 
 
 def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
