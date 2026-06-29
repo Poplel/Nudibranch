@@ -2418,6 +2418,7 @@ function App() {
           <Inspector
             page={page}
             api={api}
+            user={user}
             library={library}
             importFiles={importFiles}
             importDownloadRequests={importDownloadRequests}
@@ -6958,14 +6959,6 @@ function SettingsPanel({
   notify,
 }) {
   const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
-  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
-  useEffect(() => {
-    let active = true;
-    const load = () => api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
-    load();
-    const id = setInterval(load, 20000);
-    return () => { active = false; clearInterval(id); };
-  }, []);
   // Resync if the user object loads/changes after mount.
   useEffect(() => {
     if (user && user.search_min_confidence != null) setSearchThreshold(user.search_min_confidence);
@@ -7041,19 +7034,6 @@ function SettingsPanel({
             onTouchEnd={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
           />
         </label>
-      </section>
-      <section className="settings-section">
-        <h2>Status</h2>
-        <div className="status-list">
-          <span>User</span>
-          <strong>{user?.display_name || "Signed in"}</strong>
-          <span>API</span>
-          <strong style={{ color: "#37c871" }}>Connected</strong>
-          <span>slskd</span>
-          <strong style={connectionStyle(connections.slskd)}>{connectionLabel(connections.slskd)}</strong>
-          <span>Jellyfin</span>
-          <strong style={connectionStyle(connections.jellyfin)}>{connectionLabel(connections.jellyfin)}</strong>
-        </div>
       </section>
       {canManageSettings(user) && (
         <section className="settings-section">
@@ -7149,6 +7129,7 @@ function SettingsPanel({
 function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraft, onSaveIntegrations }) {
   const [schema, setSchema] = useState([]);
   const [draft, setDraft] = useState({});
+  const [open, setOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
@@ -7203,7 +7184,11 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
 
   return (
     <section className="settings-section">
-      <h2>Download settings</h2>
+      <h2 className="settings-collapse-header" onClick={() => setOpen((value) => !value)} style={{ cursor: "pointer" }}>
+        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />} Download settings
+      </h2>
+      {open && (
+      <>
       <label className="setting-row integration-row">
         <span>slskd album match confidence</span>
         <input
@@ -7268,6 +7253,8 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
           {saving ? "Saving…" : "Save download settings"}
         </button>
       </div>
+      </>
+      )}
     </section>
   );
 }
@@ -7709,9 +7696,36 @@ async function collectDroppedItems(dataTransfer) {
   return Array.from(dataTransfer?.files || []).map((file) => ({ file, path: file.name }));
 }
 
+function ConnectionsStatus({ api, user }) {
+  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
+  useEffect(() => {
+    let active = true;
+    const load = () => api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
+    load();
+    const id = setInterval(load, 20000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
+  return (
+    <div className="inspector-section">
+      <div className="inspector-section-label">Status</div>
+      <div className="status-list">
+        <span>User</span>
+        <strong>{user?.display_name || "Signed in"}</strong>
+        <span>API</span>
+        <strong style={{ color: "#37c871" }}>Connected</strong>
+        <span>slskd</span>
+        <strong style={connectionStyle(connections.slskd)}>{connectionLabel(connections.slskd)}</strong>
+        <span>Jellyfin</span>
+        <strong style={connectionStyle(connections.jellyfin)}>{connectionLabel(connections.jellyfin)}</strong>
+      </div>
+    </div>
+  );
+}
+
 function Inspector({
   page,
   api,
+  user,
   library,
   importFiles,
   importDownloadRequests,
@@ -7922,6 +7936,7 @@ function Inspector({
           </button>
         </div>
       )}
+      {page === "Tools" && <ConnectionsStatus api={api} user={user} />}
       {downloadProgress && (
         <div className="inspector-progress-card">
           <strong>Downloads</strong>
@@ -8212,27 +8227,7 @@ function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, ga
       const activeKey = activeKeyRef.current;
       const el = activeKey === "a" ? audioARef.current : audioBRef.current;
       const ctx = audioCtxRef.current;
-      const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
       const s = stallsRef.current;
-
-      let kbps = null, bytes = 0, ttfb = null, reqCount = 0;
-      try {
-        // audioUrl is relative (/api/v1/...) but Resource Timing entry names are absolute, so match
-        // on pathname (the stream path is unique per track) rather than the raw string.
-        let basePath = "";
-        try { basePath = audioUrl ? new URL(audioUrl, window.location.origin).pathname : ""; } catch { basePath = ""; }
-        if (basePath) {
-          const ents = performance.getEntriesByType("resource").filter((e) => {
-            try { return new URL(e.name).pathname === basePath; } catch { return false; }
-          });
-          reqCount = ents.length;
-          let totDur = 0;
-          for (const e of ents) { bytes += e.transferSize || e.encodedBodySize || 0; totDur += e.duration || 0; }
-          if (totDur > 0 && bytes > 0) kbps = Math.round((bytes * 8) / totDur);
-          const last = ents[ents.length - 1];
-          if (last && last.responseStart && last.requestStart) ttfb = Math.round(last.responseStart - last.requestStart);
-        }
-      } catch { /* ignore */ }
 
       const gainNode = gainNodesRef.current ? gainNodesRef.current[activeKey] : null;
       const playTime = el ? el.currentTime : 0;
@@ -8256,12 +8251,6 @@ function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, ga
         inStall: s.inStall,
         startupMs: s.startupMs != null ? Math.round(s.startupMs) : null,
         underrun: playTime > 0 ? (s.totalMs / 1000) / playTime : 0,
-        kbps, bytes, ttfb, reqCount,
-        connType: conn && conn.effectiveType ? conn.effectiveType : "—",
-        downlink: conn && conn.downlink != null ? conn.downlink : null,
-        rtt: conn && conn.rtt != null ? conn.rtt : null,
-        saveData: !!(conn && conn.saveData),
-        online: navigator.onLine,
         ctxState: ctx ? ctx.state : "—",
         sampleRate: ctx ? ctx.sampleRate : null,
         baseLatency: ctx && ctx.baseLatency != null ? ctx.baseLatency : null,
@@ -8304,17 +8293,6 @@ function PlayerDiagnostics({ audioARef, audioBRef, activeKeyRef, audioCtxRef, ga
       ["Stalled time", `${num((m.stalledMs || 0) / 1000)}s`, m.stalledMs > 0 ? "#ffb454" : undefined],
       ["Underrun", `${num((m.underrun || 0) * 100)}%`],
       ["Startup", m.startupMs != null ? `${m.startupMs}ms` : "—"],
-    ]],
-    ["Network", [
-      ["Throughput", m.kbps != null ? `${m.kbps} kbps` : "—"],
-      ["Downloaded", m.bytes ? `${num(m.bytes / 1048576, 2)} MB` : "—"],
-      ["TTFB", m.ttfb != null ? `${m.ttfb}ms` : "—"],
-      ["Requests", String(m.reqCount ?? 0)],
-      ["Conn type", m.connType],
-      ["Downlink", m.downlink != null ? `${m.downlink} Mbps` : "—"],
-      ["RTT", m.rtt != null ? `${m.rtt}ms` : "—"],
-      ["Save-Data", m.saveData ? "ON" : "off"],
-      ["Online", m.online ? "yes" : "no", m.online ? undefined : "#ff5a5a"],
     ]],
     ["Web Audio", [
       ["Context", m.ctxState, m.ctxState === "running" ? "#37c871" : "#ffb454"],

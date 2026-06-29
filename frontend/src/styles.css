@@ -114,6 +114,34 @@ button:disabled {
   --ok: #78d99f;
 }
 
+/* Theme-aware scrollbars. var(--accent) resolves to the themed accent inside .app and the
+   :root default elsewhere (e.g. the login screen). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  background-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--accent);
+}
+
 .sidebar {
   display: flex;
   flex-direction: column;
