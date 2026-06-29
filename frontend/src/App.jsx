@@ -129,6 +129,26 @@ function App() {
     setPlayerDiagnostics(next);
     try { localStorage.setItem("nudibranch:playerDiagnostics", next ? "1" : "0"); } catch { /* ignore */ }
   };
+  // Hidden toggle for the player diagnostics overlay: hold Ctrl and click the "N" brand mark 3 times.
+  // On macOS a Ctrl+click fires `contextmenu` (not always `click`), so we listen to both, suppress the
+  // menu, and de-dupe events that fire close together from one physical click.
+  const diagTapRef = useRef({ count: 0, last: 0 });
+  const handleBrandTap = (event) => {
+    if (!event.ctrlKey) {
+      if (event.type === "click") diagTapRef.current = { count: 0, last: 0 };
+      return;
+    }
+    if (event.type === "contextmenu") event.preventDefault();
+    const now = Date.now();
+    const since = now - diagTapRef.current.last;
+    if (since < 60) return; // ignore the second of a click+contextmenu pair from one Ctrl-click
+    const count = since < 1500 ? diagTapRef.current.count + 1 : 1;
+    diagTapRef.current = { count, last: now };
+    if (count >= 3) {
+      diagTapRef.current = { count: 0, last: 0 };
+      togglePlayerDiagnostics(!playerDiagnostics);
+    }
+  };
   const [page, setPage] = useState("Library");
   const [albumDetail, setAlbumDetail] = useState(null);
   const [artistDetail, setArtistDetail] = useState(null);
@@ -2127,7 +2147,7 @@ function App() {
     >
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">N</div>
+          <div className="brand-mark" onClick={handleBrandTap} onContextMenu={handleBrandTap}>N</div>
           <div>
             <strong>Nudibranch</strong>
           </div>
@@ -2175,7 +2195,7 @@ function App() {
               onRemoveFromQueue={removeFromQueue}
               crossfadeDuration={crossfadeDuration}
               apiKey={token}
-              diagnostics={playerDiagnostics && !!user?.is_admin}
+              diagnostics={playerDiagnostics}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
                 setPlayerOpen(false);
@@ -2334,8 +2354,6 @@ function App() {
                 onUploadYoutubeCookies={uploadYoutubeCookies}
                 api={api}
                 notify={notify}
-                playerDiagnostics={playerDiagnostics}
-                onTogglePlayerDiagnostics={togglePlayerDiagnostics}
               />
             )}
             {page === "Tools" && (
@@ -6919,6 +6937,14 @@ function SecuritySettings({ api, notify }) {
   );
 }
 
+const CONNECTION_LABELS = { connected: "Connected", error: "Unreachable", disabled: "Not configured", checking: "Checking…" };
+function connectionLabel(status) {
+  return CONNECTION_LABELS[status] || "Unknown";
+}
+function connectionStyle(status) {
+  return { color: status === "connected" ? "#37c871" : status === "error" ? "#ff5a5a" : "var(--muted)" };
+}
+
 function SettingsPanel({
   accentColor,
   setAccentColor,
@@ -6937,10 +6963,16 @@ function SettingsPanel({
   onUploadYoutubeCookies,
   api,
   notify,
-  playerDiagnostics,
-  onTogglePlayerDiagnostics,
 }) {
   const [searchThreshold, setSearchThreshold] = useState(() => (user && user.search_min_confidence != null ? user.search_min_confidence : 0.4));
+  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
+  useEffect(() => {
+    let active = true;
+    const load = () => api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
+    load();
+    const id = setInterval(load, 20000);
+    return () => { active = false; clearInterval(id); };
+  }, []);
   // Resync if the user object loads/changes after mount.
   useEffect(() => {
     if (user && user.search_min_confidence != null) setSearchThreshold(user.search_min_confidence);
@@ -7016,25 +7048,18 @@ function SettingsPanel({
             onTouchEnd={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
           />
         </label>
-        {user?.is_admin && (
-          <label className="setting-row">
-            <span>
-              Player diagnostics
-              <small>Live performance + network overlay on the player to diagnose buffering. Admin only.</small>
-            </span>
-            <input type="checkbox" checked={!!playerDiagnostics} onChange={(event) => onTogglePlayerDiagnostics?.(event.target.checked)} />
-          </label>
-        )}
       </section>
       <section className="settings-section">
         <h2>Status</h2>
         <div className="status-list">
           <span>User</span>
           <strong>{user?.display_name || "Signed in"}</strong>
-          <span>Role</span>
-          <strong>{user?.is_admin ? "Admin" : "User"}</strong>
           <span>API</span>
-          <strong>Connected</strong>
+          <strong style={{ color: "#37c871" }}>Connected</strong>
+          <span>slskd</span>
+          <strong style={connectionStyle(connections.slskd)}>{connectionLabel(connections.slskd)}</strong>
+          <span>Jellyfin</span>
+          <strong style={connectionStyle(connections.jellyfin)}>{connectionLabel(connections.jellyfin)}</strong>
         </div>
       </section>
       {canManageSettings(user) && (
@@ -7046,20 +7071,11 @@ function SettingsPanel({
             ["slskd_url", "slskd URL"],
             ["slskd_api_key", "slskd API key"],
             ["acoustid_api_key", "AcoustID API key"],
-            ["slskd_album_match_threshold", "slskd album match confidence"],
-            ["slskd_album_folder_tries", "Album folder tries"],
-            ["allow_m4a_downloads", "Download m4a files (AAC/ALAC)"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
-              {key === "allow_m4a_downloads" ? (
-                <input
-                  type="checkbox"
-                  checked={!["false", "0", "no", "off"].includes(String(integrationDraft[key] ?? "true").toLowerCase())}
-                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.checked ? "true" : "false" }))}
-                />
-              ) : key === "youtube_cookies_browser" ? (
+              {key === "youtube_cookies_browser" ? (
                 <select
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
@@ -7119,7 +7135,15 @@ function SettingsPanel({
           </button>
         </section>
       )}
-      {canManageSettings(user) && <MatchTuningSettings api={api} notify={notify} />}
+      {canManageSettings(user) && (
+        <MatchTuningSettings
+          api={api}
+          notify={notify}
+          integrationDraft={integrationDraft}
+          setIntegrationDraft={setIntegrationDraft}
+          onSaveIntegrations={onSaveIntegrations}
+        />
+      )}
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
@@ -7129,10 +7153,10 @@ function SettingsPanel({
   );
 }
 
-function MatchTuningSettings({ api, notify }) {
+function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraft, onSaveIntegrations }) {
   const [schema, setSchema] = useState([]);
   const [draft, setDraft] = useState({});
-  const [open, setOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -7152,6 +7176,9 @@ function MatchTuningSettings({ api, notify }) {
   async function save() {
     setSaving(true);
     try {
+      // The album-match confidence / folder tries / m4a toggle are integration settings; persist
+      // them (the parent's handler shows its own toast) alongside the advanced matching weights.
+      await onSaveIntegrations?.(integrationDraft);
       const values = {};
       for (const field of schema) {
         const raw = draft[field.name];
@@ -7163,9 +7190,8 @@ function MatchTuningSettings({ api, notify }) {
         setSchema(data.schema || schema);
         setDraft(data.values || values);
       }
-      notify?.("Matching saved", "Download matching settings updated.");
     } catch (error) {
-      notify?.("Matching failed", error?.message || "Could not save matching settings", "ui_error");
+      notify?.("Download settings failed", error?.message || "Could not save download settings", "ui_error");
     } finally {
       setSaving(false);
     }
@@ -7179,12 +7205,46 @@ function MatchTuningSettings({ api, notify }) {
     });
   }
 
+  const m4aChecked = !["false", "0", "no", "off"].includes(String(integrationDraft.allow_m4a_downloads ?? "true").toLowerCase());
+  const setIntegration = (key, value) => setIntegrationDraft((current) => ({ ...current, [key]: value }));
+
   return (
     <section className="settings-section">
-      <h2 className="settings-collapse-header" onClick={() => setOpen((value) => !value)} style={{ cursor: "pointer" }}>
-        {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />} Download matching
-      </h2>
-      {open && (
+      <h2>Download settings</h2>
+      <label className="setting-row integration-row">
+        <span>slskd album match confidence</span>
+        <input
+          type="number"
+          min="50"
+          max="95"
+          step="1"
+          value={integrationDraft.slskd_album_match_threshold || ""}
+          onChange={(event) => setIntegration("slskd_album_match_threshold", event.target.value)}
+        />
+      </label>
+      <label className="setting-row integration-row">
+        <span>Album folder tries</span>
+        <input
+          type="number"
+          min="1"
+          max="12"
+          step="1"
+          value={integrationDraft.slskd_album_folder_tries || ""}
+          onChange={(event) => setIntegration("slskd_album_folder_tries", event.target.value)}
+        />
+      </label>
+      <label className="setting-row integration-row">
+        <span>Download m4a files (AAC/ALAC)</span>
+        <input
+          type="checkbox"
+          checked={m4aChecked}
+          onChange={(event) => setIntegration("allow_m4a_downloads", event.target.checked ? "true" : "false")}
+        />
+      </label>
+      <h3 className="settings-collapse-header" onClick={() => setAdvancedOpen((value) => !value)} style={{ cursor: "pointer" }}>
+        {advancedOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />} Advanced matching tuning
+      </h3>
+      {advancedOpen && (
         <>
           <p className="settings-hint">
             How Soulseek results are scored and ranked. Higher recall surfaces more candidates for review; everything still goes through the
@@ -7205,14 +7265,16 @@ function MatchTuningSettings({ api, notify }) {
           ))}
           <div className="settings-button-row">
             <button className="secondary compact-button" type="button" onClick={resetDefaults} disabled={saving}>
-              Reset to defaults
-            </button>
-            <button className="primary compact-button" type="button" onClick={save} disabled={saving || !schema.length}>
-              {saving ? "Saving…" : "Save matching"}
+              Reset matching to defaults
             </button>
           </div>
         </>
       )}
+      <div className="settings-button-row">
+        <button className="primary compact-button" type="button" onClick={save} disabled={saving}>
+          {saving ? "Saving…" : "Save download settings"}
+        </button>
+      </div>
     </section>
   );
 }

@@ -3881,6 +3881,32 @@ def get_integrations(
     return _integration_settings_out(integration_settings(session))
 
 
+@router.get("/settings/connections", tags=["settings"], summary="Live connection status for slskd and Jellyfin")
+def get_connection_status(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> dict:
+    """Probe the configured slskd/Jellyfin servers so the Settings → Status panel can show whether
+    they're reachable. Short timeouts; any non-2xx/3xx or exception is reported as 'error'."""
+    settings = integration_settings(session)
+
+    def probe(url: str, path: str, headers: dict) -> str:
+        try:
+            response = httpx.get(f"{url.rstrip('/')}{path}", headers=headers, timeout=4)
+            return "connected" if response.status_code < 400 else "error"
+        except Exception:
+            return "error"
+
+    slskd_url = settings.get("slskd_url", "")
+    slskd_key = settings.get("slskd_api_key", "")
+    jellyfin_url = settings.get("jellyfin_url", "")
+    jellyfin_key = settings.get("jellyfin_api_key", "")
+    return {
+        "slskd": probe(slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else "disabled",
+        "jellyfin": probe(jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else "disabled",
+    }
+
+
 @router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key", response_model=list[JellyfinUserOut])
 def list_jellyfin_users(
     session: Session = Depends(get_session),

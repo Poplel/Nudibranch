@@ -2682,7 +2682,20 @@ nav button:hover {
 
 .integration-row {
   display: grid;
-  grid-template-columns: minmax(160px, 1fr) minmax(0, 1.2fr) auto;
+  grid-template-columns: minmax(160px, 1fr) minmax(0, 1.2fr) 72px;
+  align-items: center;
+}
+
+/* Checkboxes must not be stretched to the input height/width by the rules below. */
+.setting-row input[type="checkbox"],
+.integration-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-width: 0;
+  padding: 0;
+  justify-self: start;
+  cursor: pointer;
+  accent-color: var(--accent);
 }
 
 .integration-status {
