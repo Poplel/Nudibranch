@@ -15,6 +15,7 @@ INTEGRATION_KEYS = {
     "youtube_cookies_browser",
     "youtube_cookies_path",
     "acoustid_api_key",
+    "allow_m4a_downloads",
 }
 
 
@@ -31,6 +32,7 @@ def integration_settings(session: Session) -> dict[str, str]:
         "youtube_cookies_browser": "",
         "youtube_cookies_path": str(settings.config_path / "youtube-cookies.txt"),
         "acoustid_api_key": settings.acoustid_api_key,
+        "allow_m4a_downloads": "true",
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value

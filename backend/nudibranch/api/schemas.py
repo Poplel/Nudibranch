@@ -253,6 +253,7 @@ class IntegrationSettings(BaseModel):
     youtube_cookies_path: str = ""
     youtube_cookies_uploaded: bool = False
     acoustid_api_key: str = ""
+    allow_m4a_downloads: str = "true"
 
 
 class PlaylistTrackOut(BaseModel):

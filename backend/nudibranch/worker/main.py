@@ -92,6 +92,10 @@ LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
 # config at each search entry point (single worker, sequential tasks → safe as module state). The
 # scorer reads these without threading a session. See services/match_tuning.py.
 _match_tuning: dict[str, float] = dict(MATCH_TUNING_DEFAULTS)
+# Whether .m4a (AAC/ALAC) files may be downloaded. Admin-editable in Settings → Integrations
+# (allow_m4a_downloads). Refreshed alongside _match_tuning at each search entry point so the
+# session-less candidate filters honour it. Default True = no behaviour change.
+_allow_m4a_downloads: bool = True
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
     "acoustic",
@@ -273,6 +277,7 @@ def add_download_candidate_review_items(
     album_items: dict[tuple[str, str], ProposalItem],
     task: Task | None = None,
 ) -> int:
+    configure_match_tuning(session)
     parent_kind = ProposalKind.download if batch.kind == ProposalKind.download else ProposalKind.import_files
     grouped: dict[tuple[str, str], list[tuple[dict, ProposalItem]]] = {}
     for request in download_requests:
@@ -4567,7 +4572,10 @@ def configure_match_tuning(session: Session) -> None:
     Called at every slskd search entry point so the scorer (which has no session) honours the
     instance's configured weights, floors, and penalties. See services/match_tuning.py.
     """
+    global _allow_m4a_downloads
     _match_tuning.update(match_tuning(session))
+    value = str(integration_settings(session).get("allow_m4a_downloads", "true")).strip().lower()
+    _allow_m4a_downloads = value not in {"false", "0", "no", "off"}
 
 
 def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int, int]:
@@ -4613,8 +4621,23 @@ def lossless_folder_files(files: list[dict]) -> list[dict]:
     return [file_info for file_info in files if is_lossless_filename(str(file_info.get("filename") or ""))]
 
 
+def is_m4a_filename(filename: str) -> bool:
+    return str(filename or "").lower().endswith(".m4a")
+
+
+def download_format_allowed(filename: str) -> bool:
+    """Whether this file's format may be downloaded. m4a (AAC/ALAC) is gated by the
+    admin-editable allow_m4a_downloads setting (default on); everything else is allowed."""
+    return _allow_m4a_downloads or not is_m4a_filename(filename)
+
+
 def audio_folder_files(files: list[dict]) -> list[dict]:
-    return [file_info for file_info in files if is_audio_filename(str(file_info.get("filename") or ""))]
+    return [
+        file_info
+        for file_info in files
+        if is_audio_filename(str(file_info.get("filename") or ""))
+        and download_format_allowed(str(file_info.get("filename") or ""))
+    ]
 
 
 def is_lossless_filename(filename: str) -> bool:
@@ -4941,6 +4964,11 @@ def rank_slskd_candidates_for_request(candidates: list[dict], request: dict, ign
     accepted = []
     rejected_reasons: list[str] = []
     for candidate in filter_ignored_candidates(candidates, ignored_candidates):
+        filename = str(candidate.get("filename") or "")
+        if not download_format_allowed(filename):
+            if len(rejected_reasons) < 4:
+                rejected_reasons.append(f"{candidate.get('filename') or 'unknown'}: m4a downloads are disabled in settings")
+            continue
         file_info = {
             "filename": candidate.get("filename"),
             "size": candidate.get("size"),

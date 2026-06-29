@@ -7048,11 +7048,18 @@ function SettingsPanel({
             ["acoustid_api_key", "AcoustID API key"],
             ["slskd_album_match_threshold", "slskd album match confidence"],
             ["slskd_album_folder_tries", "Album folder tries"],
+            ["allow_m4a_downloads", "Download m4a files (AAC/ALAC)"],
             ["youtube_cookies_browser", "YouTube cookies browser"],
           ].map(([key, label]) => (
             <label className="setting-row integration-row" key={key}>
               <span>{label}</span>
-              {key === "youtube_cookies_browser" ? (
+              {key === "allow_m4a_downloads" ? (
+                <input
+                  type="checkbox"
+                  checked={!["false", "0", "no", "off"].includes(String(integrationDraft[key] ?? "true").toLowerCase())}
+                  onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.checked ? "true" : "false" }))}
+                />
+              ) : key === "youtube_cookies_browser" ? (
                 <select
                   value={integrationDraft[key] || ""}
                   onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
