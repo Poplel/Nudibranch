@@ -21,6 +21,7 @@ from nudibranch.db.models import Album, AppSetting, Artist, AuthSession, Playlis
 from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
+from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
@@ -7629,6 +7630,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     created = 0
     tracks_checked = 0
     suspicious = 0
+    dead_air = 0
     albums_scanned = 0
     total_albums = max(1, len(albums))
 
@@ -7657,6 +7659,47 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
 
         for track in album.tracks:
             tracks_checked += 1
+
+            # Dead-air detection (file-level, independent of the MB slot). A corrupt rip can be
+            # full-length — so its duration MATCHES the expected track and the duration logic
+            # below would treat it as correct — yet hold only a few seconds of real audio
+            # followed by digital silence. Decode the file and measure how much is silent; if a
+            # quarter or more is dead air, re-download the SAME track (its own tags/recording-id,
+            # not the MB slot — we want a working copy of this song, whatever it is).
+            if track.path and Path(track.path).exists():
+                total_s = (track.duration_ms or 0) / 1000
+                if total_s <= 0:
+                    try:
+                        total_s = (read_audio_metadata(Path(track.path)).get("duration_ms") or 0) / 1000
+                    except Exception:
+                        total_s = 0
+                silent_fraction = measure_silence_fraction(Path(track.path), total_s) if total_s > 0 else None
+                if silent_fraction is not None and silent_fraction >= DEAD_AIR_THRESHOLD:
+                    dead_air += 1
+                    pct = round(silent_fraction * 100)
+                    audible_s = round(total_s * (1 - silent_fraction))
+                    add_download_request_item(
+                        session,
+                        batch,
+                        artist_items,
+                        album_items,
+                        artist_name,
+                        album.title,
+                        track.title,
+                        track_number=track.track_number,
+                        disc_number=track.disc_number,
+                        duration_ms=track.duration_ms,
+                        musicbrainz_album_id=album.musicbrainz_release_id,
+                        musicbrainz_recording_id=track.musicbrainz_recording_id,
+                        replace_track_id=track.id,
+                        replace_path=track.path,
+                        require_lossless=True if track.is_lossless else None,
+                        workflow="content_replacement",
+                        display_title=track.title,
+                    )
+                    created += 1
+                    append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for '{track.title}' — {pct}% dead air (audio stops after ~{audible_s}s)")
+                    continue
 
             # Find expected slot
             expected = None
@@ -7768,13 +7811,13 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
         create_notification(
             session,
             title="Audio content check complete",
-            body=f"{tracks_checked} tracks checked across {albums_scanned} album(s) with MusicBrainz data. No incorrect audio found.",
+            body=f"{tracks_checked} tracks checked across {albums_scanned} album(s) with MusicBrainz data. No incorrect audio or dead-air tracks found.",
             event_type="tool_completed",
             target_url="/tools",
         )
-        return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": 0, "batch_id": None}
+        return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "replacements_created": 0, "batch_id": None}
     enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "replacements_created": created, "batch_id": batch.id}
+    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "replacements_created": created, "batch_id": batch.id}
 
 
 def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = None) -> dict:
