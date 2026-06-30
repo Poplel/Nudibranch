@@ -4856,6 +4856,21 @@ function LibraryMetadataEditor({
                       onBlur={field.readOnly ? undefined : () => commit(draft)}
                     />
                   )}
+                  {field.key === "replaygain_track_gain" && !field.readOnly && String(draft[field.key] ?? "") !== "" && (
+                    <button
+                      className="row-icon-button"
+                      type="button"
+                      onClick={() => {
+                        const next = { ...draft, [field.key]: "" };
+                        setDraft(next);
+                        commit(next);
+                      }}
+                      title="Remove ReplayGain"
+                      aria-label="Remove ReplayGain"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
                   {field.key === "cover_path" && onCoverUpload && (
                     <>
                       <button

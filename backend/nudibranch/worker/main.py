@@ -7825,10 +7825,12 @@ def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = N
     as a reviewable metadata change (Artist>Album>Track tree). Non-destructive — apply only
     writes the DB value + the REPLAYGAIN_TRACK_GAIN tag; samples are never touched."""
     discard_pending_batches(session, "Apply ReplayGain", ProposalKind.metadata)
+    # Only measure tracks that have no ReplayGain yet — a track with a value (whether from a
+    # prior run or a manual edit) is left alone; clear its field in the editor to re-measure it.
     tracks = list(
         session.scalars(
             select(Track)
-            .where(Track.path.is_not(None))
+            .where(Track.path.is_not(None), Track.replaygain_track_gain.is_(None))
             .options(selectinload(Track.album).selectinload(Album.artist))
             .order_by(Track.title.asc())
         )
@@ -7849,9 +7851,6 @@ def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = N
             continue
         gain = measure_track_gain(Path(track.path))
         if gain is None:
-            continue
-        # Skip tracks already at this gain (idempotent re-runs).
-        if track.replaygain_track_gain is not None and abs(track.replaygain_track_gain - gain) < 0.01:
             continue
         album = track.album
         artist_name = album.artist.name if album and album.artist else "Unknown Artist"
