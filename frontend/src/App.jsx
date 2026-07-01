@@ -165,6 +165,7 @@ function App() {
   const unshuffledQueueRef = useRef(null); // snapshot of queue order before shuffle, to revert
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
+  const lastLibraryPollRef = useRef(0); // throttle the heavy /library/tree poll (see interval below)
   const lastRecordedPlayRef = useRef(null);
   const commandPollingRef = useRef(false);
   const [approvals, setApprovals] = useState([]);
@@ -300,7 +301,14 @@ function App() {
     if (!token) return;
     refreshAll();
     const interval = window.setInterval(() => {
-      if (hasPermission(user, "library:view")) refreshLibrary();
+      // The library tree is ~470 KB and near-static (only changes on import/edit,
+      // which trigger their own refreshLibrary). Polling it every 2.5–10s saturated
+      // the WAN tunnel and starved audio streaming, so throttle it to ~60s here;
+      // mutations and manual Refresh still update it immediately.
+      if (hasPermission(user, "library:view") && Date.now() - lastLibraryPollRef.current >= 60000) {
+        lastLibraryPollRef.current = Date.now();
+        refreshLibrary();
+      }
       if (hasPermission(user, "activity:read")) refreshTasks();
       if (hasPermission(user, "activity:read")) refreshLogs();
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
@@ -453,6 +461,7 @@ function App() {
       ]);
       setPermissionCatalog(permissionData);
       setLibrary(libraryTree);
+      lastLibraryPollRef.current = Date.now(); // count this fetch toward the 60s poll throttle
       setTasks(taskData);
       setAppLogs(logData);
       handleCompletedTaskEffects(taskData, { emit: false });
