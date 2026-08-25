@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Nudibranch</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#101216" />
+    <!-- Home-screen install metadata for iOS Safari (Android/Chrome reads the manifest instead). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Nudibranch" />
+    <!--
+      Favicon is the bare brand mark on a transparent background (no plate), so it has to be
+      supplied in two inks: the white mark vanishes on a light tab bar and the dark mark vanishes
+      on a dark one. The unscoped links are the dark ink, which is the safe default for browsers
+      that ignore `media` on icon links; the `prefers-color-scheme: dark` links override with white
+      where supported.
+    -->
+    <link rel="icon" href="/favicon-dark.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-dark-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-dark-16.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-dark-48.png" />
+    <link rel="icon" type="image/png" sizes="32x32" media="(prefers-color-scheme: dark)" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" media="(prefers-color-scheme: dark)" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="48x48" media="(prefers-color-scheme: dark)" href="/favicon-48.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/pwa-icon-180.png" />
+    <script>
+      (() => {
+        try {
+          const appearance = JSON.parse(localStorage.getItem("nudibranch_appearance_last") || "null");
+          if (!appearance || typeof appearance !== "object") return;
+          const accent = appearance.accentColor || "#356df3";
+          const tint = appearance.backgroundTint || "#356df3";
+          const dark = Boolean(appearance.dark);
+          const root = document.documentElement;
+          const bg = dark ? `color-mix(in srgb, ${tint} 10%, #101216)` : `color-mix(in srgb, ${tint} 7%, #f1f2f4)`;
+          root.style.setProperty("--accent-color", accent);
+          root.style.setProperty("--background-tint", tint);
+          root.style.setProperty("--bg", bg);
+          root.style.setProperty("--text", dark ? "#f4f2ec" : "#202124");
+          root.style.background = bg;
+          root.dataset.theme = dark ? "dark" : "light";
+        } catch {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/App.jsx"></script>
+  </body>
+</html>

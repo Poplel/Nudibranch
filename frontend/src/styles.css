@@ -1,0 +1,5230 @@
+:root {
+  --bg: #eef2f0;
+  --text: #202124;
+  font-family:
+    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Required because tab panels use the `hidden` attribute, which would
+   otherwise be overridden by their own `display` declarations. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+/* Mobile scroll fix: 100vh includes browser chrome that isn't actually
+   visible, so the document itself was taller than the viewport and the
+   WHOLE PAGE scrolled, rubber-banding to reveal the background above the
+   header. Only the inner containers (.main-panel, .inspector, etc.) should
+   ever scroll. */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.login-page {
+  --accent: #356df3;
+  --accent-strong: #1743a8;
+  --soft: #eef3ff;
+  --line: #d6d8dc;
+  --text: #202124;
+  display: grid;
+  /* `body` is now overflow:hidden for the app shell's sake, so this screen has to own its own
+     scrolling — otherwise a short viewport (landscape phone, on-screen keyboard up) clips the
+     login panel with no way to reach the button. */
+  height: 100vh;
+  height: 100dvh;
+  overflow: auto;
+  place-items: center;
+  background: color-mix(in srgb, #356df3 7%, #f1f2f4);
+  color: #202124;
+}
+
+.login-panel {
+  display: grid;
+  gap: 14px;
+  width: min(360px, calc(100vw - 32px));
+  padding: 18px;
+  border: 1px solid #d6d8dc;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.12);
+}
+
+.login-brand {
+  padding: 0 0 8px;
+}
+
+.login-panel label {
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.login-panel input {
+  min-height: 38px;
+  border: 1px solid #d6d8dc;
+  border-radius: 4px;
+  padding: 0 10px;
+}
+
+.app {
+  --accent-color: #356df3;
+  --background-tint: #356df3;
+  --bg: color-mix(in srgb, var(--background-tint) 7%, #f1f2f4);
+  --panel: color-mix(in srgb, var(--background-tint) 4%, #fafafa);
+  --panel-strong: #ffffff;
+  --text: #202124;
+  --muted: #6b7078;
+  --line: color-mix(in srgb, var(--background-tint) 10%, #d6d8dc);
+  --accent: var(--accent-color);
+  --accent-strong: color-mix(in srgb, var(--accent-color) 72%, #0d1b2a);
+  --accent-soft: color-mix(in srgb, var(--accent-color) 13%, transparent);
+  --soft: color-mix(in srgb, var(--background-tint) 11%, #ffffff);
+  --warn: #a75d08;
+  --danger: #b3404a;
+  --ok: #2d7d54;
+  display: grid;
+  grid-template-columns: 248px 1fr;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app.dark {
+  --bg: color-mix(in srgb, var(--background-tint) 10%, #101216);
+  --panel: color-mix(in srgb, var(--background-tint) 8%, #181b20);
+  --panel-strong: color-mix(in srgb, var(--background-tint) 9%, #20242b);
+  --text: #f4f2ec;
+  --muted: #aab2c4;
+  --line: color-mix(in srgb, var(--background-tint) 13%, #30333a);
+  --accent: color-mix(in srgb, var(--accent-color) 82%, #ffffff);
+  --accent-strong: color-mix(in srgb, var(--accent-color) 70%, #ffffff);
+  --accent-soft: color-mix(in srgb, var(--accent-color) 21%, transparent);
+  --soft: color-mix(in srgb, var(--background-tint) 18%, #16191e);
+  --warn: #ffc15d;
+  --danger: #ff7b86;
+  --ok: #78d99f;
+}
+
+/* Theme-aware scrollbars. var(--accent) resolves to the themed accent inside .app and the
+   :root default elsewhere (e.g. the login screen). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  background-color: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: var(--accent);
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px 14px;
+  border-right: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 6px 8px 12px;
+}
+
+/* Glyph + wordmark — the same lockup the iOS app shows in Settings → About, replacing the "N"
+   placeholder tile and the separate "Nudibranch" text. The source art is a white silhouette on
+   transparency, so it is applied as a mask filled with `currentColor` rather than as an <img>:
+   that is the web equivalent of iOS's template rendering, and it keeps the lockup legible on
+   light, dark, and custom-tinted themes without shipping per-theme variants. */
+.brand-lockup {
+  display: block;
+  width: 168px;
+  max-width: 100%;
+  aspect-ratio: 560 / 157;
+  background: currentColor;
+  color: var(--text);
+  -webkit-mask: url(./brand-lockup.png) no-repeat left center / contain;
+  mask: url(./brand-lockup.png) no-repeat left center / contain;
+}
+
+.login-brand .brand-lockup {
+  width: 208px;
+  -webkit-mask-position: center;
+  mask-position: center;
+}
+
+.brand strong,
+.brand span {
+  display: block;
+}
+
+.brand span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+nav {
+  display: grid;
+  gap: 4px;
+}
+
+nav button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 36px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 10px;
+  background: transparent;
+  color: var(--muted);
+  text-align: left;
+}
+
+nav button.active,
+nav button:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.workspace {
+  min-width: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* Left is wider than right — the sidebar sits flush against the grid column with no gap of
+     its own, so the topbar's own padding is the only breathing room between the player and
+     the sidebar edge; 18px read as touching it. */
+  padding: 0 20px 0 30px;
+  height: 64px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 86%, transparent);
+}
+
+.topbar-side-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.notification-anchor {
+  position: relative;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spin-icon {
+  animation: spin 0.8s linear infinite;
+}
+
+.icon-button {
+  position: relative;
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.badge {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.severity-dot {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.severity-dot.warning {
+  background: var(--warn);
+}
+
+.severity-dot.error {
+  background: var(--danger);
+}
+
+.notification-tray {
+  position: absolute;
+  top: 46px;
+  right: 0;
+  z-index: 20;
+  width: min(360px, calc(100vw - 28px));
+  max-height: 66vh;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.16);
+}
+
+.notification-list {
+  display: grid;
+  gap: 6px;
+  max-height: calc(66vh - 46px);
+  overflow: auto;
+}
+
+.notification-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.notification-tray h2,
+.inspector h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.tray-item {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.tray-item:hover,
+.tray-item.info {
+  background: var(--accent-soft);
+}
+
+.tray-item.warning {
+  border-left: 3px solid var(--warn);
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+.tray-item.error {
+  border-left: 3px solid var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+}
+
+.tray-item small {
+  color: var(--muted);
+}
+
+
+/* No bottom padding: the main panel and the inspector run all the way down to the
+   bottom edge of the viewport rather than leaving a dead gutter there. Their bottom
+   border/corners are squared off below so it reads as content running off the
+   screen instead of a clipped box. (The ≤640px override restores both, because the
+   fixed mobile tab bar needs that clearance and the panel edge is visible again.) */
+.content-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 330px;
+  gap: 14px;
+  min-height: 0;
+  padding: 14px 14px 0;
+  overflow: hidden;
+}
+
+/* Tablet range (iPad portrait and similar): keep the full three-pane desktop shell rather
+   than dropping to the phone layout, but the 248px sidebar + 330px inspector leave almost
+   nothing for the main panel at ~750-950px wide — narrow both so real content fits. */
+@media (min-width: 641px) and (max-width: 1150px) {
+  .app {
+    grid-template-columns: 188px 1fr;
+  }
+
+  .content-grid {
+    grid-template-columns: minmax(0, 1fr) 250px;
+  }
+}
+
+.content-grid > .panel {
+  border-bottom: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.panel {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+}
+
+.main-panel {
+  overflow: auto;
+  position: relative;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.panel-header h1 {
+  margin: 0;
+  font-size: 22px;
+  letter-spacing: 0;
+}
+
+.panel-header p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.error-banner {
+  margin: 10px 12px 0;
+  padding: 10px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.error-banner {
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--line));
+  background: color-mix(in srgb, var(--danger) 10%, var(--panel-strong));
+  color: var(--danger);
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.primary,
+.secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  border-radius: 4px;
+  padding: 0 12px;
+}
+
+.primary {
+  border: 1px solid var(--accent-strong);
+  background: var(--accent);
+  color: #fff;
+}
+
+.secondary {
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+/* Subtle accent highlight for an enabled action button that's waiting to be pressed
+   (e.g. the import "Create/Update playlist" submit) so it stands out from siblings. */
+.secondary.action-ready {
+  border-color: var(--accent-strong);
+  background: var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.secondary.action-ready:hover {
+  background: color-mix(in srgb, var(--accent) 22%, var(--panel-strong));
+}
+
+.tree,
+.approval-tree,
+.wizard {
+  padding: 8px;
+}
+
+.import-view,
+.library-view,
+.task-list {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.batch-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.batch {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.batch-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.batch-header p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.file-row,
+.task-row {
+  display: grid;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: var(--panel-strong);
+}
+
+.task-row .inline-progress {
+  grid-column: 1 / -1;
+}
+
+.active-work-bar {
+  display: grid;
+  gap: 8px;
+  margin: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.active-work-item {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.35fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.active-work-item strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.inspector .active-work-bar {
+  margin: 14px 0 0;
+}
+
+.inspector .active-work-item {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.inspector-progress-card {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.inspector-progress-card strong {
+  font-size: 12px;
+}
+
+.inspector-progress-card small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.file-row {
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+}
+
+.import-edit-row {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(110px, 1fr) minmax(120px, 1fr) 56px minmax(140px, 1.4fr) auto 30px 30px;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  padding: 0 10px 0 calc(10px + 2 * 22px);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.import-edit-row:hover {
+  background: var(--accent-soft);
+}
+
+.import-edit-row.selected {
+  background: color-mix(in srgb, var(--accent) 17%, transparent);
+}
+
+.grip {
+  color: var(--muted);
+  cursor: grab;
+}
+
+.import-edit-row input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.import-edit-row small {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.row-icon-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.library-track-row {
+  display: grid;
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 10px 0 calc(10px + 2 * 22px);
+  border: 1px solid color-mix(in srgb, var(--success, #4caf50) 35%, var(--line));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--success, #4caf50) 7%, transparent);
+  opacity: 0.75;
+}
+
+.library-track-icon {
+  color: var(--success, #4caf50);
+  flex-shrink: 0;
+}
+
+.library-track-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.library-track-badge {
+  font-size: 11px;
+  color: var(--success, #4caf50);
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+/* ── Flat track list (album/track view) ───────────────────────────────────── */
+.track-list-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 10px;
+  row-gap: 1px;
+  align-items: center;
+  min-width: 0;
+  width: 100%;
+  border: 0;
+  border-radius: 4px;
+  padding: 6px 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.track-list-row:hover {
+  background: var(--soft);
+}
+
+.track-list-row svg {
+  grid-row: 1 / span 2;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+
+.track-list-title {
+  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.track-list-sub {
+  grid-column: 2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+
+.track-list-duration {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ghost-track-row {
+  display: grid;
+  grid-template-columns: 18px 18px 100px minmax(0, 1fr) auto 30px;
+  align-items: center;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0 10px 0 calc(10px + 2 * 22px);
+  border: 1px dashed color-mix(in srgb, var(--warn) 50%, var(--line));
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warn) 9%, transparent);
+  color: var(--text);
+}
+
+.ghost-track-row label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ghost-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ghost-track-row small {
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.metadata-editor {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 8px;
+  margin: 4px 8px 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.album-details {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: start;
+  margin: 4px 8px 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.metadata-panel {
+  grid-template-columns: 74px minmax(0, 1fr) auto;
+}
+
+.library-metadata-form {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.library-metadata-form > strong,
+.library-metadata-form > small {
+  overflow-wrap: anywhere;
+}
+
+.library-metadata-form > small {
+  color: var(--muted);
+}
+
+.metadata-field-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(170px, 1fr));
+  gap: 8px;
+}
+
+.metadata-field-grid label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.metadata-field-grid label.changed span {
+  color: var(--accent);
+}
+
+.metadata-input-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 30px;
+  gap: 6px;
+  align-items: center;
+}
+
+.metadata-input-action input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.metadata-input-action input[type="checkbox"] {
+  width: 18px;
+  accent-color: var(--accent);
+}
+
+.metadata-menu-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.metadata-menu-actions select,
+.playlist-create input {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.album-art {
+  display: grid;
+  width: 64px;
+  height: 64px;
+  min-height: 64px;
+  max-height: 64px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--soft);
+  color: var(--muted);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.album-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.album-detail-grid {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 6px 10px;
+  font-size: 13px;
+}
+
+.album-detail-grid label {
+  color: var(--muted);
+}
+
+.album-detail-grid strong,
+.album-detail-grid span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.metadata-editor label,
+.album-search-panel label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.metadata-editor input,
+.album-search-panel input {
+  min-width: 0;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.metadata-editor input[type="checkbox"] {
+  width: 18px;
+  accent-color: var(--accent);
+}
+
+.metadata-add-row,
+.album-search-panel {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(120px, 1fr)) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.metadata-add-row {
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(160px, 1fr) auto;
+}
+
+.album-search-panel {
+  display: grid;
+  grid-template-columns: 1fr;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.album-search-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(120px, 1fr)) auto;
+  gap: 8px;
+  align-items: end;
+}
+
+.album-results {
+  display: grid;
+  gap: 6px;
+  max-height: 360px;
+  overflow: auto;
+}
+
+.album-result {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  height: 64px;
+  min-height: 64px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 6px;
+  background: var(--panel);
+  color: var(--text);
+  text-align: left;
+}
+
+.album-result img,
+.album-result-art {
+  width: 50px;
+  height: 50px;
+  border-radius: 3px;
+  background: var(--soft);
+  object-fit: cover;
+}
+
+.album-result-art {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.album-result span,
+.album-result small {
+  display: block;
+  min-width: 0;
+}
+
+.album-result strong,
+.album-result small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.album-result small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.discover-view {
+  display: grid;
+  gap: 12px;
+}
+
+.discover-search {
+  display: grid;
+  grid-template-columns: 20px minmax(180px, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.discover-search input {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+
+.artist-avatar {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 700;
+  object-fit: cover;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.discover-tree {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.discover-tree-row {
+  padding-right: 8px;
+}
+
+.discover-tree .album-result-art,
+.discover-tree .album-result img,
+.library-row-actions .album-result-art,
+.library-row-actions .album-result img {
+  width: 28px;
+  height: 28px;
+  min-height: 28px;
+  max-height: 28px;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.discover-tree .tree-row {
+  min-height: 40px;
+}
+
+.discover-show-more {
+  padding: 6px 12px;
+  margin-left: calc(1 * 18px + 24px + 15px);
+  color: var(--accent);
+  font-size: 13px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.discover-show-more:hover {
+  text-decoration: underline;
+}
+
+.tree-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 6px;
+  align-items: center;
+  min-width: 0;
+}
+
+.tree-action-row.one-action {
+  grid-template-columns: minmax(0, 1fr) 30px;
+}
+
+.tree-action-row.library-row-actions {
+  grid-template-columns: minmax(0, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+}
+
+.quick-library-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.library-row-actions:hover .quick-library-actions,
+.library-row-actions:focus-within .quick-library-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.remove-choice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 8px 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.remove-choice span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.playlist-view {
+  display: grid;
+  gap: 8px;
+  padding: 8px;
+}
+
+.playlist-create {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.playlist-track-tree {
+  display: grid;
+  gap: 2px;
+}
+
+.playlist-order-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.playlist-order-field input {
+  width: 64px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.playlist-play-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.playlist-edit-panel,
+.playlist-edit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+}
+
+.download-branch-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+}
+
+.download-branch-toggle input {
+  accent-color: var(--accent);
+}
+
+.users-view {
+  display: grid;
+  gap: 10px;
+  padding: 8px;
+}
+
+.user-create-panel,
+.user-card {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  background: var(--panel-strong);
+}
+
+.user-create-panel h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.user-create-panel label,
+.user-card label {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.user-create-panel input:not([type="checkbox"]),
+.user-card input:not([type="checkbox"]) {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.user-list {
+  display: grid;
+  gap: 8px;
+}
+
+.user-card-header,
+.pin-reset-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.permission-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .permission-grid,
+  .metadata-editor,
+  .metadata-field-grid,
+  .album-search-fields {
+    grid-template-columns: 1fr;
+  }
+
+  /* Settings rows pair a label+description with a fixed-width control in one row —
+     fine on desktop, but the control (a button, two color swatches, a URL input) has
+     nowhere to go at phone width and runs off the right edge. Stack them instead. */
+  .setting-row {
+    flex-wrap: wrap;
+  }
+}
+
+.permission-grid fieldset {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  margin: 0;
+  padding: 10px;
+}
+
+.permission-grid legend {
+  color: var(--text);
+  font-weight: 700;
+  padding: 0 4px;
+}
+
+.inline-check {
+  display: flex !important;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px !important;
+  color: var(--text) !important;
+}
+
+.inline-check input {
+  accent-color: var(--accent);
+}
+
+.user-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.activity-view {
+  display: grid;
+  gap: 10px;
+}
+
+.now-playing-strip {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 10px;
+  background: var(--panel-strong);
+}
+
+.now-playing-strip h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.now-playing-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.playback-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto;
+  gap: 4px 8px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  background: var(--panel);
+}
+
+.playback-row span {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.playback-row small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+}
+
+.wishlist-row.removed {
+  opacity: 0.58;
+}
+
+.wishlist-row.removed .tree-row {
+  color: var(--muted);
+}
+
+.track-musicbrainz-result {
+  display: grid;
+  gap: 2px;
+  padding: 4px 0 8px;
+}
+
+.musicbrainz-change-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-left: 118px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.musicbrainz-change-list span {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 6px;
+  background: var(--panel-strong);
+}
+
+.tree-toolbar,
+.tree-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tree-toolbar {
+  justify-content: space-between;
+  margin: 0 0 8px;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.tree-toolbar-actions {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.compact,
+.compact-button {
+  width: fit-content;
+  white-space: nowrap;
+}
+
+.danger {
+  color: var(--danger);
+}
+
+.library-search-results {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.library-search-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.library-search-group-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--muted, #888);
+  padding: 4px 2px;
+}
+
+.library-search-result-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.library-search-result-row:hover {
+  background: var(--accent-soft);
+}
+
+.library-search-result-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.audio-player {
+  display: grid;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--panel-strong);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.18);
+}
+
+/* Topbar (docked) player — inline, no bubble */
+.audio-player.topbar {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  /* No max-width: was 580px, sized before refresh/notifications/sign-out moved into this box
+     (see the "Merge the utility icons... into the docked player" commit) — left the row's real
+     content (~760px) too wide for its own container. align-items: center below (inherited from
+     .topbar's own row rule, whose meaning flips from vertical- to horizontal-centering once
+     flex-direction turns column here) then centered that overflow, clipping 90px off EACH side
+     rather than just the right: the title's leading characters and the player-art thumbnail
+     rendered underneath the sidebar, not just icons at the far edge looking tight.
+     align-items: stretch is the other half of that fix. And .topbar-side-right's own
+     margin-left: auto (inside headerActions) is what actually pins refresh/notifications/
+     sign-out to the true top-right corner of the page — it only reaches that edge if this box
+     is itself allowed to fill the topbar's remaining width via flex: 1, which a max-width cap
+     defeats. .topbar-progress (flex: 1, capped at 220px) is what absorbs the rest of the width
+     on a wide window, exactly like a normal media player's progress bar filling available room. */
+  align-items: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0;
+  width: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.topbar-player-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* The from-scratch mobile mini player (App.jsx's .mobile-mini-player) — hidden here since an
+   unstyled <div> defaults to display:block, not none; shown in its own rule under the phone
+   media query below. */
+.mobile-mini-player {
+  display: none;
+}
+
+.audio-player.topbar .player-art {
+  flex: 0 0 36px;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 4px;
+  background: var(--soft);
+  color: var(--muted);
+  overflow: hidden;
+}
+
+.audio-player.topbar .player-art img {
+  width: 36px;
+  height: 36px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.topbar-track-copy {
+  flex: 0 0 160px;
+  width: 160px;
+  height: 36px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.topbar-track-copy strong,
+.topbar-track-copy small {
+  display: inline-block;
+  white-space: nowrap;
+  line-height: 1.3;
+  animation: topbar-marquee 14s linear infinite;
+}
+
+/* The reset back to the start must be a near-instant snap (85% -> 85.01%), not a smooth slide —
+   a linear transition back to translateX(0) spent ~9% of every cycle with the text's leading
+   characters clipped and no ellipsis to signal it was mid-scroll, which read as the title being
+   permanently, randomly cut off ("l Night" / "yonce / Lemonade") rather than animating. */
+@keyframes topbar-marquee {
+  0%, 15%      { transform: translateX(0); }
+  45%, 85%     { transform: translateX(calc(-1 * var(--overflow-width, 0px))); }
+  85.01%, 100% { transform: translateX(0); }
+}
+
+.topbar-track-copy strong {
+  font-size: 13px;
+}
+
+.topbar-track-copy small {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.topbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.player-play-button.compact {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+}
+
+.topbar-progress {
+  flex: 1;
+  min-width: 80px;
+  max-width: 220px;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.topbar-queue {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 50;
+  max-height: 50vh;
+  overflow: auto;
+  overscroll-behavior: none;
+  background: var(--panel-strong);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+  padding: 6px;
+}
+
+/* Working indicator — fixed overlay, top-right of workspace, no layout impact */
+.working-indicator {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 200;
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--panel-strong);
+  color: var(--muted);
+  font-size: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  pointer-events: none;
+}
+
+/* Queue entries */
+.queue-entry {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.queue-play-btn {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 1px;
+  align-items: center;
+  min-height: 36px;
+  border: 0;
+  padding: 4px 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  border-radius: 4px;
+}
+
+.queue-play-btn:hover {
+  background: var(--accent-soft);
+}
+
+.queue-play-btn.active {
+  background: var(--accent-soft);
+}
+
+.queue-play-btn strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.queue-play-btn small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.queue-remove-btn {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.queue-entry:hover .queue-remove-btn {
+  opacity: 1;
+}
+
+.queue-remove-btn:hover {
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
+}
+
+.audio-player.popped {
+  position: static;
+  width: min(330px, calc(100vw - 24px));
+}
+
+.pip-root {
+  position: fixed;
+  inset: 0;
+  display: block;
+  grid-template-columns: 1fr;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--panel-strong);
+}
+
+.audio-player.pip-player {
+  position: absolute;
+  inset: 0;
+  width: auto;
+  height: auto;
+  min-height: 0;
+  padding: 56px 48px 24px 48px;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+  background: var(--panel-strong);
+  box-shadow: none;
+  isolation: isolate;
+  /* flex column so player-core gets a definite height and the scroll area
+     inside it can actually overflow-scroll */
+  display: flex;
+  flex-direction: column;
+}
+
+.audio-player.popped.pip-player {
+  width: auto;
+}
+
+.audio-player.main-fullscreen-player {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+}
+
+.audio-player.pip-player::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(90deg, color-mix(in srgb, var(--panel-strong) 92%, transparent), color-mix(in srgb, var(--panel-strong) 58%, transparent), color-mix(in srgb, var(--panel-strong) 82%, transparent)),
+    var(--fullscreen-art, linear-gradient(135deg, var(--panel-strong), var(--soft)));
+  background-position: center;
+  background-size: cover;
+  filter: blur(12px) saturate(0.86);
+  opacity: 0.55;
+  transform: scale(1.06);
+}
+
+.audio-player.pip-player::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--background-tint) 14%, transparent);
+}
+
+.audio-player.pip-player > * {
+  position: relative;
+  z-index: 1;
+}
+
+.player-core {
+  display: grid;
+  gap: 12px;
+}
+
+.pip-player .player-core {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr;
+  grid-template-rows: auto 1fr;
+  flex: 1;
+  min-height: 0;
+  gap: 42px;
+}
+
+.lyric-line {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+  cursor: default;
+  user-select: none;
+}
+
+.lyric-line.current {
+  font-size: 26px;
+  transform: translateX(4px);
+}
+
+.lyric-line.plain {
+  font-size: 16px;
+  font-weight: 400;
+}
+
+.lyrics-loading,
+.lyrics-empty {
+  font-size: 15px;
+  color: var(--muted);
+  padding: 16px 0;
+}
+
+/* Scroll area containing sticky controls + queue in PiP/fullscreen */
+.pip-scroll-area {
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  /* min-height: 0 lets the grid 1fr track bound this box so it scrolls
+     instead of growing the page; it fills down to the bottom of the page */
+  min-height: 0;
+  overscroll-behavior: none;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
+  /* hide the queue above the bottom edge of the controls box so it only
+     shows below the controls (--mask-cut set in JS) */
+  -webkit-mask-image: linear-gradient(to bottom, transparent var(--mask-cut, 0px), #000 var(--mask-cut, 0px));
+  mask-image: linear-gradient(to bottom, transparent var(--mask-cut, 0px), #000 var(--mask-cut, 0px));
+}
+
+.pip-controls-sticky {
+  /* absolutely positioned and driven by --controls-y (set in JS from scroll):
+     slides between the bottom of the page and just under the album art,
+     moving up with the queue and clamping under the art */
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: var(--controls-y, 0px);
+  z-index: 4;
+  padding: 12px 0;
+  /* mask the queue scrolling behind the controls */
+  background: color-mix(in srgb, var(--panel-strong) 84%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 12px;
+}
+
+/* Light mode: make the control box an opaque, tinted shade (≈ the main-page
+   background) instead of near-white, matching the queue bubbles' hue. */
+.app:not(.dark) .pip-controls-sticky {
+  background: var(--bg);
+}
+
+/* PiP queue — no box background, semi-transparent bubbles */
+.local-queue.pip-queue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+  /* match the media controls' width and centering */
+  width: min(100%, 840px);
+  margin: 0 auto;
+  /* not its own scroll box — .pip-scroll-area is the single scroller so the
+     controls can slide with the queue and clamp under the album art */
+  max-height: none;
+  overflow: visible;
+  /* start just below the controls' resting (bottom) position so the queue
+     travels up together with them; room at the bottom to clear the overlay */
+  padding-top: var(--queue-pad-top, 0px);
+  padding-bottom: 96px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
+.local-queue.pip-queue .queue-entry {
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-strong) 55%, transparent);
+  backdrop-filter: blur(4px);
+}
+
+.local-queue.pip-queue .queue-play-btn {
+  color: var(--text);
+}
+
+.local-queue.pip-queue .queue-play-btn:hover,
+.local-queue.pip-queue .queue-play-btn.active {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.audio-header {
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr) 64px;
+  gap: 12px;
+  align-items: center;
+}
+
+.pip-player .audio-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  max-width: none;
+  align-self: start;
+  /* reserve the base art height so the controls clamp below the art */
+  min-height: 100px;
+  /* leave room for the absolutely-positioned album art on the left */
+  padding-left: calc(var(--art-size, 100px) + 28px);
+  /* keep the info/lyrics from spilling past the right edge */
+  overflow: hidden;
+}
+
+.pip-player .audio-track-copy {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.pip-player .fullscreen-next {
+  flex: 0 0 auto;
+  width: auto;
+  /* Fade in/out without layout shift: space reserved via opacity transition */
+  max-width: 200px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.35s ease, max-width 0.35s ease, padding 0.35s ease;
+  max-width: 0;
+  padding: 0;
+  border-width: 0;
+}
+
+.pip-player .fullscreen-next.is-visible {
+  opacity: 1;
+  pointer-events: auto;
+  max-width: 200px;
+  padding: 7px 10px 7px 6px;
+  border-width: 1px;
+}
+
+.pip-player .pip-header-lyrics {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* Lyrics+up-next stacked column — fills the right side of audio-header */
+.lyrics-next-stack {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  gap: 6px;
+}
+
+/* In the stack the up-next is only rendered when visible — always shown, no transition */
+.lyrics-next-stack .fullscreen-next {
+  flex: 0 0 auto;
+  max-width: none;
+  overflow: hidden;
+  opacity: 1;
+  pointer-events: auto;
+  transition: none;
+  padding: 5px 8px 5px 5px;
+  border-width: 1px;
+}
+
+.lyrics-next-stack .fullscreen-next.is-visible {
+  opacity: 1;
+  max-width: none;
+}
+
+.lyrics-next-stack .pip-header-lyrics {
+  flex: 1 1 0;
+  height: auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0;
+}
+
+/* Lyrics panel embedded in the header row */
+.pip-header-lyrics {
+  height: 150px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 0 8px 16px;
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--text) 20%, transparent) transparent;
+  min-width: 0;
+  max-width: 460px;
+}
+
+/* When lyrics panel is inside the stack it fills all available height */
+.pip-player.has-lyrics .player-core {
+  grid-template-rows: 3fr 2fr;
+}
+
+.pip-player.has-lyrics .audio-header {
+  align-self: stretch;
+  align-items: stretch;
+  height: 100%;
+  overflow: hidden;
+}
+
+.pip-player.has-lyrics .audio-track-copy,
+.pip-player.has-lyrics .player-window-actions {
+  align-self: flex-start;
+}
+
+.pip-header-lyrics .lyric-line {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.player-window-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.pip-player .player-window-actions {
+  position: absolute;
+  top: -36px;
+  right: 0;
+}
+
+.player-art {
+  display: grid;
+  width: 82px;
+  height: 82px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--muted);
+  overflow: hidden;
+}
+
+.pip-player .player-art {
+  /* anchored top-left; size driven by JS (--art-size) so it grows to fill the
+     empty space down to the controls when they slide toward the bottom, and
+     shrinks back to its base size when they clamp under it. Absolute so its
+     size never feeds back into the layout. */
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  pointer-events: none;
+  width: var(--art-size, 150px);
+  height: var(--art-size, 150px);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.26);
+}
+
+.player-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.audio-track-copy {
+  min-width: 0;
+}
+
+.audio-header strong,
+.audio-header small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pip-player .audio-track-copy {
+  overflow: hidden;
+}
+
+.pip-player .audio-track-copy strong {
+  font-size: 56px;
+  line-height: 1;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  width: max-content;
+  max-width: none;
+  animation: topbar-marquee 18s linear infinite;
+}
+
+.pip-player .audio-track-copy small {
+  margin-top: 10px;
+  font-size: 17px;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  width: max-content;
+  max-width: none;
+  animation: topbar-marquee 18s linear infinite;
+}
+
+.playing-from {
+  display: block;
+  margin-bottom: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.audio-header small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.audio-player audio {
+  display: none;
+}
+
+.player-progress {
+  width: 100%;
+  height: 4px;
+  accent-color: var(--accent);
+}
+
+.fullscreen-controls {
+  display: grid;
+  gap: 16px;
+}
+
+.pip-player .fullscreen-controls {
+  width: min(100%, 840px);
+  margin: 0 auto;
+}
+
+/* Inset the pip/fullscreen seek bar slightly so it sits inside its frame */
+.pip-player .fullscreen-controls .player-progress {
+  width: calc(100% - 20px);
+  margin-inline: auto;
+}
+
+.player-controls {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  align-items: center;
+  gap: 4px;
+}
+
+.player-icon-button,
+.player-play-button {
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+}
+
+.player-icon-button {
+  height: 36px;
+}
+
+.player-play-button {
+  width: 48px;
+  height: 48px;
+  margin: 0 auto;
+  border-radius: 50%;
+  background: var(--text);
+  color: var(--panel-strong);
+}
+
+.pip-player .player-play-button {
+  width: 62px;
+  height: 62px;
+}
+
+.player-icon-button:disabled {
+  opacity: 0.35;
+}
+
+.player-icon-button.active {
+  color: var(--accent);
+}
+
+.player-icon-button.active svg {
+  fill: var(--accent);
+  color: var(--accent);
+}
+
+.local-queue {
+  display: grid;
+  gap: 4px;
+  max-height: 232px;
+  overflow: auto;
+}
+
+
+.fullscreen-next {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 7px;
+  align-self: center;
+  width: 100%;
+  padding: 5px 8px 5px 5px;
+  border: 1px solid color-mix(in srgb, var(--line) 50%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--panel-strong) 38%, transparent);
+  color: var(--text);
+  box-sizing: border-box;
+}
+
+.up-next-art {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 3px;
+  background: var(--soft);
+  color: var(--muted);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.up-next-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.up-next-text {
+  overflow: hidden;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.fullscreen-next span {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  display: block;
+}
+
+.fullscreen-next strong {
+  display: block;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  width: max-content;
+  text-overflow: clip;
+  animation: topbar-marquee 10s linear infinite;
+}
+
+.fullscreen-next small {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  width: max-content;
+  text-overflow: clip;
+  animation: topbar-marquee 12s linear infinite;
+}
+
+
+.file-row div,
+.task-row {
+  min-width: 0;
+}
+
+.file-row strong,
+.file-row span,
+.task-row strong,
+.task-row span,
+.task-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-row span,
+.file-row small,
+.task-row small {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.task-row {
+  grid-template-columns: minmax(0, 1fr) 110px minmax(0, 1fr);
+  width: 100%;
+  color: var(--text);
+  text-align: left;
+}
+
+.task-entry {
+  display: grid;
+  gap: 4px;
+}
+
+.task-cancel {
+  justify-self: end;
+}
+
+.task-detail {
+  overflow: auto;
+  max-height: 320px;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.empty-panel,
+.empty-state {
+  display: grid;
+  gap: 4px;
+  min-height: 180px;
+  place-items: center;
+  align-content: center;
+  padding: 22px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.empty-panel h2,
+.empty-state h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 17px;
+}
+
+.empty-panel p,
+.empty-state p {
+  max-width: 460px;
+  margin: 0;
+}
+
+.tree-row,
+.proposal-row,
+.bulk-row {
+  display: grid;
+  /* The title column needs a real floor: an unbounded minmax(0, 1fr) next to the fixed-size
+     "auto" meta column collapses the title to 1-2 characters (with no ellipsis even drawn)
+     the moment the row is narrower than both columns' combined natural width — which real
+     desktop-layout widths (a narrowed sidebar+inspector on a tablet, a small browser window)
+     hit often. */
+  grid-template-columns: 18px 18px minmax(70px, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  border: 0;
+  border-radius: 4px;
+  padding: 0 10px 0 calc(10px + var(--depth, 0) * 22px);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+}
+
+.selectable-tree-row {
+  grid-template-columns: 18px 18px 18px minmax(70px, 1fr) auto;
+}
+
+.selectable-tree-main,
+.selectable-tree-title {
+  display: contents;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.tree-row:hover,
+.proposal-row:hover,
+.bulk-row:hover {
+  background: var(--accent-soft);
+}
+
+.tree-title,
+.proposal-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proposal-title-cell {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) minmax(140px, 38%);
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.proposal-title-cell > .proposal-title {
+  min-width: 0;
+}
+
+.proposal-title-cell > .inline-progress {
+  min-width: 140px;
+  max-width: 420px;
+}
+
+.tree-row small,
+.proposal-row small,
+.bulk-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.tree-row small.warning {
+  color: var(--warn);
+}
+
+.proposal-row {
+  grid-template-columns: 18px 18px minmax(0, 1fr) auto auto;
+  padding-left: calc(14px + var(--depth, 0) * 24px);
+}
+
+.tree-playlist-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  border-top: 1px solid var(--line);
+}
+
+.tree-playlist-header:first-child {
+  border-top: none;
+}
+
+.tree-playlist-artist {
+  padding-left: 16px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  margin-left: 8px;
+}
+
+.proposal-row.status-executing {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.proposal-row.status-completed {
+  color: color-mix(in srgb, var(--text) 82%, var(--ok));
+}
+
+.proposal-row.status-failed {
+  color: var(--danger);
+}
+
+.inline-progress {
+  display: grid;
+  gap: 5px;
+  min-width: min(320px, 100%);
+}
+
+.inline-progress.compact {
+  gap: 0;
+  min-width: 120px;
+}
+
+.inline-progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.inline-progress-track {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--soft);
+}
+
+.inline-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 180ms ease;
+}
+
+.inline-progress.indeterminate .inline-progress-track span {
+  animation: progress-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.metadata-change-row {
+  background: color-mix(in srgb, var(--background-tint) 5%, transparent);
+}
+
+.metadata-change-row small {
+  max-width: min(520px, 46vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row-toggle {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--muted);
+}
+
+.row-toggle:disabled {
+  opacity: 1;
+}
+
+.proposal-row input,
+.bulk-row input {
+  accent-color: var(--accent);
+}
+
+.bulk-row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-strong);
+}
+
+.bulk-row label {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+}
+
+.wizard {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 8px;
+}
+
+.inspector {
+  padding: 14px;
+  overflow: auto;
+}
+
+.inspector-actions {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.inspector-actions button {
+  justify-content: center;
+  width: 100%;
+}
+
+.import-dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 16px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+
+.import-dropzone.dragover {
+  border-color: var(--accent);
+  background: var(--panel-strong);
+}
+
+.inspector-actions input {
+  width: 100%;
+  min-height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.inspector-section {
+  margin-top: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+
+.inspector-section-toggle {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  padding: 5px 6px;
+}
+
+.inspector-section-toggle svg:last-child {
+  margin-left: auto;
+}
+
+.inspector-section-content {
+  display: grid;
+  gap: 8px;
+  padding: 8px 0 2px;
+}
+
+.inspector-section-content button {
+  justify-content: center;
+  width: 100%;
+}
+
+.playlist-import-url {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mode-toggle {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.mode-toggle button {
+  flex: 1;
+  border: none;
+  border-radius: 0;
+  padding: 5px 0;
+  font-size: 12px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.mode-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.mode-toggle button + button {
+  border-left: 1px solid var(--line);
+}
+
+.inspector-hint {
+  font-size: 12px;
+  color: var(--fg-muted);
+  margin: 0;
+}
+
+.playlist-import-preview {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 3px;
+  font-size: 12px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+.playlist-import-preview li {
+  display: grid;
+  grid-template-rows: auto auto;
+  overflow: hidden;
+}
+
+.playlist-import-preview li strong,
+.playlist-import-preview li span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.playlist-import-preview li span {
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+
+.playlist-import-preview li.more {
+  color: var(--fg-muted);
+  font-size: 11px;
+  padding-top: 2px;
+}
+
+.diff {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.diff span,
+.metadata-grid label {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diff p {
+  overflow-wrap: anywhere;
+  margin: 0 0 8px;
+  font-size: 13px;
+}
+
+.metadata-grid {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 10px;
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+.metadata-grid strong {
+  overflow-wrap: anywhere;
+}
+
+.settings-grid {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.settings-section h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.settings-footer {
+  padding: 10px 2px 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-footer a {
+  color: var(--accent);
+}
+
+.settings-footer button {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* ── Equalizer ─────────────────────────────────────────────────────────── */
+.settings-collapse-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-collapse-header h2 {
+  margin: 0;
+}
+
+.settings-collapse-header span.muted {
+  margin-left: auto;
+}
+
+.equalizer-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.equalizer-bands {
+  display: flex;
+  justify-content: space-between;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.equalizer-bands.disabled {
+  opacity: 0.45;
+}
+
+.equalizer-band {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+
+.equalizer-slider {
+  writing-mode: vertical-lr;
+  direction: rtl;
+  -webkit-appearance: slider-vertical;
+  appearance: slider-vertical;
+  height: 110px;
+  width: 22px;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+.equalizer-band-gain {
+  min-height: 14px;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.equalizer-band-label {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.equalizer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.equalizer-actions input[type="text"] {
+  flex: 1;
+  min-width: 120px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.equalizer-custom-list {
+  display: grid;
+  gap: 4px;
+}
+
+.equalizer-custom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.attribution-page { max-width: 920px; }
+.attribution-page > header h1 { margin: 0 0 4px; font-size: 24px; }
+.attribution-page > header p { margin: 0; }
+.attribution-group { gap: 8px; }
+.attribution-group > a { color: var(--accent); }
+.attribution-list { display: grid; }
+.attribution-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 9px 2px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text);
+  text-decoration: none;
+}
+.attribution-row:last-child { border-bottom: 0; }
+.attribution-row:hover strong { color: var(--accent); }
+.attribution-row span:first-child { display: grid; gap: 2px; }
+.attribution-row small { color: var(--muted); }
+.attribution-license { flex: none; color: var(--muted); font-size: 12px; }
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.setting-row span,
+.setting-row small {
+  display: block;
+}
+
+.setting-row small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.setting-row input[type="color"] {
+  width: 52px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+}
+
+.crossfade-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 140px;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(to right, var(--background-tint, var(--accent)) var(--progress, 50%), var(--line) var(--progress, 50%));
+  outline: none;
+  cursor: pointer;
+}
+
+.crossfade-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--background-tint, var(--accent));
+  border: 2px solid var(--panel-strong);
+  cursor: pointer;
+}
+
+.crossfade-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--background-tint, var(--accent));
+  border: 2px solid var(--panel-strong);
+  cursor: pointer;
+}
+
+.integration-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(0, 1.2fr) 72px;
+  align-items: center;
+}
+
+/* Checkboxes must not be stretched to the input height/width by the rules below. */
+.setting-row input[type="checkbox"],
+.integration-row input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  min-width: 0;
+  padding: 0;
+  justify-self: start;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
+.integration-status {
+  display: flex;
+  align-items: center;
+  min-height: 34px;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.integration-row input,
+.integration-row select {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.status-list {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 13px;
+}
+
+.status-list span {
+  color: var(--muted);
+}
+
+.api-key-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.api-key-row input {
+  min-width: 0;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.tools-view {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+}
+
+.tool-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.tool-card {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  min-height: 96px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 12px;
+  background: var(--panel-strong);
+  color: var(--text);
+  text-align: left;
+}
+
+.tool-card span,
+.tool-card small {
+  display: block;
+}
+
+.tool-card small {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.log-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.restore-panel,
+.check-files-panel {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.restore-panel h2,
+.check-files-panel h2,
+.check-files-panel h3 {
+  margin: 0;
+}
+
+.restore-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.restore-actions select {
+  min-width: 220px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.check-files-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.check-file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 8px 0;
+  border-top: 1px solid var(--line);
+}
+
+.check-file-row span,
+.check-file-row strong,
+.check-file-row small {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check-file-row small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.log-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.log-header input {
+  min-width: 220px;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 9px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.log-list {
+  display: grid;
+  gap: 6px;
+  max-height: 420px;
+  overflow: auto;
+}
+
+.log-row {
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.log-row.error {
+  border-color: color-mix(in srgb, var(--danger) 45%, var(--line));
+  color: var(--danger);
+}
+
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: var(--toast-bottom, 18px);
+  z-index: 30;
+  display: grid;
+  gap: 4px;
+  width: min(360px, calc(100vw - 36px));
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  background: var(--panel-strong);
+  color: var(--text);
+  text-align: left;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.16);
+}
+
+.toast span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.placeholder {
+  display: grid;
+  place-items: center;
+  align-content: center;
+  min-height: 320px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.placeholder h2 {
+  margin: 10px 0 0;
+  color: var(--text);
+}
+
+.placeholder p {
+  margin: 4px 0 0;
+}
+
+/* ── Mobile tab bar + "More" sheet (replaces the old horizontal-strip sidebar) ── */
+.mobile-tabbar {
+  display: none;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 40;
+  background: var(--panel-strong);
+  border-top: 1px solid var(--line);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+/* There used to be a second, bottom-docked copy of the player that this kept the tab bar
+   clear of by shifting it up by the player's height. The docked player now lives in the
+   topbar (top of the page, §mini-player), not the bottom, so shifting .mobile-tabbar up
+   here just left dead space below it and threw off anything positioned against the true
+   viewport bottom (the Inspector FAB) whenever a track was playing. The tab bar stays flush
+   at the bottom regardless of playback state now. */
+
+.mobile-tabbar button {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  padding: 8px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+
+.mobile-tabbar button.active {
+  color: var(--accent);
+}
+
+.mobile-tabbar button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.mobile-more-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  display: flex;
+  align-items: flex-end;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.mobile-more-sheet {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
+  max-height: 70dvh;
+  overflow: auto;
+  padding: 10px 10px calc(10px + 64px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--line);
+  border-radius: 12px 12px 0 0;
+  background: var(--panel-strong);
+}
+
+.mobile-more-sheet button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+}
+
+.mobile-more-sheet button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    display: none;
+  }
+
+  /* iOS standalone (home-screen) launch draws the page under the status bar/notch
+     (apple-mobile-web-app-status-bar-style: black-translucent) — pad the topbar so its
+     content (page titles, "Working…") clears it. env() is 0 in an ordinary browser tab,
+     so this is a no-op there. The docked player itself no longer lives here at all on
+     mobile — see .mobile-mini-player — so this is back to the plain single-row bar. */
+  .topbar {
+    height: auto;
+    min-height: calc(64px + env(safe-area-inset-top));
+    padding: 10px 14px;
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+
+  /* The desktop player (art/title/full transport/progress/queue/device/close, built for the
+     topbar's full remaining width once the sidebar and inspector are gone) is replaced by
+     .mobile-mini-player below, not reflowed — trying to wrap six control icons plus a
+     progress slider onto a phone width was fighting the design, not fitting it. */
+  .topbar-player-row {
+    display: none;
+  }
+
+  /* Rows (playlists, etc.) that pack a standalone icon button per action AND an
+     overflow "…" menu offering the exact same set — the row comment even says so
+     ("every gesture the row's buttons offer, so the menu is never a smaller set
+     than the row"). Six icon buttons never fit a phone width; drop the ones the
+     overflow menu already covers and keep just play/queue + the menu. */
+  .row-secondary-action {
+    display: none;
+  }
+
+  /* Refresh/notifications/sign-out move to the More sheet on mobile (mobile-more-utility-row
+     below) — global actions, not page-scoped, and always reachable there even on Home/Settings,
+     which have no Inspector. Hides both header copies (standalone and inside the docked
+     player); the More sheet's own copy isn't `.topbar-side-right` so it's unaffected. */
+  .topbar-side-right {
+    display: none;
+  }
+
+  .mobile-more-utility-row {
+    /* .mobile-more-sheet is itself a grid (repeat(auto-fill, minmax(140px, 1fr))) for the nav
+       buttons below — without this the row would be squeezed into one of those cells instead
+       of spanning as its own header line above them. */
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding-bottom: 12px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  /* Placed after the unscoped .integration-row rule (further up the file) on purpose —
+     an earlier attempt at this same override lost the cascade tie to that later,
+     always-on rule since both set grid-template-columns at equal specificity. */
+  .integration-row {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .topbar-progress {
+    order: 10;
+    flex-basis: 100%;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .content-grid {
+    grid-template-columns: 1fr;
+    padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  }
+
+  /* The panel stops above the fixed tab bar here, so its bottom edge is visible
+     again and gets its border/corners back. */
+  .content-grid > .panel {
+    border-bottom: 1px solid var(--line);
+    border-bottom-left-radius: 4px;
+    border-bottom-right-radius: 4px;
+  }
+
+  /* The Inspector carries actions with no other home on several pages (Create playlist, Add
+     selected to task queue, the whole Import scan/upload flow) — hiding it outright the way
+     the sidebar hides would make those permanently unreachable on mobile. It becomes a bottom
+     sheet instead, opened by the FAB (.mobile-inspector-fab) and closed by its own X, a tap on
+     the backdrop, or a page change (App.jsx resets mobileInspectorOpen on `page`). */
+  .inspector {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 55;
+    max-height: 75vh;
+    border-radius: 16px 16px 0 0;
+    box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.28);
+    transform: translateY(110%);
+    transition: transform 220ms ease;
+    padding-bottom: calc(14px + env(safe-area-inset-bottom));
+  }
+
+  .inspector.mobile-open {
+    transform: translateY(0);
+  }
+
+  .inspector-mobile-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin: -14px -14px 10px;
+    padding: 10px 10px 10px 14px;
+    position: sticky;
+    top: -14px;
+    background: var(--panel-strong);
+    border-bottom: 1px solid var(--line);
+    border-radius: 16px 16px 0 0;
+  }
+
+  .inspector-mobile-head h2 {
+    margin: 0;
+  }
+
+  .mobile-inspector-fab {
+    position: fixed;
+    right: 16px;
+    bottom: calc(96px + env(safe-area-inset-bottom));
+    z-index: 41;
+    width: 52px;
+    height: 52px;
+    border-radius: 50%;
+    border: 0;
+    display: grid;
+    place-items: center;
+    background: var(--accent);
+    color: #fff;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  }
+
+  /* The mini player floats in the same space the FAB normally rests in — give the FAB the
+     extra clearance (its own height, 68px, + the same 12px gap the player keeps off the tab
+     bar) rather than measuring anything at runtime. Both are plain arithmetic off a track's
+     playing/not-playing state (.app.player-docked), unlike the old --player-dock-height
+     mechanism this replaced, which broke as soon as the DOM node it measured could be a
+     different element depending on player state. */
+  .app.player-docked .mobile-inspector-fab {
+    bottom: calc(96px + env(safe-area-inset-bottom) + 80px);
+  }
+
+  .mobile-mini-player {
+    position: fixed;
+    left: 12px;
+    right: 12px;
+    bottom: calc(78px + env(safe-area-inset-bottom));
+    z-index: 42;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px 9px 9px;
+    border: 0;
+    border-radius: 16px;
+    background: var(--panel-strong);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+    color: var(--text);
+    text-align: left;
+    overflow: hidden;
+  }
+
+  .mini-progress-track {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: color-mix(in srgb, var(--text) 12%, transparent);
+  }
+
+  .mini-progress-fill {
+    height: 100%;
+    background: var(--accent);
+  }
+
+  .mini-art {
+    flex: 0 0 44px;
+    width: 44px;
+    height: 44px;
+    border-radius: 9px;
+    overflow: hidden;
+    background: var(--soft);
+    color: var(--muted);
+    display: grid;
+    place-items: center;
+  }
+
+  .mini-art img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  .mini-copy {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .mini-copy strong {
+    font-size: 14px;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mini-copy small {
+    font-size: 12px;
+    color: var(--muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .mini-play-btn {
+    flex: 0 0 auto;
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    border: 0;
+    display: grid;
+    place-items: center;
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .mini-next-btn {
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    border-radius: 50%;
+    border: 0;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    color: var(--text);
+  }
+
+  .mini-next-btn:disabled {
+    opacity: 0.35;
+  }
+
+  .mobile-inspector-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    background: rgba(0, 0, 0, 0.4);
+  }
+
+  .mobile-tabbar {
+    display: flex;
+  }
+}
+
+/* Both are only ever rendered on mobile (the FAB's trigger, App.jsx, is conditioned on
+   NO_INSPECTOR_PAGES and mobileInspectorOpen never becomes true without it) — this just keeps
+   the close button out of the desktop Inspector's static header, and the sheet mechanics inert
+   above the breakpoint in case the state is ever true when the viewport is wide (e.g. a resize
+   mid-sheet). */
+.mobile-inspector-close {
+  display: none;
+}
+
+@media (max-width: 640px) {
+  .mobile-inspector-close {
+    display: grid;
+  }
+}
+
+@media (max-width: 640px) {
+  /* .topbar / .audio-player.topbar / .topbar-progress mobile rules live in the earlier
+     @media (max-width: 640px) block above (with the safe-area padding and the mini-player
+     wrap) — this block used to duplicate them with a conflicting `order: -1`, which fought
+     the later block's `order: 1` for .audio-player.topbar depending on which one the
+     cascade favored for which property. One definition, one place. */
+
+  .panel-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .approval-actions {
+    width: 100%;
+  }
+
+  .primary,
+  .secondary {
+    justify-content: center;
+    flex: 1;
+  }
+
+  .wizard {
+    grid-template-columns: 1fr;
+  }
+
+  .import-edit-row {
+    grid-template-columns: 18px 18px minmax(0, 1fr);
+    height: auto;
+    padding-block: 6px;
+  }
+
+  .import-edit-row input,
+  .import-edit-row small,
+  .import-edit-row .row-icon-button {
+    grid-column: 3;
+  }
+
+  .ghost-track-row,
+  .discover-search,
+  .discover-heading,
+  .discover-album,
+  .discover-track,
+  .album-search-panel,
+  .metadata-editor {
+    grid-template-columns: 1fr;
+  }
+
+  .discover-album-list,
+  .discover-track-list {
+    padding-left: 0;
+  }
+
+  .metadata-add-row {
+    grid-template-columns: 1fr;
+  }
+
+  .audio-player.pip-player {
+    padding: 24px;
+  }
+
+  .pip-player .player-core {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .pip-player .audio-header {
+    max-width: none;
+    min-height: 112px;
+    /* art is a fixed 112px on mobile, so don't track --art-size here */
+    padding-left: calc(112px + 16px);
+  }
+
+  /* has-lyrics / has-up-next grid-column overrides are not needed —
+     audio-header uses flex, not grid, on the pip-player */
+
+  .pip-player .player-art {
+    width: 112px;
+    height: 112px;
+  }
+
+  .pip-header-lyrics {
+    height: 112px;
+  }
+
+  /* Inside the stack, ignore the fixed height — fill available flex space */
+  .lyrics-next-stack .pip-header-lyrics {
+    height: auto;
+  }
+
+  .pip-player .audio-track-copy strong {
+    font-size: 22px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: block;
+  }
+
+  .pip-player .fullscreen-controls {
+    width: 100%;
+  }
+
+  .fullscreen-next {
+    width: auto;
+    margin-left: 0;
+  }
+
+  /* The controls' scroll-linked slide-and-clamp position (--controls-y) and the queue's
+     matching top padding are tuned for a desktop window tall enough that "just under the
+     art" and "bottom of the page" are usefully far apart. On a phone-height viewport they
+     collapse to nearly the same spot, which pushed the whole queue below the fold behind a
+     dead gap. Pin the controls to the bottom instead and let the queue start right under
+     the header — simpler, and correct for a viewport this short regardless of scroll. */
+  .pip-player .pip-controls-sticky {
+    position: fixed;
+    top: auto;
+    bottom: 24px;
+    left: 24px;
+    right: 24px;
+    width: auto;
+  }
+
+  .pip-player .local-queue.pip-queue {
+    padding-top: 16px;
+    padding-bottom: 140px;
+  }
+
+  .pip-player .pip-scroll-area {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+.secondary:hover,
+.icon-button:hover {
+  background: var(--accent-soft);
+}
+
+.primary:hover {
+  background: var(--accent-strong);
+}
+
+/* ─── Compact player: JS-driven (.is-compact) + CSS fallback ─── */
+/* Applies when the window is too short to show art + controls + ≥1 queue entry */
+
+.audio-player.pip-player.is-compact {
+  padding: 10px 16px;
+}
+
+.audio-player.pip-player.is-compact .player-core {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  grid-template-rows: none;
+}
+
+.audio-player.pip-player.is-compact .audio-header {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  min-height: 0;
+  padding-left: 0;
+  overflow: hidden;
+  align-self: auto;
+  height: auto;
+}
+
+.audio-player.pip-player.is-compact .player-art {
+  position: relative;
+  top: auto;
+  left: auto;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  z-index: auto;
+  pointer-events: auto;
+  box-shadow: none;
+}
+
+.audio-player.pip-player.is-compact .playing-from,
+.audio-player.pip-player.is-compact .pip-scroll-area,
+.audio-player.pip-player.is-compact .fullscreen-next,
+.audio-player.pip-player.is-compact .lyrics-next-stack {
+  display: none;
+}
+
+/* lyrics button in compact: swap to blocked icon, disable interaction */
+.lyric-icon-off { display: none; }
+
+.audio-player.pip-player.is-compact .player-controls > button:first-child .lyric-icon-on,
+.audio-player.pip-player.is-micro .player-controls > button:first-child .lyric-icon-on {
+  display: none;
+}
+.audio-player.pip-player.is-compact .player-controls > button:first-child .lyric-icon-off,
+.audio-player.pip-player.is-micro .player-controls > button:first-child .lyric-icon-off {
+  display: block;
+}
+.audio-player.pip-player.is-compact .player-controls > button:first-child {
+  pointer-events: none;
+  opacity: 0.35;
+}
+
+.audio-player.pip-player.is-compact .audio-header strong {
+  font-size: 15px;
+}
+
+.audio-player.pip-player.is-compact .audio-header small {
+  font-size: 11px;
+  margin-top: 3px;
+}
+
+.audio-player.pip-player.is-compact .pip-controls-sticky {
+  position: relative;
+  top: auto;
+  padding: 0;
+  background: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border-radius: 0;
+}
+
+.audio-player.pip-player.is-compact .player-progress {
+  height: 3px;
+}
+
+.audio-player.pip-player.is-compact .player-window-actions {
+  position: relative;
+  top: auto;
+  right: auto;
+}
+
+/* CSS-only compact fallback (absolute height limit regardless of scroll) */
+@media (max-height: 220px) {
+  .audio-player.pip-player {
+    padding: 10px 16px;
+  }
+
+  .audio-player.pip-player .player-core {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 6px;
+    grid-template-rows: none;
+  }
+
+  .audio-player.pip-player .audio-header {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    min-height: 0;
+    padding-left: 0;
+    overflow: hidden;
+    align-self: auto;
+    height: auto;
+  }
+
+  .audio-player.pip-player .player-art {
+    position: relative;
+    top: auto;
+    left: auto;
+    width: 44px;
+    height: 44px;
+    flex: 0 0 44px;
+    z-index: auto;
+    pointer-events: auto;
+    box-shadow: none;
+  }
+
+  .audio-player.pip-player .playing-from,
+  .audio-player.pip-player .pip-scroll-area,
+  .audio-player.pip-player .fullscreen-next,
+  .audio-player.pip-player .lyrics-next-stack {
+    display: none;
+  }
+
+  .audio-player.pip-player .player-controls > button:first-child .lyric-icon-on {
+    display: none;
+  }
+  .audio-player.pip-player .player-controls > button:first-child .lyric-icon-off {
+    display: block;
+  }
+  .audio-player.pip-player .player-controls > button:first-child {
+    pointer-events: none;
+    opacity: 0.35;
+  }
+
+  .audio-player.pip-player .audio-header strong {
+    font-size: 15px;
+  }
+
+  .audio-player.pip-player .audio-header small {
+    font-size: 11px;
+    margin-top: 3px;
+  }
+
+  .audio-player.pip-player .pip-controls-sticky {
+    position: relative;
+    top: auto;
+    padding: 0;
+    background: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border-radius: 0;
+  }
+
+  .audio-player.pip-player .player-progress {
+    height: 3px;
+  }
+
+  .audio-player.pip-player .player-window-actions {
+    position: relative;
+    top: auto;
+    right: auto;
+  }
+}
+
+/* ─── Micro player: tiny/square — album art fills the window, text + controls overlay ─── */
+
+.audio-player.pip-player.is-micro {
+  padding: 8px 10px;
+}
+
+.audio-player.pip-player.is-micro::before {
+  filter: blur(0) saturate(1.15);
+  opacity: 0.88;
+}
+
+.audio-player.pip-player.is-micro .player-core {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: stretch;
+  height: 100%;
+  gap: 4px;
+  grid-template-rows: none;
+}
+
+/* Show audio-header but as a simple text block (no art, no actions) */
+.audio-player.pip-player.is-micro .audio-header {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  min-height: 0;
+  padding-left: 0;
+  gap: 0;
+  overflow: hidden;
+  align-self: auto;
+  height: auto;
+}
+
+.audio-player.pip-player.is-micro .player-art,
+.audio-player.pip-player.is-micro .playing-from,
+.audio-player.pip-player.is-micro .player-window-actions,
+.audio-player.pip-player.is-micro .fullscreen-next,
+.audio-player.pip-player.is-micro .lyrics-next-stack,
+.audio-player.pip-player.is-micro .pip-scroll-area {
+  display: none;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy {
+  flex: 0 0 auto; /* base rule is flex:1 1 0; in a height:auto column that gives zero height */
+  overflow: hidden;
+  max-width: 100%;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy strong {
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.audio-player.pip-player.is-micro .audio-track-copy small {
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.audio-player.pip-player.is-micro .pip-controls-sticky {
+  position: relative;
+  top: auto;
+  padding: 4px 8px;
+  background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  border-radius: 12px;
+}
+
+.audio-player.pip-player.is-micro .player-progress {
+  height: 3px;
+}
+
+.audio-player.pip-player.is-micro .player-controls {
+  grid-template-columns: repeat(5, 1fr);
+  justify-items: center;
+}
+
+.audio-player.pip-player.is-micro .player-controls button:first-child,
+.audio-player.pip-player.is-micro .player-controls button:last-child {
+  display: none;
+}
+
+@media (max-height: 320px) and (max-width: 400px) {
+  .audio-player.pip-player {
+    padding: 8px 10px;
+  }
+
+  .audio-player.pip-player::before {
+    filter: blur(0) saturate(1.15);
+    opacity: 0.88;
+  }
+
+  .audio-player.pip-player .player-core {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: stretch;
+    height: 100%;
+    gap: 4px;
+    grid-template-rows: none;
+  }
+
+  .audio-player.pip-player .audio-header {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    min-height: 0;
+    padding-left: 0;
+    gap: 0;
+    overflow: hidden;
+    align-self: auto;
+    height: auto;
+  }
+
+  .audio-player.pip-player .audio-track-copy {
+    flex: 0 0 auto;
+  }
+
+  .audio-player.pip-player .player-art,
+  .audio-player.pip-player .playing-from,
+  .audio-player.pip-player .player-window-actions,
+  .audio-player.pip-player .fullscreen-next,
+  .audio-player.pip-player .lyrics-next-stack,
+  .audio-player.pip-player .pip-scroll-area {
+    display: none;
+  }
+
+  .audio-player.pip-player .audio-track-copy strong {
+    font-size: 18px;
+  }
+
+  .audio-player.pip-player .audio-track-copy small {
+    font-size: 12px;
+    margin-top: 2px;
+  }
+
+  .audio-player.pip-player .pip-controls-sticky {
+    position: relative;
+    top: auto;
+    padding: 4px 8px;
+    background: color-mix(in srgb, var(--panel-strong) 45%, transparent);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-radius: 12px;
+  }
+
+  .audio-player.pip-player .player-progress {
+    height: 3px;
+    display: block;
+  }
+
+  .audio-player.pip-player .player-controls {
+    grid-template-columns: repeat(5, 1fr);
+    justify-items: center;
+  }
+
+  .audio-player.pip-player .player-controls button:first-child,
+  .audio-player.pip-player .player-controls button:last-child {
+    display: none;
+  }
+}
+
+/* ─── Automations page ─────────────────────────────────────────────────────── */
+
+.automations-view {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-card {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.automation-card-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.automation-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted, #888);
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.automation-form {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-form h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.automation-status-error {
+  color: var(--danger);
+}
+
+.automation-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 12px;
+  color: var(--muted, #888);
+  text-align: center;
+}
+
+/* ── Utility ─────────────────────────────────────────────────────────────── */
+.muted {
+  color: var(--muted);
+}
+
+/* ── Inspector removal (Settings / Discover) ─────────────────────────────── */
+.content-grid.no-inspector {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* ── Library: search bar (discover style) + bucket/expand row + page size ── */
+.library-search-bar {
+  margin-bottom: 8px;
+}
+
+.library-bucket-bar {
+  gap: 12px;
+}
+
+.library-control-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.bucket-row {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  gap: 1px;
+  min-width: 0;
+}
+
+.bucket-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 4px 2px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.1;
+  text-align: center;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.bucket-btn:hover {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.bucket-btn.active {
+  color: var(--accent);
+}
+
+.library-page-size-row {
+  margin-top: 8px;
+  border-bottom: 0;
+}
+
+.library-page-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.library-page-size select {
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 8px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+/* ── Security: sessions tree + API keys rows ─────────────────────────────── */
+.security-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.security-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--panel-strong);
+}
+
+.security-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.security-row-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+
+.security-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.current-badge {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.security-row .icon-button {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+}
+
+.security-create-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.security-key-input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+.security-new-key-reveal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.security-new-key-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--warn, #d08b16);
+}
+
+.security-new-key-row {
+  display: flex;
+  gap: 8px;
+}
+
+.security-secret-input {
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel);
+  color: var(--text);
+  font-family: monospace;
+}
+
+/* Sessions tree (Tools page) */
+.sessions-tree-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+}
+
+.sessions-tree-header h2 {
+  margin: 0;
+}
+
+.sessions-tree-header .muted-label {
+  margin-left: auto;
+}
+
+.sessions-list {
+  margin-top: 10px;
+}
+
+/* ── Automations: Trigger › Action › Notify builder ──────────────────────── */
+.automation-name-bar {
+  margin-bottom: 4px;
+}
+
+.automation-builder {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.automation-stage {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.automation-stage-head {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-strong);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.automation-stage-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+}
+
+.automation-stage-arrow {
+  align-self: center;
+  font-size: 22px;
+  color: var(--muted);
+}
+
+.automation-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.automation-field > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automation-field select,
+.automation-field input {
+  width: 100%;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 10px;
+  background: var(--panel-strong);
+  color: var(--text);
+}
+
+.automation-field-inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.automation-field-inline input {
+  width: auto;
+  height: auto;
+}
+
+.automation-stage-note {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.automation-builder-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+@media (max-width: 640px) {
+  .automation-builder {
+    flex-direction: column;
+  }
+  .automation-stage-arrow {
+    transform: rotate(90deg);
+  }
+}
+
+/* ── Home dashboard ───────────────────────────────────────────────────────── */
+.home-view {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 16px;
+}
+
+.home-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.home-section h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.home-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+/* ── Draggable home rows ───────────────────────────────────────────────── */
+.home-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.home-row-header h2 {
+  margin: 0;
+}
+
+.home-row-handle {
+  display: inline-flex;
+  padding: 2px;
+  color: var(--muted);
+  opacity: 0.35;
+  cursor: grab;
+  touch-action: none;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.home-row:hover .home-row-handle {
+  opacity: 1;
+}
+
+.home-row-handle:hover {
+  color: var(--text);
+}
+
+.home-row-handle:active {
+  cursor: grabbing;
+}
+
+.home-row.dragging {
+  opacity: 0.5;
+}
+
+.home-row.drop-target {
+  margin-top: -2px;
+  border-top: 2px solid var(--accent);
+}
+
+.home-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+}
+
+.home-album-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.album-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.album-card-art {
+  position: relative;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  cursor: pointer;
+}
+.album-card-art img { width: 100%; height: 100%; object-fit: cover; }
+.artist-card .album-card-art { border-radius: 50%; }
+.album-card-hover {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 120ms ease;
+  background: rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+.album-card-art:hover .album-card-hover,
+.album-card-art:focus-within .album-card-hover { opacity: 1; pointer-events: auto; }
+.album-card-play {
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  width: 44px; height: 44px;
+  border-radius: 50%;
+  border: 0;
+  display: grid; place-items: center;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+.album-card-queue, .album-card-pin {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 28px; height: 28px;
+  border-radius: 6px;
+  border: 0;
+  display: grid; place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  cursor: pointer;
+}
+/* Flank the centered play button on both album + artist cards, sitting a few
+   pixels farther out from it. */
+.album-card-pin { left: calc(18% - 3px); }
+.album-card-queue { right: calc(18% - 3px); }
+.album-card-pin.active { background: var(--accent); }
+.artist-detail-cover { border-radius: 50%; }
+.album-card-meta { display: flex; flex-direction: column; gap: 2px; cursor: pointer; min-width: 0; }
+.album-card-title { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.album-card-artist { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artist-card .album-card-meta { align-items: center; text-align: center; }
+.home-pinned-grid { margin-top: 12px; }
+
+.library-view-toggle {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: var(--panel-strong);
+}
+.library-view-toggle button {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 13px;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.library-view-toggle button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* The Tree/Grid toggle when Tracks is selected (its buttons are disabled) —
+   should read as deliberately locked, not broken. */
+.library-view-toggle.locked {
+  opacity: 0.5;
+}
+
+.library-view-toggle.locked button {
+  cursor: not-allowed;
+}
+
+/* ── Workspace tabs (Wishlist / Discover segmented control) ──────────────── */
+.workspace-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 0 8px;
+  margin: 0 0 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  border-radius: 5px;
+  padding: 6px 12px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.workspace-tabs button:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.workspace-tabs button.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.workspace-tabpanel {
+  min-width: 0;
+}
+
+.library-album-view { display: flex; flex-direction: column; gap: 14px; }
+.album-page-nav { display: inline-flex; align-items: center; gap: 8px; }
+
+.album-detail-overlay {
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.album-detail-head { display: flex; }
+.album-detail-hero { display: flex; gap: 20px; align-items: flex-end; }
+.album-detail-cover {
+  width: 200px; height: 200px;
+  flex: none;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  display: grid; place-items: center;
+  color: var(--muted);
+}
+.album-detail-cover img { width: 100%; height: 100%; object-fit: cover; }
+.album-detail-info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.album-detail-info h1 { margin: 0; }
+.album-detail-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.album-detail-tracks { display: flex; flex-direction: column; gap: 2px; }
+
+.home-album-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.home-album-art {
+  display: grid;
+  place-items: center;
+  aspect-ratio: 1 / 1;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel-strong);
+  color: var(--muted);
+}
+
+.home-album-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.home-album-title {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-album-artist {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.home-list li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.home-list-main {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.home-list-sub {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.play-history-list {
+  max-height: 420px;
+  overflow: auto;
+}
+
+.home-pin-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.home-pin-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 140px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-strong);
+  color: var(--text);
+  cursor: pointer;
+}
+
+@media (max-width: 640px) {
+  .home-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── Inspector: library top (30d) + section labels ────────────────────────── */
+.inspector-section-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.library-top-list {
+  margin: 6px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.library-top-row {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.library-top-row dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.library-top-row dd {
+  margin: 0;
+  font-size: 13px;
+}
+
+.row-icon-button.active {
+  color: var(--accent);
+}
+
+/* ── Sessions row actions ─────────────────────────────────────────────────── */
+.session-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ── Automation: definitive target picker ─────────────────────────────────── */
+.automation-selected {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.automation-selected-name {
+  flex: 1;
+  min-width: 0;
+  padding: 0 4px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-selected .icon-button {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+}
+
+.automation-search {
+  position: relative;
+}
+
+.automation-search-results {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.automation-search-result {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.automation-search-result:hover {
+  background: var(--accent-soft);
+}
+
+.row-icon-button.queued-flash { color: var(--accent); }
+.album-card-queue.queued-flash { background: var(--accent); color: #fff; }
+
+.home-list li.home-list-row { display: flex; flex-direction: row; align-items: center; justify-content: space-between; gap: 8px; }
+.home-list-text { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
+.home-list-text-play { cursor: pointer; }
+.home-list-text-play:hover .home-list-main { color: var(--accent); }
+.home-list-actions { display: flex; gap: 2px; flex: none; opacity: 0; transition: opacity 120ms ease; }
+.home-list-row:hover .home-list-actions,
+.home-list-row:focus-within .home-list-actions { opacity: 1; }
+
+.home-pin-card-wrap { position: relative; display: inline-flex; }
+.home-pin-card-wrap .home-pin-unpin {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+.home-pin-card-wrap:hover .home-pin-unpin,
+.home-pin-card-wrap:focus-within .home-pin-unpin { opacity: 1; }
+
+/* Podcasts */
+.podcasts-view { display: flex; flex-direction: column; gap: 16px; padding: 16px; }
+.podcast-library-grid { align-items: start; }
+.podcast-empty { min-height: 240px; display: grid; place-items: center; align-content: center; gap: 8px; text-align: center; }
+.podcast-empty svg { color: var(--accent); }
+.podcast-detail { gap: 22px; }
+.podcast-detail .album-detail-hero { align-items: center; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+.podcast-detail .album-detail-info { gap: 6px; }
+.podcast-detail .podcast-description { max-width: 720px; margin: 6px 0 0; line-height: 1.45; }
+.podcast-detail .album-detail-tracks { gap: 0; }
+.podcast-episode-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.podcast-episode-row:hover { background: var(--panel-strong); }
+.podcast-episode-main { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
+.podcast-episode-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.podcast-episode-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.podcast-episode-meta { font-size: 12px; }
+.podcast-episode-actions { display: flex; gap: 4px; flex: none; }
+.podcast-progress { height: 4px; border-radius: 2px; background: var(--panel-strong); overflow: hidden; margin-top: 4px; max-width: 320px; }
+.podcast-progress-fill { height: 100%; background: var(--accent); }
+.podcast-played { color: var(--accent); flex: none; }
+.podcast-inspector-policy { display: grid; gap: 10px; }
+.podcast-inspector-policy label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+.podcast-inspector-policy select,
+.podcast-inspector-policy input[type="number"] { width: 100%; min-height: 34px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-strong); color: var(--text); padding: 0 9px; }
+.podcast-inspector-policy .podcast-inspector-check { display: flex; align-items: center; gap: 7px; color: var(--text); }
+.podcast-inspector-check input { accent-color: var(--accent); }
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.68);
+  backdrop-filter: blur(5px);
+}
+.podcast-add-dialog {
+  width: min(660px, 100%);
+  max-height: min(760px, calc(100vh - 40px));
+  overflow: auto;
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.5);
+}
+.dialog-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.dialog-title-row h2 { margin: 0 0 3px; }
+.dialog-title-row p { margin: 0; }
+.podcast-source-toggle { width: fit-content; }
+.podcast-source-toggle button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; }
+.podcast-download-policy { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.podcast-download-policy select,
+.podcast-download-policy input,
+.podcast-rss-form input { min-height: 36px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel-strong); color: var(--text); padding: 0 10px; }
+.podcast-download-policy input { width: 84px; }
+.podcast-search-field { display: flex; align-items: center; gap: 8px; min-height: 40px; border: 1px solid var(--line); border-radius: 5px; padding: 0 10px; background: var(--panel-strong); }
+.podcast-search-field svg { color: var(--muted); flex: none; }
+.podcast-search-field input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); }
+.podcast-search-results { min-height: 120px; display: grid; align-content: start; }
+.podcast-search-row { display: flex; align-items: center; gap: 10px; padding: 9px 2px; border-bottom: 1px solid var(--line); }
+.podcast-search-icon { width: 38px; height: 38px; flex: none; display: grid; place-items: center; border-radius: 6px; background: var(--panel-strong); color: var(--accent); }
+.podcast-search-copy { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.podcast-search-copy strong,
+.podcast-search-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.podcast-search-copy a { color: var(--accent); font-size: 11px; }
+.podcast-rss-form { display: grid; gap: 12px; }
+.podcast-rss-form label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+.podcast-rss-form button { justify-self: end; }
+
+@media (max-width: 640px) {
+  .podcast-detail .album-detail-hero { align-items: flex-start; }
+  .podcast-detail .album-detail-cover { width: 128px; height: 128px; }
+  .podcast-episode-row { align-items: flex-start; }
+  .podcast-search-row { align-items: flex-start; flex-wrap: wrap; }
+  .podcast-search-row > button { margin-left: 48px; }
+  .podcast-download-policy { flex-wrap: wrap; }
+  .attribution-row { align-items: flex-start; flex-direction: column; gap: 4px; }
+}
+
+/* Cover-candidate picker — the server searched its art sources and returned external URLs; the
+   grid exists because the first result is frequently the wrong pressing. Picking one posts it to
+   /cover-from-url so the server downloads and stores it. */
+.cover-candidate-dialog {
+  width: min(720px, 100%);
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: 20px;
+  border-radius: 14px;
+  background: var(--panel, #16181d);
+  border: 1px solid var(--border, #2a2d35);
+}
+.cover-candidate-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.cover-candidate {
+  position: relative;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 10px;
+  overflow: hidden;
+  background: none;
+  cursor: pointer;
+  aspect-ratio: 1;
+}
+.cover-candidate:hover:not(:disabled) { border-color: var(--accent, #356df3); }
+.cover-candidate:disabled { cursor: default; opacity: 0.6; }
+.cover-candidate img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.cover-candidate-busy {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+}
+
+/* The idle remote dock sits in the docked player's slot and reports the same height, so it inherits
+   that layout wholesale. Only the identity marker differs: this row describes another device, and
+   without a visible distinction it would read as local playback. */
+.remote-dock .player-art {
+  display: grid;
+  place-items: center;
+  color: var(--muted, #6b7078);
+  background: color-mix(in srgb, var(--accent, #356df3) 12%, var(--panel-strong, #fff));
+}
+
+.remote-dock .player-art img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+/* Swept by an interpolated clock rather than stepped once per poll, so it reads as playback. */
+.remote-dock-progress {
+  margin-top: 4px;
+  height: 3px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--text, #202124) 16%, transparent);
+  overflow: hidden;
+}
+
+.remote-dock-progress span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent, #356df3);
+  transition: width 0.5s linear;
+}
+
+.remote-dock .player-buttons {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+}
+
+/* Right-click menus, for rows and cards across the app. Rendered through a portal so a row inside
+   a scrolling, overflow-clipped list can't crop them — but the portal target is the themed app
+   root (`main.app`), never document.body: every colour below is a custom property defined there,
+   and outside it `var(--panel-strong)` resolves to nothing, which leaves the menu see-through.
+
+   The background is deliberately opaque. A menu floats over album art and dense tree rows, and a
+   translucent one is unreadable against both.
+
+   ⚠ NO PANEL SCROLLS, at any depth — never add a max-height or an overflow rule here. A choice you
+   have to scroll to find is a choice you don't know you have, so a long list is a submenu off one
+   row, and a panel too tall for the window pages instead of growing past it (ContextMenuPanel).
+   Position and page size are set inline from the measured row height. */
+.context-menu {
+  position: fixed;
+  z-index: 3000;
+  width: 220px;
+  padding: 6px 0;
+  border-radius: 10px;
+  border: 1px solid var(--line, #d6d8dc);
+  background: var(--panel-strong, #ffffff);
+  color: var(--text, #202124);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.32);
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 14px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* Long playlist names truncate rather than widening the menu past its fixed column width. */
+.context-menu-label {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.context-menu-chevron {
+  flex: 0 0 auto;
+  opacity: 0.55;
+}
+
+/* The parent row stays highlighted while its submenu is open, so it reads as the way back. */
+.context-menu-item.open {
+  background: color-mix(in srgb, var(--accent, #356df3) 18%, var(--panel-strong, #ffffff));
+}
+
+/* A paged panel is pinned to one height (set inline) so the frame stays put and only its contents
+   swap. The body flexes, so the slack on a short last page sits below the items rather than moving
+   the paging rows. Still no overflow: the page size was measured to fit. */
+.context-menu-paged {
+  display: flex;
+  flex-direction: column;
+}
+
+.context-menu-paged .context-menu-body {
+  flex: 1 1 auto;
+}
+
+/* Paging rows are navigation, not choices — quieter than the items they move between. */
+.context-menu-page {
+  color: var(--muted, #6b7078);
+  font-size: 12px;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent, #356df3) 18%, var(--panel-strong, #ffffff));
+}
+
+.context-menu-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.context-menu-item.danger {
+  color: var(--danger, #b3404a);
+}
+
+.context-menu-item.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--danger, #b3404a) 16%, var(--panel-strong, #ffffff));
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 5px 0;
+  background: var(--line, #d6d8dc);
+}
+
+.context-menu-header {
+  padding: 4px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+}

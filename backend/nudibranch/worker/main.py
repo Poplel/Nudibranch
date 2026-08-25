@@ -1,0 +1,9808 @@
+import asyncio
+import hashlib
+import json
+import re
+import shutil
+import subprocess
+import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
+from pathlib import Path
+
+import httpx
+from sqlalchemy import func, select, update
+from sqlalchemy.orm import Session, selectinload
+
+from nudibranch import __version__
+from nudibranch.core.config import get_settings
+from nudibranch.db.init import init_db
+from nudibranch.db.models import LIBRARY_DELETION_RETENTION, Album, AppSetting, Artist, Episode, PlaybackHandoff, LibraryDeletion, Notification, Playlist, PlaylistTrack, Podcast, PodcastNotificationPref, ProposalBatch, ProposalItem, ProposalKind, ProposalStatus, Task, TaskStatus, Track, User, WishlistItem
+from nudibranch.services import podcasts as podcast_service
+from nudibranch.db.session import SessionLocal
+from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
+from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
+from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
+from nudibranch.services.notifications import create_notification, deliver_apns_notifications
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
+from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
+from nudibranch.services.app_log import write_app_log
+from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
+from nudibranch.services.settings_store import integration_settings, integration_value
+from nudibranch.services.acoustid import audio_matches_claim
+from nudibranch.services import content_verify
+from nudibranch.services.content_verify import verify_audio_content
+from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
+from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
+
+
+MAX_DOWNLOAD_AUTO_RETRIES = 5
+ZERO_PROGRESS_RETRY_SECONDS = 90
+STALLED_PROGRESS_RETRY_SECONDS = 150
+MISSING_TRANSFER_RETRY_SECONDS = 45
+RECENT_TRANSFER_DISAPPEARED_RETRY_SECONDS = 10
+COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
+QUEUED_TRANSFER_RETRY_SECONDS = 45
+REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
+DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
+MAX_TASK_ATTEMPTS = 4
+AUTOMATION_TICK_SECONDS = 30
+PENDING_PLAYLIST_TICK_SECONDS = 45
+# How often every Jellyfin-linked user's playlists are reconciled in the background, so a
+# playlist created or edited directly in Jellyfin shows up without a client asking. Each pass is
+# 1 + N Jellyfin calls per linked user, so this is minutes, not seconds — the same reconcile also
+# runs on every /playlists read, which covers anyone actually looking at the screen.
+PLAYLIST_MIRROR_TICK_SECONDS = 300
+# Auto-scan every subscribed podcast feed for new episodes once a day. A user who wants a faster
+# cadence adds a time/interval automation with the "scan-podcasts" tool (enqueues podcast_scan).
+PODCAST_SCAN_TICK_SECONDS = 86400
+# Prune library deletion tombstones once a day.  They only exist to let `/library/changes` report
+# deletions to offline clients; past LIBRARY_DELETION_RETENTION a client is told to full-resync
+# instead, so keeping them longer just grows the table.
+DELETION_PRUNE_TICK_SECONDS = 86400
+AUTOMATION_EVENT_SESSION_KEY = "nudibranch:automation-events"
+
+
+def expire_stale_handoffs(session: Session) -> int:
+    """Reclaim the bytes of handoffs nobody collected, and forget old ones entirely.
+
+    ⚠ This is housekeeping, not enforcement. `GET /player/handoffs/{id}` expires a stale handoff at
+    READ time, so a payload can never be adopted late even if this never runs. That is why it can sit
+    on the daily tick instead of needing one of its own — the sweep that used to run here every 30
+    seconds is exactly the pattern being avoided.
+    """
+    now = datetime.now(timezone.utc)
+    expired = session.execute(
+        update(PlaybackHandoff)
+        .where(PlaybackHandoff.status == "pending", PlaybackHandoff.expires_at < now)
+        .values(status="expired", payload_json=None, resolved_at=now)
+    ).rowcount or 0
+    session.query(PlaybackHandoff).filter(
+        PlaybackHandoff.created_at < now - timedelta(hours=24)
+    ).delete(synchronize_session=False)
+    return expired
+
+
+def queue_automation_event(session: Session, event: str) -> None:
+    """Coalesce an event until the current unit of work has committed successfully."""
+    events = session.info.setdefault(AUTOMATION_EVENT_SESSION_KEY, set())
+    events.add(event)
+
+
+def discard_queued_automation_events(session: Session) -> None:
+    """Drop coalesced events whose source work rolled back.
+
+    `session.info` survives `session.rollback()`, so without this an event queued by work that
+    then failed would linger and fire on the NEXT successful unit — announcing a download/wishlist
+    match that never actually committed. Call this from every rollback path.
+    """
+    session.info.pop(AUTOMATION_EVENT_SESSION_KEY, None)
+
+
+def fire_queued_automation_events(session: Session) -> None:
+    """Fire coalesced event automations after their originating work is durable."""
+    events = sorted(session.info.pop(AUTOMATION_EVENT_SESSION_KEY, set()))
+    if not events:
+        return
+    from nudibranch.services.automations import fire_event_automations
+
+    for event in events:
+        try:
+            fired = fire_event_automations(session, event)
+            if fired:
+                append_task_log(session, None, f"Automation event '{event}' fired {fired} automation(s)")
+        except Exception as error:  # noqa: BLE001 - an automation must never fail its source work.
+            session.rollback()
+            append_task_log(session, None, f"Automation event '{event}' failed: {error}", "error")
+
+
+
+def _upsert_setting(session: Session, key: str, value: str) -> None:
+    setting = session.get(AppSetting, key)
+    if setting:
+        setting.value = value
+    else:
+        session.add(AppSetting(key=key, value=value))
+REPLACEMENT_SEARCH_RETRY_SECONDS = 15
+TRANSFER_COMPLETE_PERCENT = 99.5
+DOWNLOAD_MANIFEST_ACTIVE_STATUSES = {"queued", "downloading", "retrying", "staged", "verifying", "verified", "failed"}
+DOWNLOAD_MANIFEST_FINISHED_STATUSES = {"completed", "rejected", "rejected_removed"}
+DOWNLOAD_MANIFEST_STAGING_STATUSES = {"staged", "verifying", "verified"}
+DOWNLOAD_SLOT_STATUSES = {"queued", "downloading"}
+DOWNLOAD_SLOT_STALE_SECONDS = 75
+DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
+# Recall-favoring matching: every candidate is reviewed before anything downloads, so we surface
+# more and let the user reject. Trust is anchored on title + duration, not on the artist appearing in
+# the (often artist-less) remote folder path. The exact numbers live in services/match_tuning.py and
+# are admin-editable in Settings → Download matching.
+SLSKD_TRACK_SEARCH_WORKERS = 1
+SLSKD_TRACK_QUERY_LIMIT = 6
+SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 15
+SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 8
+SLSKD_ALBUM_SEARCH_POLL_INTERVAL = 1.0
+LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
+# Live match tuning (weights, floors, penalties), refreshed from the admin-editable match_tuning
+# config at each search entry point (single worker, sequential tasks → safe as module state). The
+# scorer reads these without threading a session. See services/match_tuning.py.
+_match_tuning: dict[str, float] = dict(MATCH_TUNING_DEFAULTS)
+# Whether .m4a (AAC/ALAC) files may be downloaded. Admin-editable in Settings → Integrations
+# (allow_m4a_downloads). Refreshed alongside _match_tuning at each search entry point so the
+# session-less candidate filters honour it. Default True = no behaviour change.
+_allow_m4a_downloads: bool = True
+# Whether a track with no usable Soulseek candidate may fall back to a yt-dlp/YouTube download.
+# Admin-editable in Settings → Integrations (allow_ytdlp_fallback). Default OFF: Soulseek only,
+# FLAC preferred then other formats then fail (needs attention) — an admin opts in explicitly.
+# When on, every yt-dlp fallback site (both the review-gated "YouTube fallback" candidate row AND
+# the auto-executing exhausted-retries fallback) is allowed; when off they're all skipped.
+# Refreshed alongside _match_tuning at each search entry point.
+_allow_ytdlp_fallback: bool = False
+DOWNLOAD_VERSION_WORDS = {
+    "acapella",
+    "acoustic",
+    "clean",
+    "demo",
+    "edit",
+    "instrumental",
+    "karaoke",
+    "live",
+    "remaster",
+    "remastered",
+    "remix",
+    "sped",
+    "slowed",
+}
+JUNK_ARTIST_SEGMENTS = {"unknown", "unknown artist", "various artists", "various", "va", "soundtrack"}
+TEXT_SEARCH_ALTERNATIVES: list[tuple[str, tuple[str, ...]]] = [
+    ("&", ("and",)),
+    ("@", ("at",)),
+    ("#", ("number", "no")),
+    ("%", ("percent",)),
+    ("*", ("star",)),
+    ("★", ("star",)),
+    ("☆", ("star",)),
+    ("♥", ("heart",)),
+    ("+", ("plus",)),
+    ("÷", ("divide", "division")),
+    ("×", ("multiply", "times")),
+    ("=", ("equals",)),
+    ("°", ("degree",)),
+    ("½", ("half",)),
+    ("¼", ("quarter",)),
+    ("¾", ("three quarters",)),
+    ("$", ("dollar",)),
+    ("€", ("euro",)),
+    ("£", ("pound",)),
+    ("¥", ("yen",)),
+    ("∞", ("infinity",)),
+    ("0", ("zero",)),
+    ("1", ("one",)),
+    ("2", ("two",)),
+    ("3", ("three",)),
+    ("4", ("four",)),
+    ("5", ("five",)),
+    ("6", ("six",)),
+    ("7", ("seven",)),
+    ("8", ("eight",)),
+    ("9", ("nine",)),
+    ("10", ("ten",)),
+    ("11", ("eleven",)),
+    ("12", ("twelve",)),
+    ("13", ("thirteen",)),
+    ("14", ("fourteen",)),
+    ("15", ("fifteen",)),
+    ("16", ("sixteen",)),
+    ("17", ("seventeen",)),
+    ("18", ("eighteen",)),
+    ("19", ("nineteen",)),
+    ("20", ("twenty",)),
+    ("30", ("thirty",)),
+    ("40", ("forty",)),
+    ("50", ("fifty",)),
+    ("60", ("sixty",)),
+    ("70", ("seventy",)),
+    ("80", ("eighty",)),
+    ("90", ("ninety",)),
+    ("100", ("one hundred", "hundred")),
+]
+
+
+def run_propose_import(session: Session, payload: dict, task: Task | None = None) -> dict:
+    files = payload.get("files")
+    if files is None:
+        files = discover_import_files(payload.get("path"))
+    download_requests = payload.get("download_requests") or []
+    if not files and not download_requests:
+        raise ValueError("No import files or downloads were selected")
+    batch_title = "Import folder review"
+    if download_requests and not files:
+        batch_title = "Import/Add download review"
+    elif download_requests:
+        batch_title = "Import/Add review"
+    elif files and all(str(file_info.get("path") or "").startswith(str(get_settings().downloads_path)) for file_info in files):
+        batch_title = "Downloaded files review"
+    batch_kind = ProposalKind.download if download_requests and not files else ProposalKind.import_files
+    tree_path = "/task-queue" if batch_kind == ProposalKind.download else "/app/import"
+    batch = ProposalBatch(title=batch_title, kind=batch_kind, tree_path=tree_path)
+    session.add(batch)
+    session.flush()
+
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+
+    for file_info in files:
+        metadata = file_info["metadata"]
+        artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+        album = metadata.get("album") or "Unknown Album"
+        track_title = metadata.get("title") or file_info["relative_path"]
+        artist_item = artist_items.get(artist)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+
+        album_key = (artist, album)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album,
+                kind=ProposalKind.import_files,
+                payload_json=json.dumps({"artist": artist, "album": album}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=track_title,
+            kind=ProposalKind.import_files,
+            old_value=file_info["path"],
+            new_value=file_info["suggested_library_path"],
+            payload_json=json.dumps(file_info),
+        )
+        session.add(track_item)
+        session.flush()
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=track_item.id,
+                title=f"Write metadata for {track_title}",
+                kind=ProposalKind.metadata,
+                old_value=file_info["relative_path"],
+                new_value=json.dumps(metadata),
+                payload_json=json.dumps(
+                    {
+                        "source_path": file_info["path"],
+                        "size_bytes": file_info["size_bytes"],
+                        "mtime_ns": file_info["mtime_ns"],
+                        "metadata": metadata,
+                    }
+                ),
+            )
+        )
+    download_candidates = 0
+    if download_requests:
+        download_candidates = add_download_candidate_review_items(
+            session,
+            batch,
+            download_requests,
+            artist_items,
+            album_items,
+            task,
+        )
+    create_notification(
+        session,
+        title="Import review ready",
+        body=f"{len(files)} files and {len(download_requests)} downloads with {download_candidates} candidates were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"batch_id": batch.id, "files": len(files), "downloads": len(download_requests), "download_candidates": download_candidates}
+
+
+def add_download_candidate_review_items(
+    session: Session,
+    batch: ProposalBatch,
+    download_requests: list[dict],
+    artist_items: dict[str, ProposalItem],
+    album_items: dict[tuple[str, str], ProposalItem],
+    task: Task | None = None,
+) -> int:
+    configure_match_tuning(session)
+    parent_kind = ProposalKind.download if batch.kind == ProposalKind.download else ProposalKind.import_files
+    grouped: dict[tuple[str, str], list[tuple[dict, ProposalItem]]] = {}
+    for request in download_requests:
+        artist = request.get("artist") or "Unknown Artist"
+        album = request.get("album") or "Unknown Album"
+        title = request.get("track") or request.get("title") or "Unknown Track"
+        existing = find_library_track(session, artist, album, title)
+        # A request with no specific album (playlist track / Singles / unknown) just wants the
+        # SONG, so skip the download if it already exists under ANY album (matched on
+        # artist+title). It still gets added to a playlist from the library copy via the
+        # pending-playlist resolver. (Real album downloads keep the album-strict check above.)
+        req_album = (request.get("album") or "").strip().lower()
+        if not existing and (request.get("playlist_name") or req_album in {"", "singles", "unknown album"}):
+            existing = library_track_by_artist_title(session, artist, title)
+        if existing:
+            append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping download", "info")
+            continue
+        artist_item = artist_items.get(artist)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist,
+                kind=parent_kind,
+                payload_json=json.dumps({"artist": artist, "status": "searching candidates"}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+        album_key = (artist, album)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album,
+                kind=parent_kind,
+                payload_json=json.dumps({"artist": artist, "album": album, "status": "searching candidates"}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=title,
+            kind=ProposalKind.download,
+            old_value="download request",
+            payload_json=json.dumps(
+                {
+                    "kind": "track",
+                    "artist": artist,
+                    "album": album,
+                    "track": title,
+                    "status": "searching candidates",
+                }
+            ),
+        )
+        session.add(track_item)
+        session.flush()
+        grouped.setdefault(album_key, []).append((normalize_download_request(request, artist, album, title), track_item.id, title))
+    session.commit()
+
+    total_tracks = max(1, len(download_requests))
+    completed = 0
+    candidates_added = 0
+    for (artist, album), track_items in grouped.items():
+        requests = [request for request, _track_item_id, _track_title in track_items]
+        folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
+        # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
+        # matches arbitrary same-artist folders for the wrong songs) and search per-track directly.
+        if is_singles_pseudo_album(album):
+            append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+            pools = []
+        else:
+            append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
+            pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit)
+            if pools:
+                append_task_log(session, task, f"{artist} / {album}: using {len(pools)} ranked album folder(s) for candidates")
+            else:
+                append_task_log(session, task, f"{artist} / {album}: no album folder candidates found; track searches skipped for album workflow", "warning")
+        missing_track_jobs: list[tuple[dict, ProposalItem, str, int]] = []
+        for request, track_item_id, track_title in track_items:
+            track_item = session.get(ProposalItem, track_item_id)
+            if not track_item:
+                append_task_log(session, task, f"{track_title}: skipped candidate preparation because the review row was removed", "warning")
+                completed += 1
+                continue
+            query = download_query(request)
+            candidates = candidates_from_folder_pools(pools, request, limit=5)
+            if candidates:
+                add_download_candidate_items(session, batch, track_item, request, query, candidates)
+                candidates_added += len(candidates)
+                set_item_payload_status(track_item, f"{len(candidates)} candidates ready")
+                append_task_log(session, task, f"{track_title}: {len(candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s)")
+            elif any(r.get("workflow") == "lossless_replacement" for r in requests):
+                # Lossless replacement exists to UPGRADE to lossless — never pull a lossy per-track
+                # copy for it. If no lossless album folder matched, dead-end to the YouTube fallback
+                # (unless yt-dlp fallback is disabled, in which case this just needs attention).
+                set_item_payload_status(track_item, "no album-folder track match" if pools else "no album folder candidates found")
+                if ytdlp_fallback_allowed():
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
+                    append_task_log(session, task, f"{track_title}: no lossless match in the album folder(s) — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
+                else:
+                    set_item_payload_status(track_item, "no candidates found")
+                    # A dead end: no candidate to approve and no fallback queued. `payload_json`'s
+                    # "status" string is display-only — the client's Task Queue keeps a row by its
+                    # real `status` column (`failed`/`executing`, or an `action` in the payload), so
+                    # a pending item with neither is pruned as empty and the whole batch vanishes.
+                    track_item.status = ProposalStatus.failed
+                    append_task_log(session, task, f"{track_title}: no lossless match in the album folder(s) and YouTube fallback is disabled — needs attention", "warning")
+            else:
+                # Not matched inside an album folder — whether the album-folder search found folders but
+                # not THIS track, or found no folders at all — run the per-track search that works in
+                # isolation (FLAC-first). add_track_search_candidate_items only drops to YouTube when the
+                # individual search also finds nothing. This is why "Queen St" found 5 FLAC candidates on
+                # its own while the album-level pass reported "no candidates". Every unmatched track gets
+                # its own search now (was gated to single-track / non-lossless albums and dead-ended the
+                # rest straight to YouTube).
+                set_item_payload_status(track_item, "searching track candidates")
+                missing_track_jobs.append((request, track_item, query, 5))
+            completed += 1
+            if task is not None:
+                update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
+        if missing_track_jobs:
+            candidates_added += add_track_search_candidate_items(session, batch, missing_track_jobs, task)
+        if (artist, album) in album_items:
+            set_item_payload_status(album_items[(artist, album)], "candidate review ready")
+        if artist in artist_items:
+            set_item_payload_status(artist_items[artist], "candidate review ready")
+        session.commit()
+    session.flush()
+    return candidates_added
+
+
+def normalize_download_request(request: dict, artist: str, album: str, title: str) -> dict:
+    return {
+        **request,
+        "artist": artist,
+        "album": album,
+        "track": title,
+        "track_number": request.get("track_number"),
+        "disc_number": request.get("disc_number"),
+        "duration_ms": request.get("duration_ms") or request.get("length"),
+        "musicbrainz_album_id": request.get("musicbrainz_album_id"),
+        "musicbrainz_recording_id": request.get("musicbrainz_recording_id"),
+        "replace_track_id": request.get("replace_track_id"),
+        "replace_path": request.get("replace_path"),
+        "require_lossless": request.get("require_lossless"),
+        "workflow": request.get("workflow"),
+    }
+
+
+def add_track_search_candidate_items(
+    session: Session,
+    batch: ProposalBatch,
+    jobs: list[tuple[dict, ProposalItem, str, int]],
+    task: Task | None = None,
+) -> int:
+    if not jobs:
+        return 0
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    added = 0
+    prepared_jobs = []
+    for request, track_item, query, limit in jobs:
+        payload = json.loads(track_item.payload_json or "{}")
+        track_title = payload.get("track") or track_item.__dict__.get("title") or download_query(request)
+        prepared_jobs.append((request, track_item.id, track_title, query, limit))
+    workers = min(SLSKD_TRACK_SEARCH_WORKERS, len(prepared_jobs))
+    append_task_log(session, task, f"Searching {len(prepared_jobs)} track candidate set(s) with {workers} worker(s)")
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, {**request, "multiple_candidates": True}, limit): (request, track_item_id, track_title, query)
+            for request, track_item_id, track_title, query, limit in prepared_jobs
+        }
+        for future in as_completed(futures):
+            request, track_item_id, track_title, query = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:  # noqa: BLE001 - one failed search should leave the rest of the review usable.
+                result = {"candidates": [], "diagnostics": {"query_logs": [f"slskd track search failed for {query}: {error}"]}}
+            for line in result.get("diagnostics", {}).get("query_logs") or []:
+                append_task_log(session, task, line)
+            track_item = session.get(ProposalItem, track_item_id)
+            if not track_item:
+                append_task_log(session, task, f"{track_title}: skipped candidate results because the review row was removed", "warning")
+                continue
+            candidates = result.get("candidates") or []
+            if candidates:
+                add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
+                added += len(candidates[:5])
+                set_item_payload_status(track_item, f"{len(candidates[:5])} candidates ready")
+                append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
+            else:
+                rate_limited = bool(result.get("diagnostics", {}).get("rate_limited"))
+                status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidates found"
+                set_item_payload_status(track_item, status)
+                if rate_limited:
+                    append_task_log(session, task, f"{track_title}: {status}", "warning")
+                elif ytdlp_fallback_allowed():
+                    add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
+                    append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
+                else:
+                    # See the identical comment in create_album_download_candidate_batch's
+                    # sibling dead-end: without this the row is invisible in the app.
+                    track_item.status = ProposalStatus.failed
+                    append_task_log(session, task, f"{track_title}: Soulseek found no candidates and YouTube fallback is disabled — needs attention", "warning")
+            session.commit()
+    return added
+
+
+def is_singles_pseudo_album(album: str) -> bool:
+    """A 'Singles'/empty/unknown album isn't a real album folder. Searching slskd for an album
+    folder named that matches arbitrary same-artist folders (wrong songs), so these go straight to
+    per-track search."""
+    return fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
+
+
+def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
+    batch_id = payload["batch_id"]
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise ValueError("Proposal batch not found")
+    batch.status = ProposalStatus.executing
+    append_task_log(session, task, f"Executing proposal batch {batch.title} ({batch.id})")
+    approved_roots = {item.id for item in batch.items if item.selected and item.status == ProposalStatus.approved}
+    if approved_roots:
+        approved_ids = item_ids_with_descendants(batch.items, approved_roots)
+        for item in batch.items:
+            if item.id in approved_ids and item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
+                item.status = ProposalStatus.approved
+        append_task_log(session, task, f"Expanded {len(approved_roots)} approved selections to {len(approved_ids)} selected descendants")
+    selected_items = [
+        item
+        for item in batch.items
+        if item.selected and item.status == ProposalStatus.approved
+    ]
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    executable_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.import_files and item.old_value and item.new_value
+    ]
+    metadata_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.metadata and json.loads(item.payload_json or "{}").get("target_type")
+    ]
+    file_action_items = [
+        item
+        for item in selected_items
+        if item.kind in {ProposalKind.delete, ProposalKind.file_move} and json.loads(item.payload_json or "{}").get("action")
+    ]
+    playlist_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.playlist and json.loads(item.payload_json or "{}").get("action")
+    ]
+    download_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.download and json.loads(item.payload_json or "{}").get("action")
+    ]
+    wishlist_download_items = [
+        item for item in download_items if json.loads(item.payload_json or "{}").get("action") == "wishlist_request"
+    ]
+    direct_download_items = [
+        item for item in download_items if json.loads(item.payload_json or "{}").get("action") != "wishlist_request"
+    ]
+    if direct_download_items:
+        batch.kind = ProposalKind.download
+        batch.tree_path = "/downloads"
+        append_task_log(session, task, f"{batch.title}: selected candidates moved to Downloads for transfer and verification")
+    lyrics_items = [
+        item
+        for item in selected_items
+        if item.kind == ProposalKind.lyrics and json.loads(item.payload_json or "{}").get("action")
+    ]
+    progress_items = executable_items + metadata_items + file_action_items + playlist_items + wishlist_download_items[:1] + direct_download_items + lyrics_items
+    progress_total = max(1, len(progress_items))
+    progress_current = 0
+    append_task_log(
+        session,
+        task,
+        (
+            f"Selected work: {len(executable_items)} imports, {len(metadata_items)} metadata changes, "
+            f"{len(file_action_items)} file actions, {len(playlist_items)} playlist changes, "
+            f"{len(wishlist_download_items)} wishlist download requests, {len(direct_download_items)} direct downloads, "
+            f"{len(lyrics_items)} lyric actions"
+        ),
+    )
+
+    def note_progress(message: str, item: ProposalItem | None = None) -> None:
+        nonlocal progress_current
+        if item is not None:
+            item.status = ProposalStatus.executing
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, message)
+        else:
+            session.commit()
+
+    def finish_progress_step(message: str) -> None:
+        nonlocal progress_current
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, message)
+        else:
+            session.commit()
+
+    def skip_unchanged(item: ProposalItem) -> bool:
+        session.refresh(item)
+        if not item.selected or item.status not in {ProposalStatus.approved, ProposalStatus.executing}:
+            nonlocal skipped
+            skipped += 1
+            return True
+        return False
+
+    note_progress(f"Preparing {len(progress_items)} selected changes")
+
+    if not progress_items:
+        errors.append("No approved executable changes were selected.")
+        append_task_log(session, task, "No executable selected changes were found in the approved batch", "warning")
+    elif batch.kind == ProposalKind.import_files and not executable_items and not download_items:
+        errors.append("No approved import file operations were selected.")
+
+    # Import wizard files: import a whole album together and commit once per album so tracks are
+    # not added to the library one at a time.
+    executable_albums: dict[str, list[ProposalItem]] = {}
+    for item in executable_items:
+        if skip_unchanged(item):
+            continue
+        executable_albums.setdefault(str(Path(item.new_value).parent), []).append(item)
+    for album_path, album_items in executable_albums.items():
+        album_label = Path(album_path).name or "album"
+        note_progress(f"Importing {len(album_items)} track(s) from {album_label}")
+        album_imported = 0
+        for item in album_items:
+            try:
+                import_track_item(session, item)
+                item.status = ProposalStatus.completed
+                imported += 1
+                album_imported += 1
+            except Exception as error:  # noqa: BLE001 - keep importing the rest of the album.
+                item.status = ProposalStatus.failed
+                errors.append(f"{item.title}: {error}")
+            progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, f"Imported {album_imported}/{len(album_items)} track(s) from {album_label}")
+        else:
+            session.commit()
+
+    metadata_updated = 0
+    for item in metadata_items:
+        if skip_unchanged(item):
+            continue
+        try:
+            note_progress(f"Applying metadata for {item.title}", item)
+            apply_metadata_item(session, item)
+            item.status = ProposalStatus.completed
+            metadata_updated += 1
+            finish_progress_step(f"Updated metadata for {item.title}")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Metadata failed for {item.title}")
+
+    file_actions = 0
+    for item in file_action_items:
+        if skip_unchanged(item):
+            continue
+        try:
+            note_progress(f"Handling file action for {item.title}", item)
+            apply_file_action_item(session, item)
+            item.status = ProposalStatus.completed
+            file_actions += 1
+            finish_progress_step(f"Handled file action for {item.title}")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"File action failed for {item.title}")
+
+    playlist_changes = 0
+    for item in playlist_items:
+        if skip_unchanged(item):
+            continue
+        try:
+            note_progress(f"Updating playlist item {item.title}", item)
+            apply_playlist_item(session, item)
+            item.status = ProposalStatus.completed
+            playlist_changes += 1
+            finish_progress_step(f"Updated playlist item {item.title}")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Playlist update failed for {item.title}")
+
+    download_changes = 0
+    download_errors: list[str] = []
+    if wishlist_download_items:
+        try:
+            note_progress("Preparing download candidates", wishlist_download_items[0])
+            process_wishlist_request_items(session, wishlist_download_items, task)
+            for wishlist_item in wishlist_download_items:
+                wishlist_item.status = ProposalStatus.completed
+            download_changes += len(wishlist_download_items)
+            finish_progress_step("Download candidates created")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            for wishlist_item in wishlist_download_items:
+                wishlist_item.status = ProposalStatus.failed
+            errors.append(f"Download search: {error}")
+            finish_progress_step("Download candidate search failed")
+
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
+    for item in direct_download_items:
+        if skip_unchanged(item):
+            continue
+        try:
+            # Only slskd transfers consume the single download slot. yt-dlp fallbacks run as
+            # independent background tasks (the single worker already runs them one at a time),
+            # so they must NOT be slot-gated — otherwise every fallback past the first is parked
+            # "waiting to download" + executing with NO task enqueued, and nothing re-dispatches
+            # them (the slskd re-dispatch path doesn't cover yt-dlp). A batch of yt-dlp fallbacks
+            # then silently stalls after one download.
+            uses_download_slot = json.loads(item.payload_json or "{}").get("action") == "queue_download"
+            if uses_download_slot and not download_slot_available(download_slot_tracker):
+                note_progress(f"Waiting for download slot for {item.title}", item)
+                set_download_item_status(item, "waiting to download")
+                item.status = ProposalStatus.executing
+                download_changes += 1
+                finish_progress_step(f"Waiting for download slot for {item.title}")
+                continue
+            note_progress(f"Queueing download for {item.title}", item)
+            apply_download_item(session, item, task)
+            item.status = ProposalStatus.executing if keeps_download_batch_open(item) else ProposalStatus.completed
+            download_changes += 1
+            if uses_download_slot:
+                consume_download_slot(download_slot_tracker)
+            finish_progress_step(f"Queued download for {item.title}")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            failed_request = download_request_from_item(item)
+            retry_started = False
+            if failed_request:
+                payload = json.loads(item.payload_json or "{}")
+                failed_candidate = payload.get("candidate") or {}
+                retry_started = retry_download_entry(
+                    session,
+                    batch,
+                    {
+                        "batch_id": item.batch_id,
+                        "item_id": item.id,
+                        "parent_id": item.parent_id,
+                        "request": failed_request,
+                        "candidate": failed_candidate,
+                        "basename": remote_basename(failed_candidate.get("filename") or ""),
+                        "queued_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    item,
+                    f"candidate queue failed: {error}",
+                    available_slots=download_slot_tracker,
+                )
+            if retry_started:
+                download_changes += 1
+            else:
+                item.status = ProposalStatus.failed
+                download_errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Download needs attention for {item.title}")
+
+    lyric_changes = 0
+    for item in lyrics_items:
+        if skip_unchanged(item):
+            continue
+        try:
+            note_progress(f"Downloading lyrics for {item.title}", item)
+            apply_lyrics_item(session, item)
+            item.status = ProposalStatus.completed
+            lyric_changes += 1
+            finish_progress_step(f"Downloaded lyrics for {item.title}")
+        except Exception as error:  # noqa: BLE001 - keep executing independent selected items.
+            item.status = ProposalStatus.failed
+            errors.append(f"{item.title}: {error}")
+            finish_progress_step(f"Lyrics failed for {item.title}")
+
+    progress_item_ids = {item.id for item in progress_items}
+    for item in batch.items:
+        # Artist/album/grouping rows are approved alongside their actionable descendants but do
+        # not execute a step of their own. Retire those containers even when one of the real
+        # actions failed, otherwise a mixed-result batch can never become terminal.
+        if item.status == ProposalStatus.approved and item.id not in progress_item_ids:
+            item.status = ProposalStatus.completed
+        elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
+            skipped += 1
+
+    # Import-wizard files are imported directly above (not via the download manifest), so trigger
+    # a Jellyfin rescan for them here. Download imports queue their own rescan as they complete.
+    if imported:
+        append_task_log(session, task, f"Imported {imported} file(s) into the library; queueing Jellyfin scan")
+        enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
+    downloaded_import = import_completed_downloads(session)
+    open_downloads = batch_has_open_downloads(batch)
+    result_items = [
+        item for item in batch.items
+        if item.selected and is_executable_proposal_item(item)
+    ]
+    passed_count = sum(
+        item.status in {ProposalStatus.completed, ProposalStatus.executing}
+        for item in result_items
+    )
+    failed_count = sum(item.status == ProposalStatus.failed for item in result_items)
+    if errors and not result_items:
+        # A malformed/no-op approval has no item row to count, but it is still one failed action.
+        failed_count = max(1, len(errors))
+
+    if not open_downloads:
+        # Clear leftover grouping rows (artist/album containers) once the batch has executed, so a
+        # spent candidate review doesn't linger in the task queue showing empty artist/album rows.
+        # This also applies to partial results: the failed actionable rows are already terminal and
+        # their details remain in the task result, activity log, and completion notification.
+        for item in batch.items:
+            if item.status in {ProposalStatus.pending, ProposalStatus.executing} and not json.loads(item.payload_json or "{}").get("action"):
+                item.status = ProposalStatus.completed
+
+    item_results_settled = bool(result_items) and all(
+        not item.selected
+        or item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed, ProposalStatus.executing}
+        for item in result_items
+    )
+    if open_downloads:
+        batch.status = ProposalStatus.executing
+    elif item_results_settled:
+        # Item-level misses (for example, lyrics not found) are a completed batch result rather
+        # than a crashed task. Users get explicit passed/failed counts and the batch leaves the
+        # Task Queue; unexpected worker exceptions still take the worker's real failure path.
+        batch.status = ProposalStatus.completed
+    elif errors:
+        batch.status = ProposalStatus.failed
+    elif all(item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed} or not item.selected for item in batch.items):
+        batch.status = ProposalStatus.completed
+    else:
+        batch.status = ProposalStatus.pending
+    session.commit()
+
+    summary_body = task_queue_notification_body(
+        imported,
+        metadata_updated,
+        file_actions,
+        playlist_changes,
+        download_changes,
+        lyric_changes,
+        skipped,
+        errors,
+        download_errors,
+        downloaded_import,
+        open_downloads,
+        passed_count,
+        failed_count,
+    )
+    total_changes = imported + metadata_updated + file_actions + playlist_changes + download_changes + lyric_changes
+    is_download_batch = batch.kind == ProposalKind.download or bool(download_items)
+    candidate_handoff_only = (
+        bool(wishlist_download_items)
+        and download_changes == len(wishlist_download_items)
+        and total_changes == download_changes
+        and not errors
+        and not download_errors
+    )
+    title = (
+        "Downloads queued"
+        if open_downloads
+        else "Task queue item completed"
+        if batch.status == ProposalStatus.completed or is_download_batch
+        else "Task queue item failed"
+    )
+    # Only surface meaningful outcomes as notifications; a no-op completion just goes to the log.
+    important = bool(
+        errors
+        or download_errors
+        or open_downloads
+        or total_changes
+        or (downloaded_import and downloaded_import.get("imported"))
+    ) and not candidate_handoff_only
+    if important:
+        create_notification(
+            session,
+            title=title,
+            body=summary_body,
+            event_type="task_completed" if batch.status != ProposalStatus.failed or is_download_batch else "task_failed",
+            target_url="/downloads" if open_downloads else "/activity",
+            deliver_apns=not open_downloads,
+            group_key=f"download:{batch.id}" if batch.kind == ProposalKind.download or download_items else None,
+        )
+    else:
+        write_app_log(f"{title}: {summary_body}", level="info", event_type="task_completed")
+    return {
+        "batch_id": batch_id,
+        "imported": imported,
+        "metadata_updated": metadata_updated,
+        "file_actions": file_actions,
+        "playlist_changes": playlist_changes,
+        "download_changes": download_changes,
+        "lyric_changes": lyric_changes,
+        "skipped": skipped,
+        "errors": errors,
+        "download_errors": download_errors,
+        "downloaded_import": downloaded_import,
+        "open_downloads": open_downloads,
+        "passed": passed_count,
+        "failed": failed_count,
+        "completed_with_item_failures": bool(errors or download_errors)
+        and (batch.status != ProposalStatus.failed or is_download_batch),
+    }
+
+
+def task_queue_notification_body(
+    imported: int,
+    metadata_updated: int,
+    file_actions: int,
+    playlist_changes: int,
+    download_changes: int,
+    lyric_changes: int,
+    skipped: int,
+    errors: list[str],
+    download_errors: list[str] | None = None,
+    downloaded_import: dict | None = None,
+    open_downloads: bool = False,
+    passed_count: int = 0,
+    failed_count: int = 0,
+) -> str:
+    parts = [f"{passed_count} passed, {failed_count} failed"]
+    if imported:
+        parts.append(f"{imported} tracks imported")
+    if metadata_updated:
+        parts.append(f"{metadata_updated} metadata changes applied")
+    if file_actions:
+        parts.append(f"{file_actions} files handled")
+    if playlist_changes:
+        parts.append(f"{playlist_changes} playlist changes applied")
+    if download_changes:
+        parts.append(f"{download_changes} downloads handled")
+    if lyric_changes:
+        parts.append(f"{lyric_changes} lyrics downloaded")
+    if skipped:
+        parts.append(f"{skipped} items skipped")
+    if downloaded_import and downloaded_import.get("imported"):
+        parts.append(f"{downloaded_import['imported']} downloaded files added to the library")
+    if open_downloads:
+        parts.append("downloads are running and will move to the library after verification")
+    body = ". ".join(parts) + "."
+    if errors:
+        return f"{body} First issue: {trim_message(errors[0])}"
+    if download_errors:
+        return f"{body} {len(download_errors)} downloads need another candidate in Downloads. First download issue: {trim_message(download_errors[0])}"
+    return body
+
+
+def trim_message(message: str, limit: int = 700) -> str:
+    if len(message) <= limit:
+        return message
+    return f"{message[:limit].rstrip()}..."
+
+
+def should_count_skipped_item(item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if item.kind == ProposalKind.download and action in {"queue_download", "queue_ytdlp_download"}:
+        return False
+    if item.kind == ProposalKind.download and not action:
+        return False
+    return True
+
+
+def is_executable_proposal_item(item: ProposalItem) -> bool:
+    """Whether an item represents one user-approved action rather than a tree container.
+
+    This intentionally accepts terminal items too so a task recovered after a worker restart reports
+    totals for the whole approved batch, not only the unfinished remainder processed by this attempt.
+    """
+    payload = json.loads(item.payload_json or "{}")
+    if item.kind == ProposalKind.import_files:
+        return bool(item.old_value and item.new_value)
+    if item.kind == ProposalKind.metadata:
+        return bool(payload.get("target_type"))
+    if item.kind in {ProposalKind.delete, ProposalKind.file_move, ProposalKind.playlist, ProposalKind.download, ProposalKind.lyrics}:
+        return bool(payload.get("action"))
+    return False
+
+
+def keeps_download_batch_open(item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    return item.kind == ProposalKind.download and action in {"queue_download", "queue_ytdlp_download"}
+
+
+def batch_has_open_downloads(batch: ProposalBatch) -> bool:
+    return any(keeps_download_batch_open(item) and item.status == ProposalStatus.executing for item in batch.items)
+
+
+# Newly imported tracks awaiting lyrics/art enrichment. Module-level because imports land via
+# several drivers in this single-process worker (import wizard, download manifest, sweep, yt-dlp);
+# import_file_to_library queues each newly created track here, and every driver calls
+# flush_import_enrichment() at its completion to enqueue one aggregated enrich_imports task.
+_pending_enrichment_track_ids: list[str] = []
+
+
+def queue_track_for_enrichment(track_id: str | None) -> None:
+    if track_id and track_id not in _pending_enrichment_track_ids:
+        _pending_enrichment_track_ids.append(track_id)
+
+
+def flush_import_enrichment(session: Session) -> None:
+    global _pending_enrichment_track_ids
+    if not _pending_enrichment_track_ids:
+        return
+    track_ids = _pending_enrichment_track_ids
+    _pending_enrichment_track_ids = []
+    enqueue_task(session, "enrich_imports", {"track_ids": track_ids})
+    append_task_log(session, None, f"Queued lyrics/art enrichment for {len(track_ids)} imported track(s)")
+
+
+def import_track_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    replace_track_id = payload.get("replace_track_id")
+    if replace_track_id:
+        track = session.get(Track, replace_track_id)
+        if track:
+            replace_library_track_file(session, track, Path(item.old_value), Path(item.new_value), payload)
+            return
+    import_file_to_library(session, Path(item.old_value), Path(item.new_value), payload)
+
+
+def find_library_track(session: Session, artist_name: str, album_title: str, title: str):
+    """Return an existing library Track with the same artist + album + title, else None.
+
+    Matching is case/whitespace-insensitive. A track is only a duplicate when all three match, so
+    the same song on a different album is never treated as a duplicate.
+    """
+    artist_key = normalize_match_text(artist_name)
+    album_key = normalize_match_text(album_title)
+    title_key = normalize_match_text(title)
+    if not (artist_key and album_key and title_key):
+        return None
+    candidates = session.scalars(
+        select(Track)
+        .join(Album, Album.id == Track.album_id)
+        .join(Artist, Artist.id == Album.artist_id)
+        .where(func.lower(Album.title) == album_title.lower())
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    )
+    for track in candidates:
+        album = track.album
+        if not album or not album.artist:
+            continue
+        if (
+            normalize_match_text(album.artist.name) == artist_key
+            and normalize_match_text(album.title) == album_key
+            and normalize_match_text(track.title) == title_key
+        ):
+            return track
+    return None
+
+
+def library_track_by_artist_title(session: Session, artist_name: str, title: str):
+    """Return any library Track matching artist + title (album-agnostic), else None.
+
+    Used for playlist imports, where the album hint is unreliable — we just want to know
+    'do I already have this song?' so we add it to the playlist instead of re-downloading it.
+    """
+    artist_keys = artist_match_candidates(artist_name)
+    title_key = normalize_match_text(title)
+    if not (artist_keys and title_key):
+        return None
+    for track in session.scalars(
+        select(Track)
+        .join(Album, Album.id == Track.album_id)
+        .join(Artist, Artist.id == Album.artist_id)
+        .where(func.lower(func.trim(Track.title)) == title.strip().lower())
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    ):
+        if (
+            track.album
+            and track.album.artist
+            and normalize_match_text(track.album.artist.name) in artist_keys
+            and normalize_match_text(track.title) == title_key
+        ):
+            return track
+    return None
+
+
+# Sidecar extensions left behind by a Soulseek/scene release once every audio file inside a
+# folder has been imported — cover art, rip logs, cue sheets, playlists, checksums, release
+# notes. None of these are ever the target of a proposal item, so a folder holding only these
+# is functionally empty even though it isn't literally empty.
+_IMPORT_JUNK_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp",
+    ".nfo", ".txt", ".cue", ".log", ".m3u", ".m3u8", ".sfv", ".url", ".ini", ".db",
+}
+
+
+def cleanup_emptied_source_dir(source_dir: Path) -> None:
+    """Removes `source_dir` and walks upward removing now-empty ancestors, stopping at (and
+    never removing) one of the configured mount roots — CLAUDE.md: every import/download source
+    lives under `import_path`/`staging_path`/`downloads_path`, and those roots themselves must
+    survive for the next drop or the next worker cycle to have somewhere to write.
+
+    A directory is only removed if every file inside it (recursively) is a known junk sidecar
+    (`_IMPORT_JUNK_EXTENSIONS`) — anything else (another track not yet processed, an unrecognized
+    file) leaves it and every ancestor alone. Reported live 2026-08-25: completed imports/downloads
+    left their source folders behind indefinitely (a "Beyoncé - Lemonade" drop's cue/log/m3u/jpg
+    sidecars, 229 emptied Zelda soundtrack tracks' cover art, 82 UUID staging folders from
+    completed downloads) because nothing ever swept them.
+    """
+    settings = get_settings()
+    roots = {settings.import_path.resolve(), settings.staging_path.resolve(), settings.downloads_path.resolve()}
+    current = source_dir.resolve()
+    # Stop the moment we reach a root (never delete it) or step outside every known root
+    # (nothing here should ever run against an arbitrary path, but this is the backstop).
+    while current not in roots and any(current.is_relative_to(root) for root in roots):
+        if not current.is_dir():
+            return
+        try:
+            files = [entry for entry in current.rglob("*") if entry.is_file()]
+        except OSError:
+            return
+        if any(f.suffix.lower() not in _IMPORT_JUNK_EXTENSIONS for f in files):
+            return
+        try:
+            shutil.rmtree(current)
+        except OSError:
+            return
+        current = current.parent
+
+
+def import_file_to_library(session: Session, source_path: Path, target_path: Path, payload: dict) -> None:
+    metadata = payload.get("metadata", {})
+    if not source_path.exists():
+        raise FileNotFoundError(f"{source_path} no longer exists")
+
+    stat = source_path.stat()
+    if payload.get("size_bytes") and stat.st_size != payload["size_bytes"]:
+        raise ValueError("source file size changed after review")
+
+    create_record_only = payload.get("action") == "create_library_record"
+    artist_name = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+    album_title = metadata.get("album") or "Unknown Album"
+    track_title = metadata.get("title") or target_path.stem
+
+    # Never create a 100%-certain duplicate: same artist + album + title already in the library.
+    # (The same title on a different album is fine — albums are matched too.) This guards every
+    # import/download path. Leave the source file in place so nothing is silently lost.
+    duplicate = find_library_track(session, artist_name, album_title, track_title)
+    if duplicate and str(duplicate.path or "") != str(target_path):
+        append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
+        return
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if target_path.exists() and not create_record_only:
+        raise FileExistsError(f"{target_path} already exists")
+
+    if not create_record_only:
+        shutil.move(str(source_path), str(target_path))
+
+    artist = session.scalar(select(Artist).where(func.lower(Artist.name) == artist_name.lower()))
+    if not artist:
+        artist = Artist(name=artist_name)
+        session.add(artist)
+        session.flush()
+    if metadata.get("musicbrainz_artist_id"):
+        artist.musicbrainz_id = metadata.get("musicbrainz_artist_id")
+
+    album = session.scalar(select(Album).where(Album.artist_id == artist.id, func.lower(Album.title) == album_title.lower()))
+    if not album:
+        album = Album(
+            artist_id=artist.id,
+            title=album_title,
+            path=str(target_path.parent),
+            musicbrainz_release_id=metadata.get("musicbrainz_album_id"),
+        )
+        session.add(album)
+        session.flush()
+    elif metadata.get("musicbrainz_album_id"):
+        album.musicbrainz_release_id = metadata.get("musicbrainz_album_id")
+
+    # If the imported folder shipped its own cover image, adopt it before any online lookup runs
+    # — and before sweeping the source folder, which would otherwise delete that cover first.
+    if not create_record_only:
+        adopt_source_folder_cover(session, album, source_path.parent, target_path.parent)
+        cleanup_emptied_source_dir(source_path.parent)
+
+    existing_track = session.scalar(select(Track).where(Track.path == str(target_path)))
+    if existing_track:
+        return
+
+    track = Track(
+        album_id=album.id,
+        title=track_title,
+        track_number=metadata.get("track_number"),
+        disc_number=metadata.get("disc_number"),
+        duration_ms=metadata.get("duration_ms"),
+        format=metadata.get("format"),
+        bitrate=metadata.get("bitrate"),
+        path=str(target_path),
+        musicbrainz_recording_id=metadata.get("musicbrainz_recording_id"),
+        is_lossless=metadata.get("is_lossless", False),
+        musicbrainz_verified=bool(metadata.get("musicbrainz_verified")),
+    )
+    session.add(track)
+    session.flush()
+    queue_track_for_enrichment(track.id)
+
+
+def apply_metadata_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    target_type = payload.get("target_type")
+    target_id = payload.get("target_id")
+    changes = payload.get("changes") or {}
+    if target_type == "artist":
+        target = session.get(Artist, target_id)
+        if not target:
+            raise ValueError("Artist no longer exists")
+        apply_artist_changes(session, target, changes)
+    elif target_type == "album":
+        target = session.get(Album, target_id)
+        if not target:
+            raise ValueError("Album no longer exists")
+        apply_album_changes(session, target, changes)
+    elif target_type == "track":
+        target = session.get(Track, target_id)
+        if not target:
+            raise ValueError("Track no longer exists")
+        # "artist" is a virtual reassignment field, not a column — handle it separately
+        # (re-homes the track under a different artist) so apply_scalar_changes never sees it.
+        new_artist_name = None
+        if "artist" in changes:
+            changes = dict(changes)
+            new_artist_name = (changes.pop("artist") or "").strip()
+        apply_scalar_changes(target, changes, editable_track_fields())
+        # ReplayGain is non-destructive: besides the DB value (the player reads it), write
+        # the standard REPLAYGAIN_TRACK_GAIN tag so Jellyfin/other players honour it too.
+        if "replaygain_track_gain" in changes and target.path and Path(target.path).exists():
+            write_replaygain_tag(Path(target.path), target.replaygain_track_gain)
+        if new_artist_name:
+            reassign_track_to_artist(session, target, new_artist_name)
+    else:
+        raise ValueError("Unsupported metadata target")
+
+
+def apply_playlist_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if action == "set_position":
+        entry = session.get(PlaylistTrack, payload.get("playlist_track_id"))
+        if not entry:
+            raise ValueError("Playlist entry no longer exists")
+        entry.position = int(payload.get("position"))
+    elif action == "rename_playlist":
+        playlist = session.get(Playlist, payload.get("playlist_id"))
+        if not playlist:
+            raise ValueError("Playlist no longer exists")
+        if playlist.protected:
+            raise ValueError("Favorites cannot be renamed")
+        playlist.name = str(payload.get("name") or "").strip()
+    elif action == "delete_playlist":
+        playlist = session.get(Playlist, payload.get("playlist_id"))
+        if not playlist:
+            raise ValueError("Playlist no longer exists")
+        if playlist.protected:
+            raise ValueError("Favorites cannot be deleted")
+        playlist_name = playlist.name
+        jellyfin_id = playlist.jellyfin_playlist_id
+        nudibranch_user = session.get(User, playlist.user_id) if playlist.user_id else None
+        jellyfin_user_id = nudibranch_user.jellyfin_user_id if nudibranch_user else None
+        session.delete(playlist)
+        settings = integration_settings(session)
+        jf_url = settings.get("jellyfin_url", "").rstrip("/")
+        jf_key = settings.get("jellyfin_api_key", "")
+        if jf_url and jf_key:
+            try:
+                with httpx.Client(base_url=jf_url, headers={"X-Emby-Token": jf_key}, timeout=10) as jf_client:
+                    if jellyfin_id:
+                        _delete_jellyfin_item(jf_client, jellyfin_id)
+                    # Also delete any stale duplicates with this name to prevent re-import on next sync
+                    if jellyfin_user_id:
+                        _delete_jellyfin_playlists_by_name(jf_client, jellyfin_user_id, playlist_name)
+            except Exception as del_error:
+                write_app_log(f"Playlist sync: could not delete Jellyfin playlist '{playlist_name}': {del_error}", level="warning")
+    else:
+        raise ValueError("Unsupported playlist action")
+    enqueue_task(session, "sync_favorites_jellyfin", {})
+
+
+def apply_download_item(session: Session, item: ProposalItem, task: Task | None = None) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    action = payload.get("action")
+    if action == "wishlist_request":
+        append_task_log(session, task, f"Creating download candidates for wishlist request {item.title}")
+        create_download_candidate_batch(session, payload)
+        return
+    if action == "queue_download":
+        settings = integration_settings(session)
+        append_task_log(session, task, f"Queueing slskd download for {item.title}")
+        queue_slskd_download_with_candidate_fallbacks(session, item, settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), task)
+        return
+    if action == "queue_ytdlp_download":
+        append_task_log(session, task, f"Queuing background yt-dlp download for {item.title}")
+        set_download_item_status(item, "queued for yt-dlp download")
+        enqueue_task(session, "ytdlp_download", {"item_id": item.id})
+        return
+    raise ValueError("Unsupported download action")
+
+
+def queue_slskd_download_with_candidate_fallbacks(session: Session, item: ProposalItem, slskd_url: str, api_key: str, task: Task | None = None) -> dict:
+    attempts: list[str] = []
+    candidate_items = download_candidate_attempt_order(session, item)
+    append_task_log(session, task, f"{item.title}: trying {len(candidate_items)} slskd candidate(s)")
+    for candidate_item in candidate_items:
+        payload = json.loads(candidate_item.payload_json or "{}")
+        candidate = payload.get("candidate") or {}
+        request = payload.get("request") or {}
+        label = candidate.get("filename") or candidate_item.title
+        try:
+            append_task_log(session, task, f"{item.title}: queueing candidate {label}")
+            result = queue_slskd_download(slskd_url, api_key, candidate)
+            record_download_manifest_entry(request, candidate, item)
+            set_download_item_status(item, "queued in slskd; waiting for transfer state")
+            if candidate_item.id != item.id:
+                candidate_item.status = ProposalStatus.executing
+                set_download_item_status(candidate_item, "queued in slskd; waiting for transfer state")
+                item.title = candidate_item.title
+                item.new_value = candidate_item.new_value
+                item.payload_json = candidate_item.payload_json
+            append_task_log(session, task, f"{item.title}: slskd accepted candidate {label}; waiting for transfer progress")
+            return result
+        except Exception as error:  # noqa: BLE001 - try the next available candidate for this track.
+            attempts.append(f"{label}: {error}")
+            candidate_item.status = ProposalStatus.failed
+            append_task_log(session, task, f"{item.title}: slskd candidate failed: {label}: {error}", "warning")
+    raise RuntimeError("All slskd candidates failed. " + " | ".join(attempts))
+
+
+def download_candidate_attempt_order(session: Session, item: ProposalItem) -> list[ProposalItem]:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download":
+        return [item]
+    siblings = list(
+        session.scalars(
+            select(ProposalItem)
+            .where(ProposalItem.batch_id == item.batch_id)
+            .where(ProposalItem.parent_id == item.parent_id)
+            .where(ProposalItem.kind == ProposalKind.download)
+        )
+    )
+    candidates = [
+        candidate
+        for candidate in siblings
+        if json.loads(candidate.payload_json or "{}").get("action") == "queue_download"
+    ]
+    if not candidates:
+        return [item]
+
+    def candidate_sort_key(candidate: ProposalItem) -> tuple[int, str]:
+        if candidate.id == item.id:
+            return (0, candidate.id)
+        if candidate.selected:
+            return (1, candidate.id)
+        return (2, candidate.id)
+
+    return sorted(candidates, key=candidate_sort_key)
+
+
+def existing_retry_candidate_items(session: Session, item: ProposalItem, failed_candidates: list[dict]) -> list[ProposalItem]:
+    if not item.parent_id:
+        return []
+    ignored = {candidate_identity(candidate) for candidate in failed_candidates if isinstance(candidate, dict)}
+    candidates = []
+    for candidate_item in session.scalars(
+        select(ProposalItem)
+        .where(ProposalItem.batch_id == item.batch_id)
+        .where(ProposalItem.parent_id == item.parent_id)
+        .where(ProposalItem.kind == ProposalKind.download)
+    ):
+        payload = json.loads(candidate_item.payload_json or "{}")
+        if payload.get("action") != "queue_download":
+            continue
+        candidate = payload.get("candidate") or {}
+        if candidate_identity(candidate) in ignored:
+            continue
+        candidates.append(candidate_item)
+
+    def retry_sort_key(candidate_item: ProposalItem) -> tuple[int, int, str]:
+        payload = json.loads(candidate_item.payload_json or "{}")
+        try:
+            rank = int(payload.get("candidate_index", 9999))
+        except (TypeError, ValueError):
+            rank = 9999
+        selected_penalty = 0 if candidate_item.selected else 1
+        return (selected_penalty, rank, candidate_item.id)
+
+    return sorted(candidates, key=retry_sort_key)
+
+
+def download_request_from_item(item: ProposalItem) -> dict | None:
+    payload = json.loads(item.payload_json or "{}")
+    request = payload.get("request")
+    if isinstance(request, dict):
+        return request
+    candidate = payload.get("candidate") or {}
+    if payload.get("action") == "queue_ytdlp_download":
+        return None
+    parent = item.parent
+    if parent:
+        parent_payload = json.loads(parent.payload_json or "{}")
+        artist = parent_payload.get("artist")
+        album = parent_payload.get("album")
+        track = parent_payload.get("track") or parent.title
+        if artist or album or track:
+            return {"artist": artist, "album": album, "track": track}
+    if candidate.get("query"):
+        return {"track": candidate["query"]}
+    return None
+
+
+def create_download_retry_import_batch(session: Session, requests: list[dict]) -> None:
+    unique_requests: list[dict] = []
+    seen = set()
+    for request in requests:
+        key = (
+            str(request.get("artist") or "Unknown Artist").casefold(),
+            str(request.get("album") or "Unknown Album").casefold(),
+            str(request.get("track") or request.get("title") or "Unknown Track").casefold(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_requests.append(request)
+    if unique_requests:
+        run_propose_import(session, {"files": [], "download_requests": unique_requests})
+
+
+def download_manifest_path() -> Path:
+    # Internal worker state — keep it on the local config volume, not the (NAS) downloads share,
+    # so frequent rewrites never hit share permission/latency issues.
+    return get_settings().config_path / ".nudibranch-downloads.json"
+
+
+def legacy_download_manifest_path() -> Path:
+    return get_settings().downloads_path / ".nudibranch-downloads.json"
+
+
+def load_download_manifest() -> list[dict]:
+    path = download_manifest_path()
+    if not path.exists():
+        # One-time migration from the old location in the downloads folder.
+        legacy = legacy_download_manifest_path()
+        if legacy.exists():
+            try:
+                payload = json.loads(legacy.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return []
+            if isinstance(payload, list):
+                save_download_manifest(payload)
+                return payload
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return payload if isinstance(payload, list) else []
+
+
+def save_download_manifest(entries: list[dict]) -> None:
+    path = download_manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def record_download_manifest_entry(request: dict, candidate: dict, item: ProposalItem) -> None:
+    if not request or not candidate:
+        return
+    filename = str(candidate.get("filename") or "")
+    entries = load_download_manifest()
+    entries = [
+        entry
+        for entry in entries
+        if not (
+            entry.get("batch_id") == item.batch_id
+            and entry.get("item_id") == item.id
+            and entry.get("status") not in DOWNLOAD_MANIFEST_FINISHED_STATUSES
+        )
+    ]
+    entries.append(
+        {
+            "batch_id": item.batch_id,
+            "item_id": item.id,
+            "parent_id": item.parent_id,
+            "request": request,
+            "candidate": {
+                "username": candidate.get("username"),
+                "filename": filename,
+                "folder": candidate.get("folder"),
+            },
+            "basename": remote_basename(filename),
+            "initialized_at": datetime.now(timezone.utc).isoformat(),
+            "queued_at": datetime.now(timezone.utc).isoformat(),
+            "status": "queued",
+        }
+    )
+    save_download_manifest(entries[-500:])
+
+
+def remote_basename(filename: str) -> str:
+    return str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+
+def find_download_manifest_entry(file_path: Path) -> dict | None:
+    basename = file_path.name.casefold()
+    candidates = [
+        entry
+        for entry in load_download_manifest()
+        if entry.get("status") in (DOWNLOAD_MANIFEST_ACTIVE_STATUSES | {"rejected"})
+    ]
+    for entry in candidates:
+        if entry.get("basename") == basename:
+            return entry
+    normalized_path = str(file_path).replace("\\", "/").casefold()
+    for entry in candidates:
+        filename = str((entry.get("candidate") or {}).get("filename") or "").replace("\\", "/").casefold()
+        if filename and normalized_path.endswith(filename):
+            return entry
+    return None
+
+
+def update_download_manifest_entry(target: dict, status: str, **fields: object) -> None:
+    entries = load_download_manifest()
+    for entry in entries:
+        if entry == target or same_manifest_entry(entry, target):
+            if target.get("item_id"):
+                entry["item_id"] = target["item_id"]
+            if target.get("parent_id"):
+                entry["parent_id"] = target["parent_id"]
+            entry["status"] = status
+            entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+            entry.update(fields)
+            break
+    save_download_manifest(entries)
+
+
+def remove_download_manifest_entry(target: dict) -> None:
+    save_download_manifest([entry for entry in load_download_manifest() if entry != target and not same_manifest_entry(entry, target)])
+
+
+def same_manifest_entry(entry: dict, target: dict) -> bool:
+    # Match on either item_id: after reconciliation the manifest holds the NEW id, but callers
+    # that carry _original_item_id still need to find that entry.
+    target_item_ids = {v for v in [target.get("item_id"), target.get("_original_item_id")] if v}
+    return bool(
+        target_item_ids
+        and entry.get("batch_id") == target.get("batch_id")
+        and entry.get("item_id") in target_item_ids
+        and entry.get("basename")
+        and entry.get("basename") == target.get("basename")
+    )
+
+
+def download_staging_root(batch_id: str | None = None) -> Path:
+    root = get_settings().staging_path / "downloads"
+    return root / batch_id if batch_id else root
+
+
+def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, file_path: Path) -> Path:
+    if entry.get("status") in DOWNLOAD_MANIFEST_STAGING_STATUSES and entry.get("path"):
+        staged = Path(str(entry["path"]))
+        if staged.exists():
+            return staged
+    staging_root = download_staging_root(batch.id)
+    # Safety net: if the file is already inside the staging directory (e.g. the manifest status
+    # wasn't persisted but the previous move succeeded), re-save the manifest and return as-is
+    # rather than moving the file again and accumulating " (1)" suffixes.
+    try:
+        file_path.relative_to(staging_root)
+        in_staging = True
+    except ValueError:
+        in_staging = False
+    if in_staging:
+        update_download_manifest_entry(entry, "staged", path=str(file_path), staged_at=datetime.now(timezone.utc).isoformat())
+        entry.update({"status": "staged", "path": str(file_path)})
+        item = session.get(ProposalItem, entry.get("item_id"))
+        set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+        return file_path
+    staging_root.mkdir(parents=True, exist_ok=True)
+    destination = unique_destination(staging_root / safe_filename(file_path).name)
+    append_task_log(session, None, f"{entry_download_label(entry)}: moving completed download to staging: {destination.name}")
+    shutil.move(str(file_path), str(destination))
+    update_download_manifest_entry(
+        entry,
+        "staged",
+        path=str(destination),
+        download_path=str(file_path),
+        staged_at=datetime.now(timezone.utc).isoformat(),
+    )
+    entry.update({"status": "staged", "path": str(destination), "download_path": str(file_path)})
+    item = session.get(ProposalItem, entry.get("item_id"))
+    set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+    append_task_log(session, None, f"{entry_download_label(entry)}: moved to staging")
+    return destination
+
+
+def entry_download_label(entry: dict) -> str:
+    request = entry.get("request") or {}
+    candidate = entry.get("candidate") or {}
+    return str(request.get("track") or request.get("title") or candidate.get("filename") or entry.get("basename") or "download")
+
+
+def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -> dict:
+    settings = get_settings()
+    root = settings.downloads_path
+    if not root.exists():
+        return {"imported": 0, "errors": []}
+    errors: list[str] = []
+    manifest_result = import_manifest_download_batches(session, minimum_age_seconds)
+    manifest_imported = manifest_result["imported"]
+    errors.extend(manifest_result["errors"])
+    manifest_waiting = manifest_result.get("waiting", 0)
+    manifest_ready = manifest_result.get("ready", 0)
+    manifest_failed = manifest_result.get("failed", 0)
+    if manifest_imported:
+        session.flush()
+        create_notification(
+            session,
+            title="Downloaded album imported",
+            body=f"{manifest_imported} tracks were added to the library.",
+            event_type="tool_completed",
+            target_url="/library",
+        )
+        append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
+        enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
+        return {"imported": manifest_imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+    if manifest_waiting or manifest_ready or manifest_failed:
+        return {"imported": 0, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+    imported = 0
+    now = time.time()
+    known_paths = existing_library_and_proposal_paths(session)
+    for file_path in sorted(root.rglob("*")):
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            continue
+        if str(file_path) in known_paths:
+            continue
+        stat = file_path.stat()
+        if now - stat.st_mtime < minimum_age_seconds:
+            continue
+        metadata = read_audio_metadata(file_path)
+        manifest_entry = find_download_manifest_entry(file_path)
+        if manifest_entry:
+            if manifest_entry.get("status") == "rejected":
+                try:
+                    file_path.unlink()
+                    update_download_manifest_entry(manifest_entry, "rejected_removed")
+                except OSError as error:
+                    errors.append(f"{file_path.name}: failed to remove rejected download: {error}")
+            continue
+        payload = {
+            "path": str(file_path),
+            "relative_path": str(file_path.relative_to(root)),
+            "extension": file_path.suffix.lower(),
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "metadata": metadata,
+            "suggested_library_path": str(suggest_library_path(metadata, file_path)),
+        }
+        target_path = Path(payload["suggested_library_path"])
+        if str(target_path) in known_paths or target_path.exists():
+            continue
+        try:
+            import_file_to_library(session, file_path, target_path, payload)
+            mark_matching_wishlist_completed(session, metadata)
+            imported += 1
+        except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
+            errors.append(f"{file_path.name}: {error}")
+    if imported:
+        session.flush()
+        create_notification(
+            session,
+            title="Downloaded files imported",
+            body=f"{imported} files were added to the library.",
+            event_type="tool_completed",
+            target_url="/library",
+        )
+        append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
+        enqueue_task(session, "jellyfin_scan", {})
+        flush_import_enrichment(session)
+    return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+
+
+def import_manifest_download_batches(session: Session, minimum_age_seconds: int) -> dict:
+    entries_by_batch: dict[str, list[dict]] = {}
+    for entry in load_download_manifest():
+        batch_id = entry.get("batch_id")
+        if batch_id and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES:
+            entries_by_batch.setdefault(batch_id, []).append(entry)
+    for batch in session.scalars(
+        select(ProposalBatch)
+        .where(ProposalBatch.status == ProposalStatus.executing)
+        .where(ProposalBatch.tree_path == "/downloads")
+    ):
+        if batch.id not in entries_by_batch and selected_slskd_download_item_ids(batch):
+            entries_by_batch[batch.id] = []
+    imported = 0
+    errors: list[str] = []
+    waiting = 0
+    ready = 0
+    failed = 0
+    for batch_id, entries in entries_by_batch.items():
+        batch = session.get(ProposalBatch, batch_id)
+        if not batch or batch.status not in {ProposalStatus.executing, ProposalStatus.failed, ProposalStatus.pending, ProposalStatus.approved}:
+            continue
+        result = process_download_manifest_batch(session, batch, entries, minimum_age_seconds)
+        imported += result["imported"]
+        errors.extend(result["errors"])
+        waiting += result.get("waiting", 0)
+        ready += result.get("ready", 0)
+        failed += result.get("failed", 0)
+    return {"imported": imported, "errors": errors, "waiting": waiting, "ready": ready, "failed": failed}
+
+
+# Tracks the last import-failure message we notified per batch, so a persistent problem
+# (e.g. a read-only library mount) doesn't raise a notification on every 3-second scan.
+_reported_download_import_failures: dict[str, str] = {}
+
+
+def describe_import_error(error: Exception) -> str:
+    text = str(error)
+    if isinstance(error, PermissionError) or "Errno 13" in text or "Permission denied" in text:
+        return (
+            f"permission denied writing to the library ({text}). "
+            "The worker can read the library but cannot write into it — fix write permissions on "
+            "the library mount (file ownership / the container's PUID:PGID, or the NAS share ACL)."
+        )
+    return text
+
+
+def verify_staged_download_content(
+    session: Session,
+    batch: ProposalBatch,
+    entry: dict,
+    item: ProposalItem | None,
+    file_path: Path,
+    available_slots: dict[str, int] | None,
+) -> bool:
+    """Content-check a freshly-downloaded/staged file before it can reach the library.
+
+    Returns True if the file is acceptable and import should proceed; False if it was rejected
+    as bad audio and a requeue was triggered (the caller must NOT import it).
+
+    Runs the SAME verification as the bulk "Check audio content" tool — dead-air silence
+    detection (no key needed) plus an AcoustID fingerprint match against the identity we
+    actually requested. On a positive failure it deletes the staged file and routes into the
+    existing `retry_download_entry` machinery, so the download's flow context (workflow,
+    wishlist_item_id, replace_track_id, pending playlist) and the eventual YouTube fallback are
+    all preserved — the requeue lands wherever the original was going. Verification is a positive
+    gate: an unverifiable/undetermined file (no key, no fingerprint, no AcoustID data) is
+    ACCEPTED, never requeued on a guess.
+
+    Guarded by a manifest `content_checked` flag so each file is only checked once, not on
+    every ~3s download-monitor pass.
+    """
+    # Nothing to requeue against without the proposal item — leave the file for the normal flow.
+    if entry.get("content_checked") or item is None:
+        return True
+    request = entry.get("request") or {}
+    label = entry_download_label(entry)
+    try:
+        verdict = verify_audio_content(
+            Path(file_path),
+            claimed_title=request.get("track") or request.get("title"),
+            claimed_artist=request.get("artist"),
+            claimed_recording_id=request.get("musicbrainz_recording_id"),
+            total_ms=request.get("duration_ms"),
+            api_key=integration_value(session, "acoustid_api_key"),
+            # No album leniency: we asked for a SPECIFIC track, so a different song of the same
+            # album is still the wrong file for this request and should be re-fetched.
+        )
+    except Exception as error:  # noqa: BLE001 - never let verification crash the import sweep.
+        append_task_log(session, None, f"{label}: content verification errored ({error}); accepting the download", "warning")
+        update_download_manifest_entry(entry, entry.get("status") or "staged", content_checked=True)
+        entry["content_checked"] = True
+        return True
+
+    if not verdict["replace"]:
+        update_download_manifest_entry(entry, entry.get("status") or "staged", content_checked=True)
+        entry["content_checked"] = True
+        append_task_log(session, None, f"{label}: download content check — {verdict['log']}")
+        return True
+
+    # Bad audio: delete the staged copy and requeue another source. `delete_stale_download_file`
+    # only cleans the downloads/ dir, so the staged file must be removed explicitly here.
+    append_task_log(session, None, f"{label}: rejected downloaded file — {verdict['log']}; requeueing another source", "error")
+    try:
+        Path(file_path).unlink(missing_ok=True)
+    except OSError as error:
+        append_task_log(session, None, f"{label}: could not delete rejected staged file: {error}", "warning")
+    reason = f"downloaded audio failed content check ({verdict['reason']})"
+    if item is not None:
+        retry_download_entry(session, batch, entry, item, reason, transfer=None, available_slots=available_slots)
+    return False
+
+
+def process_download_manifest_batch(session: Session, batch: ProposalBatch, entries: list[dict], minimum_age_seconds: int) -> dict:
+    # Items that need manual attention (an exhausted slskd download) keep the batch from being
+    # finalized. Executing yt-dlp items are running in a background task and are NOT blockers.
+    blocking_items = selected_download_blockers(batch)
+    for blocker in blocking_items:
+        blocker_action = json.loads(blocker.payload_json or "{}").get("action")
+        if blocker_action == "queue_ytdlp_download":
+            set_download_item_status(blocker, "YouTube fallback ready — select and click Run selected to start yt-dlp download")
+        else:
+            set_download_item_status(blocker, "needs attention before this batch can finish")
+    ytdlp_executing = any(
+        json.loads(item.payload_json or "{}").get("action") == "queue_ytdlp_download"
+        and item.status == ProposalStatus.executing
+        and item.selected
+        for item in batch.items
+    )
+    all_download_item_ids = selected_slskd_download_item_ids(batch)
+    if not all_download_item_ids:
+        return {"imported": 0, "errors": []}
+    # Tracks imported in an earlier incremental pass are done; don't reconsider or re-queue them.
+    expected_item_ids = {
+        item_id
+        for item_id in all_download_item_ids
+        if (existing_item := session.get(ProposalItem, item_id)) and existing_item.status not in {ProposalStatus.completed, ProposalStatus.rejected}
+    }
+    if not expected_item_ids:
+        if not blocking_items and not ytdlp_executing:
+            finalize_completed_download_batch(session, batch)
+        return {"imported": 0, "errors": []}
+    entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
+    # Entries whose item is no longer approved (rejected/deselected/never-approved) get their
+    # slskd transfer cancelled and manifest entry/partial file removed, instead of silently
+    # downloading in the background.
+    cancel_unapproved_download_entries(session, [entry for entry in entries if entry.get("item_id") not in expected_item_ids])
+    entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
+    entries = defer_excess_download_slot_entries(session, batch, entries)
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
+    manifest_item_ids = {entry.get("item_id") for entry in entries}
+
+    staged_entries: list[tuple[dict, Path]] = []
+    errors: list[str] = []
+    waiting_count = 0
+    ready_count = 0
+    failed_count = 0
+
+    # Re-queue selected items that have no manifest entry yet (deferred for a download slot,
+    # missing a queue record, etc). This intentionally does NOT short-circuit staging and import
+    # of the entries we already have, so a finished download still reaches the library while its
+    # siblings are still waiting for a slot.
+    for item_id in sorted(expected_item_ids - manifest_item_ids):
+        item = session.get(ProposalItem, item_id)
+        if download_item_retry_exhausted(item):
+            set_download_item_status(item, "needs attention; could not be downloaded automatically")
+            failed_count += 1
+            continue
+        if item and reconnect_existing_slskd_transfer(session, item):
+            waiting_count += 1
+            continue
+        if not download_slot_available(download_slot_tracker):
+            set_download_item_status(item, "waiting to download")
+            waiting_count += 1
+            continue
+        if item and queue_missing_manifest_download(session, batch, item, available_slots=download_slot_tracker):
+            waiting_count += 1
+            continue
+        set_download_item_status(item, "searching for slskd queue record")
+        waiting_count += 1
+
+    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
+    if transfer_error_message:
+        append_task_log(session, None, f"slskd transfer lookup: {transfer_error_message}", "warning")
+        for entry in entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "searching transfer state")
+    for entry in entries:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        if download_item_retry_exhausted(item):
+            set_download_item_status(item, "needs attention; could not be downloaded automatically")
+            failed_count += 1
+            continue
+
+        transfer = transfer_lookup.get(manifest_entry_key(entry))
+        if entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
+            apply_transfer_path_to_manifest(entry, transfer)
+
+        file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
+
+        # Move a freshly-downloaded file into staging (no MusicBrainz verification — that now
+        # happens via the manual add-to-library review below). Already-staged entries return
+        # their staged path here and skip the move.
+        if file_path and entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
+            try:
+                file_path = stage_downloaded_file(session, batch, entry, file_path)
+            except Exception as error:  # noqa: BLE001 - keep the batch visible and retryable.
+                failed_count += 1
+                if item:
+                    item.status = ProposalStatus.failed
+                set_download_item_status(item, "needs attention")
+                update_download_manifest_entry(entry, "failed", retry_reason=f"staging failed: {error}")
+                append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
+                delete_stale_download_file(entry)
+                continue
+
+        if file_path:
+            # Verify the downloaded audio actually holds the track we requested before it can be
+            # added to the library. A failure deletes the file and requeues another source.
+            if not verify_staged_download_content(session, batch, entry, item, file_path, download_slot_tracker):
+                failed_count += 1
+                continue
+            staged_entries.append((entry, file_path))
+            ready_count += 1
+            set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+            continue
+
+        # Not downloaded yet — keep waiting on / retrying the transfer.
+        retry_reason = None if wait_status.startswith("downloaded; settling") else download_retry_reason(entry, transfer)
+        if item and retry_reason and not transfer_error_message:
+            if retry_download_entry(session, batch, entry, item, retry_reason, transfer, available_slots=download_slot_tracker):
+                waiting_count += 1
+                continue
+            failed_count += 1
+            continue
+        if transfer_error_message and not transfer:
+            wait_status = f"{transfer_error_message}; {wait_status}"
+        update_manifest_transfer_tracking(entry, transfer)
+        progress_state = transfer_progress_state(entry, transfer, wait_status)
+        set_download_item_status(
+            item,
+            progress_state["label"],
+            stage=progress_state.get("stage"),
+            progress=progress_state.get("progress"),
+            indeterminate=progress_state.get("indeterminate"),
+        )
+        if transfer_is_failed(transfer) and item:
+            item.status = ProposalStatus.failed
+            failed_count += 1
+        else:
+            waiting_count += 1
+        continue
+
+    update_download_container_statuses(batch)
+    session.flush()
+
+    # Whole-album imports (wishlist / plain album downloads) wait until the entire batch has settled
+    # before presenting, so an album isn't reviewed piecemeal. Per-track imports (lossless replacement
+    # / missing-track / manual replacement) instead present each downloaded track AS IT LANDS, so one
+    # finished single-track replacement doesn't wait on the hundreds of unrelated ones bundled into the
+    # same bulk batch (the "Check non-lossless" tool makes one batch of 100s of independent tracks).
+    if download_entries_import_per_album(entries) and waiting_count > 0:
+        for entry, _staged_path in staged_entries:
+            set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "downloaded; waiting for the rest of the album", stage="staging", progress=100)
+        return {"imported": 0, "errors": errors, "waiting": waiting_count + ready_count, "ready": 0, "failed": failed_count}
+
+    if not staged_entries:
+        return {"imported": 0, "errors": errors, "waiting": waiting_count, "ready": ready_count, "failed": failed_count}
+
+    # Downloads have settled. Instead of MusicBrainz auto-verification + auto-import, present a
+    # review task the user approves to add the staged files to the library.
+    try:
+        present_staged_downloads_for_library_review(session, batch, staged_entries, finalize=(failed_count == 0 and not blocking_items and waiting_count == 0))
+    except Exception as error:  # noqa: BLE001 - keep the batch visible if the review can't be built.
+        batch.status = ProposalStatus.failed
+        message = describe_import_error(error)
+        append_task_log(session, None, f"{batch.title}: could not prepare the add-to-library review: {message}", "error")
+        if _reported_download_import_failures.get(batch.id) != message:
+            _reported_download_import_failures[batch.id] = message
+            create_notification(
+                session,
+                title="Download completed with an issue",
+                body="The downloaded files could not be prepared for review. Open Activity for details.",
+                event_type="task_completed",
+                target_url="/activity",
+                group_key=f"download:{batch.id}",
+            )
+        session.commit()
+        return {"imported": 0, "errors": [message], "waiting": 0, "ready": ready_count, "failed": 1}
+    _reported_download_import_failures.pop(batch.id, None)
+    return {"imported": 0, "errors": errors, "waiting": 0, "ready": 0, "failed": failed_count}
+
+
+def reconcile_manifest_entries_to_selected_items(session: Session, batch: ProposalBatch, entries: list[dict], expected_item_ids: set[str]) -> list[dict]:
+    selected_by_parent = {
+        item.parent_id: item
+        for item in batch.items
+        if item.parent_id and item.id in expected_item_ids
+    }
+    reconciled = []
+    changed = False
+    for entry in entries:
+        if entry.get("item_id") in expected_item_ids:
+            reconciled.append(entry)
+            continue
+        manifest_item = session.get(ProposalItem, entry.get("item_id"))
+        selected_item = selected_by_parent.get(manifest_item.parent_id) if manifest_item and manifest_item.parent_id else None
+        if not selected_item:
+            reconciled.append(entry)
+            continue
+        patched = {
+            **entry,
+            "_original_item_id": entry.get("item_id"),
+            "item_id": selected_item.id,
+            "parent_id": selected_item.parent_id,
+        }
+        selected_item.title = manifest_item.title
+        selected_item.new_value = manifest_item.new_value
+        selected_item.payload_json = manifest_item.payload_json
+        update_download_manifest_entry(patched, entry.get("status") or "queued")
+        reconciled.append(patched)
+        changed = True
+    if changed:
+        session.flush()
+    return reconciled
+
+
+def cancel_unapproved_download_entries(session: Session, dropped_entries: list[dict]) -> None:
+    """Cancel the slskd transfer and drop the manifest entry/partial file for downloads that are no
+    longer approved (item rejected, deselected, or never approved). Without this, rejecting a
+    download — or the monitor dropping an unapproved one — leaves the transfer running and the file
+    orphaned in /app/downloads. Completed downloads are left untouched."""
+    if not dropped_entries:
+        return
+    transfer_lookup, transfer_error = slskd_transfer_lookup(session, dropped_entries)
+    for entry in dropped_entries:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        if item is not None and item.status == ProposalStatus.completed:
+            continue
+        if not transfer_error and item is not None:
+            transfer = transfer_lookup.get(manifest_entry_key(entry))
+            if transfer is not None:
+                cancel_existing_slskd_transfer(session, transfer, item, "download no longer approved")
+        delete_stale_download_file(entry)
+        remove_download_manifest_entry(entry)
+
+
+def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, entries: list[dict]) -> list[dict]:
+    limit = slskd_concurrent_download_limit(session)
+    transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
+    if transfer_error_message:
+        return entries
+    active_pairs = [
+        (entry, transfer)
+        for entry in entries
+        if entry.get("status") in DOWNLOAD_SLOT_STATUSES
+        for transfer in [transfer_lookup.get(manifest_entry_key(entry))]
+        if transfer_holds_download_slot(transfer)
+    ]
+    if len(active_pairs) <= limit:
+        return entries
+    started_pairs = [(entry, transfer) for entry, transfer in active_pairs if transfer_has_started(transfer)]
+    waiting_pairs = sorted(
+        [(entry, transfer) for entry, transfer in active_pairs if not transfer_has_started(transfer)],
+        key=lambda pair: str(pair[0].get("queued_at") or pair[0].get("initialized_at") or ""),
+    )
+    keep_ids = {id(entry) for entry, _transfer in started_pairs}
+    remaining_capacity = max(0, limit - len(started_pairs))
+    keep_ids.update(id(entry) for entry, _transfer in waiting_pairs[:remaining_capacity])
+    deferred: set[int] = set()
+    for entry, transfer in waiting_pairs[remaining_capacity:]:
+        item = session.get(ProposalItem, entry.get("item_id"))
+        reason = f"download slot limit {limit} reached"
+        if not item or not cancel_existing_slskd_transfer(session, transfer, item, reason):
+            continue
+        remove_download_manifest_entry(entry)
+        set_download_item_status(item, "waiting to download")
+        append_task_log(session, None, f"{entry_download_label(entry)}: deferred queued slskd transfer because {reason}")
+        deferred.add(id(entry))
+    if deferred:
+        batch.status = ProposalStatus.executing
+        session.flush()
+    return [entry for entry in entries if id(entry) not in deferred or id(entry) in keep_ids]
+
+
+def selected_download_blockers(batch: ProposalBatch) -> list[ProposalItem]:
+    blockers = []
+    for item in batch.items:
+        if not item.selected or item.kind != ProposalKind.download:
+            continue
+        action = json.loads(item.payload_json or "{}").get("action")
+        # Exclude executing ytdlp items — the background task is running; they are not stalled.
+        if action == "queue_ytdlp_download" and item.status not in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.executing}:
+            blockers.append(item)
+        elif action == "queue_download" and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"):
+            blockers.append(item)
+    return blockers
+
+
+def download_item_retry_exhausted(item: ProposalItem | None) -> bool:
+    return bool(item and item.status == ProposalStatus.failed and json.loads(item.payload_json or "{}").get("auto_retry_exhausted"))
+
+
+def download_entries_import_per_album(entries: list[dict]) -> bool:
+    """Whether a batch's downloads should import a whole album at a time.
+
+    Wishlist and plain album downloads import the album as a unit; missing-track, lossless-replacement
+    and manual single-track/album replacement downloads fill individual gaps and import each track as it
+    lands (a bulk "Check non-lossless" run is one batch of hundreds of independent single-track
+    replacements — they must not all wait on each other).
+    """
+    for entry in entries:
+        if (entry.get("request") or {}).get("workflow") in {"missing_tracks", "lossless_replacement", "manual_replacement"}:
+            return False
+    return True
+
+
+def selected_slskd_download_item_ids(batch: ProposalBatch) -> set[str]:
+    ids = set()
+    for item in batch.items:
+        if not item.selected or item.kind != ProposalKind.download:
+            continue
+        # Only items that have actually been approved for download (approved → executing, or a
+        # failed attempt awaiting retry). A still-"pending" candidate has NOT been approved, even
+        # if it is selected by default. Without this gate the download monitor auto-queues every
+        # selected candidate in a partially-approved batch (queue_missing_manifest_download),
+        # downloading whole artists/albums the user never approved.
+        if item.status not in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed}:
+            continue
+        if json.loads(item.payload_json or "{}").get("action") == "queue_download":
+            ids.add(item.id)
+    return ids
+
+
+def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item: ProposalItem, available_slots: dict[str, int] | None = None) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
+        return False
+    if not download_slot_available(available_slots):
+        set_download_item_status(item, "waiting to download")
+        item.status = ProposalStatus.executing
+        return True
+    try:
+        set_download_item_status(item, "queue record missing; queueing download automatically")
+        apply_download_item(session, item)
+        consume_download_slot(available_slots)
+        item.status = ProposalStatus.executing
+        batch.status = ProposalStatus.executing
+        append_task_log(session, None, f"{item.title}: missing queue record was recreated automatically")
+        return True
+    except Exception as error:  # noqa: BLE001 - try a different candidate without creating another row.
+        request = download_request_from_item(item)
+        if not request:
+            set_download_item_status(item, "needs attention")
+            append_task_log(session, None, f"{item.title}: queue record missing and could not be recreated: {error}", "error")
+            return False
+        candidate = payload.get("candidate") or {}
+        return retry_download_entry(
+            session,
+            batch,
+            {
+                "batch_id": item.batch_id,
+                "item_id": item.id,
+                "parent_id": item.parent_id,
+                "request": request,
+                "candidate": candidate,
+                "basename": remote_basename(candidate.get("filename") or ""),
+                "queued_at": datetime.now(timezone.utc).isoformat(),
+            },
+            item,
+            f"queue record missing and candidate failed: {error}",
+            available_slots=available_slots,
+        )
+
+
+def reconnect_existing_slskd_transfer(session: Session, item: ProposalItem) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "queue_download":
+        return False
+    request = payload.get("request") or {}
+    candidate = payload.get("candidate") or {}
+    if not request or not candidate:
+        return False
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        append_task_log(session, None, f"{item.title}: could not inspect slskd before recreating queue record: {transfer_error_message}", "warning")
+        return False
+    entry = {
+        "batch_id": item.batch_id,
+        "item_id": item.id,
+        "parent_id": item.parent_id,
+        "request": request,
+        "candidate": {
+            "username": candidate.get("username"),
+            "filename": candidate.get("filename"),
+            "folder": candidate.get("folder"),
+        },
+        "basename": remote_basename(candidate.get("filename") or ""),
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+        "initialized_at": datetime.now(timezone.utc).isoformat(),
+        "status": "queued",
+    }
+    transfer = matching_download_transfer(entry, transfers)
+    # Only reconnect to a transfer that is actively downloading/queued. Reconnecting to a stale
+    # "completed" transfer (e.g. left over from a previous run or a different downloads path)
+    # whose file isn't present just loops on "reported complete but the file was not found"; let
+    # those fall through to a fresh download instead.
+    if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
+        return False
+    record_download_manifest_entry(request, candidate, item)
+    update_manifest_transfer_tracking(entry, transfer)
+    set_download_item_status(item, transfer_wait_status(entry, transfer, "reconnected to existing slskd transfer"))
+    item.status = ProposalStatus.executing
+    append_task_log(session, None, f"{item.title}: existing slskd transfer found; queue record recreated without requeueing")
+    return True
+
+
+def slskd_download_transfer_list(session: Session) -> tuple[list[dict], str | None]:
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    if not slskd_url or not api_key:
+        return [], "slskd settings are missing"
+    try:
+        return download_transfers(slskd_url, api_key), None
+    except Exception as error:  # noqa: BLE001 - folder scans can still catch completed files.
+        return [], f"slskd transfer status unavailable: {error}"
+
+
+def slskd_transfer_lookup(session: Session, entries: list[dict]) -> tuple[dict[tuple[str, str, str], dict], str | None]:
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        return {}, transfer_error_message
+    lookup: dict[tuple[str, str, str], dict] = {}
+    for entry in entries:
+        transfer = matching_download_transfer(entry, transfers)
+        if transfer:
+            lookup[manifest_entry_key(entry)] = transfer
+    return lookup, None
+
+
+def manifest_entry_key(entry: dict) -> tuple[str, str, str]:
+    candidate = entry.get("candidate") or {}
+    return (
+        str(entry.get("batch_id") or ""),
+        str(entry.get("item_id") or entry.get("_original_item_id") or ""),
+        f"{candidate.get('username') or ''}:{candidate.get('filename') or entry.get('basename') or ''}",
+    )
+
+
+def matching_download_transfer(entry: dict, transfers: list[dict]) -> dict | None:
+    candidate = entry.get("candidate") or {}
+    expected_user = str(candidate.get("username") or "").casefold()
+    expected_filename = normalize_remote_path(candidate.get("filename"))
+    expected_basename = str(entry.get("basename") or remote_basename(expected_filename)).casefold()
+    matches: list[dict] = []
+    for transfer in transfers:
+        transfer_user = str(transfer.get("username") or "").casefold()
+        if expected_user and transfer_user and transfer_user != expected_user:
+            continue
+        paths = [
+            normalize_remote_path(transfer.get("filename")),
+            normalize_remote_path(transfer.get("local_path")),
+        ]
+        for path in paths:
+            if not path:
+                continue
+            transfer_basename = path.rsplit("/", 1)[-1].casefold()
+            if expected_basename and transfer_basename == expected_basename:
+                matches.append(transfer)
+                break
+            if expected_filename and (path.endswith(expected_filename) or expected_filename.endswith(path)):
+                matches.append(transfer)
+                break
+    if not matches:
+        return None
+    return max(matches, key=download_transfer_preference)
+
+
+def download_transfer_preference(transfer: dict) -> tuple[int, float]:
+    if transfer_is_failed(transfer):
+        state_rank = 0
+    elif transfer_is_complete_or_finishing(transfer):
+        state_rank = 1
+    elif transfer_holds_download_slot(transfer):
+        state_rank = 3
+    else:
+        state_rank = 2
+    return (state_rank, transfer_event_timestamp(transfer))
+
+
+def transfer_event_timestamp(transfer: dict) -> float:
+    for key in ("updatedAt", "UpdatedAt", "endedAt", "EndedAt", "startedAt", "StartedAt", "enqueuedAt", "EnqueuedAt", "requestedAt", "RequestedAt"):
+        raw = transfer.get(key)
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def normalize_remote_path(value: object) -> str:
+    return str(value or "").replace("\\", "/").casefold()
+
+
+def apply_transfer_path_to_manifest(entry: dict, transfer: dict | None) -> None:
+    if not transfer or entry.get("path"):
+        return
+    local_path = transfer.get("local_path")
+    if not isinstance(local_path, str) or not local_path:
+        return
+    path = Path(local_path)
+    if not path.is_absolute():
+        path = get_settings().downloads_path / path
+    update_download_manifest_entry(entry, entry.get("status") or "queued", path=str(path))
+    entry["path"] = str(path)
+
+
+def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> str:
+    if not transfer:
+        return manifest_wait_status(entry, fallback)
+    status = str(transfer.get("status") or "").strip()
+    error = transfer.get("error")
+    if transfer_is_failed(transfer):
+        detail = f": {error}" if error else f": {status}" if status else ""
+        return f"slskd transfer failed{detail}"
+    if transfer_is_complete_or_finishing(transfer):
+        return manifest_wait_status(entry, "moving completed file to staging")
+    percent = transfer_percent(transfer)
+    if percent is not None:
+        if percent <= 0 and not transfer_has_started(transfer):
+            return manifest_wait_status(entry, f"download queued in slskd: {friendly_transfer_status(status)}")
+        speed = transfer_speed_label(transfer)
+        return f"downloading {percent:.0f}%{speed}"
+    if status:
+        if transfer_is_queued_or_waiting(transfer):
+            return manifest_wait_status(entry, f"download queued in slskd: {status}")
+        return manifest_wait_status(entry, f"download status from slskd: {status}")
+    return manifest_wait_status(entry, fallback)
+
+
+def transfer_progress_state(entry: dict, transfer: dict | None, fallback: str) -> dict:
+    status = transfer_wait_status(entry, transfer, fallback)
+    if not transfer:
+        return {"stage": "queued", "progress": 0, "label": status}
+    if transfer_is_failed(transfer):
+        return {"stage": "failed", "progress": transfer_percent(transfer) or 0, "label": status}
+    if transfer_is_complete_or_finishing(transfer):
+        return {"stage": "transferring", "progress": 100, "label": status, "indeterminate": True}
+    percent = transfer_percent(transfer)
+    if percent is not None:
+        stage = "downloading" if percent > 0 or transfer_has_started(transfer) else "queued"
+        return {"stage": stage, "progress": percent, "label": status}
+    if transfer_is_queued_or_waiting(transfer):
+        return {"stage": "queued", "progress": 0, "label": status}
+    return {"stage": "transferring", "progress": 0, "label": status, "indeterminate": True}
+
+
+def transfer_percent(transfer: dict | None) -> float | None:
+    if not transfer:
+        return None
+    percent = transfer.get("percent")
+    if not isinstance(percent, (int, float)):
+        return None
+    return max(0, min(100, float(percent)))
+
+
+def transfer_has_started(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    bytes_transferred = transfer.get("bytes_transferred")
+    speed = transfer.get("average_speed")
+    try:
+        if bytes_transferred is not None and int(bytes_transferred) > 0:
+            return True
+        if speed is not None and float(speed) > 0:
+            return True
+    except (TypeError, ValueError):
+        return False
+    return transfer_state_category(transfer) in {"in_progress", "succeeded", "completed"}
+
+
+def transfer_is_queued_or_waiting(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    return transfer_state_category(transfer) in {"queued", "initializing"}
+
+
+def friendly_transfer_status(status: str) -> str:
+    cleaned = str(status or "").strip()
+    return cleaned or "queued"
+
+
+def transfer_speed_label(transfer: dict | None) -> str:
+    if not transfer:
+        return ""
+    speed = transfer.get("average_speed")
+    try:
+        speed_value = float(speed)
+    except (TypeError, ValueError):
+        return ""
+    if speed_value <= 0:
+        return ""
+    if speed_value >= 1024 * 1024:
+        return f" · {speed_value / (1024 * 1024):.1f} MB/s"
+    if speed_value >= 1024:
+        return f" · {speed_value / 1024:.0f} KB/s"
+    return f" · {speed_value:.0f} B/s"
+
+
+def transfer_is_complete_or_finishing(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    category = transfer_state_category(transfer)
+    if category in {"succeeded", "completed"}:
+        return True
+    if category in {"failed", "queued", "initializing"}:
+        return False
+    percent = transfer_percent(transfer)
+    return percent is not None and percent >= TRANSFER_COMPLETE_PERCENT
+
+
+def transfer_is_failed(transfer: dict | None) -> bool:
+    if not transfer:
+        return False
+    if transfer.get("error"):
+        return True
+    return transfer_state_category(transfer) == "failed"
+
+
+def transfer_status_is_failed(status: object) -> bool:
+    return transfer_state_category({"status": status}) == "failed"
+
+
+def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
+    if transfer_is_failed(transfer):
+        error = transfer.get("error") if transfer else None
+        status = transfer.get("status") if transfer else None
+        return f"transfer failed: {error or status or 'unknown error'}"
+    age = manifest_entry_age_seconds(entry)
+    if entry.get("status") == "retrying" and age >= REPLACEMENT_SEARCH_RETRY_SECONDS:
+        return str(entry.get("retry_reason") or "continuing automatic replacement search")
+    if transfer_is_complete_or_finishing(transfer):
+        if age >= COMPLETED_MISSING_FILE_RETRY_SECONDS:
+            downloads_root = get_settings().downloads_path
+            slskd_path = (transfer or {}).get("local_path")
+            where = f"; slskd wrote it to {slskd_path}" if slskd_path else ""
+            return f"slskd reported complete but the file was not found under {downloads_root}{where} (check that slskd's downloads dir is the same shared folder)"
+        return None
+    if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
+        return "transfer stayed queued"
+    if not transfer:
+        last_error = entry.get("last_transfer_error")
+        last_status = entry.get("last_transfer_status")
+        if last_error or transfer_status_is_failed(last_status):
+            return f"transfer failed: {last_error or last_status or 'unknown error'}"
+        last_seen_age = manifest_seconds_since(entry.get("last_transfer_seen_at"))
+        if last_seen_age is not None and last_seen_age >= RECENT_TRANSFER_DISAPPEARED_RETRY_SECONDS:
+            return "slskd transfer disappeared before the file arrived"
+        if age >= MISSING_TRANSFER_RETRY_SECONDS:
+            return "slskd transfer did not appear after queueing"
+        return None
+    percent = transfer_percent(transfer)
+    if percent is None:
+        return None
+    last_percent = manifest_float(entry.get("last_transfer_percent"))
+    last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
+    if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
+        queued_retry_seconds = queued_transfer_retry_seconds(entry)
+        if transfer_is_queued_or_waiting(transfer) and age < queued_retry_seconds:
+            return None
+        if transfer_is_queued_or_waiting(transfer):
+            return "transfer stayed queued"
+        return "transfer stayed at 0%"
+    if last_percent is not None and abs(last_percent - percent) >= 0.5:
+        return None
+    if last_progress_age is not None and last_progress_age >= STALLED_PROGRESS_RETRY_SECONDS:
+        return f"transfer stalled at {percent:.0f}%"
+    if last_percent is None and age >= STALLED_PROGRESS_RETRY_SECONDS * 2:
+        return f"transfer stalled at {percent:.0f}%"
+    return None
+
+
+def queued_transfer_retry_seconds(entry: dict) -> int:
+    retry_count = int(entry.get("retry_count") or 0)
+    request = entry.get("request") or {}
+    if retry_count > 0 or request.get("replace_track_id") or request.get("require_lossless"):
+        return REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS
+    return QUEUED_TRANSFER_RETRY_SECONDS
+
+
+def slskd_concurrent_download_limit(session: Session) -> int:
+    # Downloads are handled strictly one track at a time. The old configurable concurrency caused
+    # slot-accounting deadlocks (queued-remotely transfers counting against their own retries), so
+    # it is fixed at 1 and the slskd_concurrent_downloads setting is ignored.
+    return 1
+
+
+def active_download_slot_count(session: Session, entries: list[dict]) -> int:
+    slot_entries = [entry for entry in entries if entry.get("status") in DOWNLOAD_SLOT_STATUSES]
+    transfers, transfer_error_message = slskd_download_transfer_list(session)
+    if transfer_error_message:
+        append_task_log(session, None, f"{transfer_error_message}; preserving current download slots", "warning")
+        return sum(1 for entry in slot_entries if manifest_entry_uses_recent_download_slot(entry))
+    transfer_lookup: dict[tuple[str, str, str], dict] = {}
+    for entry in slot_entries:
+        transfer = matching_download_transfer(entry, transfers)
+        if transfer:
+            transfer_lookup[manifest_entry_key(entry)] = transfer
+    global_active = sum(1 for transfer in transfers if transfer_holds_download_slot(transfer))
+    active = 0
+    for entry in slot_entries:
+        transfer = transfer_lookup.get(manifest_entry_key(entry))
+        if transfer:
+            update_manifest_transfer_tracking(entry, transfer)
+            if transfer_holds_download_slot(transfer):
+                active += 1
+            continue
+        if manifest_entry_waiting_for_slskd_record(entry):
+            active += 1
+    return max(active, global_active)
+
+
+def manifest_entry_uses_recent_download_slot(entry: dict) -> bool:
+    if entry.get("status") not in DOWNLOAD_SLOT_STATUSES:
+        return False
+    last_seen_age = manifest_seconds_since(entry.get("last_transfer_seen_at"))
+    if last_seen_age is not None:
+        return last_seen_age <= DOWNLOAD_SLOT_STALE_SECONDS
+    return manifest_entry_age_seconds(entry) <= DOWNLOAD_SLOT_STALE_SECONDS
+
+
+def manifest_entry_waiting_for_slskd_record(entry: dict) -> bool:
+    initialized_age = manifest_seconds_since(entry.get("initialized_at"))
+    if initialized_age is not None:
+        return initialized_age <= DOWNLOAD_SLOT_PENDING_RECORD_SECONDS
+    return manifest_entry_age_seconds(entry) <= DOWNLOAD_SLOT_PENDING_RECORD_SECONDS
+
+
+def transfer_holds_download_slot(transfer: dict | None) -> bool:
+    if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
+        return False
+    if transfer_has_started(transfer) or transfer_is_queued_or_waiting(transfer):
+        return True
+    # An unrecognized but non-terminal state still occupies a slskd slot; count it so
+    # we never over-queue past the concurrent-download limit.
+    return transfer_state_category(transfer) == "unknown" and bool(transfer.get("status"))
+
+
+def download_slots_available(session: Session, entries: list[dict]) -> int:
+    return max(0, slskd_concurrent_download_limit(session) - active_download_slot_count(session, entries))
+
+
+def download_slot_available(slot_tracker: dict[str, int] | None) -> bool:
+    return slot_tracker is None or int(slot_tracker.get("available") or 0) > 0
+
+
+def consume_download_slot(slot_tracker: dict[str, int] | None) -> None:
+    if slot_tracker is not None:
+        slot_tracker["available"] = max(0, int(slot_tracker.get("available") or 0) - 1)
+
+
+def defer_download_for_slot(
+    session: Session,
+    item: ProposalItem,
+    entry: dict,
+    reason: str,
+    failed_candidates: list[dict],
+    retry_count: int,
+) -> bool:
+    update_download_manifest_entry(
+        entry,
+        "retrying",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    item.status = ProposalStatus.executing
+    set_download_item_status(item, "waiting to download")
+    return True
+
+
+def queue_existing_retry_candidate(
+    session: Session,
+    item: ProposalItem,
+    entry: dict,
+    retry_count: int,
+    failed_candidates: list[dict],
+    reason: str,
+    available_slots: dict[str, int] | None = None,
+) -> bool:
+    settings = integration_settings(session)
+    for candidate_item in existing_retry_candidate_items(session, item, failed_candidates):
+        candidate_payload = json.loads(candidate_item.payload_json or "{}")
+        candidate = candidate_payload.get("candidate") or {}
+        request = entry.get("request") or candidate_payload.get("request") or {}
+        label = candidate.get("filename") or candidate_item.title
+        try:
+            if not download_slot_available(available_slots):
+                set_download_item_status(item, "waiting to download")
+                return False
+            append_task_log(session, None, f"{item.title}: trying existing alternate candidate {label}")
+            queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
+            consume_download_slot(available_slots)
+            payload = json.loads(item.payload_json or "{}")
+            payload.update(
+                {
+                    "action": "queue_download",
+                    "request": request,
+                    "candidate": candidate,
+                    "failed_candidates": failed_candidates[-25:],
+                    "status": f"existing alternate candidate queued ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
+                    "auto_retry_exhausted": False,
+                }
+            )
+            item.payload_json = json.dumps(payload)
+            item.title = candidate_item.title
+            item.new_value = candidate_item.new_value
+            item.status = ProposalStatus.executing
+            candidate_item.status = ProposalStatus.executing
+            record_download_manifest_entry(request, candidate, item)
+            update_download_manifest_entry(
+                {
+                    "batch_id": item.batch_id,
+                    "item_id": item.id,
+                    "basename": remote_basename(candidate.get("filename") or ""),
+                },
+                "queued",
+                retry_count=retry_count,
+                failed_candidates=failed_candidates[-25:],
+                queued_at=datetime.now(timezone.utc).isoformat(),
+                initialized_at=datetime.now(timezone.utc).isoformat(),
+            )
+            set_download_item_status(item, f"queued in slskd: existing alternate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+            append_task_log(session, None, f"{item.title}: existing alternate candidate queued after {reason}")
+            return True
+        except Exception as error:  # noqa: BLE001 - keep walking the already reviewed alternates.
+            failed_candidates.append(
+                {
+                    "username": candidate.get("username"),
+                    "filename": candidate.get("filename"),
+                    "reason": str(error),
+                }
+            )
+            candidate_item.status = ProposalStatus.failed
+            append_task_log(session, None, f"{item.title}: existing alternate candidate failed: {label}: {error}", "warning")
+    return False
+
+
+def retry_download_entry(
+    session: Session,
+    batch: ProposalBatch,
+    entry: dict,
+    item: ProposalItem,
+    reason: str,
+    transfer: dict | None = None,
+    available_slots: dict[str, int] | None = None,
+) -> bool:
+    retry_count = max(0, min(int(entry.get("retry_count") or 0), MAX_DOWNLOAD_AUTO_RETRIES))
+    current_candidate = entry.get("candidate") or {}
+    failed_candidates = manifest_failed_candidates(entry)
+    if current_candidate:
+        failed_candidates.append(
+            {
+                "username": current_candidate.get("username"),
+                "filename": current_candidate.get("filename"),
+                "reason": reason,
+            }
+        )
+    holds_slot = transfer is not None and transfer_holds_download_slot(transfer)
+    # If we can't act yet (no free slot) and the current transfer isn't occupying a slot we could
+    # reclaim, just wait — do NOT cancel/re-queue every scan. Re-queuing a failed transfer each
+    # scan churned the track, spammed the log, and stopped retry_count from ever advancing.
+    if not holds_slot and retry_count < MAX_DOWNLOAD_AUTO_RETRIES and not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
+    # We're proceeding (or exhausting): abandon the current transfer now. Cancelling a slot-holding
+    # transfer frees its slot for the 1:1 replacement swap (this was the "waiting for download slot"
+    # deadlock); a failed transfer holds no slot, so there is nothing to give back.
+    if transfer is not None:
+        cancel_existing_slskd_transfer(session, transfer, item, reason)
+        transfer = None
+        if holds_slot and available_slots is not None:
+            available_slots["available"] = int(available_slots.get("available") or 0) + 1
+    # Delete the old download file so slskd doesn't accumulate "(1)" dedup suffixes on retry.
+    delete_stale_download_file(entry)
+    if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+        return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
+    if not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
+    retry_count += 1
+    request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
+    append_task_log(session, None, f"{item.title}: {reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", "warning")
+    set_download_item_status(item, f"trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+    payload = json.loads(item.payload_json or "{}")
+    payload["auto_retry_exhausted"] = False
+    item.payload_json = json.dumps(payload)
+    item.status = ProposalStatus.executing
+    update_download_manifest_entry(
+        entry,
+        "retrying",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    append_task_log(
+        session,
+        None,
+        f"{item.title}: {reason}; trying replacement candidate {retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES}",
+        "warning",
+    )
+    if queue_existing_retry_candidate(session, item, entry, retry_count, failed_candidates, reason, available_slots=available_slots):
+        return True
+    try:
+        search_result = search_slskd_for_request(session, request, limit=8)
+        candidates = filter_ignored_candidates(search_result.get("candidates") or [], failed_candidates)
+    except Exception as error:  # noqa: BLE001 - keep the failed row visible with a useful reason.
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "retrying",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason=f"replacement search failed: {error}",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        item.status = ProposalStatus.executing
+        set_download_item_status(item, f"replacement search failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement search failed and will retry: {error}", "warning")
+        return True
+    if not candidates:
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, "no replacement candidates were found", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "retrying",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason="no replacement candidates were found",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        item.status = ProposalStatus.executing
+        set_download_item_status(item, f"no replacement candidate yet; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        return True
+    candidate = candidates[0]
+    payload = json.loads(item.payload_json or "{}")
+    payload.update(
+        {
+            "action": "queue_download",
+            "request": entry.get("request") or payload.get("request") or {},
+            "candidate": candidate,
+            "failed_candidates": failed_candidates[-25:],
+            "status": f"replacement candidate found; queueing ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
+            "auto_retry_exhausted": False,
+        }
+    )
+    item.payload_json = json.dumps(payload)
+    item.title = f"slskd: {candidate.get('filename') or download_query(payload['request'])}"
+    item.new_value = candidate.get("username")
+    item.status = ProposalStatus.executing
+    if not download_slot_available(available_slots):
+        return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
+    try:
+        settings = integration_settings(session)
+        queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
+        consume_download_slot(available_slots)
+        record_download_manifest_entry(entry.get("request") or {}, candidate, item)
+        update_download_manifest_entry(
+            {
+                "batch_id": item.batch_id,
+                "item_id": item.id,
+                "basename": remote_basename(candidate.get("filename") or ""),
+            },
+            "queued",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            queued_at=datetime.now(timezone.utc).isoformat(),
+            initialized_at=datetime.now(timezone.utc).isoformat(),
+        )
+        set_download_item_status(item, f"queued in slskd: replacement candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate queued after {reason}")
+        return True
+    except Exception as error:  # noqa: BLE001 - immediately try again on the next scan without duplicating rows.
+        failed_candidates.append(
+            {
+                "username": candidate.get("username"),
+                "filename": candidate.get("filename"),
+                "reason": str(error),
+            }
+        )
+        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+            return exhaust_download_retries(session, item, entry, f"replacement queue failed: {error}", failed_candidates, retry_count)
+        update_download_manifest_entry(
+            entry,
+            "retrying",
+            retry_count=retry_count,
+            failed_candidates=failed_candidates[-25:],
+            retry_reason=f"replacement queue failed: {error}",
+            queued_at=datetime.now(timezone.utc).isoformat(),
+        )
+        item.status = ProposalStatus.executing
+        set_download_item_status(item, f"replacement queue failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
+        append_task_log(session, None, f"{item.title}: replacement candidate failed to queue: {error}", "warning")
+        return True
+
+
+def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item: ProposalItem, reason: str) -> bool:
+    if not transfer:
+        return False
+    transfer_id = str(transfer.get("id") or "")
+    username = str(transfer.get("username") or "")
+    if not transfer_id or not username:
+        return False
+    settings = integration_settings(session)
+    try:
+        if cancel_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), username, transfer_id, remove=True):
+            append_task_log(session, None, f"{item.title}: cancelled previous slskd transfer before retrying: {reason}", "warning")
+            return True
+    except Exception as error:  # noqa: BLE001 - retry can still proceed if slskd already removed the record.
+        append_task_log(session, None, f"{item.title}: could not cancel previous slskd transfer before retrying: {error}", "warning")
+    return False
+
+
+def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:
+    payload = json.loads(item.payload_json or "{}")
+    # Tree rows show only a short status; the detailed reason goes to the log + a
+    # notification (below) and is kept here under a non-displayed key.
+    payload["status"] = "needs attention"
+    payload["retry_reason"] = reason
+    payload["auto_retry_exhausted"] = True
+    payload["failed_candidates"] = failed_candidates[-25:]
+    item.payload_json = json.dumps(payload)
+    item.status = ProposalStatus.failed
+    update_download_manifest_entry(
+        entry,
+        "failed",
+        retry_count=retry_count,
+        failed_candidates=failed_candidates[-25:],
+        retry_reason=reason,
+    )
+    label = entry_download_label(entry)
+    append_task_log(session, None, f"{label}: could not download from Soulseek after {retry_count} candidate(s): {reason}", "error")
+    # Don't dead-end: auto re-queue this track via YouTube so the rest of the batch/playlist
+    # isn't held up. The request carries wishlist_item_id, so when yt-dlp imports it the
+    # wishlist item completes and it joins any pending playlist. (yt-dlp failing is terminal
+    # — run_ytdlp_download marks its own item "needs attention", so no retry loop.)
+    request = download_request_from_item(item)
+    query = download_query(request) if request else ""
+    if request and query and ytdlp_fallback_allowed():
+        try:
+            create_ytdlp_fallback_batch(session, request, query)
+            payload["status"] = "Soulseek failed — retrying via YouTube"
+            item.payload_json = json.dumps(payload)
+            append_task_log(session, None, f"{label}: Soulseek exhausted — auto-queued YouTube fallback", "warning")
+            return False
+        except Exception as error:  # noqa: BLE001 - fall through to a needs-attention notice.
+            append_task_log(session, None, f"{label}: could not queue YouTube fallback: {error}", "error")
+    create_notification(
+        session,
+        title="Download needs attention",
+        body=f"Couldn't download {label} from Soulseek after {retry_count} candidate(s). Use the YouTube fallback for this track to finish the album.",
+        event_type="task_failed",
+        target_url="/downloads",
+    )
+    return False
+
+
+def manifest_failed_candidates(entry: dict) -> list[dict]:
+    failed = entry.get("failed_candidates")
+    return list(failed) if isinstance(failed, list) else []
+
+
+def filter_ignored_candidates(candidates: list[dict], ignored_candidates: list[dict]) -> list[dict]:
+    ignored = {candidate_identity(candidate) for candidate in ignored_candidates}
+    return [candidate for candidate in candidates if candidate_identity(candidate) not in ignored]
+
+
+def candidate_identity(candidate: dict) -> tuple[str, str]:
+    return (
+        str(candidate.get("username") or "").casefold(),
+        str(candidate.get("filename") or "").replace("\\", "/").casefold(),
+    )
+
+
+def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> None:
+    if not transfer:
+        return
+    percent = transfer.get("percent")
+    now = datetime.now(timezone.utc).isoformat()
+    manifest_status = entry.get("status") or "queued"
+    if transfer_is_failed(transfer):
+        manifest_status = "queued"
+    elif transfer_is_complete_or_finishing(transfer):
+        manifest_status = "downloading"
+    elif transfer_has_started(transfer):
+        manifest_status = "downloading"
+    elif transfer_is_queued_or_waiting(transfer):
+        manifest_status = "queued"
+    fields: dict[str, object] = {
+        "last_transfer_seen_at": now,
+        "last_transfer_status": transfer.get("status"),
+        "last_transfer_id": transfer.get("id"),
+        "last_transfer_error": transfer.get("error"),
+        "last_transfer_bytes_transferred": transfer.get("bytes_transferred"),
+        "last_transfer_bytes_remaining": transfer.get("bytes_remaining"),
+        "last_transfer_average_speed": transfer.get("average_speed"),
+    }
+    if isinstance(percent, (int, float)):
+        bounded = max(0, min(100, float(percent)))
+        last_percent = manifest_float(entry.get("last_transfer_percent"))
+        fields["last_transfer_percent"] = bounded
+        if last_percent is None or abs(last_percent - bounded) >= 0.5:
+            fields["last_transfer_progress_at"] = now
+    update_download_manifest_entry(entry, manifest_status, **fields)
+    entry.update({"status": manifest_status, **fields})
+
+
+def manifest_entry_age_seconds(entry: dict) -> int:
+    return manifest_seconds_since(entry.get("queued_at")) or 0
+
+
+def manifest_seconds_since(value: object) -> int | None:
+    if not value:
+        return None
+    try:
+        since = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - since).total_seconds()))
+
+
+def manifest_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def manifest_entry_file_path(entry: dict, minimum_age_seconds: int) -> tuple[Path | None, str]:
+    root = get_settings().downloads_path
+    if entry.get("status") in DOWNLOAD_MANIFEST_STAGING_STATUSES and entry.get("path"):
+        staged = Path(str(entry["path"]))
+        if staged.exists():
+            return staged, "staged; ready for verification"
+        return None, "staged file is missing"
+    staging_root = get_settings().staging_path / "downloads"
+    known_path = entry.get("path")
+    candidates = []
+    known_candidates: set[Path] = set()
+    if known_path:
+        known = Path(known_path)
+        known_candidate = known if known.is_absolute() else root / known
+        # Never treat a staging-directory path as a download candidate for a non-staged entry:
+        # if the status wasn't persisted, stage_downloaded_file will re-handle it rather than
+        # moving the file again within staging.
+        try:
+            known_candidate.relative_to(staging_root)
+            in_staging = True
+        except ValueError:
+            in_staging = False
+        if not in_staging:
+            known_candidates.add(known_candidate)
+            candidates.append(known_candidate)
+    candidates.extend(root.rglob("*"))
+    now = time.time()
+    for file_path in candidates:
+        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            continue
+        if file_path in known_candidates:
+            matches_entry = True
+        else:
+            matches_entry = manifest_entry_matches_path(entry, file_path)
+        if not matches_entry:
+            continue
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        if now - stat.st_mtime < minimum_age_seconds:
+            return None, "downloaded; settling before verification"
+        return file_path, "downloaded; ready for verification"
+    return None, "queued in slskd; checking transfer state"
+
+
+def manifest_wait_status(entry: dict, wait_status: str) -> str:
+    queued_at = entry.get("queued_at")
+    if not queued_at:
+        return wait_status
+    try:
+        queued_at_dt = datetime.fromisoformat(str(queued_at))
+    except ValueError:
+        return wait_status
+    seconds = max(0, int((datetime.now(timezone.utc) - queued_at_dt).total_seconds()))
+    if seconds < 90:
+        elapsed = f"{seconds}s"
+    else:
+        elapsed = f"{seconds // 60}m"
+    return f"{wait_status} ({elapsed})"
+
+
+def update_download_container_statuses(batch: ProposalBatch) -> None:
+    children_by_parent: dict[str, list[ProposalItem]] = {}
+    for item in batch.items:
+        if item.parent_id:
+            children_by_parent.setdefault(item.parent_id, []).append(item)
+
+    def selected_action_descendants(item: ProposalItem) -> list[ProposalItem]:
+        children = children_by_parent.get(item.id, [])
+        if not children:
+            payload = json.loads(item.payload_json or "{}")
+            if item.selected and item.kind == ProposalKind.download and payload.get("action") == "queue_download":
+                return [item]
+            return []
+        descendants: list[ProposalItem] = []
+        for child in children:
+            descendants.extend(selected_action_descendants(child))
+        return descendants
+
+    for item in batch.items:
+        if item.id not in children_by_parent:
+            continue
+        leaves = selected_action_descendants(item)
+        if not leaves:
+            continue
+        statuses = [
+            json.loads(leaf.payload_json or "{}").get("status")
+            or (leaf.status.value if hasattr(leaf.status, "value") else str(leaf.status))
+            for leaf in leaves
+        ]
+        progress_payloads = [json.loads(leaf.payload_json or "{}").get("download_progress") or {} for leaf in leaves]
+        downloaded = sum(1 for status in statuses if download_status_is_downloaded(status))
+        verified = sum(1 for status in statuses if download_status_is_verified(status))
+        failed = sum(1 for status in statuses if "need attention" in status or "failed" in status or "mismatch" in status or "could not be verified" in status)
+        total = len(leaves)
+        progress_values = [download_status_progress_value(status, payload) for status, payload in zip(statuses, progress_payloads)]
+        average_progress = sum(progress_values) / max(1, total)
+        if failed:
+            status = f"{failed} of {total} need attention"
+        elif verified == total:
+            status = "verified 100% · ready to import"
+        elif downloaded == total:
+            verify_percent = (verified / max(1, total)) * 100
+            status = f"verifying {verify_percent:.0f}% · {verified} of {total} verified"
+        elif downloaded:
+            status = f"downloading {average_progress:.0f}% · {downloaded} of {total} downloaded"
+        elif average_progress > 0:
+            status = f"downloading {average_progress:.0f}% · 0 of {total} downloaded"
+        elif any("waiting to download" in status for status in statuses):
+            status = f"waiting to download · {downloaded} of {total} downloaded"
+        elif any("queued in slskd" in status or "download queued in slskd" in status for status in statuses):
+            status = f"queued in slskd · {downloaded} of {total} downloaded"
+        else:
+            status = f"waiting for transfer progress · {downloaded} of {total} downloaded"
+        stage = "failed" if failed else "verified" if verified == total else "verifying" if downloaded == total else "downloading" if average_progress > 0 else "queued"
+        set_item_payload_status(item, status, download_progress_payload(status, stage=stage, progress=average_progress, indeterminate=stage in {"verifying"}))
+
+
+def download_status_is_downloaded(status: str) -> bool:
+    lowered = str(status or "").casefold()
+    return any(token in lowered for token in ("downloaded", "staged", "verifying", "verified", "importing"))
+
+
+def download_status_is_verified(status: str) -> bool:
+    lowered = str(status or "").casefold()
+    return any(token in lowered for token in ("verified", "importing"))
+
+
+def download_status_progress_value(status: str, progress_payload: dict | None = None) -> float:
+    if isinstance(progress_payload, dict) and isinstance(progress_payload.get("value"), (int, float)):
+        return max(0.0, min(100.0, float(progress_payload["value"])))
+    lowered = str(status or "").casefold()
+    if download_status_is_downloaded(status):
+        return 100.0
+    match = re.search(r"downloading\s+(\d+(?:\.\d+)?)%", lowered)
+    if match:
+        return max(0.0, min(100.0, float(match.group(1))))
+    return 0.0
+
+
+def manifest_entry_matches_path(entry: dict, file_path: Path) -> bool:
+    basename = file_path.name.casefold()
+    if entry.get("basename") == basename:
+        return True
+    filename = str((entry.get("candidate") or {}).get("filename") or "").replace("\\", "/").casefold()
+    return bool(filename and str(file_path).replace("\\", "/").casefold().endswith(filename))
+
+
+def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, verification: dict) -> bool:
+    try:
+        file_path.unlink()
+    except OSError as error:
+        verification["message"] = f"{verification['message']} Could not remove {file_path.name}: {error}"
+    item = session.get(ProposalItem, entry.get("item_id"))
+    if item:
+        append_task_log(session, None, f"{item.title}: {verification['message']}; retrying another candidate", "warning")
+        set_download_item_status(item, "retrying another candidate")
+        retry_started = retry_download_entry(
+            session,
+            batch,
+            entry,
+            item,
+            verification["message"],
+            available_slots={"available": download_slots_available(session, load_download_manifest())},
+        )
+        if retry_started:
+            batch.status = ProposalStatus.executing
+            create_notification(
+                session,
+                title="Download candidate rejected",
+                body=f"{file_path.name} did not match and another candidate is being tried.",
+                event_type="task_warning",
+                target_url="/downloads",
+                deliver_apns=False,
+                group_key=f"download:{batch.id}",
+            )
+            session.commit()
+            return True
+    update_download_manifest_entry(entry, "failed", path=str(file_path), metadata=verification.get("metadata"), retry_reason=verification["message"])
+    if item:
+        item.status = ProposalStatus.failed
+        set_download_item_status(item, "needs attention")
+    batch.status = ProposalStatus.failed
+    create_notification(
+        session,
+        title="Download completed with an issue",
+        body="The downloaded track did not match the requested music. Open Activity for details.",
+        event_type="task_completed",
+        target_url="/activity",
+        group_key=f"download:{batch.id}",
+    )
+    session.commit()
+    return False
+
+
+def handle_download_verification_issue(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, message: str, verification: dict) -> None:
+    update_download_manifest_entry(entry, "queued", path=str(file_path), verification_error=message, metadata=verification.get("metadata"))
+    item = session.get(ProposalItem, entry.get("item_id"))
+    if item:
+        item.status = ProposalStatus.failed
+        set_download_item_status(item, message)
+    batch.status = ProposalStatus.failed
+    create_notification(
+        session,
+        title="Download completed with an issue",
+        body="The downloaded track could not be verified. Open Activity for details.",
+        event_type="task_completed",
+        target_url="/activity",
+        group_key=f"download:{batch.id}",
+    )
+    session.commit()
+
+
+def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
+    return import_verified_download_entries(session, batch, verified_entries, finalize=True)
+
+
+def finalize_completed_download_batch(session: Session, batch: ProposalBatch) -> None:
+    cleanup_download_staging_batch(batch.id)
+    for item in batch.items:
+        if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
+            item.status = ProposalStatus.completed
+    batch.status = ProposalStatus.completed
+    session.flush()
+
+
+def cleanup_orphaned_download_batches(session: Session) -> int:
+    """Finalize download batches whose work is done but which never got marked complete.
+
+    Auto paths (e.g. the yt-dlp fallback) can leave a candidate batch `pending` after its
+    only actionable download item completed — the artist/album grouping nodes carry no
+    `action` and never execute — which renders as an empty "Download candidates · 0 of 0"
+    batch lingering in the Task Queue. Finalize ONLY batches that have at least one
+    completed actionable item and no still-open actionable item. A batch still being
+    searched has zero actionable items (grouping/track rows carry no `action` until
+    candidates attach), so it is deliberately left untouched.
+    """
+    cleaned = 0
+    batches = session.scalars(
+        select(ProposalBatch).where(
+            ProposalBatch.kind == ProposalKind.download,
+            ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.executing]),
+        )
+    ).all()
+    for batch in batches:
+        actionable = [
+            item for item in batch.items
+            if json.loads(item.payload_json or "{}").get("action")
+        ]
+        if not actionable:
+            continue  # mid-search or structure-only batch — leave it alone
+        if any(item.status not in {ProposalStatus.completed, ProposalStatus.rejected} for item in actionable):
+            continue  # still has open download work
+        if not any(item.status == ProposalStatus.completed for item in actionable):
+            continue  # nothing actually completed — keep it visible
+        finalize_completed_download_batch(session, batch)
+        cleaned += 1
+    return cleaned
+
+
+def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
+    """Turn a fully-downloaded, staged batch into a manual "add to library" review task.
+
+    All completed download batches accumulate into a single pending import_files review batch
+    so the user approves everything at once rather than one card per album.
+    """
+    # Reuse an existing pending review batch so multiple completed download batches
+    # consolidate into one "Add to library" card instead of one per album.
+    review_batch: ProposalBatch | None = session.scalar(
+        select(ProposalBatch)
+        .options(selectinload(ProposalBatch.items))
+        .where(ProposalBatch.kind == ProposalKind.import_files)
+        .where(ProposalBatch.tree_path == "/task-queue")
+        .where(ProposalBatch.status == ProposalStatus.pending)
+        .order_by(ProposalBatch.created_at.desc())
+        .limit(1)
+    )
+
+    # Rebuild artist/album node maps from whatever's already in the batch.
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    if review_batch is not None:
+        for existing_item in review_batch.items:
+            try:
+                payload = json.loads(existing_item.payload_json or "{}")
+            except (ValueError, TypeError):
+                payload = {}
+            artist = payload.get("artist")
+            album = payload.get("album")
+            if not artist:
+                continue
+            if existing_item.parent_id is None:
+                artist_items[artist] = existing_item
+            elif album and existing_item.old_value is None:
+                album_items[(artist, album)] = existing_item
+
+    created = 0
+
+    def ensure_review_tree(artist: str, album: str) -> str:
+        nonlocal review_batch
+        if review_batch is None:
+            review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, tree_path="/task-queue")
+            session.add(review_batch)
+            session.flush()
+        if artist not in artist_items:
+            artist_item = ProposalItem(batch_id=review_batch.id, title=artist, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist}))
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist] = artist_item
+        album_key = (artist, album)
+        if album_key not in album_items:
+            album_item = ProposalItem(batch_id=review_batch.id, parent_id=artist_items[artist].id, title=album, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist, "album": album}))
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        return album_items[album_key].id
+
+    for entry, staged_path in staged_entries:
+        # Per-item idempotency: never add the same downloaded track to a review twice (handles a
+        # track that fails, retries, and succeeds after the album was already presented).
+        item_id = str(entry.get("item_id") or "")
+        already_in_review = item_id and session.scalar(
+            select(ProposalItem.id)
+            .where(ProposalItem.kind == ProposalKind.import_files)
+            .where(ProposalItem.payload_json.like(f'%"source_download_item_id": "{item_id}"%'))
+            .limit(1)
+        )
+        if not already_in_review:
+            request = entry.get("request") or {}
+            metadata = normalize_download_metadata(read_audio_metadata(staged_path), request)
+            try:
+                write_audio_metadata(staged_path, metadata)
+            except Exception as error:  # noqa: BLE001 - tagging is best-effort; import still works.
+                append_task_log(session, None, f"{entry_download_label(entry)}: could not write tags before review: {error}", "warning")
+            replace_track_id = request.get("replace_track_id")
+            replace_track = session.get(Track, replace_track_id) if replace_track_id else None
+            target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
+            artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+            album = metadata.get("album") or "Unknown Album"
+            album_item_id = ensure_review_tree(artist, album)
+            session.add(
+                ProposalItem(
+                    batch_id=review_batch.id,
+                    parent_id=album_item_id,
+                    title=metadata.get("title") or staged_path.stem,
+                    kind=ProposalKind.import_files,
+                    old_value=str(staged_path),
+                    new_value=str(target_path),
+                    payload_json=json.dumps(
+                        {
+                            "action": "replace_library_track" if replace_track else "import_download",
+                            "source_download_batch_id": batch.id,
+                            "source_download_item_id": item_id,
+                            "replace_track_id": replace_track.id if replace_track else None,
+                            "metadata": metadata,
+                        }
+                    ),
+                )
+            )
+            created += 1
+        # The download is done; the review task now owns the staged file.
+        update_download_manifest_entry(entry, "completed", path=str(staged_path))
+        download_item = session.get(ProposalItem, entry.get("item_id"))
+        if download_item:
+            download_item.status = ProposalStatus.completed
+            set_download_item_status(download_item, "downloaded; review to add to library", stage="staging", progress=100)
+    if review_batch is not None:
+        # Title: list distinct artists in the batch.
+        all_artists = sorted({a for a in artist_items if a != "Unknown Artist"} or {"Unknown Artist"})
+        artist_label = ", ".join(all_artists[:3]) + (" & more" if len(all_artists) > 3 else "")
+        review_batch.title = f"Add to library: {artist_label}"
+        session.flush()
+        if created:
+            append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
+            create_notification(
+                session,
+                title="Downloaded music ready to add",
+                body=f"{created} track(s) downloaded for {artist_label}. Review and approve to add them to your library.",
+                event_type="approval_needed",
+                target_url="/task-queue",
+                group_key=f"download:{batch.id}",
+            )
+    if finalize:
+        # Mark the download batch complete WITHOUT cleaning staging — the review task still needs
+        # the staged files; they leave staging when it is approved and imported.
+        for item in batch.items:
+            if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
+                item.status = ProposalStatus.completed
+        batch.status = ProposalStatus.completed
+    session.flush()
+
+
+def import_verified_download_entries(
+    session: Session,
+    batch: ProposalBatch,
+    verified_entries: list[tuple[dict, Path, dict]],
+    finalize: bool = True,
+) -> int:
+    known_paths = existing_library_and_proposal_paths(session)
+    imported = 0
+    imported_albums: set[tuple[str, str]] = set()
+    for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
+        request = entry.get("request") or {}
+        normalized_metadata = normalize_download_metadata(metadata, request)
+        normalized_metadata["musicbrainz_verified"] = True
+        append_task_log(session, None, f"{entry_download_label(entry)}: writing normalized metadata before library import")
+        write_audio_metadata(file_path, normalized_metadata)
+        replacement_track = session.get(Track, request.get("replace_track_id")) if request.get("replace_track_id") else None
+        target_path = replacement_target_path(replacement_track, normalized_metadata, file_path)
+        if not replacement_track and str(target_path) in known_paths:
+            if file_path.exists() and file_path.resolve() != target_path.resolve():
+                file_path.unlink()
+                append_task_log(session, None, f"{entry_download_label(entry)}: removed duplicate staged file because {target_path.name} already exists")
+            update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
+            duplicate_item = session.get(ProposalItem, entry.get("item_id"))
+            if duplicate_item:
+                duplicate_item.status = ProposalStatus.completed
+            continue
+        payload = {
+            "path": str(file_path),
+            "relative_path": relative_media_path(file_path),
+            "extension": file_path.suffix.lower(),
+            "size_bytes": file_path.stat().st_size,
+            "mtime_ns": file_path.stat().st_mtime_ns,
+            "metadata": normalized_metadata,
+            "suggested_library_path": str(target_path),
+        }
+        if replacement_track:
+            replace_library_track_file(session, replacement_track, file_path, target_path, payload)
+            append_task_log(session, None, f"{entry_download_label(entry)}: replaced library file at {target_path}")
+        else:
+            import_file_to_library(session, file_path, target_path, payload)
+            append_task_log(session, None, f"{entry_download_label(entry)}: moved staged file into library at {target_path}")
+        mark_matching_wishlist_completed(session, normalized_metadata)
+        update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
+        imported_item = session.get(ProposalItem, entry.get("item_id"))
+        if imported_item:
+            imported_item.status = ProposalStatus.completed
+        imported += 1
+        known_paths.add(str(target_path))
+        imported_albums.add(
+            (
+                str(normalized_metadata.get("albumartist") or normalized_metadata.get("artist") or "Unknown Artist"),
+                str(normalized_metadata.get("album") or "Unknown Album"),
+            )
+        )
+    for artist_name, album_title in sorted(imported_albums):
+        ensure_album_cover_for_import(session, artist_name, album_title)
+    if finalize:
+        finalize_completed_download_batch(session, batch)
+        append_task_log(session, None, f"{batch.title}: library import finished for {imported} track(s)")
+    else:
+        session.flush()
+        append_task_log(session, None, f"{batch.title}: imported {imported} verified track(s); other tracks still in progress")
+    return imported
+
+
+def relative_media_path(file_path: Path) -> str:
+    settings = get_settings()
+    roots = [
+        download_staging_root(),
+        settings.staging_path,
+        settings.downloads_path,
+        settings.import_path,
+        settings.library_path,
+    ]
+    for root in roots:
+        try:
+            return str(file_path.relative_to(root))
+        except ValueError:
+            continue
+    return file_path.name
+
+
+def album_folder_path(album: Album) -> Path:
+    if album.path:
+        return Path(album.path)
+    track_dirs = [Path(track.path).parent for track in album.tracks if track.path]
+    if track_dirs:
+        return track_dirs[0]
+    return get_settings().library_path / safe_path_part(album.artist.name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")
+
+
+def cover_extension(content_type: str, url: str) -> str:
+    content_type = content_type.split(";", 1)[0].strip().casefold()
+    if content_type == "image/png":
+        return ".png"
+    if content_type == "image/webp":
+        return ".webp"
+    if content_type in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    suffix = Path(url.split("?", 1)[0]).suffix.lower()
+    return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp"} else ".jpg"
+
+
+COVER_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}
+COVER_FILE_STEMS = ("cover", "folder", "front", "albumart", "album")
+
+
+def find_existing_cover_file_in_dir(directory: Path) -> str | None:
+    try:
+        if not directory.is_dir():
+            return None
+        entries = list(directory.iterdir())
+    except OSError:
+        return None
+    by_stem: dict[str, Path] = {}
+    for entry in entries:
+        try:
+            if not entry.is_file():
+                continue
+        except OSError:
+            continue
+        if entry.suffix.lower() not in COVER_IMAGE_EXTENSIONS:
+            continue
+        stem = entry.stem.casefold()
+        if stem in COVER_FILE_STEMS and stem not in by_stem:
+            by_stem[stem] = entry
+    for stem in COVER_FILE_STEMS:
+        match = by_stem.get(stem)
+        if match is not None:
+            return str(match)
+    return None
+
+
+def find_existing_cover_file(album: Album) -> str | None:
+    return find_existing_cover_file_in_dir(album_folder_path(album))
+
+
+def album_has_valid_local_cover(album: Album) -> bool:
+    cover_path = album.cover_path
+    if not cover_path:
+        return False
+    if cover_path.startswith("http://") or cover_path.startswith("https://"):
+        return False
+    candidate = Path(cover_path)
+    return candidate.exists() and candidate.is_file()
+
+
+def download_album_cover_to_library(session: Session, album: Album, urls: list[str]) -> str | None:
+    album_dir = album_folder_path(album)
+    album_dir.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for url in urls:
+        try:
+            response = httpx.get(url, timeout=20, follow_redirects=True, headers={"User-Agent": "Nudibranch/0.1"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.casefold().startswith("image/"):
+                raise ValueError(f"unexpected content type {content_type or 'unknown'}")
+            cover_path = album_dir / f"cover{cover_extension(content_type, url)}"
+            cover_path.write_bytes(response.content)
+            append_task_log(session, None, f"{album.artist.name} / {album.title}: downloaded album art to {cover_path}")
+            return str(cover_path)
+        except Exception as error:  # noqa: BLE001 - try the next artwork source.
+            last_error = error
+            append_task_log(session, None, f"{album.artist.name} / {album.title}: cover download failed from {url}: {error}", "warning")
+    if last_error:
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: no cover source could be downloaded: {last_error}", "warning")
+    return None
+
+
+# Covers at or above this longest-edge pixel size are considered high-resolution and left alone
+# by the cover-refresh maintenance tool. The upgraded lookup targets 1200 px (Cover Art Archive
+# front-1200 / iTunes 1200x1200bb), so this floor catches the legacy 250 px / 600 px art.
+COVER_REFRESH_TARGET_PX = 1000
+
+
+def image_dimensions_from_bytes(data: bytes) -> tuple[int, int] | None:
+    """Best-effort (width, height) from an image header, no Pillow dependency.
+
+    Supports PNG, GIF, BMP, WEBP, and JPEG (the formats Cover Art Archive / iTunes serve).
+    Returns None if the dimensions can't be read."""
+    if len(data) < 26:
+        return None
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+        return (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big"))
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return (int.from_bytes(data[6:8], "little"), int.from_bytes(data[8:10], "little"))
+    if data[:2] == b"BM":
+        return (abs(int.from_bytes(data[18:22], "little", signed=True)), abs(int.from_bytes(data[22:26], "little", signed=True)))
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        try:
+            if chunk == b"VP8 ":
+                return (int.from_bytes(data[26:28], "little") & 0x3FFF, int.from_bytes(data[28:30], "little") & 0x3FFF)
+            if chunk == b"VP8L":
+                b0, b1, b2, b3 = data[21], data[22], data[23], data[24]
+                width = ((b1 & 0x3F) << 8 | b0) + 1
+                height = ((b3 & 0x0F) << 10 | b2 << 2 | (b1 & 0xC0) >> 6) + 1
+                return (width, height)
+            if chunk == b"VP8X":
+                return (int.from_bytes(data[24:27], "little") + 1, int.from_bytes(data[27:30], "little") + 1)
+        except IndexError:
+            return None
+        return None
+    if data[:2] == b"\xff\xd8":  # JPEG: scan for a Start-Of-Frame marker.
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xD8, 0xD9, 0x01) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return (int.from_bytes(data[i + 7:i + 9], "big"), int.from_bytes(data[i + 5:i + 7], "big"))
+            if seg_len < 2:
+                return None
+            i += 2 + seg_len
+    return None
+
+
+def image_dimensions(path: Path) -> tuple[int, int] | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    return image_dimensions_from_bytes(data)
+
+
+def download_cover_bytes(session: Session, urls: list[str], label: str) -> tuple[bytes, tuple[int, int] | None] | None:
+    """Fetch the first URL that returns image bytes; returns (bytes, dimensions).
+
+    Every failure is logged (mirroring `download_album_cover_to_library`) — the previous bare
+    `except: continue` made a run that upgraded nothing indistinguishable from one where every
+    lookup source 404'd, timed out, or got rate-limited."""
+    last_error: str | None = None
+    for url in urls:
+        try:
+            response = httpx.get(url, timeout=20, follow_redirects=True, headers={"User-Agent": "Nudibranch/0.1"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.casefold().startswith("image/"):
+                last_error = f"unexpected content type {content_type or 'unknown'}"
+                append_task_log(session, None, f"{label}: cover refresh fetch failed from {url}: {last_error}", "warning")
+                continue
+            dims = image_dimensions_from_bytes(response.content)
+            if dims is None:
+                append_task_log(session, None, f"{label}: cover refresh fetch from {url} returned an undecodable image", "warning")
+            return response.content, dims
+        except Exception as error:  # noqa: BLE001 - try the next artwork source.
+            last_error = str(error)
+            append_task_log(session, None, f"{label}: cover refresh fetch failed from {url}: {error}", "warning")
+    if urls:
+        append_task_log(session, None, f"{label}: no cover refresh source could be fetched: {last_error}", "warning")
+    return None
+
+
+def refresh_low_res_cover_in_place(session: Session, cover_path_str: str, candidate_urls: list[str], label: str) -> bool:
+    """Overwrite an existing low-resolution local cover with a higher-resolution version, in place.
+
+    Keeps the same file path (so the served /cover URL is unchanged) but changes the file bytes —
+    the FileResponse ETag is derived from size+mtime, so installed clients re-fetch. Never downgrades:
+    the replacement must be strictly larger than what's on disk (or the current file unreadable)."""
+    path = Path(cover_path_str)
+    if not path.is_file():
+        return False
+    current = image_dimensions(path)
+    if current and max(current) >= COVER_REFRESH_TARGET_PX:
+        return False
+    if not candidate_urls:
+        append_task_log(session, None, f"{label}: cover refresh found no candidate artwork sources", "warning")
+        return False
+    fetched = download_cover_bytes(session, candidate_urls, label)
+    if not fetched:
+        return False
+    data, new_dims = fetched
+    if not new_dims:
+        return False
+    if current and max(new_dims) <= max(current):
+        append_task_log(session, None, f"{label}: cover refresh candidate {new_dims} was not larger than current {current}; skipped")
+        return False
+    try:
+        path.write_bytes(data)
+    except OSError as error:
+        append_task_log(session, None, f"{label}: could not write refreshed cover: {error}", "warning")
+        return False
+    append_task_log(session, None, f"{label}: refreshed cover {current or 'unknown'} -> {new_dims}")
+    return True
+
+
+def artist_folder_path(artist: Artist) -> Path:
+    return get_settings().library_path / safe_path_part(artist.name, "Unknown Artist")
+
+
+def artist_has_valid_local_cover(artist: Artist) -> bool:
+    cover_path = artist.cover_path
+    if not cover_path:
+        return False
+    if cover_path.startswith("http://") or cover_path.startswith("https://"):
+        return False
+    candidate = Path(cover_path)
+    return candidate.exists() and candidate.is_file()
+
+
+def download_artist_cover_to_library(session: Session, artist: Artist, urls: list[str]) -> str | None:
+    artist_dir = artist_folder_path(artist)
+    artist_dir.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for url in urls:
+        try:
+            response = httpx.get(url, timeout=20, follow_redirects=True, headers={"User-Agent": "Nudibranch/0.1"})
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            if not content_type.casefold().startswith("image/"):
+                raise ValueError(f"unexpected content type {content_type or 'unknown'}")
+            cover_path = artist_dir / f"cover{cover_extension(content_type, url)}"
+            cover_path.write_bytes(response.content)
+            append_task_log(session, None, f"{artist.name}: downloaded artist art to {cover_path}")
+            return str(cover_path)
+        except Exception as error:  # noqa: BLE001 - try the next artwork source.
+            last_error = error
+            append_task_log(session, None, f"{artist.name}: artist art download failed from {url}: {error}", "warning")
+    if last_error:
+        append_task_log(session, None, f"{artist.name}: no artist art source could be downloaded: {last_error}", "warning")
+    return None
+
+
+def representative_album_cover(artist: Artist) -> str | None:
+    """The first local album cover for this artist, used as a fallback artist image
+    (the cover endpoint serves any file under the library, so no copy is needed)."""
+    for album in artist.albums:
+        if album_has_valid_local_cover(album):
+            return album.cover_path
+    return None
+
+
+def adopt_source_folder_cover(session: Session, album: Album, source_dir: Path, album_dir: Path) -> None:
+    """If the imported source folder contains a cover image, copy it into the album folder.
+
+    Only audio files are moved into the library on import, so a cover.jpg that shipped alongside the
+    tracks would otherwise be left behind in /app/import. Runs only when the album has no valid local
+    cover yet, so it never overwrites existing art."""
+    if album_has_valid_local_cover(album):
+        return
+    source_cover = find_existing_cover_file_in_dir(source_dir)
+    if not source_cover:
+        return
+    source_cover_path = Path(source_cover)
+    try:
+        album_dir.mkdir(parents=True, exist_ok=True)
+        dest = album_dir / f"cover{source_cover_path.suffix.lower()}"
+        if source_cover_path.resolve() != dest.resolve():
+            shutil.copy2(source_cover_path, dest)
+        album.cover_path = str(dest)
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: adopted cover from import folder ({source_cover})")
+    except OSError as error:
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: could not adopt import-folder cover: {error}", "warning")
+
+
+def ensure_album_cover(session: Session, album: Album) -> None:
+    """Set a local album cover if missing: adopt one already in the folder, else download online."""
+    if album_has_valid_local_cover(album):
+        return
+    existing = find_existing_cover_file(album)
+    if existing:
+        album.cover_path = existing
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: adopting existing cover file {existing}")
+        return
+    try:
+        results = search_album_releases(album.artist.name, album.title)
+    except Exception as error:  # noqa: BLE001 - art should not block import enrichment.
+        append_task_log(session, None, f"{album.artist.name} / {album.title}: album art lookup failed: {error}", "warning")
+        return
+    cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
+    if cover_path:
+        album.cover_path = cover_path
+
+
+def ensure_artist_cover(session: Session, artist: Artist) -> None:
+    """Set a local artist image if missing: adopt one in the folder, else Deezer, else album cover."""
+    if artist_has_valid_local_cover(artist):
+        return
+    existing = find_existing_cover_file_in_dir(artist_folder_path(artist))
+    if existing:
+        artist.cover_path = existing
+        append_task_log(session, None, f"{artist.name}: adopting existing artist cover file {existing}")
+        return
+    try:
+        cover_path = download_artist_cover_to_library(session, artist, artist_image_candidate_urls(artist.name))
+    except Exception as error:  # noqa: BLE001 - art should not block import enrichment.
+        append_task_log(session, None, f"{artist.name}: artist art lookup failed: {error}", "warning")
+        cover_path = None
+    if not cover_path:
+        cover_path = representative_album_cover(artist)
+        if cover_path:
+            append_task_log(session, None, f"{artist.name}: using album cover as artist art {cover_path}")
+    if cover_path:
+        artist.cover_path = cover_path
+
+
+def ensure_album_cover_for_import(session: Session, artist_name: str, album_title: str) -> None:
+    album = session.scalar(
+        select(Album)
+        .join(Artist, Album.artist_id == Artist.id)
+        .where(func.lower(Artist.name) == artist_name.lower(), func.lower(Album.title) == album_title.lower())
+    )
+    if not album or album.cover_path:
+        return
+    try:
+        results = search_album_releases(artist_name, album_title)
+    except Exception as error:  # noqa: BLE001 - cover art should not block completed imports.
+        append_task_log(session, None, f"{artist_name} / {album_title}: album art lookup failed: {error}", "warning")
+        return
+    cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(artist_name, album_title, results))
+    if not cover_path:
+        append_task_log(session, None, f"{artist_name} / {album_title}: no album art found", "warning")
+        return
+    album.cover_path = cover_path
+    append_task_log(session, None, f"{artist_name} / {album_title}: album art set")
+
+
+def cleanup_download_staging_batch(batch_id: str) -> None:
+    staging_root = download_staging_root(batch_id)
+    try:
+        if staging_root.exists() and not any(staging_root.rglob("*")):
+            staging_root.rmdir()
+    except OSError:
+        return
+
+
+def replacement_target_path(track: Track | None, metadata: dict, file_path: Path) -> Path:
+    if track and track.path:
+        old_path = Path(track.path)
+        return old_path.with_suffix(file_path.suffix.lower())
+    return unique_destination(suggest_library_path(metadata, file_path))
+
+
+def replace_library_track_file(session: Session, track: Track, source_path: Path, target_path: Path, payload: dict) -> None:
+    old_path = Path(track.path) if track.path else None
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    # The original is set aside beside itself only so a failed replacement can be rolled back. It
+    # stays in its own directory, so the rename is atomic and cannot cross a filesystem, and it is
+    # deleted as soon as the replacement is in place — removals are permanent and nothing is kept.
+    holding_path: Path | None = None
+    if old_path and old_path.exists():
+        holding_path = unique_destination(old_path.with_name(f".{old_path.name}.replacing"))
+        append_task_log(session, None, f"{track.title}: setting the original aside while the replacement is installed")
+        shutil.move(str(old_path), str(holding_path))
+    elif target_path.exists():
+        append_task_log(session, None, f"{track.title}: removing existing replacement target at {target_path}")
+        target_path.unlink()
+    try:
+        append_task_log(session, None, f"{track.title}: moving verified lossless replacement to {target_path}")
+        shutil.move(str(source_path), str(target_path))
+    except Exception:
+        if old_path is not None and holding_path is not None and holding_path.exists():
+            old_path.parent.mkdir(parents=True, exist_ok=True)
+            append_task_log(session, None, f"{track.title}: replacement move failed; restoring the original file", "warning")
+            shutil.move(str(holding_path), str(old_path))
+        raise
+    if holding_path is not None and holding_path.exists():
+        append_task_log(session, None, f"{track.title}: deleting the replaced original")
+        holding_path.unlink()
+    metadata = payload.get("metadata", {})
+    track.title = metadata.get("title") or track.title
+    track.track_number = metadata.get("track_number")
+    track.disc_number = metadata.get("disc_number")
+    track.duration_ms = metadata.get("duration_ms")
+    track.format = metadata.get("format")
+    track.bitrate = metadata.get("bitrate")
+    track.path = str(target_path)
+    track.musicbrainz_recording_id = metadata.get("musicbrainz_recording_id")
+    track.is_lossless = metadata.get("is_lossless", False)
+    track.musicbrainz_verified = bool(metadata.get("musicbrainz_verified"))
+
+
+def verify_downloaded_file(session: Session, file_path: Path, manifest_entry: dict | None) -> dict:
+    if not manifest_entry:
+        return {"status": "unknown", "message": "Download manifest entry is missing."}
+    request = manifest_entry.get("request") or {}
+    file_metadata = read_audio_metadata(file_path)
+    expected_metadata = expected_download_musicbrainz_metadata(session, request)
+    file_issue = downloaded_file_mismatch_reason(file_metadata, expected_metadata)
+    if file_issue:
+        return {"status": "mismatch", "request": request, "metadata": expected_metadata, "message": f"{file_path.name}: {file_issue}"}
+    match = musicbrainz_download_file_match(file_metadata, expected_metadata, file_path)
+    if match["matched"]:
+        return {
+            "status": "verified",
+            "request": request,
+            "metadata": verified_download_metadata({**file_metadata, **expected_metadata}, expected_metadata),
+            "score": match.get("score"),
+            "message": match.get("message"),
+        }
+    expected = download_query(expected_metadata)
+    found = " ".join(
+        str(part)
+        for part in [file_metadata.get("albumartist") or file_metadata.get("artist"), file_metadata.get("album"), file_metadata.get("title") or file_path.stem]
+        if part
+    ).strip()
+    return {
+        "status": "mismatch",
+        "request": request,
+        "metadata": expected_metadata,
+        "message": f"{file_path.name} matched {found or 'a different recording'} instead of {expected or 'the requested track'}.",
+    }
+
+
+def expected_download_musicbrainz_metadata(session: Session, request: dict) -> dict:
+    expected = dict(request)
+    expected["title"] = request.get("track") or request.get("title")
+    artist = request.get("artist")
+    album = request.get("album")
+    if not artist or not album:
+        return expected
+    if expected.get("duration_ms") and (expected.get("musicbrainz_recording_id") or expected.get("title") or expected.get("track")):
+        return expected
+    try:
+        album_record = lookup_album_tracks(str(artist), str(album), request.get("musicbrainz_album_id"))
+    except Exception as error:  # noqa: BLE001 - keep downloads moving with request metadata if MusicBrainz is unavailable.
+        append_task_log(session, None, f"MusicBrainz metadata lookup failed for {artist} / {album}: {error}", "warning")
+        return expected
+    best_track = best_musicbrainz_track_for_request(album_record, request)
+    if best_track:
+        expected.update(
+            {
+                "artist": album_record.get("artist") or artist,
+                "albumartist": album_record.get("artist") or artist,
+                "album": album_record.get("album") or album,
+                "title": best_track.get("title") or expected.get("title"),
+                "track": best_track.get("title") or expected.get("track"),
+                "track_number": best_track.get("track_number") or expected.get("track_number"),
+                "disc_number": best_track.get("disc_number") or expected.get("disc_number"),
+                "duration_ms": best_track.get("length") or expected.get("duration_ms"),
+                "musicbrainz_recording_id": best_track.get("musicbrainz_recording_id") or expected.get("musicbrainz_recording_id"),
+                "musicbrainz_album_id": album_record.get("musicbrainz_album_id") or expected.get("musicbrainz_album_id"),
+            }
+        )
+    return expected
+
+
+def best_musicbrainz_track_for_request(album_record: dict, request: dict) -> dict | None:
+    tracks = album_record.get("tracks") or []
+    if not tracks:
+        return None
+    request_recording_id = normalize_match_text(request.get("musicbrainz_recording_id"))
+    if request_recording_id:
+        for track in tracks:
+            if normalize_match_text(track.get("musicbrainz_recording_id")) == request_recording_id:
+                return track
+    scored = sorted(
+        ((musicbrainz_request_track_score(track, request), track) for track in tracks),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    return scored[0][1] if scored and scored[0][0] >= 0.55 else None
+
+
+def musicbrainz_request_track_score(track: dict, request: dict) -> float:
+    title = request.get("track") or request.get("title")
+    title_score = fuzzy_similarity(fuzzy_text(title), fuzzy_text(track.get("title"))) if title and track.get("title") else 0.0
+    try:
+        expected_number = int(request.get("track_number") or 0)
+        track_number = int(track.get("track_number") or 0)
+    except (TypeError, ValueError):
+        expected_number = 0
+        track_number = 0
+    number_score = 1.0 if expected_number and track_number and expected_number == track_number else 0.0
+    duration_score = duration_match_score(request_duration_ms(request), track.get("length"))
+    return (title_score * 0.62) + (number_score * 0.28) + (duration_score * 0.10)
+
+
+def musicbrainz_download_file_match(file_metadata: dict, expected: dict, file_path: Path) -> dict:
+    expected_recording_id = normalize_match_text(expected.get("musicbrainz_recording_id"))
+    file_recording_id = normalize_match_text(file_metadata.get("musicbrainz_recording_id"))
+    if expected_recording_id and file_recording_id:
+        matched = expected_recording_id == file_recording_id
+        return {
+            "matched": matched,
+            "score": 1.0 if matched else 0.0,
+            "message": "MusicBrainz recording id matched." if matched else "MusicBrainz recording id did not match.",
+        }
+    expected_title = fuzzy_text(expected.get("track") or expected.get("title"))
+    file_title = fuzzy_text(file_metadata.get("title") or file_path.stem)
+    title_score = fuzzy_similarity(expected_title, file_title) if expected_title and file_title else 0.0
+    expected_artist = fuzzy_text(expected.get("albumartist") or expected.get("artist"))
+    file_artist = fuzzy_text(file_metadata.get("albumartist") or file_metadata.get("artist"))
+    artist_score = fuzzy_similarity(expected_artist, file_artist) if expected_artist and file_artist else 0.75
+    expected_album = fuzzy_text(expected.get("album"))
+    file_album = fuzzy_text(file_metadata.get("album"))
+    album_score = fuzzy_similarity(expected_album, file_album) if expected_album and file_album else 0.75
+    duration_score = duration_match_score(request_duration_ms(expected), file_metadata.get("duration_ms"))
+    score = (title_score * 0.52) + (artist_score * 0.18) + (album_score * 0.12) + (duration_score * 0.18)
+    if title_score < 0.76:
+        return {"matched": False, "score": score, "message": f"title confidence {title_score:.0%} was too low"}
+    if duration_score < 0.45:
+        return {"matched": False, "score": score, "message": f"duration confidence {duration_score:.0%} was too low"}
+    return {"matched": score >= 0.72, "score": score, "message": f"MusicBrainz metadata confidence {score:.0%}"}
+
+
+def downloaded_file_mismatch_reason(metadata: dict, request: dict) -> str | None:
+    expected_duration = request_duration_ms(request)
+    actual_duration = metadata.get("duration_ms")
+    if expected_duration and actual_duration:
+        delta = abs(int(actual_duration) - int(expected_duration))
+        tolerance = max(5000, int(expected_duration * 0.08))
+        if delta > tolerance:
+            return f"duration {round(int(actual_duration) / 1000)}s does not match expected {round(int(expected_duration) / 1000)}s"
+    if request.get("require_lossless") and lossy_or_suspicious_audio(metadata):
+        return "file is not a reliable lossless replacement"
+    return None
+
+
+def request_duration_ms(request: dict) -> int | None:
+    raw = request.get("duration_ms") or request.get("length")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def lossy_or_suspicious_audio(metadata: dict) -> bool:
+    fmt = str(metadata.get("format") or "").casefold()
+    bitrate = int(metadata.get("bitrate") or 0)
+    if fmt in {"mp3", "m4a", "aac", "ogg", "opus", "wma"}:
+        return True
+    if fmt in {"flac", "alac", "wav", "aiff", "aif"} and bitrate and bitrate < 650_000:
+        return True
+    return not metadata.get("is_lossless")
+
+
+def metadata_matches_request(metadata: dict, request: dict) -> bool:
+    request_recording_id = normalize_match_text(request.get("musicbrainz_recording_id"))
+    metadata_recording_id = normalize_match_text(metadata.get("musicbrainz_recording_id"))
+    if request_recording_id and metadata_recording_id:
+        return request_recording_id == metadata_recording_id
+    request_artist = normalize_match_text(request.get("artist"))
+    request_track = normalize_match_text(request.get("track") or request.get("title"))
+    metadata_artist = normalize_match_text(metadata.get("albumartist") or metadata.get("artist"))
+    metadata_track = normalize_match_text(metadata.get("title"))
+    if request_track and metadata_track and not loose_text_match(request_track, metadata_track):
+        return False
+    if request_artist and metadata_artist and not loose_text_match(request_artist, metadata_artist):
+        return False
+    return bool((request_track and metadata_track) or (request_artist and metadata_artist))
+
+
+def _request_album(request: dict) -> str | None:
+    album = request.get("album")
+    if fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}:
+        return None
+    return album
+
+
+def verified_download_metadata(metadata: dict, request: dict) -> dict:
+    artist = request.get("artist") or metadata.get("artist")
+    return {
+        **metadata,
+        "artist": artist,
+        "albumartist": artist,
+        "album": _request_album(request) or metadata.get("album"),
+        "title": request.get("track") or request.get("title") or metadata.get("title"),
+    }
+
+
+def normalize_download_metadata(metadata: dict, request: dict) -> dict:
+    artist = request.get("artist") or metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+    album = _request_album(request) or metadata.get("album") or "Unknown Album"
+    title = request.get("track") or request.get("title") or metadata.get("title") or "Unknown Title"
+    normalized = {
+        **metadata,
+        "artist": artist,
+        "albumartist": artist,
+        "album": album,
+        "title": title,
+        "track_number": request.get("track_number") or metadata.get("track_number"),
+        "disc_number": request.get("disc_number") or metadata.get("disc_number"),
+        "musicbrainz_album_id": request.get("musicbrainz_album_id") or metadata.get("musicbrainz_album_id"),
+        "musicbrainz_recording_id": request.get("musicbrainz_recording_id") or metadata.get("musicbrainz_recording_id"),
+    }
+    normalized["format"] = metadata.get("format")
+    normalized["is_lossless"] = metadata.get("is_lossless", False)
+    return normalized
+
+
+def loose_text_match(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    return left in right or right in left
+
+
+def mark_matching_wishlist_completed(session: Session, metadata: dict) -> None:
+    artist = normalize_match_text(metadata.get("albumartist") or metadata.get("artist"))
+    album = normalize_match_text(metadata.get("album"))
+    title = normalize_match_text(metadata.get("title"))
+    if not artist or not title:
+        return
+    candidates = list(
+        session.scalars(
+            select(WishlistItem).where(WishlistItem.status.in_(["wanted", "review", "approved"]))
+        )
+    )
+    matched = False
+    for item in candidates:
+        same_artist = normalize_match_text(item.artist) == artist
+        same_album = not item.album or not album or normalize_match_text(item.album) == album
+        # Album-/artist-level wishlist entries have no specific track to match against
+        # (an album request is expanded into per-track downloads), so an artist+album
+        # match is enough; only require a track-title match when the item names a track.
+        if item.track:
+            same_track = normalize_match_text(item.track) == title
+        else:
+            same_track = True
+        if same_artist and same_album and same_track:
+            item.status = "completed"
+            item.status_changed_at = datetime.now(timezone.utc)
+            matched = True
+    if matched:
+        queue_automation_event(session, "wishlist_match")
+
+
+def normalize_match_text(value: str | None) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def artist_match_candidates(artist: str | None) -> list[str]:
+    """Normalized artist names to match a library track against. Spotify joins collaborators with
+    commas ("A, B, C"), but the library usually files the song under just the primary artist — so
+    also try the first comma-separated name, else a multi-artist playlist track never resolves."""
+    full = normalize_match_text(artist)
+    candidates = [full] if full else []
+    if artist and "," in artist:
+        primary = normalize_match_text(artist.split(",")[0])
+        if primary and primary not in candidates:
+            candidates.append(primary)
+    return candidates
+
+
+def existing_library_and_proposal_paths(session: Session) -> set[str]:
+    paths = {
+        str(path)
+        for path in session.scalars(select(Track.path).where(Track.path.is_not(None)))
+        if path
+    }
+    paths.update(
+        str(path)
+        for path in session.scalars(
+            select(ProposalItem.old_value)
+            .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+            .where(ProposalItem.old_value.is_not(None))
+            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+        )
+        if path
+    )
+    return paths
+
+
+def process_wishlist_request_items(session: Session, items: list[ProposalItem], task: Task | None = None) -> None:
+    grouped: dict[tuple[str, str, str], list[dict]] = {}
+    wishlist_item_ids = []
+    for item in items:
+        payload = json.loads(item.payload_json or "{}")
+        artist = payload.get("artist") or "Unknown Artist"
+        album = payload.get("album") or "Singles"
+        workflow = payload.get("workflow") or "wishlist"
+        if payload.get("wishlist_item_id"):
+            wishlist_item_ids.append(payload["wishlist_item_id"])
+        grouped.setdefault((workflow, artist, album), []).append(payload)
+    append_task_log(session, task, f"Preparing download candidates for {len(items)} tracks across {len(grouped)} album(s)")
+    # All albums share one batch so candidates can be reviewed and approved in a single pass.
+    workflows = {wf for wf, _, _ in grouped.keys()}
+    workflow = next(iter(workflows), "wishlist")
+    title_prefix = {
+        "lossless_replacement": "Lossless replacement candidates",
+        "missing_tracks": "Missing track candidates",
+    }.get(workflow, "Download candidates")
+    shared_batch: ProposalBatch | None = None
+    shared_artist_items: dict[str, ProposalItem] = {}
+    shared_album_items: dict[tuple[str, str], ProposalItem] = {}
+    for (album_workflow, artist, album), requests in grouped.items():
+        shared_batch = create_album_download_candidate_batch(
+            session, artist, album, requests, task, workflow=album_workflow, existing_batch=shared_batch,
+            batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
+        )
+    if shared_batch is not None:
+        create_notification(
+            session,
+            title="Download candidates ready",
+            body="Soulseek candidates are ready — review and approve them in the Task Queue.",
+            event_type="approval_needed",
+            target_url="/task-queue",
+            group_key=f"download:{shared_batch.id}",
+        )
+    if wishlist_item_ids:
+        for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
+            wishlist_item.status = "approved"
+            wishlist_item.status_changed_at = datetime.now(timezone.utc)
+
+
+def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    if payload.get("action") != "download_lyrics":
+        raise ValueError("Unsupported lyrics action")
+    track = session.scalar(
+        select(Track)
+        .where(Track.id == payload.get("track_id"))
+        .options(selectinload(Track.album).selectinload(Album.artist))
+    )
+    if not track or not track.path:
+        raise ValueError("Track file no longer exists in the library")
+    audio_path = Path(track.path)
+    if not audio_path.exists():
+        raise FileNotFoundError(f"{audio_path} is missing")
+    lyric_text = fetch_lyrics_with_fallback(track)
+    if not lyric_text:
+        raise ValueError("No synced or unsynced lyrics were found")
+    lrc_path = audio_path.with_suffix(".lrc")
+    lrc_path.write_text(lyric_text, encoding="utf-8")
+
+
+def create_album_download_candidate_batch(
+    session: Session,
+    artist: str,
+    album: str,
+    requests: list[dict],
+    task: Task | None = None,
+    tree_path: str = "/task-queue",
+    workflow: str = "wishlist",
+    existing_batch: ProposalBatch | None = None,
+    batch_title: str | None = None,
+    artist_items: dict[str, ProposalItem] | None = None,
+    album_items: dict[tuple[str, str], ProposalItem] | None = None,
+) -> ProposalBatch:
+    configure_match_tuning(session)
+    if existing_batch is None:
+        title_prefix = batch_title or {
+            "lossless_replacement": "Lossless replacement candidates",
+            "missing_tracks": "Missing track candidates",
+        }.get(workflow, "Download candidates")
+        batch = ProposalBatch(title=f"{title_prefix}: {artist} / {album}", kind=ProposalKind.download, tree_path=tree_path)
+        session.add(batch)
+        session.flush()
+    else:
+        batch = existing_batch
+    if artist_items is None:
+        artist_items = {}
+    if album_items is None:
+        album_items = {}
+    append_task_log(session, task, f"Preparing download candidates for {artist} / {album} with {len(requests)} requested track(s)")
+    artist_item = artist_items.get(artist)
+    if not artist_item:
+        artist_item = ProposalItem(
+            batch_id=batch.id,
+            title=artist,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist}),
+        )
+        session.add(artist_item)
+        session.flush()
+        artist_items[artist] = artist_item
+    album_key = (artist, album)
+    album_item = album_items.get(album_key)
+    if not album_item:
+        album_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=artist_item.id,
+            title=album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album}),
+        )
+        session.add(album_item)
+        session.flush()
+        album_items[album_key] = album_item
+    track_items: list[tuple[dict, str, str]] = []
+    for request in requests:
+        query = download_query(request)
+        track_title = request.get("track") or request.get("title") or query
+        track_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_item.id,
+            title=track_title,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album, "track": track_title, "status": "queued"}),
+        )
+        session.add(track_item)
+        session.flush()
+        track_items.append((request, track_item.id, track_title))
+    session.commit()
+
+    slskd_tracks = 0
+    retry_tracks = 0
+    diagnostic_lines = []
+    folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
+    # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
+    # matches arbitrary same-artist folders for the wrong songs) and go straight to per-track search.
+    skip_album_folder_search = is_singles_pseudo_album(album)
+    search_progress = {"done": 0}
+    if skip_album_folder_search:
+        append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+        album_queries: list[str] = []
+        total_tracks = max(1, len(track_items))
+        folder_pools = []
+        folder_pool = None
+    else:
+        append_task_log(session, task, f"{artist} / {album}: searching slskd for lossless album folders")
+        album_queries = album_search_query_variants(artist, album, requests)
+        # Report progress across the whole prepare phase: one step per album-search query, then one
+        # per track, so the "x of n" counter keeps climbing during the (slow) album search too.
+        total_tracks = max(1, len(album_queries) + len(track_items))
+
+        def album_search_progress(message: str) -> None:
+            search_progress["done"] = min(search_progress["done"] + 1, len(album_queries))
+            if task is not None:
+                update_task_progress(session, task, search_progress["done"], total_tracks, message)
+
+        folder_pools = search_album_folder_pools(session, artist, album, requests, task, limit=folder_try_limit, progress_callback=album_search_progress)
+        # Credit any queries skipped by an early exit so the counter flows into the per-track phase.
+        search_progress["done"] = len(album_queries)
+        folder_pool = folder_pools[0] if folder_pools else None
+        if folder_pool:
+            diagnostic_lines.append(
+                f"{artist} {album}: using {folder_pool.get('folder') or 'matched folder'} from {folder_pool.get('username')} for {folder_pool.get('matched_tracks', 0)} tracks."
+            )
+            append_task_log(
+                session,
+                task,
+                f"{artist} / {album}: matched {len(folder_pools)} lossless album folder(s); trying up to {folder_try_limit} folder(s), best is from {folder_pool.get('username')} with {folder_pool.get('matched_tracks', 0)} track(s) already matched",
+            )
+        else:
+            append_task_log(session, task, f"{artist} / {album}: no reusable album folder was found", "warning")
+    search_jobs = []
+    completed_tracks = search_progress["done"]
+    integration = integration_settings(session)
+    slskd_url = integration.get("slskd_url", "")
+    api_key = integration.get("slskd_api_key", "")
+    match_threshold = slskd_album_match_threshold(integration)
+    if folder_pool and not folder_pool.get("match_threshold"):
+        folder_pool["match_threshold"] = match_threshold
+    for request, track_item_id, track_title in track_items:
+        track_item = session.get(ProposalItem, track_item_id)
+        if not track_item:
+            append_task_log(session, task, f"{track_title}: skipped candidate preparation because the review row was removed", "warning")
+            continue
+        query = download_query(request)
+        set_item_payload_status(track_item, f"searching {track_title}")
+        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
+        require_lossless = bool(request.get("require_lossless"))
+        has_lossless = any(candidate.get("quality") == "lossless" for candidate in folder_candidates)
+        if folder_candidates and (has_lossless or not require_lossless):
+            confidence = folder_candidates[0].get("confidence")
+            diagnostic_lines.append(f"{query}: reused {folder_candidates[0].get('folder') or 'the same folder'} from {folder_candidates[0].get('username')} at {confidence}% confidence.")
+            append_task_log(session, task, f"{track_title}: {len(folder_candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s); best {folder_candidates[0].get('filename')} at {confidence}% confidence")
+            add_download_candidate_items(session, batch, track_item, request, query, folder_candidates)
+            slskd_tracks += 1
+            set_item_payload_status(track_item, f"{len(folder_candidates)} candidates ready")
+            completed_tracks += 1
+            if task is not None:
+                update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
+        else:
+            # No candidate at all, OR a lossless-required request that only found lossy in the album
+            # folders — search for the track by its NAME ALONE (we can't rely on the artist/album in the
+            # path) and try to match a FLAC. Any lossy album-folder candidate is carried as a fallback,
+            # so we keep it if the standalone search turns up nothing better; the search loop merges the
+            # results FLAC-first and only drops to YouTube when nothing is found at all.
+            in_folders = " in any album folder" if folder_pools else ""
+            need = "no lossless match" if (folder_candidates and require_lossless) else f"no match{in_folders}"
+            set_item_payload_status(track_item, "searching individual track")
+            append_task_log(session, task, f"{track_title}: {need}; searching for the individual track by name")
+            search_jobs.append((request, track_item.id, track_title, query, 5, folder_candidates))
+        session.commit()
+
+    if search_jobs:
+        workers = min(SLSKD_TRACK_SEARCH_WORKERS, len(search_jobs))
+        append_task_log(session, task, f"{artist} / {album}: searching {len(search_jobs)} track(s) with {workers} concurrent worker(s)")
+        if task is not None:
+            update_task_progress(session, task, completed_tracks, total_tracks, f"Searching {len(search_jobs)} download candidates")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(search_slskd_for_request_with_settings, slskd_url, api_key, request, candidate_limit): (request, track_item_id, track_title, query, fallback_candidates)
+                for request, track_item_id, track_title, query, candidate_limit, fallback_candidates in search_jobs
+            }
+            for future in as_completed(futures):
+                request, track_item_id, track_title, query, fallback_candidates = futures[future]
+                try:
+                    search_result = future.result()
+                except Exception as error:  # noqa: BLE001 - keep creating candidates for the rest of the album.
+                    search_result = {
+                        "candidates": [],
+                        "diagnostics": {"queries": download_query_variants(request), "query_logs": [f"slskd search failed for {query}: {error}"]},
+                    }
+                for line in search_result.get("diagnostics", {}).get("query_logs") or []:
+                    append_task_log(session, task, line)
+                track_item = session.get(ProposalItem, track_item_id)
+                if not track_item:
+                    append_task_log(session, task, f"{track_title}: skipped candidate results because the review row was removed", "warning")
+                    completed_tracks += 1
+                    continue
+                # Merge the standalone (name-only) search results with any lossy album-folder fallback,
+                # then rank FLAC-first: a FLAC found by the title search wins, but a lossy album copy is
+                # kept if the search found nothing better.
+                known = {candidate_identity(candidate) for candidate in (search_result["candidates"] or [])}
+                merged = list(search_result["candidates"] or []) + [c for c in (fallback_candidates or []) if candidate_identity(c) not in known]
+                merged.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+                candidates = merged[:5]
+                diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
+                if candidates and not request.get("multiple_candidates") and not folder_pool:
+                    folder_pool = download_folder_pool(candidates[0])
+                    if folder_pool:
+                        folder_pool["match_threshold"] = match_threshold
+                if candidates:
+                    add_download_candidate_items(session, batch, track_item, request, query, candidates)
+                    slskd_tracks += 1
+                    set_item_payload_status(track_item, "candidate ready")
+                    append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
+                else:
+                    retry_tracks += 1
+                    rate_limited = bool(search_result.get("diagnostics", {}).get("rate_limited"))
+                    status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidate found"
+                    set_item_payload_status(track_item, status)
+                    if rate_limited:
+                        append_task_log(session, task, f"{track_title}: {status}", "warning")
+                    elif ytdlp_fallback_allowed():
+                        add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
+                        append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
+                    else:
+                        # See `add_download_candidate_review_items`'s identical dead-end: without
+                        # this the row is invisible in the app.
+                        track_item.status = ProposalStatus.failed
+                        append_task_log(session, task, f"{track_title}: Soulseek found no candidates and YouTube fallback is disabled — needs attention", "warning")
+                completed_tracks += 1
+                session.commit()
+                if task is not None:
+                    update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
+    session.flush()
+    append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing fallback or attention")
+    return batch
+
+
+def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
+    for index, candidate in enumerate(candidates):
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=track_item.id,
+                title=f"slskd: {candidate.get('filename') or query}",
+                kind=ProposalKind.download,
+                selected=index == 0,
+                old_value=query,
+                new_value=candidate.get("username"),
+                payload_json=json.dumps(
+                    {
+                        "action": "queue_download",
+                        "request": request,
+                        "candidate": candidate,
+                        "candidate_index": index,
+                        "status": candidate_status_label(candidate),
+                    }
+                ),
+            )
+        )
+
+
+def candidate_format_label(candidate: dict) -> str:
+    """Terse format/quality label shown on each candidate row (e.g. "FLAC", "MP3 320")."""
+    name = str(candidate.get("filename") or "")
+    ext = Path(name.replace("\\", "/")).suffix.lower().lstrip(".")
+    label = ext.upper() if ext else str(candidate.get("quality") or "").upper()
+    if not is_lossless_filename(name):
+        try:
+            bitrate = int(candidate.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        if bitrate:
+            label = f"{label} {bitrate}".strip()
+    return label
+
+
+def candidate_status_label(candidate: dict) -> str:
+    confidence = candidate.get("confidence")
+    parts = []
+    if confidence is not None:
+        parts.append(f"{confidence}% match")
+    if candidate.get("same_album_folder"):
+        parts.append("same album folder")
+    fmt = candidate_format_label(candidate)
+    if fmt:
+        parts.append(fmt)
+    return " · ".join(parts) if parts else "candidate"
+
+
+def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, selected: bool = True) -> None:
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            parent_id=track_item.id,
+            title=f"YouTube fallback: {query}",
+            kind=ProposalKind.download,
+            selected=selected,
+            old_value=query,
+            new_value="yt-dlp",
+            payload_json=json.dumps(
+                {
+                    "action": "queue_ytdlp_download",
+                    "request": request,
+                }
+            ),
+        )
+    )
+
+
+def create_download_candidate_batch(session: Session, request: dict) -> None:
+    query = download_query(request)
+    batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, tree_path="/downloads")
+    session.add(batch)
+    session.flush()
+    track_parent = add_download_tree_parents(session, batch, request, query)
+    set_item_payload_status(track_parent, f"searching {query}")
+    session.commit()
+    search_result = search_slskd_for_request(session, request, limit=4 if request.get("multiple_candidates") else 1)
+    candidates = search_result["candidates"]
+    diagnostics = search_result["diagnostics"]
+    if not candidates:
+        if not ytdlp_fallback_allowed():
+            set_item_payload_status(track_parent, "no candidates found")
+            batch.status = ProposalStatus.failed
+            append_task_log(session, None, f"No Soulseek candidates for '{query}' and YouTube fallback is disabled: {slskd_diagnostic_body(query, diagnostics)}", "warning")
+            create_notification(
+                session,
+                title="Download needs attention",
+                body=f"No Soulseek candidates were found for '{query}'. YouTube fallback is disabled, so this needs attention.",
+                event_type="task_failed",
+                target_url="/downloads",
+            )
+            return
+        session.delete(batch)
+        append_task_log(session, None, f"No Soulseek candidates for '{query}': {slskd_diagnostic_body(query, diagnostics)}", "warning")
+        create_ytdlp_fallback_batch(session, request, query)
+        return
+    for index, candidate in enumerate(candidates):
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=track_parent.id,
+                title=candidate.get("filename") or query,
+                kind=ProposalKind.download,
+                selected=index == 0,
+                old_value=query,
+                new_value=candidate.get("username"),
+                payload_json=json.dumps(
+                    {
+                        "action": "queue_download",
+                        "request": request,
+                        "candidate": candidate,
+                    }
+                ),
+            )
+        )
+        session.commit()
+    set_item_payload_status(track_parent, "candidate ready")
+    session.flush()
+    create_notification(
+        session,
+        title="Download candidates ready",
+        body=f"{len(candidates)} slskd candidates found for {query}. {slskd_diagnostic_body(query, diagnostics)}",
+        event_type="approval_needed",
+        target_url="/downloads",
+        group_key=f"download:{batch.id}",
+    )
+
+
+def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> None:
+    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, tree_path="/downloads", status=ProposalStatus.executing)
+    session.add(batch)
+    session.flush()
+    track_parent = add_download_tree_parents(session, batch, request, query)
+    item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=track_parent.id,
+        title=f"YouTube fallback: {query}",
+        kind=ProposalKind.download,
+        old_value=query,
+        new_value="yt-dlp",
+        status=ProposalStatus.executing,
+        payload_json=json.dumps(
+            {
+                "action": "queue_ytdlp_download",
+                "request": request,
+                "status": "queued for yt-dlp download",
+            }
+        ),
+    )
+    session.add(item)
+    session.flush()
+    track_parent.status = ProposalStatus.executing
+    set_item_payload_status(track_parent, "downloading from YouTube via yt-dlp")
+    append_task_log(session, None, f"yt-dlp: slskd found no candidates for '{query}'; queuing YouTube download automatically")
+    enqueue_task(session, "ytdlp_download", {"item_id": item.id})
+    create_notification(
+        session,
+        title="No Soulseek results — downloading from YouTube",
+        body=f"Soulseek had no candidates for '{query}'. yt-dlp will download it automatically from YouTube.",
+        event_type="approval_needed",
+        target_url="/downloads",
+        deliver_apns=False,
+        group_key=f"download:{batch.id}",
+    )
+
+
+def set_item_payload_status(item: ProposalItem, status: str, download_progress: dict | None = None) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    payload["status"] = status
+    if download_progress is not None:
+        payload["download_progress"] = download_progress
+    item.payload_json = json.dumps(payload)
+
+
+def set_download_item_status(
+    item: ProposalItem | None,
+    status: str,
+    *,
+    stage: str | None = None,
+    progress: float | None = None,
+    indeterminate: bool | None = None,
+) -> None:
+    if not item:
+        return
+    progress_payload = download_progress_payload(status, stage=stage, progress=progress, indeterminate=indeterminate)
+    set_item_payload_status(item, status, progress_payload)
+    if item.parent and item.parent.kind == ProposalKind.download:
+        set_item_payload_status(item.parent, status, progress_payload)
+        item.parent.status = ProposalStatus.executing
+
+
+def download_progress_payload(status: str, *, stage: str | None = None, progress: float | None = None, indeterminate: bool | None = None) -> dict:
+    lowered = str(status or "").casefold()
+    value = max(0.0, min(100.0, float(progress))) if isinstance(progress, (int, float)) else None
+    resolved_stage = stage
+    resolved_indeterminate = bool(indeterminate)
+    if resolved_stage is None:
+        if any(token in lowered for token in ("need attention", "failed", "mismatch", "could not be verified")):
+            resolved_stage = "failed"
+            value = 0 if value is None else value
+        elif "verified" in lowered:
+            resolved_stage = "verified"
+            value = 100
+        elif "importing" in lowered:
+            resolved_stage = "importing"
+            value = 100
+            resolved_indeterminate = True
+        elif "verifying" in lowered:
+            resolved_stage = "verifying"
+            value = 100 if value is None else value
+            resolved_indeterminate = True
+        elif any(token in lowered for token in ("downloaded", "staged", "moving completed file")):
+            resolved_stage = "staging"
+            value = 100
+            resolved_indeterminate = "moving" in lowered
+        elif match := re.search(r"downloading\s+(\d+(?:\.\d+)?)%", lowered):
+            resolved_stage = "downloading"
+            value = max(0.0, min(100.0, float(match.group(1))))
+        elif any(token in lowered for token in ("waiting to download", "queued", "requested", "initializing", "checking transfer state")):
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+        elif any(token in lowered for token in ("searching", "retrying", "replacement")):
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+            resolved_indeterminate = True
+        else:
+            resolved_stage = "queued"
+            value = 0 if value is None else value
+    return {
+        "stage": resolved_stage,
+        "value": 0 if value is None else value,
+        "label": status,
+        "indeterminate": resolved_indeterminate,
+    }
+
+
+def download_folder_pool(candidate: dict) -> dict | None:
+    folder_files = candidate.get("folder_files") or []
+    if not folder_files:
+        return None
+    return {
+        "username": candidate.get("username"),
+        "folder": candidate.get("folder"),
+        "files": folder_files,
+        "query": candidate.get("query"),
+        "free_upload_slots": candidate.get("free_upload_slots"),
+        "upload_speed": candidate.get("upload_speed"),
+        "queue_length": candidate.get("queue_length"),
+    }
+
+
+def search_album_folder_pool(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None) -> dict | None:
+    pools = search_album_folder_pools(session, artist, album, requests, task, limit=1)
+    return pools[0] if pools else None
+
+
+def search_album_folder_pools(session: Session, artist: str, album: str, requests: list[dict], task: Task | None = None, limit: int = 5, progress_callback=None) -> list[dict]:
+    if not requests:
+        return []
+    settings = integration_settings(session)
+    queries = album_search_query_variants(artist, album, requests)
+    if not queries:
+        return []
+    match_threshold = slskd_album_match_threshold(settings)
+    folder_try_limit = min(max(1, limit), slskd_album_folder_try_limit(settings))
+    requested_track_count = len(requests)
+    pools: dict[tuple[str, str], dict] = {}
+    for query_index, query in enumerate(queries, start=1):
+        if progress_callback is not None:
+            progress_callback(f"Searching album folders ({query_index}/{len(queries)})")
+        try:
+            append_task_log(session, task, f"slskd album search started: {query}")
+            result = search_slskd_detailed(
+                settings.get("slskd_url", ""),
+                settings.get("slskd_api_key", ""),
+                query,
+                limit=120,
+                poll_interval=SLSKD_ALBUM_SEARCH_POLL_INTERVAL,
+                timeout_seconds=SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS,
+                timeout_buffer_seconds=SLSKD_ALBUM_SEARCH_BUFFER_SECONDS,
+                wait_for_settled_results=True,
+            )
+            diagnostics = result.get("diagnostics") or {}
+            append_task_log(
+                session,
+                task,
+                (
+                    f"slskd album search finished: {query}: "
+                    f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
+                    f"{len(result.get('folder_candidates') or [])} folder candidates "
+                    f"(slskd reported {diagnostics.get('response_count', 0)} responses/{diagnostics.get('file_count', 0)} files, "
+                    f"complete={diagnostics.get('is_complete')})"
+                ),
+            )
+            if not diagnostics.get("responses"):
+                append_task_log(session, task, f"slskd album search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}", "warning")
+        except Exception as error:
+            append_task_log(session, task, f"slskd album search failed: {query}: {error}", "warning")
+            continue
+        added_from_query = 0
+        for candidate in result.get("folder_candidates") or result.get("candidates", []):
+            pool = download_folder_pool(candidate)
+            if not pool:
+                continue
+            pool = audio_folder_pool(pool)
+            if not pool:
+                continue
+            key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+            current = pools.setdefault(key, {**pool, "files": [], "queries": []})
+            current["queries"].append(query)
+            known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
+            for file_info in pool.get("files") or []:
+                filename = str(file_info.get("filename") or "")
+                if filename and filename not in known_filenames:
+                    current["files"].append(file_info)
+                    known_filenames.add(filename)
+                    added_from_query += 1
+        ranked_after_query = ranked_album_folder_pools(pools, requests, match_threshold)
+        accepted_after_query = accepted_album_folder_pools(ranked_after_query, match_threshold, requested_track_count)
+        append_task_log(
+            session,
+            task,
+            f"{artist} / {album}: {query} added {added_from_query} lossless file(s); {len(accepted_after_query)} folder(s) now meet album confidence",
+        )
+        best_matched = max((score[0] for score, _pool in accepted_after_query), default=0)
+        best_lossless_matched = max((score[6] if len(score) > 6 else 0 for score, _pool in accepted_after_query), default=0)
+        # Stop early only once a single FLAC folder covers the whole album — keep searching past an
+        # MP3-complete folder in case a lossless one turns up (FLAC over MP3; MP3 kept as a fallback).
+        if best_lossless_matched >= requested_track_count:
+            append_task_log(session, task, f"{artist} / {album}: found a complete lossless album folder ({best_lossless_matched}/{requested_track_count} tracks); stopping album search early")
+            break
+        # No complete FLAC folder yet, but we have enough candidate folders AND a complete (MP3)
+        # album — stop and use them; FLAC still ranks first if any partial-lossless folder exists.
+        if len(accepted_after_query) >= folder_try_limit and best_matched >= requested_track_count:
+            append_task_log(session, task, f"{artist} / {album}: found {len(accepted_after_query)} matching folder(s) (no complete lossless folder); stopping at try limit {folder_try_limit}")
+            break
+    ranked = ranked_album_folder_pools(pools, requests, match_threshold)
+    accepted = accepted_album_folder_pools(ranked, match_threshold, requested_track_count)
+    if not accepted:
+        append_task_log(session, task, f"{artist} / {album}: album queries did not locate enough confident folders; skipping individual track seed searches", "warning")
+    if not pools:
+        return []
+    if not accepted:
+        if ranked:
+            best_score, best_pool = ranked[0]
+            append_task_log(
+                session,
+                task,
+                (
+                    f"{artist} / {album}: best folder rejected: {best_pool.get('folder') or 'unknown folder'} "
+                    f"matched {best_score[0]} tracks, artist score {best_score[2]:.2f}, album folder score {best_score[3]:.2f}, "
+                    f"{best_score[4]} lossless file(s)"
+                ),
+                "warning",
+            )
+        return []
+    result_pools = []
+    for score, pool in accepted[:max(folder_try_limit, ALBUM_FOLDER_COVERAGE_LIMIT)]:
+        prepared = {**pool}
+        prepared["matched_tracks"] = score[0]
+        prepared["match_threshold"] = match_threshold
+        prepared["album_query"] = ", ".join(prepared.get("queries") or queries)
+        prepared["album_folder_score"] = {
+            "matched": score[0],
+            "confidence_total": score[1],
+            "artist": score[2],
+            "album": score[3],
+            "lossless": score[4],
+            "files": score[5],
+        }
+        result_pools.append(prepared)
+    best_score, best_pool = accepted[0]
+    append_task_log(
+        session,
+        task,
+        (
+            f"{artist} / {album}: best album folder {best_pool.get('folder') or 'unknown folder'} scored "
+            f"artist {best_score[2]:.2f}, album folder {best_score[3]:.2f}, matched {best_score[0]} requested track(s), "
+            f"{best_score[4]} lossless file(s)"
+        ),
+    )
+    # Supplementary per-track sources: every OTHER folder by this artist that has lossless files, even
+    # if it isn't a full album folder. Per-track candidate collection scans these too (FLAC-first), so
+    # a track that's missing from / only-lossy in the album folders is still grabbed as FLAC from
+    # wherever it exists (a single, a partial rip, a compilation).
+    expected_artist = fuzzy_text(artist)
+    result_keys = {(str(p.get("username") or ""), str(p.get("folder") or "")) for p in result_pools}
+    supplementary = 0
+    for pool in pools.values():
+        if supplementary >= SUPPLEMENTARY_FOLDER_LIMIT:
+            break
+        key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+        if key in result_keys or not lossless_folder_files(pool.get("files") or []):
+            continue
+        if best_segment_score(expected_artist, album_folder_segments(pool)) < 0.5:
+            continue
+        result_pools.append({**pool, "match_threshold": match_threshold, "supplementary": True})
+        supplementary += 1
+    if supplementary:
+        append_task_log(session, task, f"{artist} / {album}: also keeping {supplementary} supplementary artist folder(s) as per-track FLAC sources")
+    return result_pools
+
+
+# Cap how many folders get the expensive per-track file matching. A popular album can return
+# hundreds of valid folders from slskd; fully scoring every one against every requested track is
+# what made candidate preparation take minutes. We only need a handful of folders to try.
+ALBUM_FOLDER_FULL_SCORE_LIMIT = 16
+# Additionally force-score the folders whose size best fits the requested track count. This rescues
+# the real album folder for self-titled albums (album name == artist name → every folder by the
+# artist scores album=1.0, so the by-name ranking is dominated by huge discography folders and the
+# actual 12-track album folder never gets evaluated).
+ALBUM_FOLDER_FIT_SCORE_LIMIT = 8
+# How many accepted folders to keep for per-track candidate collection. The download still prefers the
+# best folder, but a track missing from the top folders (e.g. a bonus track only some rips include)
+# can be picked up from a lower-ranked folder, so keep well more than the download try-limit.
+ALBUM_FOLDER_COVERAGE_LIMIT = 20
+# Extra by-this-artist folders (not full album folders — singles, partial rips, compilations) kept as
+# per-track sources so a track missing from the album folders can still be grabbed as FLAC from
+# wherever it lives. "If a file for this track exists, even in another folder, grab it."
+SUPPLEMENTARY_FOLDER_LIMIT = 50
+
+
+def _album_folder_fit(audio_count: int, requested: int) -> int:
+    # 0 when the folder has exactly the requested number of tracks; missing tracks are penalised
+    # twice as hard as surplus (a too-small partial folder is worse than a slightly-too-big one).
+    if requested <= 0:
+        return 0
+    return -(audio_count - requested) if audio_count >= requested else (audio_count - requested) * 2
+
+
+def ranked_album_folder_pools(pools: dict[tuple[str, str], dict], requests: list[dict], threshold: float) -> list[tuple[tuple[int, float, float, float, int, int], dict]]:
+    expected_artist = fuzzy_text(requests[0].get("artist")) if requests else ""
+    expected_album = str(requests[0].get("album") or "") if requests else ""
+    requested = len(requests)
+    # Phase 1: cheap pre-rank using only folder-name + size signals (no per-track file matching).
+    prelim: list[dict] = []
+    for pool in pools.values():
+        files = audio_folder_files(pool.get("files") or [])
+        lossless_count = len(lossless_folder_files(files))
+        folder_segments = album_folder_segments(pool)
+        prelim.append({
+            "album": album_folder_name_score(expected_album, pool),
+            "artist": best_segment_score(expected_artist, folder_segments),
+            "audio": len(files),
+            "lossless": lossless_count,
+            "fit": _album_folder_fit(len(files), requested),
+            "lossless_fit": _album_folder_fit(lossless_count, requested),
+            "pool": pool,
+        })
+    # Pick which folders get full per-track scoring: the most promising by folder name + size, UNION
+    # the best size-fit folders (so the real album folder is scored even when album==artist makes the
+    # name score useless and giant discography folders would crowd out the top slots), UNION the best
+    # LOSSLESS-size-fit folders so a FLAC album folder is always evaluated and can win over an MP3 one
+    # (FLAC over MP3; MP3 kept as fallback).
+    by_name = sorted(prelim, key=lambda e: (e["album"], e["artist"], e["lossless"], e["audio"]), reverse=True)
+    by_fit = sorted(prelim, key=lambda e: (e["fit"], e["album"], e["artist"], e["lossless"]), reverse=True)
+    by_lossless_fit = sorted((e for e in prelim if e["lossless"]), key=lambda e: (e["lossless_fit"], e["album"], e["artist"]), reverse=True)
+    full_score_ids: set[int] = set()
+    for entry in (*by_name[:ALBUM_FOLDER_FULL_SCORE_LIMIT], *by_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT], *by_lossless_fit[:ALBUM_FOLDER_FIT_SCORE_LIMIT]):
+        full_score_ids.add(id(entry["pool"]))
+    # Phase 2: fully score the chosen folders; the rest keep cheap scores so they remain available but
+    # rank below the fully-scored matches. Cheap score's trailing 0 = unknown lossless_matched.
+    scored: list[tuple[tuple, dict]] = []
+    for entry in prelim:
+        pool = entry["pool"]
+        # Score the selected folders even if the folder NAME is a weak album match — coverage (the
+        # tracks it actually contains) decides acceptance, which is how a differently-named FLAC folder
+        # gets in. The full_score_ids set is bounded, so this stays cheap.
+        if id(pool) in full_score_ids and entry["audio"]:
+            scored.append((score_album_folder_pool(pool, requests, threshold), pool))
+        else:
+            scored.append(((0, 0.0, entry["artist"], entry["album"], entry["lossless"], entry["audio"], 0), pool))
+    return sorted(scored, key=album_folder_pool_sort_key, reverse=True)
+
+
+def add_seed_track_folder_pools(
+    session: Session,
+    task: Task | None,
+    settings: dict[str, str],
+    artist: str,
+    album: str,
+    requests: list[dict],
+    pools: dict[tuple[str, str], dict],
+    match_threshold: float,
+    folder_try_limit: int,
+) -> None:
+    seed_requests = representative_album_seed_requests(requests, limit=min(3, folder_try_limit))
+    for index, request in enumerate(seed_requests, start=1):
+        track_title = request.get("track") or request.get("title") or f"track {index}"
+        append_task_log(session, task, f"{artist} / {album}: seed search {index}/{len(seed_requests)} using {track_title}")
+        result = search_slskd_for_request_with_settings(
+            settings.get("slskd_url", ""),
+            settings.get("slskd_api_key", ""),
+            {**request, "artist": artist, "album": album, "require_lossless": True, "multiple_candidates": True},
+            limit=8,
+        )
+        for line in result.get("diagnostics", {}).get("query_logs") or []:
+            append_task_log(session, task, line)
+        added = 0
+        for candidate in result.get("candidates") or []:
+            pool = audio_folder_pool(download_folder_pool(candidate))
+            if not pool:
+                continue
+            key = (str(pool.get("username") or ""), str(pool.get("folder") or ""))
+            current = pools.setdefault(key, {**pool, "files": [], "queries": []})
+            current["queries"].append(str(candidate.get("query") or download_query(request)))
+            known_filenames = {str(file_info.get("filename") or "") for file_info in current["files"]}
+            for file_info in pool.get("files") or []:
+                filename = str(file_info.get("filename") or "")
+                if filename and filename not in known_filenames:
+                    current["files"].append(file_info)
+                    known_filenames.add(filename)
+                    added += 1
+        ranked = ranked_album_folder_pools(pools, requests, match_threshold)
+        accepted = accepted_album_folder_pools(ranked, match_threshold, len(requests))
+        append_task_log(session, task, f"{artist} / {album}: seed search from {track_title} added {added} lossless file(s); {len(accepted)} folder(s) now meet album confidence")
+        if accepted:
+            break
+
+
+def representative_album_seed_requests(requests: list[dict], limit: int) -> list[dict]:
+    if not requests or limit <= 0:
+        return []
+    if len(requests) <= limit:
+        return requests
+    indexes = [0, len(requests) // 2, len(requests) - 1]
+    chosen = []
+    seen = set()
+    for index in indexes:
+        if index in seen:
+            continue
+        seen.add(index)
+        chosen.append(requests[index])
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def accepted_album_folder_pools(ranked: list[tuple[tuple, dict]], threshold: float, requested: int = 0) -> list[tuple[tuple, dict]]:
+    # Accept a folder either by NAME (clears the album-name threshold) OR by COVERAGE — it actually
+    # contains most of the requested tracks as confident per-file matches. Coverage is what lets a
+    # differently-named FLAC folder ("The Fame Monster (Deluxe)" / "Fame, The (2008)" for "The Fame")
+    # be used instead of only the exactly-named MP3 folder. Lossless is preferred via the sort key.
+    accepted = []
+    for score, pool in ranked:
+        matched, artist_score, album_score, files = score[0], score[2], score[3], score[5]
+        if files <= 0:
+            continue
+        name_ok = album_score >= threshold and (artist_score >= 0.25 or album_score >= 0.92)
+        coverage_ok = requested > 0 and matched >= max(2, int(0.6 * requested)) and artist_score >= 0.25
+        if name_ok or coverage_ok:
+            accepted.append((score, pool))
+    return accepted
+
+
+def album_folder_pool_sort_key(item: tuple[tuple, dict]) -> tuple:
+    score, _pool = item
+    matched, confidence_total, artist_score, album_score, lossless, files = score[:6]
+    lossless_matched = score[6] if len(score) > 6 else 0
+    average_track_confidence = confidence_total / max(matched, 1)
+    # Rank by what the folder actually DELIVERS, not by how well its name matches: FLAC coverage
+    # (how many requested tracks it supplies as FLAC) first, then total coverage, so a complete FLAC
+    # folder named "2008 - The Fame" beats an exactly-named "The Fame" folder that only has 14 of 16
+    # (or only MP3). Folder name / artist are tiebreakers among equal coverage.
+    return (lossless_matched, matched, album_score, artist_score, average_track_confidence, lossless, -files)
+
+
+def slskd_album_match_threshold(settings: dict[str, str]) -> float:
+    try:
+        value = float(settings.get("slskd_album_match_threshold") or 72)
+    except (TypeError, ValueError):
+        value = 72
+    return max(0.5, min(0.95, value / 100 if value > 1 else value))
+
+
+def slskd_album_folder_try_limit(settings: dict[str, str]) -> int:
+    try:
+        value = int(settings.get("slskd_album_folder_tries") or 5)
+    except (TypeError, ValueError):
+        value = 5
+    return max(1, min(12, value))
+
+
+def configure_match_tuning(session: Session) -> None:
+    """Refresh the module-level match tuning from the admin-editable match_tuning config.
+
+    Called at every slskd search entry point so the scorer (which has no session) honours the
+    instance's configured weights, floors, and penalties. See services/match_tuning.py.
+    """
+    global _allow_m4a_downloads, _allow_ytdlp_fallback
+    _match_tuning.update(match_tuning(session))
+    settings = integration_settings(session)
+    value = str(settings.get("allow_m4a_downloads", "true")).strip().lower()
+    _allow_m4a_downloads = value not in {"false", "0", "no", "off"}
+    ytdlp_value = str(settings.get("allow_ytdlp_fallback", "true")).strip().lower()
+    _allow_ytdlp_fallback = ytdlp_value not in {"false", "0", "no", "off"}
+
+
+def score_album_folder_pool(pool: dict, requests: list[dict], threshold: float) -> tuple[int, float, float, float, int, int, int]:
+    matched = 0
+    lossless_matched = 0
+    confidence_total = 0.0
+    artist_scores = []
+    files = audio_folder_files(pool.get("files") or [])
+    lossless = len(lossless_folder_files(pool.get("files") or []))
+    folder_segments = album_folder_segments(pool)
+    artist_score = best_segment_score(fuzzy_text(requests[0].get("artist") if requests else ""), folder_segments)
+    album_score = album_folder_name_score(str(requests[0].get("album") or "") if requests else "", pool)
+    prepared_pool = {**pool, "files": files, "match_threshold": threshold}
+    for request in requests:
+        candidate = candidate_from_folder_pool(prepared_pool, request, threshold)
+        if not candidate:
+            continue
+        matched += 1
+        if candidate.get("quality") == "lossless":
+            lossless_matched += 1
+        confidence_total += float(candidate.get("confidence") or 0)
+        artist_scores.append(float(candidate.get("artist_score") or 0))
+    if artist_scores:
+        artist_score = max(artist_score, sum(artist_scores) / max(1, len(artist_scores)))
+    # lossless_matched (last) = how many requested tracks this folder supplies as FLAC. The sort key
+    # ranks it above total coverage so a FLAC folder beats an equally-complete MP3 folder, while MP3
+    # folders are still retained as second-rate fallbacks.
+    return (matched, confidence_total, artist_score, album_score, lossless, len(files), lossless_matched)
+
+
+def audio_folder_pool(pool: dict | None) -> dict | None:
+    # Keep every audio file (lossless and lossy). Lossless is preferred at ranking time, but lossy
+    # files are retained so a lossy album surfaces candidates instead of dead-ending to YouTube.
+    if not pool:
+        return None
+    files = audio_folder_files(pool.get("files") or [])
+    if not files:
+        return None
+    return {**pool, "files": files}
+
+
+def lossless_folder_files(files: list[dict]) -> list[dict]:
+    return [file_info for file_info in files if is_lossless_filename(str(file_info.get("filename") or ""))]
+
+
+def is_m4a_filename(filename: str) -> bool:
+    return str(filename or "").lower().endswith(".m4a")
+
+
+def download_format_allowed(filename: str) -> bool:
+    """Whether this file's format may be downloaded. m4a (AAC/ALAC) is gated by the
+    admin-editable allow_m4a_downloads setting (default on); everything else is allowed."""
+    return _allow_m4a_downloads or not is_m4a_filename(filename)
+
+
+def ytdlp_fallback_allowed() -> bool:
+    """Whether a track with no Soulseek candidate may fall back to yt-dlp/YouTube. Gated by the
+    admin-editable allow_ytdlp_fallback setting (default on)."""
+    return _allow_ytdlp_fallback
+
+
+def audio_folder_files(files: list[dict]) -> list[dict]:
+    return [
+        file_info
+        for file_info in files
+        if is_audio_filename(str(file_info.get("filename") or ""))
+        and download_format_allowed(str(file_info.get("filename") or ""))
+    ]
+
+
+def is_lossless_filename(filename: str) -> bool:
+    return str(filename or "").lower().endswith(LOSSLESS_AUDIO_EXTENSIONS)
+
+
+def is_audio_filename(filename: str) -> bool:
+    return Path(str(filename or "").replace("\\", "/")).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+
+
+def album_folder_segments(pool: dict) -> list[str]:
+    folder = str(pool.get("folder") or "")
+    if not folder:
+        filenames = [str(file_info.get("filename") or "") for file_info in pool.get("files") or []]
+        folder = str(Path(filenames[0].replace("\\", "/")).parent) if filenames else ""
+    return [segment for segment in re.split(r"[/\\]+", folder) if segment]
+
+
+def album_folder_name_score(album: str, pool: dict) -> float:
+    expected = fuzzy_text(album)
+    if not expected:
+        return 0.5
+    segments = album_folder_segments(pool)
+    if not segments:
+        return 0.0
+    scored_segments = [fuzzy_text(segment) for segment in segments]
+    scored_segments.append(fuzzy_text(" ".join(segments[-2:])))
+    scored_segments.append(fuzzy_text(" ".join(segments)))
+    return max(fuzzy_similarity(expected, segment) for segment in scored_segments if segment)
+
+
+def candidate_from_folder_pool(pool: dict | None, request: dict, threshold: float | None = None) -> dict | None:
+    if not pool:
+        return None
+    threshold = threshold if threshold is not None else float(pool.get("match_threshold") or 0.72)
+    track = request.get("track") or request.get("title")
+    if not track:
+        return None
+    files = audio_folder_files(pool.get("files") or [])
+    ranked = sorted(
+        (
+            (download_file_match_score(file_info, request, username=pool.get("username"), folder=pool.get("folder")), file_info)
+            for file_info in files
+        ),
+        key=lambda item: folder_file_score(item[1], item[0].get("confidence", 0.0)),
+    )
+    # Use the recall floor for per-file acceptance inside an already-matched folder (the album-level
+    # threshold governs which folders are accepted, not which files within them), so a correct track
+    # with a messy filename in the right folder still becomes a candidate.
+    file_floor = min(float(threshold), float(_match_tuning["min_confidence"]))
+    ranked = [(score, file_info) for score, file_info in ranked if score.get("confidence", 0.0) >= file_floor and not score.get("rejected")]
+    if not ranked:
+        return None
+    score, file_info = ranked[0]
+    confidence = float(score.get("confidence") or 0.0)
+    return {
+        "username": pool.get("username"),
+        "query": download_query(request),
+        "filename": file_info.get("filename"),
+        "folder": pool.get("folder"),
+        "size": file_info.get("size"),
+        "duration": file_info.get("duration"),
+        "bitrate": file_info.get("bitrate"),
+        "free_upload_slots": pool.get("free_upload_slots"),
+        "upload_speed": pool.get("upload_speed"),
+        "queue_length": pool.get("queue_length"),
+        "quality": "lossless" if is_lossless_filename(str(file_info.get("filename") or "")) else "lossy",
+        "confidence": round(confidence * 100),
+        "artist_score": round(float(score.get("artist_score") or 0.0), 3),
+        "album_score": round(float(score.get("album_score") or 0.0), 3),
+        "title_score": round(float(score.get("title_score") or 0.0), 3),
+        "duration_score": round(float(score.get("duration_score") or 0.0), 3),
+        "files": [file_info],
+        "folder_files": files,
+    }
+
+
+def candidates_from_folder_pools(pools: list[dict], request: dict, limit: int = 5, max_pools: int | None = None) -> list[dict]:
+    # Gather this track's best candidate from EVERY folder (not just the top few by album rank): a
+    # track can be missing from the best folder but present in a lower-ranked one (e.g. a complete
+    # FLAC rip, or an MP3 folder). Then rank the collected candidates by quality (FLAC first) and
+    # confidence so the lossless copy is selected even when it came from a lower-ranked folder, with
+    # MP3 retained as a fallback.
+    collected: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    pool_limit = max_pools if max_pools is not None else len(pools)
+    for pool_index, pool in enumerate(pools[:pool_limit], start=1):
+        candidate = candidate_from_folder_pool(pool, request)
+        if not candidate:
+            continue
+        identity = candidate_identity(candidate)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        candidate["same_album_folder"] = True
+        candidate["album_folder_rank"] = pool_index
+        collected.append(candidate)
+    collected.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+    return collected[:limit]
+
+
+def folder_file_confidence(file_info: dict, request: dict) -> float:
+    return float(download_file_match_score(file_info, request).get("confidence") or 0.0)
+
+
+def download_file_match_score(file_info: dict, request: dict, username: object | None = None, folder: object | None = None) -> dict:
+    title = fuzzy_text(request.get("track") or request.get("title"))
+    artist = fuzzy_text(request.get("artist"))
+    album = fuzzy_text(request.get("album"))
+    if not title:
+        return {"confidence": 0.0, "rejected": True, "reason": "missing expected title"}
+    filename = str(file_info.get("filename") or "")
+    stem = Path(filename.replace("\\", "/")).stem
+    path_segments = [segment for segment in re.split(r"[/\\]+", filename) if segment]
+    folder_segments = [segment for segment in re.split(r"[/\\]+", str(folder or "")) if segment]
+    segments = [*folder_segments, *(path_segments[-1:] if folder_segments else path_segments)]
+    variants = {
+        fuzzy_text(stem),
+        fuzzy_text(strip_leading_track_number(stem)),
+        fuzzy_text(remove_known_album_terms(stem, request)),
+        fuzzy_text(strip_leading_track_number(remove_known_album_terms(stem, request))),
+    }
+    variants.discard("")
+    if not variants:
+        return {"confidence": 0.0, "rejected": True, "reason": "missing candidate title"}
+    title_score = max(fuzzy_similarity(title, variant) for variant in variants)
+    artist_score = best_segment_score(artist, segments)
+    album_score = best_segment_score(album, folder_segments or path_segments[:-1])
+    duration_score = duration_match_score(request_duration_ms(request), candidate_duration_ms(file_info))
+    # Required gate (recall-favoring): only a present, plausible title is mandatory. A missing artist
+    # in the (frequently artist-less) folder path and a non-lossless format NEVER reject here — they
+    # only lower the ranking — so a correct file in a generically named folder still surfaces.
+    tuning = _match_tuning
+    if title_score < float(tuning["title_floor"]):
+        return {
+            "confidence": 0.0,
+            "title_score": title_score,
+            "artist_score": artist_score,
+            "album_score": album_score,
+            "duration_score": duration_score,
+            "rejected": True,
+            "reason": "title match too weak",
+        }
+    if any(fuzzy_text(segment) in JUNK_ARTIST_SEGMENTS for segment in segments):
+        artist_score *= 0.4
+    candidate_version_words = version_words_for_text(stem)
+    expected_version_words = version_words_for_text(str(request.get("track") or request.get("title") or ""))
+    extra_version_words = candidate_version_words - expected_version_words
+    number = leading_track_number(stem)
+    request_number = request.get("track_number")
+    try:
+        request_number_int = int(request_number) if request_number is not None else None
+    except (TypeError, ValueError):
+        request_number_int = None
+    track_number_bonus = 0.0
+    if number is not None and request_number_int is not None:
+        track_number_bonus = float(tuning["track_number_bonus"]) if number == request_number_int else -float(tuning["track_number_penalty"])
+    album_bonus = (
+        float(tuning["album_bonus_strong"]) if album and album_score >= 0.85
+        else float(tuning["album_bonus_weak"]) if album and album_score >= 0.60
+        else 0.0
+    )
+    # Duration is the single strongest signal that two files are the same recording, so it carries the
+    # most weight after the title and can rescue a file whose folder omits the artist. Artist is a
+    # ranking signal, not a gate.
+    artist_component = artist_score if artist else 0.5
+    confidence = (
+        (title_score * float(tuning["weight_title"]))
+        + (duration_score * float(tuning["weight_duration"]))
+        + (artist_component * float(tuning["weight_artist"]))
+        + album_bonus
+        + track_number_bonus
+    )
+    # A wrong version (remix/live/instrumental the request didn't ask for) is demoted hard, not
+    # rejected, so it only wins when nothing better exists.
+    if extra_version_words:
+        confidence *= float(tuning["penalty_wrong_version"])
+    # Different/absent artist → likely a same-word wrong song. A wrong-artist file escapes the demotion
+    # only when BOTH a strong title (>= strong_title — the filename really is this track, just in an
+    # artist-less folder) AND a tight duration vouch for it. A coincidental duration alone must NOT
+    # rescue a weak-title wrong-artist file (e.g. Kanye's "New Again" for Lady Gaga's "Again Again":
+    # title 0.7, artist 0.32, duration 1.0).
+    if artist and artist_score < 0.5 and (title_score < float(tuning["strong_title"]) or duration_score < 0.75):
+        confidence *= float(tuning["penalty_artist_mismatch"])
+    return {
+        "confidence": max(0.0, min(1.0, confidence)),
+        "title_score": title_score,
+        "artist_score": artist_score,
+        "album_score": album_score,
+        "duration_score": duration_score,
+        "rejected": False,
+        "reason": "matched",
+        "username": username,
+    }
+
+
+def candidate_duration_ms(file_info: dict) -> int | None:
+    raw = file_info.get("duration") or file_info.get("Duration") or file_info.get("length") or file_info.get("Length")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return int(value if value > 10000 else value * 1000)
+
+
+def duration_match_score(expected_ms: int | None, candidate_ms: int | None, tolerance_ms: int | None = None) -> float:
+    # Unknown duration is neutral (0.5), never a penalty — a missing expected/candidate length must
+    # not silently kill an otherwise-good match (soft gate).
+    if not expected_ms or not candidate_ms:
+        return 0.5
+    tolerance_ms = tolerance_ms or int(float(_match_tuning["duration_tolerance_seconds"]) * 1000)
+    delta = abs(expected_ms - candidate_ms)
+    if delta <= tolerance_ms:
+        return 1.0
+    # Linear decay to 0 over ~4× the tolerance beyond the window, so a far-off length is heavily
+    # penalised (but still not hard-rejected).
+    return max(0.0, 1.0 - (delta - tolerance_ms) / (tolerance_ms * 4))
+
+
+def best_segment_score(expected: str, segments: list[str]) -> float:
+    if not expected:
+        return 0.5
+    expected_tokens = set(expected.split())
+    best = 0.0
+    for segment in segments:
+        normalized = fuzzy_text(segment)
+        if not normalized:
+            continue
+        segment_tokens = set(normalized.split())
+        if normalized in JUNK_ARTIST_SEGMENTS:
+            best = max(best, 0.0)
+            continue
+        if expected_tokens and expected_tokens.issubset(segment_tokens):
+            return 1.0
+        if expected and (expected in normalized or normalized in expected):
+            best = max(best, 0.95)
+        best = max(best, SequenceMatcher(None, expected, normalized).ratio())
+    return best
+
+
+def version_words_for_text(value: object) -> set[str]:
+    return set(fuzzy_text(value).split()) & DOWNLOAD_VERSION_WORDS
+
+
+def fuzzy_similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    sequence_score = SequenceMatcher(None, left, right).ratio()
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    # Symmetric token overlap (Jaccard): a short query whose every token happens to appear in a
+    # longer, *different* title no longer scores ~1.0 just because all of its own tokens are present
+    # (e.g. "the time" vs "party all the time").
+    overlap_score = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+    # Substring containment scaled by length ratio: a near-equal substring still scores ~1.0, but a
+    # short fragment inside a longer different title scores only its length fraction.
+    if left in right or right in left:
+        shorter, longer = sorted((left, right), key=len)
+        containment_score = len(shorter) / max(1, len(longer))
+    else:
+        containment_score = 0.0
+    return max(sequence_score, overlap_score, containment_score)
+
+
+def strip_accents(value: str) -> str:
+    """Fold accented/diacritic characters to their plain ASCII base letter (e.g. "Beyoncé" ->
+    "Beyonce") rather than dropping them. A shared network like Soulseek routinely has the same
+    release shared under both spellings — a folder literally named "Beyonce" containing files
+    tagged "Beyoncé" is a real, confirmed case, not a hypothetical."""
+    return "".join(
+        char for char in unicodedata.normalize("NFKD", str(value or "")) if not unicodedata.combining(char)
+    )
+
+
+def fuzzy_text(value: object) -> str:
+    text = str(value or "").casefold().replace("’", "'")
+    for token, alternatives in TEXT_SEARCH_ALTERNATIVES:
+        replacement = alternatives[0]
+        if token.isdigit():
+            text = re.sub(rf"\b{re.escape(token)}\b", f" {token} {replacement} ", text)
+        else:
+            text = text.replace(token, f" {replacement} ")
+    text = re.sub(r"\[[^\]]+\]|\([^\)]+\)", " ", text)
+    # ⚠️ Must fold accents to their base letter BEFORE the [^a-z0-9]+ strip below, not after —
+    # otherwise an accented character (outside a-z0-9) is simply deleted rather than folded, so
+    # "Beyoncé" became "beyonc" instead of "beyonce" and never matched the unaccented spelling at
+    # all (below the fuzzy-similarity threshold rather than merely a few points off).
+    text = strip_accents(text)
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", text).split())
+
+
+def strip_leading_track_number(value: str) -> str:
+    return re.sub(r"^\s*\d{1,3}\s*[-_. )]+", "", str(value or ""))
+
+
+def leading_track_number(value: str) -> int | None:
+    match = re.match(r"^\s*(\d{1,3})\s*[-_. )]+", str(value or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def remove_known_album_terms(value: str, request: dict) -> str:
+    text = fuzzy_text(value)
+    for field in ("artist", "album"):
+        for token in fuzzy_text(request.get(field)).split():
+            text = re.sub(rf"\b{re.escape(token)}\b", " ", text)
+    return " ".join(text.split())
+
+
+def has_extra_version_words(stem: str, normalized_title: str) -> bool:
+    title_tokens = set(normalized_title.split())
+    version_words = {"remix", "instrumental", "acapella", "karaoke", "live", "demo", "edit", "clean", "explicit"}
+    stem_tokens = set(fuzzy_text(stem).split())
+    return bool((stem_tokens - title_tokens) & version_words)
+
+
+def folder_file_score(file_info: dict, confidence: float) -> tuple[int, float, str]:
+    filename = str(file_info.get("filename") or "")
+    quality_rank = 0 if is_lossless_filename(filename) else 1
+    return (quality_rank, -confidence, filename)
+
+
+def search_slskd_for_request(session: Session, request: dict, limit: int = 1, task: Task | None = None) -> dict:
+    configure_match_tuning(session)
+    settings = integration_settings(session)
+    result = search_slskd_for_request_with_settings(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), request, limit)
+    for line in result.get("diagnostics", {}).get("query_logs") or []:
+        append_task_log(session, task, line)
+    return result
+
+
+def rank_slskd_candidates_for_request(candidates: list[dict], request: dict, ignored_candidates: list[dict], limit: int) -> tuple[list[dict], list[str]]:
+    accepted = []
+    rejected_reasons: list[str] = []
+    for candidate in filter_ignored_candidates(candidates, ignored_candidates):
+        filename = str(candidate.get("filename") or "")
+        if not download_format_allowed(filename):
+            if len(rejected_reasons) < 4:
+                rejected_reasons.append(f"{candidate.get('filename') or 'unknown'}: m4a downloads are disabled in settings")
+            continue
+        file_info = {
+            "filename": candidate.get("filename"),
+            "size": candidate.get("size"),
+            "duration": candidate.get("duration"),
+            "bitrate": candidate.get("bitrate"),
+        }
+        score = download_file_match_score(file_info, request, username=candidate.get("username"), folder=candidate.get("folder"))
+        reason = str(score.get("reason") or "unknown")
+        confidence = float(score.get("confidence") or 0.0)
+        enriched = {
+            **candidate,
+            "confidence": round(confidence * 100),
+            "title_score": round(float(score.get("title_score") or 0.0), 3),
+            "artist_score": round(float(score.get("artist_score") or 0.0), 3),
+            "album_score": round(float(score.get("album_score") or 0.0), 3),
+            "duration_score": round(float(score.get("duration_score") or 0.0), 3),
+            "match_reason": reason,
+        }
+        # Don't exclude lossy results when lossless is requested: surface both (lossless ranks above
+        # lossy via slskd_candidate_sort_key) so the user can take a lossy match when no lossless
+        # exists rather than dead-ending to YouTube. The format is shown on each candidate row.
+        if not score.get("rejected") and confidence >= _match_tuning["min_confidence"]:
+            accepted.append(enriched)
+        elif len(rejected_reasons) < 4:
+            rejected_reasons.append(f"{candidate.get('filename') or 'unknown'} ({round(confidence * 100)}%): {reason}")
+    accepted.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+    return accepted[:limit], rejected_reasons
+
+
+def slskd_candidate_sort_key(candidate: dict, require_lossless: bool = False) -> tuple:
+    quality = candidate.get("quality")
+    quality_score = 2 if quality == "lossless" else 1 if quality == "lossy" else 0
+    free_slots = 1 if candidate.get("free_upload_slots") else 0
+    try:
+        upload_speed = float(candidate.get("upload_speed") or 0)
+    except (TypeError, ValueError):
+        upload_speed = 0
+    try:
+        queue_length = int(candidate.get("queue_length") or 0)
+    except (TypeError, ValueError):
+        queue_length = 0
+    try:
+        size = int(candidate.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    confidence = int(candidate.get("confidence") or 0)
+    # When lossless is requested, any lossless match outranks every lossy one (so the auto-selected
+    # top candidate is lossless if one exists) while lossy stays available below it. Otherwise rank
+    # by confidence first with quality as a tiebreak.
+    if require_lossless:
+        return (quality_score, confidence, free_slots, upload_speed, -queue_length, size)
+    return (confidence, quality_score, free_slots, upload_speed, -queue_length, size)
+
+
+def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
+    attempted = []
+    query_logs = []
+    rate_limited = False
+    raw_ignored_candidates = request.get("ignored_candidates") or []
+    ignored_candidates = raw_ignored_candidates if isinstance(raw_ignored_candidates, list) else []
+    ignored = {candidate_identity(candidate) for candidate in ignored_candidates if isinstance(candidate, dict)}
+    last_result = {"candidates": [], "diagnostics": {"queries": [], "query_logs": query_logs, "rate_limited": False}}
+    for index, query in enumerate(download_query_variants(request)[:SLSKD_TRACK_QUERY_LIMIT]):
+        if not query or query in attempted:
+            continue
+        attempted.append(query)
+        query_logs.append(f"slskd track search started: {query}")
+        result = None
+        for attempt in range(7):
+            try:
+                result = search_slskd_detailed(
+                    slskd_url,
+                    api_key,
+                    query,
+                    limit=max(12, len(ignored) + limit * 8),
+                    poll_interval=0.75,
+                    timeout_seconds=10 if index < 3 else 8,
+                    timeout_buffer_seconds=2,
+                )
+                break
+            except Exception as error:  # noqa: BLE001 - keep trying lower-confidence query variants.
+                if is_rate_limit_error(error) and attempt < 6:
+                    rate_limited = True
+                    delay = min(10.0, 2.0 * (attempt + 1))
+                    query_logs.append(f"slskd track search rate limited: {query}; retrying in {delay:g}s")
+                    time.sleep(delay)
+                    continue
+                rate_limited = rate_limited or is_rate_limit_error(error)
+                query_logs.append(f"slskd track search failed: {query}: {error}")
+                last_result = {
+                    "candidates": [],
+                    "diagnostics": {
+                        "queries": attempted.copy(),
+                        "query_logs": query_logs,
+                        "query": query,
+                        "rate_limited": rate_limited,
+                    },
+                }
+                break
+        if result is None:
+            if rate_limited:
+                query_logs.append(f"slskd track search deferred after rate limits: {query}; trying the next query variant")
+                time.sleep(3)
+            continue
+        result["diagnostics"]["query"] = query
+        result["diagnostics"]["queries"] = attempted.copy()
+        result["diagnostics"]["query_logs"] = query_logs
+        result["diagnostics"]["rate_limited"] = rate_limited
+        result["candidates"], rejected = rank_slskd_candidates_for_request(result.get("candidates") or [], request, ignored_candidates, limit)
+        if rejected:
+            result["diagnostics"]["rejected_candidates"] = rejected
+        result["diagnostics"]["ignored_candidates"] = len(ignored_candidates)
+        last_result = result
+        diagnostics = result["diagnostics"]
+        query_logs.append(
+            (
+                f"slskd track search finished: {query}: "
+                f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
+                f"{len(result.get('candidates') or [])} usable candidates after {diagnostics.get('polls', 0)} polls "
+                f"(slskd reported {diagnostics.get('response_count', 0)} responses/{diagnostics.get('file_count', 0)} files, "
+                f"complete={diagnostics.get('is_complete')})"
+            ),
+        )
+        if not diagnostics.get("responses"):
+            query_logs.append(f"slskd track search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}")
+        for rejected_line in rejected:
+            query_logs.append(f"slskd candidate rejected: {rejected_line}")
+        if result["candidates"]:
+            return result
+    last_result["diagnostics"]["queries"] = attempted
+    last_result["diagnostics"]["query_logs"] = query_logs
+    last_result["diagnostics"]["rate_limited"] = rate_limited
+    query_logs.append(f"slskd found no candidates after {len(attempted)} query variant(s): {download_query(request)}")
+    return last_result
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429
+
+
+def add_download_tree_parents(session: Session, batch: ProposalBatch, request: dict, query: str) -> ProposalItem:
+    artist = request.get("artist") or "Unknown Artist"
+    album = request.get("album") or "Singles"
+    track = request.get("track") or request.get("title") or query
+    artist_item = ProposalItem(
+        batch_id=batch.id,
+        title=artist,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist}),
+    )
+    session.add(artist_item)
+    session.flush()
+    album_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=artist_item.id,
+        title=album,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist, "album": album}),
+    )
+    session.add(album_item)
+    session.flush()
+    track_item = ProposalItem(
+        batch_id=batch.id,
+        parent_id=album_item.id,
+        title=track,
+        kind=ProposalKind.download,
+        selected=True,
+        payload_json=json.dumps({"artist": artist, "album": album, "track": track}),
+    )
+    session.add(track_item)
+    session.flush()
+    return track_item
+
+
+def slskd_diagnostic_body(query: str, diagnostics: dict) -> str:
+    queries = diagnostics.get("queries") or [diagnostics.get("query") or query]
+    return (
+        f"{query}: searched {', '.join(str(item) for item in queries if item)}; "
+        f"last search {diagnostics.get('search_id', 'unknown')} returned "
+        f"{diagnostics.get('responses', 0)} responses, {diagnostics.get('files', 0)} files, "
+        f"{diagnostics.get('candidates', 0)} candidates after {diagnostics.get('polls', 0)} polls "
+        f"(state: {diagnostics.get('state') or 'unknown'}, timeout: {diagnostics.get('timeout_seconds', 'unknown')}s)."
+    )
+
+
+def queue_ytdlp_download(session: Session, request: dict, task: "Task | None" = None) -> "Path | None":
+    import uuid as _uuid
+    settings = get_settings()
+    integration = integration_settings(session)
+    query = download_query(request)
+    if not query:
+        raise ValueError("Download query is empty")
+    settings.downloads_path.mkdir(parents=True, exist_ok=True)
+    output_id = _uuid.uuid4().hex[:16]
+    output_template = f"ytdlp-{output_id}.%(ext)s"
+    command = [
+        "yt-dlp",
+        f"ytsearch1:{query}",
+        "--no-playlist",
+        "--paths", str(settings.downloads_path),
+        "--output", output_template,
+        "--format", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "mp3",
+        # YouTube's web client now requires a PO token (else HTTP 403 on the media
+        # download). Prefer clients that don't need one — `tv` works with the uploaded
+        # cookies, `web_embedded`/`android_vr` need no token at all.
+        "--extractor-args", "youtube:player_client=tv,web_embedded,android_vr,default",
+    ]
+    cookies_path = integration.get("youtube_cookies_path") or ""
+    cookies_file = Path(cookies_path) if cookies_path else None
+    if cookies_file and cookies_file.exists() and cookies_file.stat().st_size > 0:
+        command.extend(["--cookies", str(cookies_file)])
+        append_task_log(session, task, f"yt-dlp: using cookies file {cookies_file} ({cookies_file.stat().st_size} bytes)")
+    elif cookies_file and cookies_file.exists():
+        append_task_log(session, task, f"yt-dlp: cookies file {cookies_file} is empty — not passing --cookies; re-upload a valid cookies.txt", "warning")
+    elif cookies_path:
+        append_task_log(session, task, f"yt-dlp: cookies file configured but not found at {cookies_path} — not passing --cookies", "warning")
+    else:
+        append_task_log(session, task, "yt-dlp: no cookies file configured (Settings → Integrations → YouTube cookies file)")
+    append_task_log(session, task, f"yt-dlp: searching YouTube for '{query}' and downloading to {settings.downloads_path}")
+    try:
+        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=1800)
+        output = (result.stdout or "").strip()
+        if output:
+            append_task_log(session, task, f"yt-dlp output: {output[-1500:]}")
+    except subprocess.CalledProcessError as error:
+        details = (error.stderr or error.stdout or "").strip()
+        if not details:
+            details = f"exit code {error.returncode}"
+        append_task_log(session, task, f"yt-dlp failed for '{query}': {details[-1500:]}", "error")
+        raise RuntimeError(f"yt-dlp failed for {query}: {details[-1200:]}") from error
+    # Locate the downloaded file by the unique output_id prefix
+    downloaded: Path | None = None
+    for candidate in settings.downloads_path.glob(f"ytdlp-{output_id}.*"):
+        if candidate.is_file() and candidate.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+            downloaded = candidate
+            break
+    if downloaded:
+        size_kb = downloaded.stat().st_size // 1024
+        append_task_log(session, task, f"yt-dlp: downloaded '{downloaded.name}' ({size_kb} KB)")
+    else:
+        append_task_log(session, task, f"yt-dlp: command succeeded but no audio file found (output_id={output_id})", "warning")
+    return downloaded
+
+
+def fetch_lrclib_lyrics(track: Track) -> str | None:
+    duration_seconds = round((track.duration_ms or 0) / 1000) if track.duration_ms else None
+    params = {
+        "track_name": track.title,
+        "artist_name": track.album.artist.name,
+        "album_name": track.album.title,
+    }
+    if duration_seconds:
+        params["duration"] = str(duration_seconds)
+    headers = {"User-Agent": "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"}
+    with httpx.Client(base_url="https://lrclib.net", headers=headers, timeout=20) as client:
+        response = client.get("/api/get", params=params)
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+    return payload.get("syncedLyrics") or payload.get("plainLyrics")
+
+
+def fetch_lrclib_lyrics_search(track: Track) -> str | None:
+    """Secondary lyrics source: LRCLIB's fuzzy /api/search.
+
+    /api/get requires an exact track+artist+album(+duration) match and 404s often. /api/search is
+    looser but can return the wrong recording, so each candidate is validated with title/artist
+    similarity and a duration sanity check before its lyrics are accepted."""
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    artist_name = track.album.artist.name
+    params = {"track_name": track.title or "", "artist_name": artist_name or ""}
+    headers = {"User-Agent": "Nudibranch/0.1 (https://github.com/Poplel/Nudibranch)"}
+    try:
+        with httpx.Client(base_url="https://lrclib.net", headers=headers, timeout=20) as client:
+            response = client.get("/api/search", params=params)
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            results = response.json()
+    except httpx.HTTPError:
+        return None
+    if not isinstance(results, list) or not results:
+        return None
+
+    duration_seconds = round((track.duration_ms or 0) / 1000) if track.duration_ms else None
+    title_norm = normalize(track.title or "")
+    artist_norm = normalize(artist_name or "")
+    best = None
+    best_score = 0.0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        title_sim = text_similarity(title_norm, normalize(result.get("trackName") or ""))
+        artist_sim = text_similarity(artist_norm, normalize(result.get("artistName") or ""))
+        # The title must clearly match; require at least a loose artist match too.
+        if title_sim < 0.6 or artist_sim < 0.5:
+            continue
+        result_duration = result.get("duration")
+        if duration_seconds and result_duration:
+            # A different recording (live/remix/wrong song) usually differs by more than ~15s.
+            if abs(float(result_duration) - duration_seconds) > 15:
+                continue
+        score = title_sim * 0.6 + artist_sim * 0.4
+        if score > best_score:
+            best_score = score
+            best = result
+    if not best or best_score < 0.6:
+        return None
+    return best.get("syncedLyrics") or best.get("plainLyrics")
+
+
+def fetch_lyrics_with_fallback(track: Track) -> str | None:
+    """LRCLIB exact match first, then a heuristically-validated fuzzy search fallback."""
+    lyric_text = fetch_lrclib_lyrics(track)
+    if lyric_text:
+        return lyric_text
+    return fetch_lrclib_lyrics_search(track)
+
+
+def download_query(request: dict) -> str:
+    return " ".join(str(part) for part in [request.get("artist"), request.get("album"), request.get("track")] if part).strip()
+
+
+def album_search_query_variants(artist: str, album: str, requests: list[dict]) -> list[str]:
+    artist_values = text_search_values(artist, max_values=2)
+    album_values = text_search_values(album, max_values=3)
+    primary_artist = artist_values[0] if artist_values else artist
+    primary_album = album_values[0] if album_values else album
+    years = release_year_values(requests)
+    variants: list[str] = []
+    # Search broad; format is enforced locally by extension, never by a "flac" keyword (which only
+    # matches folders literally named "FLAC" and silently returned zero results for FLAC albums in
+    # plainly named folders).
+    variants.append(" ".join(part for part in [primary_artist, primary_album] if part))
+    variants.append(" ".join(part for part in [primary_album, primary_artist] if part))
+    # Album-name-only fallback. Some artist names return ZERO results on the Soulseek network even
+    # though the files (with the artist in their folder path) are abundantly shared — e.g. every
+    # "Lady Gaga ..." query returns 0, but "The Fame" returns hundreds of FLAC folders that DO contain
+    # "Lady Gaga" in their paths. The local folder scorer filters by artist (folder-path match), so a
+    # broad album-only query is safe; the early-exit on a complete folder keeps it from running for
+    # albums whose artist+album query already matched.
+    if primary_album:
+        variants.append(primary_album)
+    for year in years[:2]:
+        variants.append(" ".join(part for part in [primary_album, year] if part))
+        variants.append(" ".join(part for part in [primary_artist, primary_album, year] if part))
+    for album_value in album_values[1:]:
+        variants.append(" ".join(part for part in [primary_artist, album_value] if part))
+        variants.append(" ".join(part for part in [album_value, primary_artist] if part))
+    # `artist_values[1:]` already includes an accent-folded spelling when the artist name has one
+    # (via `text_search_values`), so this loop is what actually turns up a share like "Beyonce"
+    # when the library's own tag is the accented "Beyoncé".
+    for artist_value in artist_values[1:]:
+        variants.append(" ".join(part for part in [artist_value, primary_album] if part))
+    # Last resort: some artist names STILL return zero results network-wide no matter how the
+    # query is phrased or spelled — a Soulseek-side block on the literal string, confirmed live
+    # for "Beyoncé": every variant above (including the unaccented "Beyonce" spelling) got 0
+    # responses while the files were plainly out there. Masking the leading character with a
+    # wildcard keeps the rest of the name as a search anchor while dodging an exact-string block.
+    # Appended last, so it only fires once every real variant above has already come up empty.
+    if primary_artist and len(primary_artist) > 1:
+        wildcard_artist = f"*{primary_artist[1:]}"
+        variants.append(" ".join(part for part in [wildcard_artist, primary_album] if part))
+    return unique_nonempty(variants)
+
+
+def release_year_values(requests: list[dict]) -> list[str]:
+    years: list[str] = []
+    for request in requests:
+        for key in ("year", "date", "release_date", "released", "album_year", "album_date"):
+            match = re.search(r"\b(19\d{2}|20\d{2})\b", str(request.get(key) or ""))
+            if match:
+                years.append(match.group(1))
+    return unique_nonempty(years)
+
+
+def download_query_variants(request: dict) -> list[str]:
+    artist = str(request.get("artist") or "").strip()
+    album = str(request.get("album") or "").strip()
+    track = str(request.get("track") or request.get("title") or "").strip()
+    album_values = text_search_values(album, max_values=3)
+    track_values = text_search_values(track, max_values=2)[:2]
+    variants = []
+    primary_album = album_values[0] if album_values else album
+    primary_track = track_values[0] if track_values else track
+    # Search broad, filter locally. "artist title" is the canonical Soulseek query and returns the
+    # most focused result set; the album-qualified query helps disambiguate; title-only is the
+    # desperate last resort that still catches files in artist-less folders. The format is enforced
+    # by local extension filtering, never by a "flac" keyword (that only matches folders literally
+    # named "FLAC" and was silently returning zero results).
+    variants.append(" ".join(part for part in [artist, primary_track] if part))
+    variants.append(f"{artist} - {primary_track}".strip(" -"))
+    variants.append(" ".join(part for part in [artist, primary_album, primary_track] if part))
+    variants.append(" ".join(part for part in [primary_album, primary_track] if part))
+    variants.append(primary_track)
+    for album_value in album_values[1:]:
+        variants.append(" ".join(part for part in [artist, album_value, primary_track] if part))
+    variants.extend(
+        " ".join(part for part in [artist, track_value] if part)
+        for track_value in track_values[1:]
+    )
+    # Unlike album/track above, `artist` here is used raw rather than through
+    # `text_search_values` (which already folds accents), so an accented artist name (e.g.
+    # "Beyoncé") needs its own explicit unaccented fallback — see the identical, confirmed symptom
+    # for album search below in `album_search_query_variants`.
+    folded_artist = strip_accents(artist)
+    if folded_artist and folded_artist != artist:
+        variants.append(" ".join(part for part in [folded_artist, primary_track] if part))
+        variants.append(f"{folded_artist} - {primary_track}".strip(" -"))
+    return unique_nonempty(variants)
+
+
+def text_search_values(value: str, max_values: int = 8) -> list[str]:
+    values = [value]
+    # Right after the literal spelling, ahead of the digit/symbol alternatives below, so it
+    # reliably survives the max_values truncation — an unaccented fallback query variant (e.g.
+    # "Beyonce" alongside "Beyoncé") is confirmed to matter more than most of what follows it.
+    folded = strip_accents(value)
+    if folded and folded != value:
+        values.append(folded)
+    for token, alternatives in TEXT_SEARCH_ALTERNATIVES:
+        if token not in value:
+            continue
+        for alternative in alternatives:
+            if token.isdigit():
+                values.append(re.sub(rf"\b{re.escape(token)}\b", alternative, value, flags=re.IGNORECASE))
+            else:
+                values.append(value.replace(token, alternative))
+                values.append(value.replace(token, alternative.title()))
+    return unique_nonempty(values)[:max_values]
+
+
+def unique_nonempty(values: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        normalized = " ".join(str(value or "").split())
+        key = normalized.casefold()
+        if not normalized or key in seen:
+            continue
+        seen.add(key)
+        result.append(normalized)
+    return result
+
+
+def relocate_track_to_dir(track: Track, target_dir: Path) -> None:
+    """Move a track's audio file (and .lrc sidecar) into target_dir and update track.path. No-op if already there."""
+    if not track.path:
+        return
+    source = Path(track.path)
+    target = target_dir / source.name
+    if source.resolve() == target.resolve():
+        return
+    if not source.exists():
+        # File already gone/moved; just record the intended new location.
+        track.path = str(target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target = unique_destination(target)
+    shutil.move(str(source), str(target))
+    lrc = source.with_suffix(".lrc")
+    if lrc.exists():
+        shutil.move(str(lrc), str(target.with_suffix(".lrc")))
+    track.path = str(target)
+
+
+def sync_album_folder(session: Session, album: Album) -> None:
+    """Move all of an album's track files into the canonical library/<artist>/<album>/ folder,
+    update album.path, and remove now-empty source folders."""
+    if album is None:
+        return
+    artist_name = album.artist.name if album.artist else "Unknown Artist"
+    canonical = (
+        get_settings().library_path
+        / safe_path_part(artist_name, "Unknown Artist")
+        / safe_path_part(album.title, "Unknown Album")
+    )
+    old_dirs: set[Path] = set()
+    for track in list(album.tracks):
+        if track.path:
+            old_dirs.add(Path(track.path).parent)
+        relocate_track_to_dir(track, canonical)
+    album.path = str(canonical)
+    for d in old_dirs:
+        try:
+            if d.resolve() != canonical.resolve() and d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        except OSError:
+            pass
+
+
+def get_or_create_artist(session: Session, name: str) -> Artist:
+    """Find an Artist by case/whitespace-insensitive name, creating one if absent
+    (artist-reassign edits). Case-sensitive lookup here let "2Scoops" and "2SCOOPS"
+    become two separate rows instead of reusing the existing artist."""
+    artist = session.scalar(select(Artist).where(func.lower(Artist.name) == name.strip().lower()))
+    if artist is None:
+        artist = Artist(name=name)
+        session.add(artist)
+        session.flush()
+    return artist
+
+
+def reassign_album_to_artist(session: Session, album: Album, new_artist_name: str) -> None:
+    """Move a whole album to a different artist (the album editor's "Artist" field).
+
+    Reassigns via the relationship, relocates files, merges into a same-titled album under
+    the target artist if one already exists, and prunes the old album/artist when emptied.
+    """
+    old_artist = album.artist
+    target_artist = get_or_create_artist(session, new_artist_name)
+    if old_artist is not None and target_artist.id == old_artist.id:
+        return
+    existing = session.scalar(
+        select(Album).where(
+            Album.artist_id == target_artist.id,
+            func.lower(Album.title) == album.title.lower(),
+            Album.id != album.id,
+        )
+    )
+    if existing is not None:
+        for track in list(album.tracks):
+            # Reassign through the relationship so album.tracks empties in-session; a raw FK
+            # set would cascade album_id=NULL when the now-empty album is deleted (NOT NULL).
+            track.album = existing
+        session.flush()
+        session.refresh(existing)
+        sync_album_folder(session, existing)
+        cleanup_empty_album_artist(session, album)
+        return
+    album.artist = target_artist
+    session.flush()
+    session.refresh(album)
+    sync_album_folder(session, album)
+    if old_artist is not None:
+        remaining = session.scalar(
+            select(func.count()).select_from(Album).where(Album.artist_id == old_artist.id)
+        )
+        if remaining == 0:
+            session.delete(old_artist)
+
+
+def reassign_track_to_artist(session: Session, track: Track, new_artist_name: str) -> None:
+    """Move a single track to a different artist (the track editor's "Artist" field).
+
+    The track keeps its album title but is re-homed under a same-titled album owned by the
+    target artist (created if needed); the file moves and any emptied source is pruned.
+    """
+    old_album = track.album
+    if old_album is None:
+        return
+    if old_album.artist is not None and old_album.artist.name == new_artist_name:
+        return
+    target_artist = get_or_create_artist(session, new_artist_name)
+    target_album = session.scalar(
+        select(Album).where(
+            Album.artist_id == target_artist.id, func.lower(Album.title) == old_album.title.lower()
+        )
+    )
+    if target_album is None:
+        target_album = Album(artist=target_artist, title=old_album.title, sort_name=old_album.sort_name)
+        session.add(target_album)
+        session.flush()
+    track.album = target_album
+    session.flush()
+    canonical = (
+        get_settings().library_path
+        / safe_path_part(target_artist.name, "Unknown Artist")
+        / safe_path_part(target_album.title, "Unknown Album")
+    )
+    relocate_track_to_dir(track, canonical)
+    target_album.path = str(canonical)
+    session.flush()
+    cleanup_empty_album_artist(session, old_album)
+
+
+def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> None:
+    # A remote cover_path URL (artist editor "Auto lookup" / Check Artist Covers)
+    # is downloaded into the artist folder so GET /library/artists/{id}/cover serves
+    # a real local file instead of 404ing on the URL (mirror apply_album_changes).
+    cover_value = changes.get("cover_path")
+    if isinstance(cover_value, str) and cover_value.lower().startswith(("http://", "https://")):
+        changes = dict(changes)
+        local_cover = download_artist_cover_to_library(session, artist, [cover_value])
+        if local_cover:
+            changes["cover_path"] = local_cover
+        else:
+            changes.pop("cover_path", None)
+    old_name = artist.name
+    apply_scalar_changes(artist, changes, {"name", "sort_name", "musicbrainz_id", "cover_path", "cover_locked"})
+    name_changed = artist.name != old_name
+    if not name_changed:
+        # sort_name / musicbrainz_id-only edits must not merge into a same-name artist
+        # (that deletes this artist and discards the edit). Merge only on a name change.
+        return
+    matching_artist = session.scalar(
+        select(Artist).where(func.lower(Artist.name) == artist.name.lower(), Artist.id != artist.id)
+    )
+    if not matching_artist:
+        for album in list(artist.albums):
+            sync_album_folder(session, album)
+        return
+    for album in list(artist.albums):
+        matching_album = session.scalar(
+            select(Album).where(
+                Album.artist_id == matching_artist.id,
+                func.lower(Album.title) == album.title.lower(),
+                Album.id != album.id,
+            )
+        )
+        if matching_album:
+            for track in list(album.tracks):
+                # Reassign via the relationship so album.tracks empties in-session;
+                # a direct FK set leaves the stale collection and deleting the album
+                # in cleanup_empty_album_artist would null album_id (NOT NULL fail).
+                track.album = matching_album
+            session.flush()
+            session.refresh(matching_album)
+            sync_album_folder(session, matching_album)
+            cleanup_empty_album_artist(session, album)
+        else:
+            album.artist = matching_artist
+            session.flush()
+            session.refresh(album)
+            sync_album_folder(session, album)
+
+
+def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
+    # When the cover_path is a remote URL (e.g. the library "Auto lookup" button or
+    # an album-search pick hands us a Cover Art Archive / iTunes URL), download it
+    # into the album folder so it serves like the Check Album Covers tool's output.
+    # Storing the URL verbatim would make GET /library/albums/{id}/cover 404.
+    cover_value = changes.get("cover_path")
+    if isinstance(cover_value, str) and cover_value.lower().startswith(("http://", "https://")):
+        changes = dict(changes)
+        local_cover = download_album_cover_to_library(session, album, [cover_value])
+        if local_cover:
+            changes["cover_path"] = local_cover
+        else:
+            changes.pop("cover_path", None)
+    # "artist" is a virtual reassignment field, not a column — pull it out before the
+    # scalar apply (Album has no `artist` string attr) and move the album afterwards.
+    new_artist_name = None
+    if "artist" in changes:
+        changes = dict(changes)
+        new_artist_name = (changes.pop("artist") or "").strip()
+    old_title = album.title
+    apply_scalar_changes(
+        album,
+        changes,
+        {
+            "title", "sort_name", "release_title", "path", "cover_path", "cover_locked",
+            "musicbrainz_release_id", "musicbrainz_release_group_id",
+        },
+    )
+    if new_artist_name and (album.artist is None or new_artist_name != album.artist.name):
+        reassign_album_to_artist(session, album, new_artist_name)
+        return
+    title_changed = album.title != old_title
+    if not title_changed:
+        # Cover-art / mbid / path-only edits must not trigger a merge: the merge below
+        # deletes this album and keeps matching_album, which would silently discard the
+        # change we just applied (e.g. the new cover_path). Only an actual title change
+        # can create a collision worth merging.
+        return
+    matching_album = session.scalar(
+        select(Album).where(
+            Album.artist_id == album.artist_id,
+            func.lower(Album.title) == album.title.lower(),
+            Album.id != album.id,
+        )
+    )
+    if not matching_album:
+        sync_album_folder(session, album)
+        return
+    for track in list(album.tracks):
+        # Reassign through the relationship (not the FK column) so album.tracks is
+        # emptied in-session; otherwise deleting the now-empty album in
+        # cleanup_empty_album_artist cascades album_id=NULL onto these tracks and
+        # trips the NOT NULL constraint.
+        track.album = matching_album
+    session.flush()
+    session.refresh(matching_album)
+    sync_album_folder(session, matching_album)
+    cleanup_empty_album_artist(session, album)
+
+
+def apply_scalar_changes(target, changes: dict, allowed_fields: set[str]) -> None:
+    for key, value in changes.items():
+        if key in allowed_fields:
+            setattr(target, key, value)
+
+
+def editable_track_fields() -> set[str]:
+    return {
+        "title",
+        "track_number",
+        "disc_number",
+        "duration_ms",
+        "format",
+        "bitrate",
+        "path",
+        "musicbrainz_recording_id",
+        "explicit",
+        "is_lossless",
+        "musicbrainz_verified",
+        "metadata_locked",
+        "artwork_locked",
+        "filename_locked",
+        "replaygain_track_gain",
+    }
+
+
+def apply_file_action_item(session: Session, item: ProposalItem) -> None:
+    payload = json.loads(item.payload_json or "{}")
+    source_path = Path(item.old_value or "")
+    track = session.get(Track, payload.get("track_id"))
+    if payload.get("action") == "remove_empty_album":
+        # Record-only deletion of an orphan 0-track album row. Never touches files —
+        # an empty duplicate often shares its folder/cover.jpg with the real album.
+        album = session.get(Album, payload.get("album_id"))
+        if album and album.tracks:
+            raise ValueError("Album is no longer empty")
+        if album:
+            cleanup_empty_album_artist(session, album)
+        return
+    if payload.get("action") == "remove_record":
+        if not track:
+            raise ValueError("Track record no longer exists")
+        album = track.album
+        session.delete(track)
+        session.flush()
+        cleanup_empty_album_artist(session, album)
+        return
+    if payload.get("action") == "delete_file":
+        settings = get_settings()
+        library_root = settings.library_path.resolve()
+        resolved = source_path.resolve()
+        if library_root not in [resolved, *resolved.parents]:
+            raise ValueError("File must be inside the library folder")
+        if not resolved.is_file():
+            raise FileNotFoundError(f"{resolved} no longer exists")
+        resolved.unlink()
+        remove_lyrics_sidecar(session, resolved)
+        return
+    if payload.get("action") == "trash_duplicate":
+        # Retained action name for proposals created before removals became permanent; the
+        # duplicate is now deleted outright rather than relocated.
+        if source_path.exists():
+            append_task_log(session, None, f"Deleting duplicate: {source_path.name}")
+            source_path.unlink()
+            remove_lyrics_sidecar(session, source_path)
+        if track:
+            album = track.album
+            session.delete(track)
+            session.flush()
+            cleanup_empty_album_artist(session, album)
+        return
+    if payload.get("action") == "relocate_track":
+        if not track:
+            raise ValueError("Track record no longer exists")
+        if not source_path.exists():
+            raise FileNotFoundError(f"{source_path} no longer exists")
+        target_path = Path(item.new_value or "")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        if target_path.resolve() != source_path.resolve():
+            target_path = unique_destination(target_path)
+            shutil.move(str(source_path), str(target_path))
+            # move a matching .lrc lyrics sidecar alongside, if present
+            lrc = source_path.with_suffix(".lrc")
+            if lrc.exists():
+                shutil.move(str(lrc), str(target_path.with_suffix(".lrc")))
+        track.path = str(target_path)
+        if track.album is not None:
+            track.album.path = str(target_path.parent)
+        return
+    # Delete/move: a track whose file is already missing (e.g. lost during a prior rename)
+    # must still be removable — moving a nonexistent source used to raise and abort before
+    # the DB record was ever deleted, permanently stranding the broken row.
+    if source_path.exists():
+        if payload.get("action") == "delete":
+            # Removals are permanent. The file is deleted in place, never relocated, and its
+            # lyrics sidecar goes with it so nothing is left orphaned in the library folder.
+            library_root = get_settings().library_path.resolve()
+            resolved = source_path.resolve()
+            if library_root not in [resolved, *resolved.parents]:
+                raise ValueError("File must be inside the library folder")
+            append_task_log(session, None, f"{item.title}: deleting {resolved}")
+            resolved.unlink()
+            remove_lyrics_sidecar(session, resolved)
+        else:
+            target_path = unique_destination(Path(item.new_value or ""))
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_path), str(target_path))
+    else:
+        append_task_log(session, None, f"{item.title}: source file {source_path} already missing; removing library record only")
+    if track:
+        album = track.album
+        session.delete(track)
+        session.flush()
+        cleanup_empty_album_artist(session, album)
+
+
+def delete_stale_download_file(entry: dict) -> None:
+    """Delete a download file from the downloads directory when it's being abandoned or replaced.
+
+    Only deletes files inside the configured downloads path — never touches the library or staging.
+    """
+    path_str = entry.get("path") or entry.get("download_path")
+    if not path_str:
+        return
+    file_path = Path(str(path_str))
+    downloads_root = get_settings().downloads_path
+    try:
+        file_path.relative_to(downloads_root)
+    except ValueError:
+        return  # not inside downloads — leave it alone
+    try:
+        if file_path.is_file():
+            file_path.unlink()
+    except OSError:
+        pass
+
+
+def safe_filename(path: Path, max_bytes: int = 240) -> Path:
+    # Strip slskd's repeated dedup suffixes like " (1) (1) (1)" from retried downloads.
+    # Only matches 1–3 digit numbers so year suffixes like "(1984)" are preserved.
+    stem = re.sub(r"(\s*\(\d{1,3}\))+$", "", path.stem)
+    suffix = path.suffix
+    max_stem = max_bytes - len(suffix.encode())
+    stem_bytes = stem.encode()
+    if len(stem_bytes) > max_stem:
+        stem = stem_bytes[:max_stem].decode(errors="ignore").rstrip()
+    return path.with_name(stem + suffix)
+
+
+def remove_lyrics_sidecar(session: Session, audio_path: Path) -> None:
+    """Delete the ``.lrc`` sidecar that belongs to a deleted audio file.
+
+    Removals are permanent, so nothing may be left behind in the library folder. A sidecar whose
+    track is gone is unreachable and would otherwise keep an empty album directory alive.
+    """
+    lrc = audio_path.with_suffix(".lrc")
+    if lrc.exists():
+        lrc.unlink()
+        append_task_log(session, None, f"Deleted orphaned lyrics sidecar: {lrc.name}")
+
+
+def unique_destination(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise FileExistsError(f"No available destination for {path}")
+
+
+def cleanup_empty_album_artist(session: Session, album: Album | None) -> None:
+    """Removes what a track deletion just left behind: an album with no tracks, then an artist with
+    nothing under it at all.
+
+    ⚠️ The artist check sweeps the artist's **other** empty albums first, and that is the point.
+    It used to delete `album` and then keep the artist if any album row remained — so an artist
+    whose only survivor was a 0-track shell (an "Unknown Album" left by an old import, say) lived
+    on forever with an empty album under it. Deleting an artist's last real album therefore left two
+    phantom rows on every client, and no user action could clear them: there is nothing to remove
+    through the UI but an empty record. Only zero-track albums are swept, so nothing holding music
+    is ever touched.
+    """
+    if not album:
+        return
+    artist = album.artist
+    track_count = session.scalar(select(func.count()).select_from(Track).where(Track.album_id == album.id))
+    if track_count == 0:
+        session.delete(album)
+        session.flush()
+    if not artist:
+        return
+    for other in list(session.scalars(select(Album).where(Album.artist_id == artist.id))):
+        other_tracks = session.scalar(select(func.count()).select_from(Track).where(Track.album_id == other.id))
+        if other_tracks == 0:
+            session.delete(other)
+    session.flush()
+    album_count = session.scalar(select(func.count()).select_from(Album).where(Album.artist_id == artist.id))
+    if album_count == 0:
+        session.delete(artist)
+
+
+def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Background task: run yt-dlp for one proposal item, import the result, and finalize the batch."""
+    item_id = payload.get("item_id")
+    item = session.get(ProposalItem, item_id) if item_id else None
+    if not item:
+        raise ValueError(f"yt-dlp proposal item {item_id} not found")
+
+    item_payload = json.loads(item.payload_json or "{}")
+    request = item_payload.get("request") or {}
+    query = download_query(request) or item.old_value or item.title
+
+    item.status = ProposalStatus.executing
+    set_download_item_status(item, "downloading from YouTube via yt-dlp")
+    session.commit()
+
+    downloaded_path: Path | None = None
+    imported_to_library = False
+    try:
+        downloaded_path = queue_ytdlp_download(session, request, task=task)
+    except Exception as error:
+        item.status = ProposalStatus.failed
+        # Tree rows show only a short status; the detail goes to the log + notification
+        # (below) and is kept in the payload under a non-displayed key.
+        set_download_item_status(item, "needs attention")
+        failed_payload = json.loads(item.payload_json or "{}")
+        failed_payload["error"] = str(error)
+        item.payload_json = json.dumps(failed_payload)
+        append_task_log(session, task, f"yt-dlp: download failed for '{query}': {error}", "error")
+        create_notification(
+            session,
+            title="Download completed with an issue",
+            body=f"'{query}' could not be downloaded. Open Activity for details.",
+            event_type="task_completed",
+            target_url="/activity",
+            group_key=f"download:{item.batch_id}",
+        )
+        failed_batch = session.get(ProposalBatch, item.batch_id)
+        if failed_batch:
+            failed_batch.status = ProposalStatus.completed
+        session.commit()
+        return {
+            "query": query,
+            "imported": False,
+            "passed": 0,
+            "failed": 1,
+            "errors": [str(error)],
+            "completed_with_item_failures": True,
+        }
+
+    item_payload["ytdlp_file_path"] = str(downloaded_path) if downloaded_path else None
+    item_payload["status"] = "downloaded from YouTube"
+    item.payload_json = json.dumps(item_payload)
+    item.status = ProposalStatus.completed
+    session.commit()
+
+    # Import the downloaded file directly, bypassing the manifest scan's early-exit guard.
+    if downloaded_path and downloaded_path.is_file():
+        try:
+            settings = get_settings()
+            # yt-dlp output is untagged, so the file's own metadata is junk (the
+            # filename/path fallback gave "app" / "ytdlp-...."). Drive the name, tags,
+            # and Artist>Album>Track path from the download request's known fields,
+            # then embed them so Jellyfin and re-scans agree (mirrors the slskd path).
+            metadata = normalize_download_metadata(read_audio_metadata(downloaded_path), request)
+            try:
+                write_audio_metadata(downloaded_path, metadata)
+            except Exception as tag_error:  # noqa: BLE001 - tag failure shouldn't block import.
+                append_task_log(session, task, f"yt-dlp: could not tag '{downloaded_path.name}': {tag_error}", "warning")
+            target_path = Path(suggest_library_path(metadata, downloaded_path))
+            known_paths = existing_library_and_proposal_paths(session)
+            if str(target_path) not in known_paths and not target_path.exists():
+                import_file_to_library(session, downloaded_path, target_path, {
+                    "path": str(downloaded_path),
+                    "relative_path": str(downloaded_path.relative_to(settings.downloads_path)),
+                    "extension": downloaded_path.suffix.lower(),
+                    "size_bytes": downloaded_path.stat().st_size,
+                    "metadata": metadata,
+                    "suggested_library_path": str(target_path),
+                })
+                mark_matching_wishlist_completed(session, metadata)
+                append_task_log(session, task, f"yt-dlp: '{query}' added to library as '{target_path.name}'")
+                create_notification(
+                    session,
+                    title="YouTube download imported",
+                    body=f"'{query}' was downloaded from YouTube and added to the library.",
+                    event_type="tool_completed",
+                    target_url="/library",
+                    group_key=f"download:{item.batch_id}",
+                )
+                session.flush()
+                enqueue_task(session, "jellyfin_scan", {})
+                flush_import_enrichment(session)
+                imported_to_library = True
+            else:
+                append_task_log(session, task, f"yt-dlp: '{query}' already in library, skipping import")
+        except Exception as import_error:  # noqa: BLE001
+            append_task_log(session, task, f"yt-dlp: import failed for '{query}': {import_error}", "warning")
+    else:
+        append_task_log(session, task, f"yt-dlp: no audio file found after download for '{query}' — import skipped", "warning")
+
+    # Finalize the parent batch once nothing actionable remains. The auto-queued yt-dlp
+    # fallback leaves the candidate batch `pending` and its artist/album grouping nodes
+    # (which carry no `action`) never execute — so the old `executing`-only + all-items
+    # check never fired, leaving an empty "Download candidates" batch lingering in the
+    # Task Queue after the import. Finalize on remaining *actionable* leaves instead.
+    batch = session.get(ProposalBatch, item.batch_id)
+    if batch and batch.status not in {ProposalStatus.completed, ProposalStatus.rejected}:
+        open_work = any(
+            json.loads(other.payload_json or "{}").get("action")
+            and other.status not in {ProposalStatus.completed, ProposalStatus.rejected}
+            for other in batch.items
+        )
+        if not open_work:
+            finalize_completed_download_batch(session, batch)
+            append_task_log(session, task, f"yt-dlp: batch '{batch.title}' marked complete")
+    session.commit()
+    return {
+        "query": query,
+        "file": str(downloaded_path) if downloaded_path else None,
+        "imported": imported_to_library,
+    }
+
+
+def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
+    """Map Nudibranch tracks to Jellyfin audio items (populates jellyfin_item_id on tracks).
+
+    Playlist and favorites state is now live from Jellyfin via the API routes.
+    This job only keeps the track↔Jellyfin-item mapping current so that add/remove
+    operations can resolve Nudibranch track IDs to Jellyfin item IDs without extra calls.
+    """
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        append_task_log(session, None, "Jellyfin not configured — skipping track mapping", "warning")
+        return {"mapped": 0, "total": 0}
+
+    linked_users = list(session.scalars(
+        select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != "")
+    ))
+    if not linked_users:
+        append_task_log(session, None, "No Nudibranch users have a linked Jellyfin account — link one in Users")
+        return {"mapped": 0, "total": 0}
+
+    headers = {"X-Emby-Token": jellyfin_api_key}
+    with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=25) as client:
+        user_id = linked_users[0].jellyfin_user_id
+
+        # Fetch all Jellyfin audio items once
+        audio_index = _fetch_all_jellyfin_audio(client, user_id)
+        append_task_log(session, None, f"Track mapping: fetched {len(audio_index)} Jellyfin audio items")
+
+        # Re-validate EVERY track against the current Jellyfin index, not just the unmapped ones. A
+        # stored jellyfin_item_id goes STALE when Jellyfin re-indexes a file (e.g. after a track
+        # replacement, or a Jellyfin library rescan) and reissues the item id — and a stale id is
+        # silently rejected on playlist add, so the track vanishes from playlists. Fast path: skip
+        # tracks whose id is still present in the index. Otherwise re-match: refresh to the current id,
+        # or clear it when the item is genuinely gone (so a later scan can remap and it isn't used as
+        # a dead id). Mapping only-the-NULL tracks left stale ids unfixable forever.
+        current_ids = {item.get("Id") for item in audio_index if item.get("Id")}
+        all_tracks = list(session.scalars(select(Track)))
+        newly_mapped = 0
+        refreshed = 0
+        cleared = 0
+        for track in all_tracks:
+            stored = track.jellyfin_item_id
+            if stored and stored in current_ids:
+                continue  # still valid
+            jf_id = _find_in_audio_index(audio_index, track)
+            if jf_id:
+                track.jellyfin_item_id = jf_id
+                if stored is None:
+                    newly_mapped += 1
+                elif jf_id != stored:
+                    refreshed += 1
+            elif stored is not None:
+                track.jellyfin_item_id = None
+                cleared += 1
+        if newly_mapped or refreshed or cleared:
+            session.commit()
+        total_mapped = session.scalar(select(func.count(Track.id)).where(Track.jellyfin_item_id.isnot(None))) or 0
+        total_tracks = session.scalar(select(func.count(Track.id))) or 0
+        append_task_log(session, None, f"Track mapping: {newly_mapped} newly mapped, {refreshed} refreshed (stale), {cleared} cleared (gone); {total_mapped}/{total_tracks} total mapped to Jellyfin")
+    count_row = session.get(AppSetting, "mapping_run_count")
+    new_count = (int(count_row.value) if count_row else 0) + 1
+    _upsert_setting(session, "mapping_last_run_at", datetime.now(timezone.utc).isoformat())
+    _upsert_setting(session, "mapping_run_count", str(new_count))
+    session.commit()
+    _try_create_pending_playlists(session)
+    return {"mapped": newly_mapped, "total": total_tracks}
+
+
+def run_playlist_mirror(session: Session, payload: dict) -> dict:
+    """Reconcile every Jellyfin-linked user's playlists with Jellyfin, in both directions.
+
+    Runs on a timer from the worker idle loop (and can be enqueued directly). It is the same
+    reconcile the `/playlists` reads perform — imported from routes rather than reimplemented, so
+    there is exactly one merge implementation and the background pass can never drift from the
+    foreground one. `user_id` in the payload limits it to one user.
+
+    A user whose Jellyfin is unreachable is skipped, not failed: `_mirror_pull` returns False
+    without touching anything when the fetch fails, which is what stops an outage from being read
+    as "the user deleted everything".
+    """
+    # Imported lazily: routes.py pulls in the whole API layer, and the worker only needs it here.
+    from nudibranch.api.routes import _jf_client, _mirror_pull
+
+    user_id = payload.get("user_id")
+    query = select(User).where(User.jellyfin_user_id.is_not(None))
+    if user_id:
+        query = query.where(User.id == user_id)
+    reconciled = skipped = 0
+    for user in list(session.scalars(query)):
+        client, jf_user_id = _jf_client(session, user)
+        if not client:
+            skipped += 1
+            continue
+        try:
+            with client:
+                if _mirror_pull(session, user, client, jf_user_id):
+                    session.commit()
+                    reconciled += 1
+                else:
+                    session.rollback()
+        except Exception as error:  # noqa: BLE001 - one user's Jellyfin must not stop the rest.
+            session.rollback()
+            skipped += 1
+            append_task_log(session, None, f"Playlist mirror: {user.username} skipped ({error})", "warning")
+    return {"reconciled": reconciled, "skipped": skipped}
+
+
+def run_migrate_native_playlists_to_jellyfin(session: Session, payload: dict) -> dict:
+    """Seed a newly-linked Jellyfin account from the user's existing playlists/Favorites.
+
+    Enqueued by routes.py's PUT /me/jellyfin-user and PUT /users/{id}/jellyfin-user handlers the
+    moment a user's jellyfin_user_id transitions from unset to set.
+
+    ⚠️ This is a **copy that establishes the mirror, not a move**. It used to delete every native
+    row once pushed, because under the old either/or design the API could no longer reach them —
+    a Jellyfin-linked account's playlists lived only in Jellyfin. The consequence was that
+    *unlinking* an account (or clearing the instance's Jellyfin settings) made every playlist
+    disappear, the rows already being gone. Native rows are now the source of truth for everyone
+    and Jellyfin mirrors them, so this keeps them and records the Jellyfin id it created against
+    each one — that pairing is what `_mirror_pull` reconciles against. Do NOT restore the delete.
+
+    Best-effort per track: a track with no resolvable Jellyfin item id (not yet scanned into
+    Jellyfin) is skipped and counted, not silently dropped without a trace — the summary
+    notification says how many were left out. Those stay in the local playlist and are simply not
+    mirrored yet (`_merge_jellyfin_tracks` is what stops the next pull pruning them). An existing
+    same-named Jellyfin playlist is reused (missing tracks merged in) rather than creating a
+    duplicate; Favorites has no Jellyfin playlist equivalent, so each resolvable track's IsFavorite
+    flag is set instead (a merge — it can only add, never remove one set in a prior session).
+    """
+    user_id = payload.get("user_id")
+    user = session.get(User, user_id) if user_id else None
+    if not user or not user.jellyfin_user_id:
+        append_task_log(session, None, "Playlist migration: user is no longer linked to Jellyfin — skipping", "warning")
+        return {"migrated_playlists": 0, "migrated_favorite_tracks": 0, "skipped_tracks": 0}
+
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        append_task_log(session, None, "Playlist migration: Jellyfin not configured — skipping", "warning")
+        return {"migrated_playlists": 0, "migrated_favorite_tracks": 0, "skipped_tracks": 0}
+
+    native_playlists = list(
+        session.scalars(
+            select(Playlist)
+            .where(Playlist.user_id == user.id)
+            .options(selectinload(Playlist.tracks).selectinload(PlaylistTrack.track))
+        )
+    )
+    if not native_playlists:
+        return {"migrated_playlists": 0, "migrated_favorite_tracks": 0, "skipped_tracks": 0}
+
+    jf_user_id = user.jellyfin_user_id
+    migrated_favorite_tracks = 0
+    skipped_favorite_tracks = 0
+    migrated_playlists = 0
+    skipped_playlist_tracks = 0
+
+    with httpx.Client(base_url=jellyfin_url, headers={"X-Emby-Token": jellyfin_api_key}, timeout=25) as client:
+        audio_index = _fetch_all_jellyfin_audio(client, jf_user_id)
+        current_ids = {item.get("Id") for item in audio_index if item.get("Id")}
+
+        def resolve_item_id(track: Track) -> str | None:
+            if track.jellyfin_item_id and track.jellyfin_item_id in current_ids:
+                return track.jellyfin_item_id
+            jf_id = _find_in_audio_index(audio_index, track)
+            if jf_id:
+                track.jellyfin_item_id = jf_id
+            return jf_id
+
+        for playlist in native_playlists:
+            entries = sorted(playlist.tracks, key=lambda pt: (pt.position if pt.position is not None else 0))
+
+            if playlist.protected:
+                # Jellyfin has no "Favorites playlist" — each track's IsFavorite flag is the
+                # equivalent. Setting it is additive (never un-favorites), so this is safe to run
+                # even if the account already has unrelated Jellyfin favorites.
+                for entry in entries:
+                    track = entry.track
+                    if not track:
+                        continue
+                    item_id = resolve_item_id(track)
+                    if not item_id:
+                        skipped_favorite_tracks += 1
+                        continue
+                    try:
+                        client.post(f"/Users/{jf_user_id}/FavoriteItems/{item_id}").raise_for_status()
+                        migrated_favorite_tracks += 1
+                    except Exception as error:  # noqa: BLE001 - one bad track shouldn't abort the migration.
+                        append_task_log(session, None, f"Playlist migration: could not favorite '{track.title}' in Jellyfin: {error}", "warning")
+                        skipped_favorite_tracks += 1
+                continue
+
+            item_ids: list[str] = []
+            for entry in entries:
+                track = entry.track
+                if not track:
+                    continue
+                item_id = resolve_item_id(track)
+                if item_id:
+                    item_ids.append(item_id)
+                else:
+                    skipped_playlist_tracks += 1
+
+            try:
+                existing_id = find_jellyfin_playlist(client, jf_user_id, playlist.name)
+            except Exception:  # noqa: BLE001 - a lookup failure just means "create a new one".
+                existing_id = None
+            already_present = _jellyfin_playlist_item_ids(client, existing_id, jf_user_id) if existing_id else set()
+            to_add = [item_id for item_id in item_ids if item_id not in already_present]
+
+            try:
+                if not existing_id:
+                    create_resp = client.post("/Playlists", json={"Name": playlist.name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": []})
+                    create_resp.raise_for_status()
+                    existing_id = create_resp.json().get("Id") or create_resp.json().get("PlaylistId") or ""
+                if existing_id and to_add:
+                    client.post(f"/Playlists/{existing_id}/Items", params={"ids": ",".join(to_add), "userId": jf_user_id}).raise_for_status()
+                # The pairing that makes this playlist mirrored from here on.
+                if existing_id:
+                    playlist.jellyfin_playlist_id = existing_id
+                migrated_playlists += 1
+            except Exception as error:  # noqa: BLE001 - leave this one unmirrored rather than lose it.
+                append_task_log(session, None, f"Playlist migration: could not create/populate Jellyfin playlist '{playlist.name}': {error}", "error")
+
+        # Persists both the resolved track.jellyfin_item_id values and the new playlist pairings.
+        session.commit()
+
+    summary_parts = []
+    if migrated_playlists:
+        summary_parts.append(f"{migrated_playlists} playlist(s)")
+    if migrated_favorite_tracks:
+        summary_parts.append(f"{migrated_favorite_tracks} favorite track(s)")
+    skipped_total = skipped_playlist_tracks + skipped_favorite_tracks
+    body = f"Copied {', '.join(summary_parts) if summary_parts else 'nothing'} into Jellyfin for {user.display_name}."
+    if skipped_total:
+        # No unlink/re-link advice any more: the playlists still hold these tracks locally, and a
+        # Jellyfin scan followed by any edit to the playlist mirrors them across.
+        body += f" {skipped_total} track(s) aren't in Jellyfin yet, so they aren't mirrored — they're still in the playlist here. Run a Jellyfin scan to pick them up."
+    append_task_log(session, None, f"Playlist sync for {user.username}: {body}")
+    create_notification(
+        session,
+        title="Playlists synced to Jellyfin",
+        body=body,
+        event_type="tool_completed",
+        target_url="/playlists",
+        user_id=user.id,
+    )
+    return {
+        "migrated_playlists": migrated_playlists,
+        "migrated_favorite_tracks": migrated_favorite_tracks,
+        "skipped_tracks": skipped_total,
+    }
+
+
+_PENDING_PLAYLIST_MAX_RETRIES = 8
+
+
+def _origin_registry_key(user_id: str, origin: str) -> str:
+    """AppSetting key mapping an import origin (source URL) → the created Jellyfin playlist id,
+    so re-importing the same playlist updates it instead of duplicating. Hashed to fit the key
+    column and avoid the Playlist(user_id, name) unique constraint."""
+    digest = hashlib.sha1(origin.encode("utf-8")).hexdigest()[:24]
+    return f"playlist_origin:{user_id}:{digest}"
+
+
+def _jellyfin_playlist_for_origin(session: Session, user_id: str, origin: str | None) -> str | None:
+    if not origin or not user_id:
+        return None
+    row = session.get(AppSetting, _origin_registry_key(user_id, origin))
+    return row.value if row and row.value else None
+
+
+def _record_jellyfin_playlist_origin(session: Session, user_id: str, origin: str | None, playlist_id: str) -> None:
+    if not origin or not user_id or not playlist_id:
+        return
+    _upsert_setting(session, _origin_registry_key(user_id, origin), playlist_id)
+
+
+def _jellyfin_playlist_item_ids(client: httpx.Client, playlist_id: str, jf_user_id: str) -> set[str]:
+    """Jellyfin item ids currently in a playlist — used to avoid adding duplicates on re-import."""
+    try:
+        resp = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id})
+        resp.raise_for_status()
+        return {item.get("Id") for item in resp.json().get("Items", []) if item.get("Id")}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _jellyfin_playlist_exists(client: httpx.Client, playlist_id: str, jf_user_id: str) -> bool:
+    """Whether a Jellyfin playlist id still resolves. Returns False ONLY on a definitive 404 —
+    a stale id (the playlist was deleted in Jellyfin but its id lingers in our origin registry /
+    pending record) otherwise makes every add return 404 and the import never completes. Transient
+    errors return True so we never recreate (and duplicate) a playlist over a network blip."""
+    try:
+        resp = client.get(f"/Playlists/{playlist_id}/Items", params={"userId": jf_user_id, "limit": 0})
+        return resp.status_code != 404
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _merge_duplicate_pending_playlists(session: Session, settings: list[AppSetting]) -> list[AppSetting]:
+    """Collapse pending-playlist records that point at the same playlist (same user+origin, else
+    same user+name) into the earliest one, unioning their original_tracks. Returns the surviving
+    records. Prevents two records racing to create duplicate Jellyfin/native playlists."""
+    groups: dict[tuple, list[tuple[AppSetting, dict]]] = {}
+    survivors: list[AppSetting] = []
+    for setting in settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            continue
+        user_id = data.get("user_id")
+        origin = (data.get("origin") or "").strip()
+        name = normalize_match_text(data.get("playlist_name"))
+        if not user_id or not name:
+            survivors.append(setting)
+            continue
+        key = (user_id, "origin:" + origin) if origin else (user_id, "name:" + name)
+        groups.setdefault(key, []).append((setting, data))
+    for key, members in groups.items():
+        primary_setting, primary_data = members[0]
+        if len(members) == 1:
+            survivors.append(primary_setting)
+            continue
+        seen = {(normalize_match_text(t.get("artist")), normalize_match_text(t.get("title")))
+                for t in primary_data.get("original_tracks") or []}
+        merged = list(primary_data.get("original_tracks") or [])
+        for extra_setting, extra_data in members[1:]:
+            for t in extra_data.get("original_tracks") or []:
+                sig = (normalize_match_text(t.get("artist")), normalize_match_text(t.get("title")))
+                if sig not in seen:
+                    seen.add(sig)
+                    merged.append(t)
+            # Carry over a real playlist id / added_ids if the primary lacks one.
+            if not primary_data.get("jellyfin_playlist_id") and extra_data.get("jellyfin_playlist_id"):
+                primary_data["jellyfin_playlist_id"] = extra_data["jellyfin_playlist_id"]
+            session.delete(extra_setting)
+        primary_data["original_tracks"] = merged
+        primary_setting.value = json.dumps(primary_data)
+        write_app_log(f"Pending playlist '{primary_data.get('playlist_name')}': merged {len(members)} duplicate import record(s)")
+        survivors.append(primary_setting)
+    return survivors
+
+
+def _try_create_pending_playlists(session: Session) -> None:
+    """After track mapping, create any Jellyfin playlists that were deferred from a playlist import."""
+    pending_settings = list(session.scalars(
+        select(AppSetting).where(AppSetting.key.like("pending_playlist:%"))
+    ))
+    if not pending_settings:
+        return
+
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        return
+
+    # Collapse pending records that target the same playlist (same user + origin, else same name)
+    # into one. Two records for one playlist each create/extend independently — with Jellyfin's
+    # create indexing lag they miss each other and make DUPLICATE playlists. Merge their original
+    # tracks into the earliest record and drop the rest so only one create path runs.
+    pending_settings = _merge_duplicate_pending_playlists(session, pending_settings)
+
+    headers = {"X-Emby-Token": jellyfin_api_key}
+    for setting in pending_settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            session.delete(setting)
+            continue
+        playlist_name = data.get("playlist_name") or ""
+        original_tracks = data.get("original_tracks") or []
+        stored_user_id = data.get("user_id")
+        retry_count = int(data.get("retry_count", 0))
+        if not playlist_name or not original_tracks:
+            session.delete(setting)
+            continue
+
+        # Resolve original tracks → jellyfin_item_id. Use the canonical album-agnostic resolver,
+        # which re-checks artist+title with symmetric normalize_match_text on BOTH sides. The old
+        # inline query compared the casefolded/whitespace-collapsed request against a bare SQLite
+        # lower(column) (ASCII-only, no trim/collapse) for title AND artist, so names with accents or
+        # stray whitespace silently failed to match and were dropped — the playlist consistently
+        # ended up short of its real track count.
+        jf_ids: list[str] = []
+        unresolved = 0       # not found in the library at all
+        resolved_no_jf = 0   # in the library but not yet mapped to a Jellyfin item
+        unindexed: list[str] = []  # names of the in-library-but-unmapped tracks (+ file presence)
+        for entry in original_tracks:
+            title = entry.get("title") or ""
+            if not title:
+                continue
+            track = library_track_by_artist_title(session, entry.get("artist") or "", title)
+            if not track:
+                unresolved += 1
+            elif not track.jellyfin_item_id:
+                resolved_no_jf += 1
+                file_present = bool(track.path and Path(track.path).exists())
+                unindexed.append(f"{track.title} [{'file present' if file_present else 'FILE MISSING'}]")
+            else:
+                jf_ids.append(track.jellyfin_item_id)
+        # Drop duplicate ids (duplicate playlist entries, or two library rows sharing one Jellyfin
+        # item). Jellyfin collapses dupes on add anyway, and keeping them inflates the count so the
+        # playlist looks "complete" while holding fewer real tracks.
+        deduped_jf_ids = list(dict.fromkeys(jf_ids))
+        dup_count = len(jf_ids) - len(deduped_jf_ids)
+        jf_ids = deduped_jf_ids
+        if unresolved or resolved_no_jf or dup_count:
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {len(original_tracks)} originals → {len(jf_ids)} "
+                f"distinct Jellyfin item(s) ({unresolved} not in library, {resolved_no_jf} in library "
+                f"but not yet indexed by Jellyfin, {dup_count} duplicate)",
+                level="info",
+            )
+        if unindexed:
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {len(unindexed)} not in Jellyfin → " + "; ".join(unindexed[:25]),
+                level="info",
+            )
+        # Some songs are in the library but Jellyfin hasn't indexed them yet — kick ONE Jellyfin scan
+        # (bounded by a flag) so it indexes them. Jellyfin scans asynchronously, so they won't appear
+        # this pass; the record stays open and a later sync/re-import maps and adds them.
+        if resolved_no_jf and not data.get("index_scan_requested"):
+            data["index_scan_requested"] = True
+            enqueue_task(session, "jellyfin_scan", {})
+            write_app_log(
+                f"Pending playlist '{playlist_name}': {resolved_no_jf} song(s) in the library but not "
+                f"indexed by Jellyfin — queued a Jellyfin scan; re-import once it finishes to add them",
+                level="info",
+            )
+
+        # Find the Jellyfin user ID: prefer the user who initiated the import.
+        jf_user_id = None
+        if stored_user_id:
+            initiating_user = session.scalar(select(User).where(User.id == stored_user_id))
+            if initiating_user and initiating_user.jellyfin_user_id:
+                jf_user_id = initiating_user.jellyfin_user_id
+        if not jf_user_id:
+            fallback = session.scalar(select(User).where(User.jellyfin_user_id.isnot(None), User.jellyfin_user_id != ""))
+            if fallback:
+                jf_user_id = fallback.jellyfin_user_id
+
+        playlist_id = data.get("jellyfin_playlist_id") or ""
+        added_ids = set(data.get("added_ids") or [])
+        total_titled = len([t for t in original_tracks if t.get("title")])
+        origin = data.get("origin")
+
+        # Reuse the playlist this origin was imported into before (re-import → update, not a
+        # duplicate). Falls back to find-by-name below for playlists created before origin tracking.
+        if not playlist_id and origin:
+            playlist_id = _jellyfin_playlist_for_origin(session, stored_user_id, origin) or ""
+            if playlist_id:
+                data["jellyfin_playlist_id"] = playlist_id
+
+        # Nothing mapped yet and no playlist — wait for tracks to finish downloading.
+        if not jf_ids and not playlist_id:
+            retry_count += 1
+            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
+                write_app_log(f"Pending playlist '{playlist_name}': giving up after {retry_count} retries with no tracks mapped", level="warning")
+                if stored_user_id:
+                    create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created in Jellyfin — no imported tracks were found after several sync attempts.", event_type="playlist_import_failed")
+                session.delete(setting)
+            else:
+                data["retry_count"] = retry_count
+                setting.value = json.dumps(data)
+            continue
+
+        if not jf_user_id:
+            write_app_log(f"Pending playlist '{playlist_name}': no linked Jellyfin user found; will retry", level="warning")
+            continue
+
+        # Create the playlist once, then ADD newly-imported tracks on later syncs (a big playlist
+        # downloads over time). Always de-dup against the playlist's REAL contents so re-imports
+        # never add duplicates.
+        new_ids: list[str] = []
+        try:
+            with httpx.Client(base_url=jellyfin_url, headers=headers, timeout=15) as client:
+                # A resolved id (from the origin registry / pending record) may point at a playlist
+                # that was since deleted in Jellyfin. Trusting it makes every add 404 and the pending
+                # record retries forever without ever recreating. Drop the stale id so we re-resolve.
+                if playlist_id and not _jellyfin_playlist_exists(client, playlist_id, jf_user_id):
+                    write_app_log(f"Jellyfin playlist '{playlist_name}' id {playlist_id} no longer exists; recreating", level="warning")
+                    playlist_id = ""
+                    data.pop("jellyfin_playlist_id", None)
+                    added_ids = set()
+                # Find existing playlist(s) by name and COLLAPSE duplicates to one canonical id.
+                # Jellyfin's create has an indexing lag, so a prior run / sibling record can leave
+                # more than one playlist with this name; keep the one we already track (else the
+                # first) and delete the rest, then add into it — never create alongside duplicates.
+                try:
+                    named_ids = list_jellyfin_playlist_ids_by_name(client, jf_user_id, playlist_name)
+                except Exception:  # noqa: BLE001
+                    named_ids = []
+                if named_ids:
+                    canonical = playlist_id if playlist_id in named_ids else named_ids[0]
+                    for dup in named_ids:
+                        if dup != canonical:
+                            _delete_jellyfin_item(client, dup)
+                    if len(named_ids) > 1:
+                        write_app_log(f"Playlist sync: collapsed {len(named_ids) - 1} duplicate Jellyfin playlist(s) named '{playlist_name}'", level="warning")
+                    playlist_id = canonical
+                if playlist_id:
+                    current = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
+                    # Dedup against BOTH the playlist's current items AND the ids we already added on
+                    # prior syncs (persisted in the record). Jellyfin's item read-back can come back
+                    # empty or in a different id-space; without our own memory the dedup never matches,
+                    # so we re-add the same tracks every tick forever — and never finalize, since
+                    # retry_count resets whenever new_ids is non-empty.
+                    new_ids = [jf_id for jf_id in jf_ids if jf_id not in current and jf_id not in added_ids]
+                    if new_ids:
+                        client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(new_ids), "userId": jf_user_id}).raise_for_status()
+                        write_app_log(f"Added {len(new_ids)} track(s) to Jellyfin playlist '{playlist_name}'")
+                    data["jellyfin_playlist_id"] = playlist_id
+                else:
+                    new_ids = list(jf_ids)
+                    resp = client.post("/Playlists", json={"Name": playlist_name, "UserId": jf_user_id, "MediaType": "Audio", "Ids": new_ids})
+                    resp.raise_for_status()
+                    playlist_id = resp.json().get("Id") or resp.json().get("PlaylistId") or ""
+                    data["jellyfin_playlist_id"] = playlist_id
+                    write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
+                    if stored_user_id:
+                        create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done")
+                # Credit only what ACTUALLY landed. Jellyfin silently rejects stale item ids, so the old
+                # `added_ids |= jf_ids` counted ids that never made it — the record then reached
+                # total_titled and deleted itself while the playlist was short, with no retry.
+                present = _jellyfin_playlist_item_ids(client, playlist_id, jf_user_id)
+                added_ids = added_ids | (set(jf_ids) & present)
+                not_accepted = [jf_id for jf_id in jf_ids if jf_id not in present]
+                if not_accepted:
+                    write_app_log(
+                        f"Pending playlist '{playlist_name}': tried to ensure {len(jf_ids)} track(s) but "
+                        f"Jellyfin playlist holds {len(present)} — {len(not_accepted)} item id(s) not accepted "
+                        f"(stale jellyfin_item_id)",
+                        level="warning",
+                    )
+                    # Self-heal: queue ONE Jellyfin remap (run_sync_favorites_jellyfin re-validates every
+                    # track's id, then re-runs this creation). Bounded by a flag so we don't remap on
+                    # every tick; the record is kept (added_ids < total) so the refreshed ids land next pass.
+                    if not data.get("stale_remap_requested"):
+                        data["stale_remap_requested"] = True
+                        enqueue_task(session, "sync_favorites_jellyfin", {})
+                        write_app_log(f"Pending playlist '{playlist_name}': queued a Jellyfin remap to refresh {len(not_accepted)} stale id(s)")
+                _record_jellyfin_playlist_origin(session, stored_user_id, origin, playlist_id)
+        except Exception as error:  # noqa: BLE001
+            write_app_log(f"Failed to update Jellyfin playlist '{playlist_name}': {error}", level="warning")
+            continue
+
+        data["added_ids"] = list(added_ids)
+        # Done once every original track is in. Otherwise keep the pending record so late
+        # downloads are added later; give up only after several syncs add nothing new.
+        if len(added_ids) >= total_titled:
+            session.delete(setting)
+        else:
+            retry_count = 0 if new_ids else retry_count + 1
+            if retry_count >= _PENDING_PLAYLIST_MAX_RETRIES:
+                write_app_log(f"Pending playlist '{playlist_name}': added {len(added_ids)} of {total_titled}; no new tracks after {retry_count} syncs — finalizing", level="warning")
+                session.delete(setting)
+            else:
+                data["retry_count"] = retry_count
+                setting.value = json.dumps(data)
+
+    session.commit()
+
+
+def create_pending_native_playlists(session: Session) -> None:
+    """Native (DB-backed) fallback for playlist imports when Jellyfin is NOT connected.
+
+    Resolves a pending playlist's original tracks against the local library by title+artist
+    (no Jellyfin mapping needed) and creates/extends a Nudibranch Playlist. Called from
+    run_enrich_imports (i.e. right after tracks land), so async downloads get added on their
+    own import-completion pass. Only runs when Jellyfin is unconfigured, so it never competes
+    with the Jellyfin path (_try_create_pending_playlists)."""
+    settings = integration_settings(session)
+    if settings.get("jellyfin_url") and settings.get("jellyfin_api_key"):
+        return
+    pending_settings = list(session.scalars(select(AppSetting).where(AppSetting.key.like("pending_playlist:%"))))
+    for setting in pending_settings:
+        try:
+            data = json.loads(setting.value)
+        except json.JSONDecodeError:
+            session.delete(setting)
+            continue
+        playlist_name = data.get("playlist_name") or ""
+        original_tracks = data.get("original_tracks") or []
+        stored_user_id = data.get("user_id")
+        attempts = int(data.get("native_attempts", 0)) + 1
+        if not playlist_name or not original_tracks or not stored_user_id:
+            session.delete(setting)
+            continue
+        resolved_ids: list[str] = []
+        for entry in original_tracks:
+            title = entry.get("title") or ""
+            if not title:
+                continue
+            # Same canonical resolver as the Jellyfin path — symmetric artist+title normalization,
+            # so accented/odd-whitespace names aren't silently dropped (see _try_create_pending_playlists).
+            track = library_track_by_artist_title(session, entry.get("artist") or "", title)
+            if track:
+                resolved_ids.append(track.id)
+        # Reuse the playlist this origin was imported into before (re-import → update); fall
+        # back to name for playlists created before origin tracking.
+        origin = data.get("origin")
+        playlist = None
+        if origin:
+            playlist = session.scalar(select(Playlist).where(Playlist.user_id == stored_user_id, Playlist.origin == origin))
+        if not playlist:
+            playlist = session.scalar(select(Playlist).where(Playlist.user_id == stored_user_id, func.lower(Playlist.name) == playlist_name.lower()))
+        if resolved_ids and not playlist:
+            playlist = Playlist(name=playlist_name, user_id=stored_user_id, protected=False, origin=origin)
+            session.add(playlist)
+            session.flush()
+            create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added with {len(resolved_ids)} track(s).", event_type="playlist_import_done")
+            write_app_log(f"Created Nudibranch playlist '{playlist_name}' with {len(resolved_ids)} track(s)")
+        if playlist and origin and not playlist.origin:
+            playlist.origin = origin
+        if playlist and resolved_ids:
+            existing_ids = {pt.track_id for pt in playlist.tracks}
+            next_position = max((pt.position or 0) for pt in playlist.tracks) + 1 if playlist.tracks else 1
+            for track_id in resolved_ids:
+                if track_id in existing_ids:
+                    continue
+                session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track_id, position=next_position))
+                existing_ids.add(track_id)
+                next_position += 1
+        # Stop once every original track is in, or after a generous number of import-completion
+        # passes (attempts only advance on real imports, so a long review never expires it).
+        if len(resolved_ids) >= len(original_tracks) or attempts >= _PENDING_PLAYLIST_MAX_RETRIES:
+            if not resolved_ids and stored_user_id:
+                create_notification(session, user_id=stored_user_id, title="Playlist not created", body=f"'{playlist_name}' could not be created — no imported tracks were found.", event_type="playlist_import_failed")
+            session.delete(setting)
+        else:
+            data["native_attempts"] = attempts
+            setting.value = json.dumps(data)
+
+
+def run_create_pending_playlists(session: Session, _payload: dict) -> dict:
+    """Build any deferred playlists right now from tracks already in the library.
+
+    Used when a playlist is imported but nothing needs downloading (every song is already owned),
+    so no import/sync ever fires to trigger the usual creation path. Runs both backends — each
+    no-ops when it doesn't apply (native only when Jellyfin is unconfigured; the Jellyfin path only
+    when it is), so this is safe to call unconditionally. The native path leaves its commit to the
+    caller, so commit here to cover the Jellyfin-unconfigured case.
+
+    Refreshes the Jellyfin track mapping FIRST (run_sync_favorites_jellyfin re-validates every id,
+    maps anything Jellyfin has since indexed, then calls _try_create_pending_playlists itself), so a
+    re-import picks up tracks that finished indexing since the last attempt.
+    """
+    create_pending_native_playlists(session)
+    settings = integration_settings(session)
+    if settings.get("jellyfin_url") and settings.get("jellyfin_api_key"):
+        run_sync_favorites_jellyfin(session, {})  # re-maps + calls _try_create_pending_playlists
+    session.commit()
+    return {"created": True}
+
+
+def _fetch_all_jellyfin_audio(client: httpx.Client, user_id: str) -> list[dict]:
+    """Fetch all Jellyfin audio items in one request for local matching (no per-track API calls)."""
+    fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "10000"},
+        )
+        resp.raise_for_status()
+        return resp.json().get("Items", [])
+    except Exception as error:
+        write_app_log("Playlist sync: failed to fetch Jellyfin audio index", level="warning", error=str(error))
+        return []
+
+
+def _find_in_audio_index(audio_index: list[dict], track: Track) -> str | None:
+    """Find a track's Jellyfin item ID from a pre-fetched audio list. No HTTP requests."""
+    best_item: dict | None = None
+    best_score = 0.0
+    for item in audio_index:
+        score = jellyfin_audio_match_score(track, item)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item and best_score >= 0.65:
+        return best_item.get("Id")
+    return None
+
+
+def _sync_jellyfin_favorites(session: Session, client: httpx.Client, user_id: str, favorites_playlist: Playlist, audio_index: list[dict]) -> int:
+    """Bidirectional merge: pull Jellyfin IsFavorite → Nudibranch, push Nudibranch → Jellyfin IsFavorite."""
+    nudibranch_tracks = list(favorites_playlist.tracks)
+    nudibranch_track_ids = {str(e.track_id) for e in nudibranch_tracks}
+
+    fields = "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"IsFavorite": "true", "IncludeItemTypes": "Audio", "Recursive": "true", "Fields": fields, "Limit": "500"},
+        )
+        resp.raise_for_status()
+        jellyfin_favorites: list[dict] = resp.json().get("Items", [])
+    except Exception as error:
+        append_task_log(session, None, f"Favorites sync: could not fetch Jellyfin favorites: {error}", "warning")
+        return 0
+
+    append_task_log(session, None, f"Favorites sync: {len(nudibranch_tracks)} Nudibranch, {len(jellyfin_favorites)} Jellyfin")
+    changes = 0
+    jellyfin_favorite_ids: set[str] = set()
+
+    # Pull: add Jellyfin favorites not yet in Nudibranch
+    for item in jellyfin_favorites:
+        item_id = item.get("Id")
+        if item_id:
+            jellyfin_favorite_ids.add(item_id)
+        track = find_local_track_for_jellyfin_item(session, item)
+        if track and str(track.id) not in nudibranch_track_ids:
+            session.add(PlaylistTrack(playlist_id=favorites_playlist.id, track_id=track.id, position=len(nudibranch_track_ids) + 1))
+            nudibranch_track_ids.add(str(track.id))
+            append_task_log(session, None, f"Favorites sync: pulled '{item.get('Name') or track.title}' from Jellyfin favorites")
+            changes += 1
+
+    # Push: mark any Nudibranch favorites not yet in Jellyfin's IsFavorite
+    for entry in nudibranch_tracks:
+        item_id = _find_in_audio_index(audio_index, entry.track)
+        if item_id and item_id not in jellyfin_favorite_ids:
+            try:
+                client.post(f"/Users/{user_id}/FavoriteItems/{item_id}").raise_for_status()
+                jellyfin_favorite_ids.add(item_id)
+                changes += 1
+            except Exception as error:
+                append_task_log(session, None, f"Favorites sync: could not mark {entry.track.title} as favorite: {error}", "warning")
+    return changes
+
+
+def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
+    settings = integration_settings(session)
+    jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
+    jellyfin_api_key = settings.get("jellyfin_api_key", "")
+    if not jellyfin_url or not jellyfin_api_key:
+        raise ValueError("Jellyfin URL and API key are required")
+    with httpx.Client(base_url=jellyfin_url, headers={"X-Emby-Token": jellyfin_api_key}, timeout=25) as client:
+        response = client.post("/Library/Refresh")
+        response.raise_for_status()
+    write_app_log("Jellyfin scan queued: library refresh requested", level="info", event_type="tool_completed")
+    # Queue a remap after the scan so newly indexed items get matched. Jellyfin scans
+    # asynchronously so this fires immediately; the 5-min periodic remap catches any
+    # items Jellyfin hasn't indexed yet by the time this task runs.
+    enqueue_task(session, "sync_favorites_jellyfin", {})
+    return {"requested": True}
+
+
+def run_check_files(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
+    settings = get_settings()
+    library_root = settings.library_path.resolve()
+    audio_suffixes = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".alac"}
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    tracks_by_path: dict[str, Track] = {}
+    for track in tracks:
+        if not track.path:
+            continue
+        try:
+            track_path = Path(track.path).resolve()
+            track_path.relative_to(library_root)
+        except (OSError, ValueError):
+            continue
+        tracks_by_path[str(track_path)] = track
+    db_paths = set(tracks_by_path)
+    disk_paths = {
+        str(path.resolve())
+        for path in settings.library_path.rglob("*")
+        if path.is_file() and path.suffix.lower() in audio_suffixes
+    }
+    missing_file_paths = sorted(path for path in db_paths if not Path(path).exists())
+    missing_record_paths = sorted(path for path in disk_paths if path not in db_paths)
+    # Read metadata once for every file on disk that no record claims; it is reused both to
+    # relink moved files and to create records for genuinely new files.
+    orphan_records = {path: file_info_for_existing_library_file(Path(path)) for path in missing_record_paths}
+    # A migration (e.g. moving Nudibranch to a new VM) usually relocates files rather than
+    # deleting them. Re-point records at the matching file on disk instead of marking every
+    # track as needing a redownload.
+    relinked, consumed_orphans, relinked_paths = relink_moved_library_files(session, tracks_by_path, missing_file_paths, orphan_records)
+    if relinked:
+        append_task_log(session, None, f"File check relinked {relinked} record(s) to files that moved on disk")
+        session.flush()
+    missing_file_paths = [path for path in missing_file_paths if path not in relinked_paths]
+    missing_records = [info for path, info in orphan_records.items() if path not in consumed_orphans]
+    missing_files = [
+        {
+            "track_id": tracks_by_path[path].id,
+            "path": path,
+            "title": tracks_by_path[path].title,
+            "artist": tracks_by_path[path].album.artist.name,
+            "album": tracks_by_path[path].album.title,
+            "track_number": tracks_by_path[path].track_number,
+        }
+        for path in missing_file_paths
+    ]
+    queued_missing_files = queue_missing_file_downloads(session, missing_files)
+    queued_missing_records = queue_missing_record_imports(session, missing_records)
+    create_notification(
+        session,
+        title="File check complete",
+        body=f"Relinked {relinked} moved file(s). {len(missing_files)} records still missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue.",
+        event_type="tool_completed",
+        target_url="/task-queue",
+    )
+    return {
+        "relinked": relinked,
+        "missing_files": missing_files,
+        "missing_records": [],
+        "queued_missing_files": queued_missing_files,
+        "queued_missing_records": queued_missing_records,
+    }
+
+
+def relink_moved_library_files(
+    session: Session,
+    tracks_by_path: dict[str, Track],
+    missing_file_paths: list[str],
+    orphan_records: dict[str, dict],
+) -> tuple[int, set[str], set[str]]:
+    """Re-point records whose file moved on disk (e.g. after a VM migration) at the matching
+    orphan file instead of redownloading it.
+
+    Returns (relinked_count, consumed_orphan_paths, relinked_record_paths). Only orphan files
+    (present on disk but claimed by no record) are eligible targets, and each is used at most
+    once, so relinking never creates duplicate or conflicting paths.
+    """
+    consumed: set[str] = set()
+    relinked_paths: set[str] = set()
+    if not missing_file_paths or not orphan_records:
+        return 0, consumed, relinked_paths
+
+    orphans_by_basename: dict[str, list[str]] = {}
+    orphans_by_recording: dict[str, list[str]] = {}
+    orphans_by_metakey: dict[tuple[str, str, str], list[str]] = {}
+    for path, info in orphan_records.items():
+        orphans_by_basename.setdefault(Path(path).name.casefold(), []).append(path)
+        metadata = info.get("metadata") or {}
+        recording_id = normalize_match_text(metadata.get("musicbrainz_recording_id"))
+        if recording_id:
+            orphans_by_recording.setdefault(recording_id, []).append(path)
+        metakey = (
+            normalize_match_text(metadata.get("albumartist") or metadata.get("artist")),
+            normalize_match_text(metadata.get("album")),
+            normalize_match_text(metadata.get("title")),
+        )
+        if any(metakey):
+            orphans_by_metakey.setdefault(metakey, []).append(path)
+
+    album_moves: dict[str, str] = {}
+    relinked = 0
+    for old_path in missing_file_paths:
+        track = tracks_by_path.get(old_path)
+        if not track:
+            continue
+        match = relink_candidate(track, old_path, orphans_by_basename, orphans_by_recording, orphans_by_metakey, consumed)
+        if not match:
+            continue
+        track.path = match
+        consumed.add(match)
+        relinked_paths.add(old_path)
+        relinked += 1
+        if track.album_id:
+            album_moves[track.album_id] = str(Path(match).parent)
+
+    if relinked:
+        for album_id, parent in album_moves.items():
+            album = session.get(Album, album_id)
+            if album:
+                album.path = parent
+        session.flush()
+    return relinked, consumed, relinked_paths
+
+
+def relink_candidate(
+    track: Track,
+    old_path: str,
+    orphans_by_basename: dict[str, list[str]],
+    orphans_by_recording: dict[str, list[str]],
+    orphans_by_metakey: dict[tuple[str, str, str], list[str]],
+    consumed: set[str],
+) -> str | None:
+    old_basename = Path(old_path).name.casefold()
+
+    # 1. MusicBrainz recording id is the strongest signal and survives re-tagging/renames.
+    recording_id = normalize_match_text(track.musicbrainz_recording_id)
+    if recording_id:
+        available = [path for path in orphans_by_recording.get(recording_id, []) if path not in consumed]
+        if len(available) == 1:
+            return available[0]
+        if len(available) > 1:
+            by_name = [path for path in available if Path(path).name.casefold() == old_basename]
+            if len(by_name) == 1:
+                return by_name[0]
+            suffix = longest_path_suffix_match(old_path, available)
+            if suffix:
+                return suffix
+
+    # 2. Same filename (the common case: a plain move/copy keeps filenames intact).
+    available = [path for path in orphans_by_basename.get(old_basename, []) if path not in consumed]
+    if len(available) == 1:
+        return available[0]
+    if len(available) > 1:
+        suffix = longest_path_suffix_match(old_path, available)
+        if suffix:
+            return suffix
+
+    # 3. Artist / album / title metadata (handles files renamed during the migration).
+    album = track.album
+    metakey = (
+        normalize_match_text(album.artist.name if album and album.artist else None),
+        normalize_match_text(album.title if album else None),
+        normalize_match_text(track.title),
+    )
+    if any(metakey):
+        available = [path for path in orphans_by_metakey.get(metakey, []) if path not in consumed]
+        if len(available) == 1:
+            return available[0]
+        if len(available) > 1:
+            return longest_path_suffix_match(old_path, available)
+    return None
+
+
+def longest_path_suffix_match(old_path: str, candidates: list[str]) -> str | None:
+    """Pick the candidate sharing the longest trailing path-component run with old_path.
+
+    Returns a match only when a single candidate wins outright, so ambiguous cases are left
+    for manual review rather than guessed.
+    """
+    old_parts = [part.casefold() for part in Path(old_path).parts]
+    best_len = 0
+    best: list[str] = []
+    for candidate in candidates:
+        candidate_parts = [part.casefold() for part in Path(candidate).parts]
+        shared = 0
+        for left, right in zip(reversed(old_parts), reversed(candidate_parts)):
+            if left != right:
+                break
+            shared += 1
+        if shared > best_len:
+            best_len = shared
+            best = [candidate]
+        elif shared == best_len:
+            best.append(candidate)
+    if best_len >= 1 and len(best) == 1:
+        return best[0]
+    return None
+
+
+def queue_missing_file_downloads(session: Session, missing_files: list[dict]) -> int:
+    if not missing_files:
+        return 0
+    existing = existing_missing_file_download_keys(session)
+    rows = []
+    for record in missing_files:
+        key = missing_file_download_key(record.get("artist"), record.get("album"), record.get("title"))
+        if key in existing:
+            continue
+        rows.append(record)
+        existing.add(key)
+    if not rows:
+        return 0
+    batch = ProposalBatch(title="Download missing library files", kind=ProposalKind.download, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    for record in rows:
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=record["title"],
+                kind=ProposalKind.download,
+                payload_json=json.dumps(
+                    {
+                        "action": "wishlist_request",
+                        "kind": "track",
+                        # Must be "replace_track_id" (not "track_id") — apply_download_item /
+                        # import_track_item key off this exact field to route the verified
+                        # download through replace_library_track_file instead of a fresh
+                        # import_file_to_library, which would treat it as a duplicate of this
+                        # same (missing-file) track and silently discard the download.
+                        "replace_track_id": record.get("track_id"),
+                        "replace_path": record.get("path"),
+                        "artist": record.get("artist"),
+                        "album": record.get("album"),
+                        "track": record.get("title"),
+                        "track_number": record.get("track_number"),
+                    }
+                ),
+            )
+        )
+    session.flush()
+    return len(rows)
+
+
+def run_check_duplicates(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Find tracks with the same artist + album + title appearing in multiple files and queue a
+    review batch to delete the duplicate copies (keeping the best copy of each song)."""
+    discard_pending_batches(session, "Remove duplicate library files", ProposalKind.delete)
+    tracks = list(
+        session.scalars(
+            select(Track).options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    groups: dict[tuple[str, str, str], list[Track]] = {}
+    for track in tracks:
+        if not track.path or not track.album or not track.album.artist:
+            continue
+        key = (
+            normalize_match_text(track.album.artist.name),
+            normalize_match_text(track.album.title),
+            normalize_match_text(track.title),
+        )
+        if not all(key):
+            continue
+        groups.setdefault(key, []).append(track)
+    duplicate_groups = {key: items for key, items in groups.items() if len(items) > 1}
+    if not duplicate_groups:
+        create_notification(
+            session,
+            title="Duplicate check complete",
+            body="No duplicate tracks were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"songs_with_duplicates": 0, "files_queued": 0}
+
+    batch = ProposalBatch(title="Remove duplicate library files", kind=ProposalKind.delete, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+
+    def file_size(track: Track) -> int:
+        if not track.path:
+            return 0
+        try:
+            return Path(track.path).stat().st_size
+        except OSError:
+            return 0
+
+    def ensure_tree(artist_name: str, album_title: str) -> str:
+        if artist_name not in artist_items:
+            ai = ProposalItem(
+                batch_id=batch.id,
+                title=artist_name,
+                kind=ProposalKind.delete,
+                payload_json=json.dumps({"artist": artist_name}),
+            )
+            session.add(ai)
+            session.flush()
+            artist_items[artist_name] = ai
+        album_key = (artist_name, album_title)
+        if album_key not in album_items:
+            ali = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_items[artist_name].id,
+                title=album_title,
+                kind=ProposalKind.delete,
+                payload_json=json.dumps({"artist": artist_name, "album": album_title}),
+            )
+            session.add(ali)
+            session.flush()
+            album_items[album_key] = ali
+        return album_items[album_key].id
+
+    queued = 0
+    for group in duplicate_groups.values():
+        # Keep the best copy: lossless > larger file > lower id (stable). Delete the rest.
+        sorted_group = sorted(group, key=lambda t: (0 if t.is_lossless else 1, -file_size(t), t.id or ""))
+        keeper = sorted_group[0]
+        for dup in sorted_group[1:]:
+            album = dup.album
+            artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+            album_title = album.title if album else "Unknown Album"
+            album_item_id = ensure_tree(artist_name, album_title)
+            session.add(
+                ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=album_item_id,
+                    title=dup.title,
+                    kind=ProposalKind.delete,
+                    old_value=dup.path,
+                    payload_json=json.dumps(
+                        {
+                            "action": "trash_duplicate",
+                            "track_id": dup.id,
+                            "keeping_track_id": keeper.id,
+                            "keeping_path": keeper.path,
+                        }
+                    ),
+                )
+            )
+            queued += 1
+    session.flush()
+    create_notification(
+        session,
+        title="Duplicate review ready",
+        body=f"{queued} duplicate file(s) across {len(duplicate_groups)} song(s). Review and approve to delete them.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"songs_with_duplicates": len(duplicate_groups), "files_queued": queued}
+
+
+def queue_missing_record_imports(session: Session, missing_records: list[dict]) -> int:
+    if not missing_records:
+        return 0
+    known_paths = existing_library_and_proposal_paths(session)
+    rows = [record for record in missing_records if record.get("path") and record["path"] not in known_paths]
+    if not rows:
+        return 0
+    batch = ProposalBatch(title="Create records for library files", kind=ProposalKind.import_files, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    for record in rows:
+        path = record["path"]
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=(record.get("metadata") or {}).get("title") or record.get("name") or Path(path).stem,
+                kind=ProposalKind.import_files,
+                old_value=path,
+                new_value=path,
+                payload_json=json.dumps(record),
+            )
+        )
+    session.flush()
+    return len(rows)
+
+
+def existing_missing_file_download_keys(session: Session) -> set[tuple[str, str, str]]:
+    keys = set()
+    items = session.scalars(
+        select(ProposalItem)
+        .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+        .where(ProposalItem.kind == ProposalKind.download)
+        .where(ProposalItem.payload_json.is_not(None))
+        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+    )
+    for item in items:
+        payload = json.loads(item.payload_json or "{}")
+        if payload.get("action") != "wishlist_request":
+            continue
+        keys.add(missing_file_download_key(payload.get("artist"), payload.get("album"), payload.get("track") or item.title))
+    return keys
+
+
+def missing_file_download_key(artist: str | None, album: str | None, title: str | None) -> tuple[str, str, str]:
+    return (normalize_match_text(artist), normalize_match_text(album), normalize_match_text(title))
+
+
+def file_info_for_existing_library_file(file_path: Path) -> dict:
+    settings = get_settings()
+    stat = file_path.stat()
+    metadata = read_audio_metadata(file_path)
+    try:
+        relative_path = str(file_path.relative_to(settings.library_path))
+    except ValueError:
+        relative_path = file_path.name
+    return {
+        "path": str(file_path),
+        "relative_path": relative_path,
+        "extension": file_path.suffix.lower(),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "metadata": metadata,
+        "suggested_library_path": str(file_path),
+        "action": "create_library_record",
+        "name": file_path.name,
+    }
+
+
+def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Download missing lyrics", ProposalKind.lyrics)
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+            .order_by(Track.title.asc())
+        )
+    )
+    missing = []
+    existing = 0
+    for index, track in enumerate(tracks):
+        if task is not None and index % 25 == 0:
+            update_task_progress(session, task, index, max(1, len(tracks)), f"Checking lyrics for {track.title}")
+        if not track.path:
+            continue
+        audio_path = Path(track.path)
+        if not audio_path.exists():
+            continue
+        if audio_path.with_suffix(".lrc").exists():
+            existing += 1
+            continue
+        missing.append(track)
+
+    if not missing:
+        create_notification(
+            session,
+            title="Lyrics check complete",
+            body=f"{existing} tracks already have lyrics. No missing lyrics found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"checked": len(tracks), "existing": existing, "missing": 0, "batch_id": None}
+
+    batch = ProposalBatch(title="Download missing lyrics", kind=ProposalKind.lyrics, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    for track in missing:
+        artist_name = track.album.artist.name
+        album_title = track.album.title
+        artist_item = artist_items.get(artist_name)
+        if not artist_item:
+            artist_item = ProposalItem(
+                batch_id=batch.id,
+                title=artist_name,
+                kind=ProposalKind.lyrics,
+                payload_json=json.dumps({"artist": artist_name}),
+            )
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        album_key = (artist_name, album_title)
+        album_item = album_items.get(album_key)
+        if not album_item:
+            album_item = ProposalItem(
+                batch_id=batch.id,
+                parent_id=artist_item.id,
+                title=album_title,
+                kind=ProposalKind.lyrics,
+                payload_json=json.dumps({"artist": artist_name, "album": album_title}),
+            )
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_item.id,
+                title=track.title,
+                kind=ProposalKind.lyrics,
+                old_value=str(Path(track.path).with_suffix(".lrc")),
+                new_value="LRCLIB",
+                payload_json=json.dumps(
+                    {
+                        "action": "download_lyrics",
+                        "track_id": track.id,
+                        "artist": artist_name,
+                        "album": album_title,
+                        "track": track.title,
+                    }
+                ),
+            )
+        )
+    create_notification(
+        session,
+        title="Lyrics review ready",
+        body=f"{len(missing)} lyric downloads were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
+
+
+def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Fill MusicBrainz info", ProposalKind.metadata)
+    artists = list(
+        session.scalars(
+            select(Artist)
+            .options(selectinload(Artist.albums).selectinload(Album.tracks))
+            .order_by(Artist.name.asc())
+        )
+    )
+    batch = ProposalBatch(title="Fill MusicBrainz info", kind=ProposalKind.metadata, tree_path="/library")
+    session.add(batch)
+    session.flush()
+
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    def is_high_confidence_album(result: dict, artist_name: str, album_title: str) -> bool:
+        return (
+            (result.get("match_score") or 0) >= 90
+            and text_similarity(normalize(album_title), normalize(result.get("album_title") or "")) >= 0.85
+            and text_similarity(normalize(artist_name), normalize(result.get("artist_name") or "")) >= 0.85
+        )
+
+    def is_high_confidence_track(track_title: str, mb_track: dict) -> bool:
+        return text_similarity(normalize(track_title), normalize(mb_track.get("title") or "")) >= 0.85
+
+    def flagged(name: str, uncertain: bool) -> str:
+        return ("⚠ " + name) if uncertain else name
+
+    total_albums = max(1, sum(len(a.albums) for a in artists))
+    album_index = 0
+    n_albums_scanned = 0
+    proposed = 0
+
+    for artist in artists:
+        artist_needs = not artist.musicbrainz_id
+        artist_item = None
+        artist_mbid = None
+        artist_uncertain = False
+
+        for album in artist.albums:
+            album_index += 1
+            if task is not None:
+                update_task_progress(session, task, album_index, total_albums, f"Checking MusicBrainz info: {artist.name} – {album.title}")
+            album_needs_release = not album.musicbrainz_release_id
+            album_needs_rg = not album.musicbrainz_release_group_id
+            tracks_needing = [t for t in album.tracks if not t.musicbrainz_recording_id or t.track_number is None or t.disc_number is None]
+
+            if not artist_needs and not album_needs_release and not album_needs_rg and not tracks_needing:
+                continue
+
+            n_albums_scanned += 1
+            try:
+                result = lookup_musicbrainz_ids(artist.name, album.title)
+            except Exception as error:  # noqa: BLE001 - keep checking other albums
+                write_app_log(
+                    f"MusicBrainz ID check: lookup failed for {artist.name} / {album.title}: {error}",
+                    level="warning",
+                )
+                time.sleep(1)
+                continue
+            time.sleep(1)
+
+            if result is None:
+                continue
+
+            album_uncertain = not is_high_confidence_album(result, artist.name, album.title)
+
+            if artist_mbid is None and result.get("artist_mbid"):
+                artist_mbid = result["artist_mbid"]
+                artist_uncertain = album_uncertain
+
+            album_changes: dict = {}
+            if album_needs_release and result.get("release_id"):
+                album_changes["musicbrainz_release_id"] = result["release_id"]
+            if album_needs_rg and result.get("release_group_id"):
+                album_changes["musicbrainz_release_group_id"] = result["release_group_id"]
+
+            # Match needing tracks to result tracks
+            mb_tracks = result.get("tracks") or []
+            track_proposals: list[tuple] = []  # (track, mb_track, track_changes, track_uncertain)
+            for track in tracks_needing:
+                chosen = None
+                used_track_number_match = False
+                best_sim = 0.0
+                for mb_track in mb_tracks:
+                    # Prefer track_number match (considering disc_number when both present)
+                    tn_match = (
+                        track.track_number is not None
+                        and mb_track.get("track_number") is not None
+                        and track.track_number == mb_track["track_number"]
+                        and (
+                            not track.disc_number
+                            or not mb_track.get("disc_number")
+                            or track.disc_number == mb_track["disc_number"]
+                        )
+                    )
+                    if tn_match:
+                        chosen = mb_track
+                        used_track_number_match = True
+                        break
+                    sim = text_similarity(normalize(track.title), normalize(mb_track.get("title") or ""))
+                    if sim > best_sim:
+                        best_sim = sim
+                        chosen = mb_track
+
+                if chosen is None:
+                    continue
+                if not used_track_number_match:
+                    # Fell back to title similarity — apply a minimum threshold
+                    title_sim = text_similarity(normalize(track.title), normalize(chosen.get("title") or ""))
+                    if title_sim < 0.5:
+                        continue
+                mb_recording_id = chosen.get("musicbrainz_recording_id")
+                track_uncertain = not is_high_confidence_track(track.title, chosen)
+                track_changes: dict = {}
+                if not track.musicbrainz_recording_id and mb_recording_id:
+                    track_changes["musicbrainz_recording_id"] = mb_recording_id
+                    if not track_uncertain and not album_uncertain:
+                        track_changes["musicbrainz_verified"] = True
+                # Fill missing disc/track numbers (disc = MB medium position, so single-disc
+                # albums get disc 1 — fixes mixed NULL/1 disc ordering).
+                if track.track_number is None and chosen.get("track_number") is not None:
+                    track_changes["track_number"] = chosen["track_number"]
+                if track.disc_number is None and chosen.get("disc_number") is not None:
+                    track_changes["disc_number"] = chosen["disc_number"]
+                if not track_changes:
+                    continue
+                track_proposals.append((track, chosen, track_changes, track_uncertain))
+
+            if not album_changes and not track_proposals:
+                continue
+
+            # Lazily create artist_item
+            if artist_item is None:
+                artist_item = ProposalItem(
+                    batch_id=batch.id,
+                    title=artist.name,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name}),
+                )
+                session.add(artist_item)
+                session.flush()
+
+            # Create album node
+            if album_changes:
+                album_item = ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=artist_item.id,
+                    title=flagged(album.title, album_uncertain),
+                    kind=ProposalKind.metadata,
+                    old_value=json.dumps({k: getattr(album, k) for k in album_changes}),
+                    new_value=json.dumps(album_changes),
+                    payload_json=json.dumps({"target_type": "album", "target_id": album.id, "changes": album_changes}),
+                )
+                proposed += 1
+            else:
+                album_item = ProposalItem(
+                    batch_id=batch.id,
+                    parent_id=artist_item.id,
+                    title=album.title,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name, "album": album.title}),
+                )
+            session.add(album_item)
+            session.flush()
+
+            for track, _mb_track, track_changes, track_uncertain in track_proposals:
+                session.add(
+                    ProposalItem(
+                        batch_id=batch.id,
+                        parent_id=album_item.id,
+                        title=flagged(track.title, track_uncertain),
+                        kind=ProposalKind.metadata,
+                        old_value=json.dumps({k: getattr(track, k) for k in track_changes}),
+                        new_value=json.dumps(track_changes),
+                        payload_json=json.dumps({"target_type": "track", "target_id": track.id, "changes": track_changes}),
+                    )
+                )
+                proposed += 1
+
+        # After all albums: upgrade artist_item if we can fill artist mbid
+        if artist_needs and artist_mbid:
+            if artist_item is None:
+                artist_item = ProposalItem(
+                    batch_id=batch.id,
+                    title=artist.name,
+                    kind=ProposalKind.metadata,
+                    payload_json=json.dumps({"artist": artist.name}),
+                )
+                session.add(artist_item)
+                session.flush()
+            artist_item.title = flagged(artist.name, artist_uncertain)
+            artist_item.old_value = json.dumps({"musicbrainz_id": artist.musicbrainz_id})
+            artist_item.new_value = json.dumps({"musicbrainz_id": artist_mbid})
+            artist_item.payload_json = json.dumps({"target_type": "artist", "target_id": artist.id, "changes": {"musicbrainz_id": artist_mbid}})
+            proposed += 1
+
+    if proposed == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="MusicBrainz check complete",
+            body="All MusicBrainz IDs are already filled in or no matches were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"checked": n_albums_scanned, "proposed": 0, "batch_id": None}
+
+    create_notification(
+        session,
+        title="MusicBrainz IDs review ready",
+        body=f"{proposed} MusicBrainz ID updates were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"checked": n_albums_scanned, "proposed": proposed, "batch_id": batch.id}
+
+
+def run_enrich_imports(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Post-import enrichment for newly added tracks: album art, artist art, and lyrics.
+
+    Art is only fetched when missing; lyrics use LRCLIB exact match then a validated fuzzy fallback.
+    Tracks left without lyrics are retained as item-level misses in the final completion summary;
+    detailed lookup diagnostics remain in Activity."""
+    track_ids = payload.get("track_ids") or []
+    tracks: list[Track] = []
+    for track_id in track_ids:
+        track = session.scalar(
+            select(Track)
+            .where(Track.id == track_id)
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+        if track and track.album and track.album.artist:
+            tracks.append(track)
+    if not tracks:
+        return {"tracks": 0, "lyrics_found": 0, "lyrics_missing": 0}
+
+    total = len(tracks)
+    progress_total = total * 2  # art pass + lyrics pass
+    progress_current = 0
+
+    # Artwork (deduped per album/artist).
+    seen_albums: set[str] = set()
+    seen_artists: set[str] = set()
+    for track in tracks:
+        album = track.album
+        artist = album.artist
+        if artist.id not in seen_artists:
+            seen_artists.add(artist.id)
+            ensure_artist_cover(session, artist)
+        if album.id not in seen_albums:
+            seen_albums.add(album.id)
+            ensure_album_cover(session, album)
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, progress_current, progress_total, f"Checking artwork ({progress_current}/{total})")
+    session.commit()
+
+    # Lyrics.
+    lyrics_found = 0
+    missing: list[Track] = []
+    for index, track in enumerate(tracks, start=1):
+        if not track.path:
+            progress_current += 1
+            continue
+        lrc_path = Path(track.path).with_suffix(".lrc")
+        if lrc_path.exists():
+            lyrics_found += 1
+            progress_current += 1
+            continue
+        try:
+            lyric_text = fetch_lyrics_with_fallback(track)
+        except Exception as error:  # noqa: BLE001 - one bad lookup must not abort the batch.
+            lyric_text = None
+            write_app_log(f"Lyrics lookup error for {track.album.artist.name} — {track.title}: {error}", "warning")
+        if lyric_text:
+            try:
+                lrc_path.write_text(lyric_text, encoding="utf-8")
+                lyrics_found += 1
+                append_task_log(session, task, f"Fetched lyrics for {track.album.artist.name} / {track.title}")
+            except OSError as error:
+                append_task_log(session, task, f"Could not write lyrics for {track.title}: {error}", "warning")
+                missing.append(track)
+        else:
+            missing.append(track)
+            write_app_log(
+                f"No lyrics found for {track.album.artist.name} — {track.title}",
+                "info",
+                artist=track.album.artist.name,
+                album=track.album.title,
+                track=track.title,
+            )
+        progress_current += 1
+        if task is not None:
+            update_task_progress(session, task, min(progress_current, progress_total), progress_total, f"Fetching lyrics ({index}/{total})")
+
+    if missing:
+        create_notification(
+            session,
+            title="Lyrics update completed",
+            body=f"{lyrics_found} passed, {len(missing)} failed. Lyrics were not available for some tracks; open Activity for details.",
+            event_type="task_completed",
+            target_url="/activity",
+        )
+    # Native playlist fallback: if a playlist import is pending and Jellyfin isn't
+    # connected, create/extend the Nudibranch playlist now that these tracks exist.
+    create_pending_native_playlists(session)
+    session.commit()
+    return {"tracks": total, "lyrics_found": lyrics_found, "lyrics_missing": len(missing)}
+
+
+def run_check_album_covers(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Download missing album covers", ProposalKind.artwork)
+    albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist))
+            .order_by(Album.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Download missing album covers", kind=ProposalKind.artwork, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    found = 0
+    for album in albums:
+        if album_has_valid_local_cover(album):
+            continue
+        cover_path = find_existing_cover_file(album)
+        if cover_path:
+            append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: adopting existing cover file {cover_path}")
+        else:
+            try:
+                results = search_album_releases(album.artist.name, album.title)
+            except Exception as error:  # noqa: BLE001 - keep checking other albums.
+                append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: album cover lookup failed: {error}", level="warning")
+                continue
+            cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(album.artist.name, album.title, results))
+        if not cover_path:
+            continue
+        if cover_path == album.cover_path:
+            continue
+        found += 1
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=f"{album.artist.name} / {album.title}",
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"cover_path": album.cover_path}),
+                new_value=json.dumps({"cover_path": cover_path}),
+                payload_json=json.dumps(
+                    {
+                        "target_type": "album",
+                        "target_id": album.id,
+                        "changes": {"cover_path": cover_path},
+                    }
+                ),
+            )
+        )
+    if found == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Album cover check complete",
+            body=f"{len(albums)} albums checked. No missing covers were found online.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"albums_checked": len(albums), "cover_changes": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Album cover review ready",
+        body=f"{found} album cover changes were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"albums_checked": len(albums), "cover_changes": found, "batch_id": batch.id}
+
+
+def run_refresh_covers(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Maintenance: re-fetch low-resolution album covers at the higher (1200 px) lookup size.
+
+    Overwrites the existing local cover file in place so its ETag changes and installed clients
+    replace their cached bytes. Skips covers already >= COVER_REFRESH_TARGET_PX and never downgrades.
+    Only albums whose current cover is genuinely small trigger the (slow) MusicBrainz lookup."""
+    albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist))
+            .order_by(Album.title.asc())
+        )
+    )
+    total = len(albums)
+    checked = 0
+    refreshed = 0
+    for index, album in enumerate(albums, start=1):
+        if task is not None:
+            update_task_progress(session, task, index, total, f"Refreshing covers ({index}/{total})")
+        if album.cover_locked:
+            continue
+        if not album_has_valid_local_cover(album):
+            continue
+        current = image_dimensions(Path(album.cover_path))
+        if current and max(current) >= COVER_REFRESH_TARGET_PX:
+            continue
+        checked += 1
+        # Each candidate costs one MusicBrainz request (search_album_releases) plus up to two
+        # iTunes lookups (album_cover_candidate_urls, then again inside refresh_low_res_cover_in_
+        # place's fetch). Un-throttled across dozens of albums this can trip MusicBrainz's rate
+        # limit, which previously failed silently and looked identical to "nothing to upgrade."
+        if checked > 1:
+            time.sleep(0.5)
+        try:
+            results = search_album_releases(album.artist.name, album.title)
+        except Exception as error:  # noqa: BLE001 - keep refreshing other albums.
+            append_task_log(session, task=None, message=f"{album.artist.name} / {album.title}: cover refresh lookup failed: {error}", level="warning")
+            continue
+        urls = album_cover_candidate_urls(album.artist.name, album.title, results)
+        if refresh_low_res_cover_in_place(session, album.cover_path, urls, f"{album.artist.name} / {album.title}"):
+            refreshed += 1
+    create_notification(
+        session,
+        title="Cover refresh complete",
+        body=f"{refreshed} of {checked} low-resolution album covers were upgraded ({total} albums scanned).",
+        event_type="tool_completed",
+        target_url="/tools",
+    )
+    return {"albums_scanned": total, "low_res_checked": checked, "covers_refreshed": refreshed}
+
+
+def run_check_artist_covers(session: Session, _payload: dict) -> dict:
+    discard_pending_batches(session, "Download missing artist covers", ProposalKind.artwork)
+    artists = list(
+        session.scalars(
+            select(Artist)
+            .options(selectinload(Artist.albums))
+            .order_by(Artist.name.asc())
+        )
+    )
+    batch = ProposalBatch(title="Download missing artist covers", kind=ProposalKind.artwork, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    found = 0
+    for artist in artists:
+        if artist_has_valid_local_cover(artist):
+            continue
+        try:
+            cover_path = find_existing_cover_file_in_dir(artist_folder_path(artist))
+            if cover_path:
+                append_task_log(session, task=None, message=f"{artist.name}: adopting existing artist cover file {cover_path}")
+            else:
+                cover_path = download_artist_cover_to_library(session, artist, artist_image_candidate_urls(artist.name))
+            if not cover_path:
+                cover_path = representative_album_cover(artist)
+                if cover_path:
+                    append_task_log(session, task=None, message=f"{artist.name}: using album cover as artist art {cover_path}")
+        except Exception as error:  # noqa: BLE001 - keep checking other artists.
+            append_task_log(session, task=None, message=f"{artist.name}: artist cover lookup failed: {error}", level="warning")
+            continue
+        if not cover_path or cover_path == artist.cover_path:
+            continue
+        found += 1
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                title=artist.name,
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"cover_path": artist.cover_path}),
+                new_value=json.dumps({"cover_path": cover_path}),
+                payload_json=json.dumps(
+                    {
+                        "target_type": "artist",
+                        "target_id": artist.id,
+                        "changes": {"cover_path": cover_path},
+                    }
+                ),
+            )
+        )
+    if found == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Artist cover check complete",
+            body=f"{len(artists)} artists checked. No missing covers were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"artists_checked": len(artists), "cover_changes": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="Artist cover review ready",
+        body=f"{found} artist cover changes were added to the task queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"artists_checked": len(artists), "cover_changes": found, "batch_id": batch.id}
+
+
+def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Missing album tracks", ProposalKind.download)
+    albums = list(
+        session.scalars(
+            select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
+        )
+    )
+    created = 0
+    checked = 0
+    batch = ProposalBatch(title="Missing album tracks", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    for album in albums:
+        checked += 1
+        if task is not None and checked % 5 == 0:
+            update_task_progress(session, task, checked, max(1, len(albums)), f"Checking missing tracks for {album.artist.name} / {album.title}")
+        lookup_title = album.release_title or album.title
+        try:
+            append_task_log(session, task, f"{album.artist.name} / {album.title}: checking MusicBrainz album track list")
+            record = lookup_album_tracks(album.artist.name, lookup_title, album.musicbrainz_release_id)
+        except Exception as error:  # noqa: BLE001 - one bad lookup should not stop the full scan.
+            append_task_log(session, task, f"{album.artist.name} / {album.title}: missing-track lookup failed: {error}", "warning")
+            continue
+        if record.get("musicbrainz_album_id") and not album.musicbrainz_release_id:
+            album.musicbrainz_release_id = record.get("musicbrainz_album_id")
+        existing_positions = {
+            (track.disc_number or 1, track.track_number)
+            for track in album.tracks
+            if track.track_number
+        }
+        existing_titles = {normalize_match_text(track.title) for track in album.tracks if track.title}
+        for track in record.get("tracks", []):
+            track_number = track.get("track_number")
+            disc_number = track.get("disc_number") or 1
+            title_key = normalize_match_text(track.get("title"))
+            # Skip tracks already on the album — by position OR by title — so we never re-download
+            # something the album already has (the cause of the duplicate imports).
+            if not track_number:
+                continue
+            if (disc_number, track_number) in existing_positions or (title_key and title_key in existing_titles):
+                continue
+            add_download_request_item(
+                session,
+                batch,
+                artist_items,
+                album_items,
+                album.artist.name,
+                album.title,
+                track.get("title"),
+                track_number=track.get("track_number"),
+                disc_number=disc_number,
+                duration_ms=track.get("length"),
+                musicbrainz_album_id=record.get("musicbrainz_album_id"),
+                musicbrainz_recording_id=track.get("musicbrainz_recording_id"),
+                require_lossless=True,
+                workflow="missing_tracks",
+            )
+            created += 1
+            append_task_log(session, task, f"{album.artist.name} / {album.title}: queued missing track review item for {track.get('title')} with lossless candidate matching")
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Missing track check complete",
+            body=f"{checked} albums checked. No missing tracks were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    return {"albums_checked": checked, "download_items_created": created, "batch_id": batch.id}
+
+
+def run_check_non_lossless(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    discard_pending_batches(session, "Lossless replacement downloads", ProposalKind.download)
+    tracks = list(session.scalars(select(Track).options(selectinload(Track.album).selectinload(Album.artist)).order_by(Track.title.asc())))
+    batch = ProposalBatch(title="Lossless replacement downloads", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    checked = 0
+    for track in tracks:
+        checked += 1
+        if task is not None and checked % 25 == 0:
+            update_task_progress(session, task, checked, max(1, len(tracks)), f"Checking lossless status for {track.title}")
+        try:
+            metadata = read_audio_metadata(Path(track.path)) if track.path and Path(track.path).exists() else {
+                "format": track.format,
+                "bitrate": track.bitrate,
+                "is_lossless": track.is_lossless,
+            }
+        except Exception:
+            metadata = {"format": track.format, "bitrate": track.bitrate, "is_lossless": False}
+        if not lossy_or_suspicious_audio(metadata):
+            continue
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        add_download_request_item(
+            session,
+            batch,
+            artist_items,
+            album_items,
+            artist_name,
+            album_title,
+            track.title,
+            track_number=track.track_number,
+            disc_number=track.disc_number,
+            duration_ms=track.duration_ms or metadata.get("duration_ms"),
+            musicbrainz_album_id=album.musicbrainz_release_id if album else None,
+            musicbrainz_recording_id=track.musicbrainz_recording_id,
+            replace_track_id=track.id,
+            replace_path=track.path,
+            require_lossless=True,
+            workflow="lossless_replacement",
+        )
+        created += 1
+        append_task_log(session, task, f"{artist_name} / {album_title}: queued lossless replacement review item for {track.title}")
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Lossless check complete",
+            body=f"{checked} tracks checked. No lossy or suspicious files were found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
+
+
+def run_requeue_replacement(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Manually queue a replacement download for one or more existing library tracks.
+
+    Builds a wishlist_request candidate batch with `replace_track_id` set so that, once the
+    user approves a candidate in the Task Queue, `replace_library_track_file` swaps the file
+    in place (the old file is deleted once the new one is in place). Backs the per-track /
+    per-album "Replace" buttons (e.g. to
+    swap a clean version for the explicit one). Review-gated like every other download.
+    """
+    track_ids = payload.get("track_ids") or []
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.id.in_(track_ids))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    ) if track_ids else []
+    if not tracks:
+        append_task_log(session, task, "Manual replacement: no matching tracks found", "warning")
+        return {"download_items_created": 0, "batch_id": None}
+    batch = ProposalBatch(title="Manual replacement downloads", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    for track in tracks:
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        add_download_request_item(
+            session,
+            batch,
+            artist_items,
+            album_items,
+            artist_name,
+            album_title,
+            track.title,
+            track_number=track.track_number,
+            disc_number=track.disc_number,
+            duration_ms=track.duration_ms,
+            musicbrainz_album_id=album.musicbrainz_release_id if album else None,
+            musicbrainz_recording_id=track.musicbrainz_recording_id,
+            replace_track_id=track.id,
+            replace_path=track.path,
+            workflow="manual_replacement",
+        )
+        created += 1
+        append_task_log(session, task, f"{artist_name} / {album_title}: queued manual replacement for {track.title}")
+    if created == 0:
+        session.delete(batch)
+        return {"download_items_created": 0, "batch_id": None}
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    create_notification(
+        session,
+        title="Replacement search queued",
+        body=f"Searching for replacement download(s) for {created} track(s) — review candidates in the Task Queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+        deliver_apns=False,
+        group_key=f"download:{batch.id}",
+    )
+    return {"download_items_created": created, "batch_id": batch.id}
+
+
+def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Find tracks whose audio is NOT what the library says it is, and queue replacements.
+
+    Two layers per track, cheapest first (see services/content_verify.py):
+      1. **Preliminary heuristics** (no AcoustID key needed): dead-air silence detection, plus a
+         MusicBrainz duration-slot comparison for logging/context. Dead air on its own queues a
+         replacement.
+      2. **AcoustID fingerprint confirmation** — run on EVERY track that passes the heuristics
+         (not just duration-mismatched ones). This is the fix for wrong-but-same-length audio:
+         a file that plays a different song of the right length used to sail through the old
+         duration gate and was never fingerprinted. Now every track's audio is checked against
+         its own claimed identity; a confident mismatch (that is not merely another track of the
+         same album) queues a replacement of THIS track with its own title.
+
+    Scans ALL albums — not just those with a MusicBrainz release id — so tracks in playlist
+    imports / "Singles" / untagged albums are verified too (they were skipped entirely before).
+    Every track logs a verdict line so a miss can be debugged from the Activity/task log.
+    """
+    discard_pending_batches(session, "Replace incorrect audio files", ProposalKind.download)
+    from nudibranch.services.metadata_lookup import normalize, text_similarity
+
+    albums = list(
+        session.scalars(
+            select(Album)
+            .options(selectinload(Album.artist), selectinload(Album.tracks))
+            .order_by(Album.title.asc())
+        )
+    )
+    api_key = integration_value(session, "acoustid_api_key")
+    if not api_key:
+        append_task_log(session, task, "Check audio content: no AcoustID key configured — only dead-air (silence) detection will run; wrong-but-audible audio cannot be confirmed. Add a key in Settings → Integrations.", "warning")
+    batch = ProposalBatch(title="Replace incorrect audio files", kind=ProposalKind.download, tree_path="/task-queue")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    tracks_checked = 0
+    suspicious = 0
+    dead_air = 0
+    foreign = 0
+    undetermined = 0
+    unverifiable = 0
+    albums_scanned = 0
+    total_albums = max(1, len(albums))
+
+    for album in albums:
+        albums_scanned += 1
+        artist_name = album.artist.name if album.artist else "Unknown Artist"
+        if task is not None:
+            update_task_progress(session, task, albums_scanned, total_albums, f"Verifying audio: {artist_name} – {album.title}")
+
+        # Preliminary heuristic context: the MusicBrainz tracklist gives us per-slot expected
+        # durations (to log a mismatch) and the album's recording-ids/titles (so a mis-numbered
+        # file that actually holds another track of THIS album is NOT treated as wrong audio).
+        expected_tracks: list[dict] = []
+        if album.musicbrainz_release_id:
+            try:
+                record = lookup_album_tracks(artist_name, album.title, album.musicbrainz_release_id)
+                expected_tracks = record.get("tracks") or []
+            except Exception as e:
+                append_task_log(session, task, f"Could not fetch MusicBrainz tracklist for {artist_name} / {album.title}: {e} — verifying by audio only", "warning")
+            time.sleep(1)
+        slot_map: dict[tuple[int, int], dict] = {}
+        for exp in expected_tracks:
+            tn = exp.get("track_number")
+            if tn is not None:
+                slot_map[(exp.get("disc_number") or 1, tn)] = exp
+        album_recording_ids = {e.get("musicbrainz_recording_id") for e in expected_tracks if e.get("musicbrainz_recording_id")}
+        album_titles = [e.get("title") for e in expected_tracks if e.get("title")]
+
+        for track in album.tracks:
+            tracks_checked += 1
+            if not track.path or not Path(track.path).exists():
+                append_task_log(session, task, f"{artist_name} / {album.title} / {track.title}: file missing on disk — skipping", "warning")
+                continue
+
+            # --- Preliminary duration-slot heuristic (informational; does NOT gate AcoustID) ---
+            duration_note = ""
+            expected = None
+            if track.track_number is not None:
+                expected = slot_map.get((track.disc_number or 1, track.track_number))
+            if expected is None and expected_tracks:
+                best_score, best_exp = 0.0, None
+                for exp in expected_tracks:
+                    score = text_similarity(normalize(track.title), normalize(exp.get("title") or ""))
+                    if score > best_score:
+                        best_score, best_exp = score, exp
+                if best_score >= 0.5:
+                    expected = best_exp
+            if expected and expected.get("length") and track.duration_ms:
+                tol = max(5000, int(expected["length"] * 0.08))
+                delta = abs(track.duration_ms - expected["length"])
+                if delta <= tol:
+                    duration_note = "duration matches MB slot"
+                else:
+                    suspicious += 1
+                    duration_note = f"duration OFF MB slot by {round(delta/1000)}s"
+
+            # --- AcoustID content confirmation on EVERY track (+ dead-air inside) ---
+            verdict = verify_audio_content(
+                Path(track.path),
+                claimed_title=track.title,
+                claimed_artist=artist_name,
+                claimed_recording_id=track.musicbrainz_recording_id,
+                total_ms=track.duration_ms,
+                api_key=api_key,
+                album_recording_ids=album_recording_ids,
+                album_titles=album_titles,
+            )
+            # Politeness: verify_audio_content makes one AcoustID network call unless it
+            # short-circuited on dead air / missing file / no key.
+            if api_key and verdict.get("reason") not in {"dead_air", "missing_file", "no_acoustid_key"}:
+                time.sleep(0.4)
+
+            kind = verdict["verdict"]
+            log_level = "warning" if verdict["replace"] else "info"
+            log_line = f"{artist_name} / {album.title} / {track.title}: {verdict['log']}"
+            if duration_note:
+                log_line += f" [{duration_note}]"
+            append_task_log(session, task, log_line, log_level)
+
+            if kind == content_verify.DEAD_AIR:
+                dead_air += 1
+            elif kind == content_verify.FOREIGN_AUDIO:
+                foreign += 1
+            elif kind == content_verify.UNDETERMINED:
+                undetermined += 1
+            elif kind == content_verify.UNVERIFIABLE:
+                unverifiable += 1
+
+            if not verdict["replace"]:
+                continue
+
+            # A foreign-audio file's stored duration_ms / recording-id describe the WRONG song
+            # (often a mis-stamped id pointing at the other track), so don't feed them to the
+            # replacement search — re-derive from the correct title+artist. A dead-air file IS
+            # the right song (just silent), so its stored duration/id are kept.
+            is_foreign = kind == content_verify.FOREIGN_AUDIO
+            add_download_request_item(
+                session,
+                batch,
+                artist_items,
+                album_items,
+                artist_name,
+                album.title,
+                track.title,
+                track_number=track.track_number,
+                disc_number=track.disc_number,
+                duration_ms=None if is_foreign else track.duration_ms,
+                musicbrainz_album_id=album.musicbrainz_release_id,
+                musicbrainz_recording_id=None if is_foreign else track.musicbrainz_recording_id,
+                replace_track_id=track.id,
+                replace_path=track.path,
+                require_lossless=True if track.is_lossless else None,
+                workflow="content_replacement",
+                display_title=track.title,
+            )
+            created += 1
+            append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for '{track.title}' ({kind})")
+
+    summary = (
+        f"{tracks_checked} track(s) checked across {albums_scanned} album(s): "
+        f"{created} replacement(s) queued ({dead_air} dead-air, {foreign} wrong-audio); "
+        f"{undetermined} could not be identified by AcoustID, {unverifiable} unverifiable."
+    )
+    append_task_log(session, task, f"Check audio content complete — {summary}")
+    if created == 0:
+        session.delete(batch)
+        create_notification(
+            session,
+            title="Audio content check complete",
+            body=f"{summary} No incorrect or dead-air tracks found.",
+            event_type="tool_completed",
+            target_url="/tools",
+        )
+        return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": 0, "batch_id": None}
+    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": created, "batch_id": batch.id}
+
+
+def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    """Measure each track's loudness (ffmpeg ebur128) and propose its ReplayGain track gain
+    as a reviewable metadata change (Artist>Album>Track tree). Non-destructive — apply only
+    writes the DB value + the REPLAYGAIN_TRACK_GAIN tag; samples are never touched."""
+    discard_pending_batches(session, "Apply ReplayGain", ProposalKind.metadata)
+    # Only measure tracks that have no ReplayGain yet — a track with a value (whether from a
+    # prior run or a manual edit) is left alone; clear its field in the editor to re-measure it.
+    tracks = list(
+        session.scalars(
+            select(Track)
+            .where(Track.path.is_not(None), Track.replaygain_track_gain.is_(None))
+            .options(selectinload(Track.album).selectinload(Album.artist))
+            .order_by(Track.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Apply ReplayGain", kind=ProposalKind.metadata, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    checked = 0
+    total = max(1, len(tracks))
+    for track in tracks:
+        checked += 1
+        if task is not None and checked % 5 == 0:
+            update_task_progress(session, task, checked, total, f"Measuring loudness for {track.title}")
+        if not track.path or not Path(track.path).exists():
+            continue
+        gain = measure_track_gain(Path(track.path))
+        if gain is None:
+            continue
+        album = track.album
+        artist_name = album.artist.name if album and album.artist else "Unknown Artist"
+        album_title = album.title if album else "Unknown Album"
+        if artist_name not in artist_items:
+            artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.metadata, payload_json=json.dumps({"artist": artist_name}))
+            session.add(artist_item)
+            session.flush()
+            artist_items[artist_name] = artist_item
+        album_key = (artist_name, album_title)
+        if album_key not in album_items:
+            album_item = ProposalItem(batch_id=batch.id, parent_id=artist_items[artist_name].id, title=album_title, kind=ProposalKind.metadata, payload_json=json.dumps({"artist": artist_name, "album": album_title}))
+            session.add(album_item)
+            session.flush()
+            album_items[album_key] = album_item
+        changes = {"replaygain_track_gain": gain}
+        session.add(
+            ProposalItem(
+                batch_id=batch.id,
+                parent_id=album_items[album_key].id,
+                title=track.title,
+                kind=ProposalKind.metadata,
+                old_value=json.dumps({"replaygain_track_gain": track.replaygain_track_gain}),
+                new_value=json.dumps(changes),
+                payload_json=json.dumps({"target_type": "track", "target_id": track.id, "changes": changes}),
+            )
+        )
+        created += 1
+    if created == 0:
+        session.delete(batch)
+        write_app_log("ReplayGain scan complete: every track already has up-to-date gain", level="info", event_type="tool_completed")
+        return {"tracks_checked": len(tracks), "items_created": 0, "batch_id": None}
+    create_notification(
+        session,
+        title="ReplayGain review ready",
+        body=f"ReplayGain measured for {created} track(s) — review and approve in the Task Queue.",
+        event_type="approval_needed",
+        target_url="/task-queue",
+    )
+    return {"tracks_checked": len(tracks), "items_created": created, "batch_id": batch.id}
+
+
+def add_download_request_item(
+    session: Session,
+    batch: ProposalBatch,
+    artist_items: dict[str, ProposalItem],
+    album_items: dict[tuple[str, str], ProposalItem],
+    artist: str,
+    album: str,
+    track: str | None,
+    track_number: int | None = None,
+    disc_number: int | None = None,
+    duration_ms: int | None = None,
+    musicbrainz_album_id: str | None = None,
+    musicbrainz_recording_id: str | None = None,
+    replace_track_id: str | None = None,
+    replace_path: str | None = None,
+    require_lossless: bool | None = None,
+    workflow: str | None = None,
+    display_title: str | None = None,
+) -> None:
+    if artist not in artist_items:
+        artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
+        session.add(artist_item)
+        session.flush()
+        artist_items[artist] = artist_item
+    album_key = (artist, album)
+    if album_key not in album_items:
+        album_item = ProposalItem(
+            batch_id=batch.id,
+            parent_id=artist_items[artist].id,
+            title=album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps({"artist": artist, "album": album}),
+        )
+        session.add(album_item)
+        session.flush()
+        album_items[album_key] = album_item
+    session.add(
+        ProposalItem(
+            batch_id=batch.id,
+            parent_id=album_items[album_key].id,
+            title=display_title or track or album,
+            kind=ProposalKind.download,
+            payload_json=json.dumps(
+                {
+                    "action": "wishlist_request",
+                    "kind": "track",
+                    "artist": artist,
+                    "album": album,
+                    "track": track,
+                    "track_number": track_number,
+                    "disc_number": disc_number,
+                    "duration_ms": duration_ms,
+                    "musicbrainz_album_id": musicbrainz_album_id,
+                    "musicbrainz_recording_id": musicbrainz_recording_id,
+                    "replace_track_id": replace_track_id,
+                    "replace_path": replace_path,
+                    "require_lossless": require_lossless,
+                    "workflow": workflow,
+                }
+            ),
+        )
+    )
+
+
+def run_backup_now(session: Session, _payload: dict) -> dict:
+    settings = get_settings()
+    settings.backups_path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    backup_path = settings.backups_path / f"nudibranch-{timestamp}.sqlite"
+    session.commit()
+    shutil.copy2(settings.db_path, backup_path)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{settings.db_path}{suffix}")
+        if sidecar.exists():
+            shutil.copy2(sidecar, settings.backups_path / f"{backup_path.name}{suffix}")
+    create_notification(session, title="Backup complete", body=str(backup_path), event_type="tool_completed", target_url="/tools")
+    return {"backup_path": str(backup_path)}
+
+
+def run_restore_default(session: Session, _payload: dict) -> dict:
+    backup = run_backup_now(session, {})
+    for model in (ProposalItem, ProposalBatch, PlaylistTrack, Playlist, WishlistItem, Track, Album, Artist):
+        for item in list(session.scalars(select(model))):
+            session.delete(item)
+    session.commit()
+    create_notification(session, title="Restore complete", body="Library data was restored to default.", event_type="tool_completed", target_url="/tools")
+    return {"reset": True, "pre_restore_backup": backup.get("backup_path")}
+
+
+def run_restore_backup(session: Session, payload: dict) -> dict:
+    settings = get_settings()
+    backup_path = Path(payload.get("backup_path", "")).resolve()
+    backup_root = settings.backups_path.resolve()
+    if backup_root not in [backup_path, *backup_path.parents] or not backup_path.exists():
+        raise ValueError("Backup must be inside the backups folder")
+    pre_restore = run_backup_now(session, {})
+    session.commit()
+    shutil.copy2(backup_path, settings.db_path)
+    for suffix in ("-wal", "-shm"):
+        source = Path(f"{backup_path}{suffix}")
+        target = Path(f"{settings.db_path}{suffix}")
+        if source.exists():
+            shutil.copy2(source, target)
+        elif target.exists():
+            target.unlink()
+    create_notification(session, title="Restore complete", body=backup_path.name, event_type="tool_completed", target_url="/tools")
+    return {"restored_from": str(backup_path), "pre_restore_backup": pre_restore.get("backup_path")}
+
+
+def run_clear_downloads(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    root = get_settings().downloads_path
+    append_task_log(session, task, f"Clear downloads started for {root}")
+    if task is not None:
+        update_task_progress(session, task, 0, 1, "Scanning downloads folder")
+    root.mkdir(parents=True, exist_ok=True)
+    manifest_path = download_manifest_path().resolve()
+    append_task_log(session, task, f"Keeping download manifest at {manifest_path}")
+    removed_files = 0
+    removed_dirs = 0
+    scanned = 0
+    skipped = 0
+    errors: list[str] = []
+    try:
+        paths = sorted(root.rglob("*"), key=lambda candidate: len(candidate.parts), reverse=True)
+    except OSError as error:
+        append_task_log(session, task, f"Clear downloads scan failed: {error}", "error")
+        create_notification(
+            session,
+            title="Downloads cleanup completed",
+            body="0 passed, 1 failed. The downloads folder could not be checked; open Activity for details.",
+            event_type="task_completed",
+            target_url="/activity",
+        )
+        return {
+            "removed_files": 0,
+            "removed_dirs": 0,
+            "skipped": 0,
+            "passed": 0,
+            "failed": 1,
+            "errors": [str(error)],
+            "completed_with_item_failures": True,
+        }
+    total = max(1, len(paths))
+    append_task_log(session, task, f"Clear downloads found {len(paths)} path(s) to review")
+    for index, path in enumerate(paths, start=1):
+        scanned += 1
+        try:
+            if path.resolve() == manifest_path:
+                skipped += 1
+                append_task_log(session, task, f"Skipped download manifest {path}")
+                continue
+            if path.is_file():
+                path.unlink()
+                removed_files += 1
+                append_task_log(session, task, f"Removed downloaded file {path}")
+            elif path.is_dir():
+                try:
+                    path.rmdir()
+                    removed_dirs += 1
+                    append_task_log(session, task, f"Removed empty downloads directory {path}")
+                except OSError:
+                    skipped += 1
+                    append_task_log(session, task, f"Skipped non-empty downloads directory {path}")
+                    continue
+        except OSError as error:
+            message = f"{path}: {error}"
+            errors.append(message)
+            append_task_log(session, task, f"Clear downloads could not remove {message}", "error")
+        if task is not None and (index == total or index % 25 == 0):
+            task.lease_until = Task.lease_expiry()
+            update_task_progress(
+                session,
+                task,
+                index,
+                total,
+                f"Cleared {removed_files} file(s), {removed_dirs} folder(s), skipped {skipped}",
+                removed_files=removed_files,
+                removed_dirs=removed_dirs,
+                skipped=skipped,
+                errors=len(errors),
+            )
+    append_task_log(
+        session,
+        task,
+        f"Clear downloads finished: scanned {scanned}, removed {removed_files} file(s), removed {removed_dirs} folder(s), skipped {skipped}, errors {len(errors)}",
+        "warning" if errors else "info",
+    )
+    create_notification(
+        session,
+        title="Downloads cleanup completed",
+        body=f"{removed_files + removed_dirs} passed, {len(errors)} failed. {removed_files} files and {removed_dirs} folders removed; {skipped} skipped.",
+        event_type="task_completed",
+        target_url="/activity" if errors else "/tools",
+    )
+    return {
+        "removed_files": removed_files,
+        "removed_dirs": removed_dirs,
+        "skipped": skipped,
+        "scanned": scanned,
+        "passed": removed_files + removed_dirs,
+        "failed": len(errors),
+        "errors": errors,
+        "completed_with_item_failures": bool(errors),
+    }
+
+
+def first_admin_id(session: Session) -> str:
+    admin_id = session.scalar(select(User.id).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
+    if not admin_id:
+        raise ValueError("No admin user exists for generated wishlist items")
+    return admin_id
+
+
+def find_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> str | None:
+    response = client.get(f"/Users/{user_id}/Items", params={"Recursive": "true", "IncludeItemTypes": "Playlist", "SearchTerm": name})
+    response.raise_for_status()
+    for item in response.json().get("Items", []):
+        if item.get("Name") == name:
+            return item.get("Id")
+    return None
+
+
+def list_jellyfin_playlist_ids_by_name(client: httpx.Client, user_id: str, name: str) -> list[str]:
+    """ALL Jellyfin playlist ids with this exact name — used to collapse duplicate playlists."""
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+    )
+    response.raise_for_status()
+    return [item["Id"] for item in response.json().get("Items", []) if item.get("Name") == name and item.get("Id")]
+
+
+def ensure_favorites_playlist(session: Session, user_id: str) -> Playlist:
+    playlist = session.scalar(select(Playlist).where(Playlist.protected.is_(True), Playlist.user_id == user_id))
+    if not playlist:
+        playlist = session.scalar(select(Playlist).where(Playlist.name == "Favorites", Playlist.user_id == user_id))
+    if not playlist:
+        playlist = Playlist(name="Favorites", protected=True, user_id=user_id)
+        session.add(playlist)
+        session.flush()
+    elif not playlist.protected:
+        playlist.protected = True
+        session.flush()
+    return playlist
+
+
+class JellyfinPlaylistMissing(RuntimeError):
+    pass
+
+
+def _delete_jellyfin_item(client: httpx.Client, item_id: str) -> None:
+    try:
+        resp = client.delete(f"/Items/{item_id}")
+        if resp.is_success or resp.status_code == 404:
+            return
+        write_app_log(f"Playlist sync: DELETE /Items/{item_id} returned {resp.status_code}", level="warning")
+    except Exception as error:
+        write_app_log(f"Playlist sync: could not delete Jellyfin item {item_id}: {error}", level="warning")
+
+
+def _delete_jellyfin_playlists_by_name(client: httpx.Client, user_id: str, name: str) -> int:
+    """Delete ALL Jellyfin playlists with this name — cleans up duplicates before recreating."""
+    try:
+        resp = client.get(
+            f"/Users/{user_id}/Items",
+            params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+        )
+        resp.raise_for_status()
+    except Exception:
+        return 0
+    deleted = 0
+    for item in resp.json().get("Items", []):
+        if item.get("Name") == name and item.get("Id"):
+            _delete_jellyfin_item(client, item["Id"])
+            deleted += 1
+    if deleted:
+        write_app_log(f"Playlist sync: cleaned up {deleted} stale Jellyfin playlist(s) named '{name}'")
+    return deleted
+
+
+def list_jellyfin_playlists(client: httpx.Client, user_id: str) -> dict[str, dict]:
+    write_app_log("Playlist sync: GET /Users/{id}/Items?IncludeItemTypes=Playlist")
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={"Recursive": "true", "IncludeItemTypes": "Playlist", "Limit": "1000"},
+    )
+    response.raise_for_status()
+    playlists = {}
+    for item in response.json().get("Items", []):
+        name = item.get("Name")
+        if name:
+            playlists[name] = item
+    write_app_log(f"Playlist sync: found {len(playlists)} Jellyfin playlist(s): {list(playlists.keys())}")
+    return playlists
+
+
+def jellyfin_playlist_item_ids(client: httpx.Client, user_id: str, playlist_id: str) -> set[str]:
+    return {item.get("Id") for item in jellyfin_playlist_items(client, user_id, playlist_id) if item.get("Id")}
+
+
+def jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str) -> list[dict]:
+    write_app_log(f"Playlist sync: GET /Playlists/{playlist_id}/Items")
+    try:
+        response = client.get(
+            f"/Playlists/{playlist_id}/Items",
+            params={"userId": user_id, "Fields": "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album"},
+        )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        if error.response.status_code == 404:
+            raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found") from error
+        if error.response.status_code == 405:
+            return []
+        raise
+    items = response.json().get("Items", [])
+    write_app_log(f"Playlist sync: playlist {playlist_id} has {len(items)} item(s)")
+    return items
+
+
+def create_jellyfin_playlist(client: httpx.Client, user_id: str, name: str) -> httpx.Response:
+    response = client.post(
+        "/Playlists",
+        json={"Name": name, "UserId": user_id, "MediaType": "Audio", "Ids": []},
+    )
+    if response.is_success:
+        return response
+    fallback = client.post("/Playlists", params={"name": name, "userId": user_id, "mediaType": "Audio"})
+    fallback.raise_for_status()
+    return fallback
+
+
+def jellyfin_playlist_id_from_response(response: httpx.Response) -> str:
+    payload = response.json()
+    playlist_id = payload.get("Id") or payload.get("id")
+    if not playlist_id:
+        raise RuntimeError("Jellyfin created a playlist but did not return a playlist id")
+    return str(playlist_id)
+
+
+def add_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, item_ids: list[str]) -> None:
+    if not item_ids:
+        return
+    write_app_log(f"Playlist sync: POST /Playlists/{playlist_id}/Items ({len(item_ids)} items batch)")
+    response = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": ",".join(item_ids), "userId": user_id})
+    if response.is_success:
+        write_app_log(f"Playlist sync: batch add to {playlist_id} succeeded")
+        return
+    if response.status_code in (403, 404):
+        # 404 = gone; 403 = playlist is owned by a different Jellyfin user — recreate it
+        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} is not accessible (HTTP {response.status_code})")
+    if response.status_code < 500:
+        response.raise_for_status()
+    write_app_log(f"Playlist sync: batch add to {playlist_id} got {response.status_code}, falling back to per-item", level="warning")
+    failures = []
+    for item_id in item_ids:
+        write_app_log(f"Playlist sync: POST /Playlists/{playlist_id}/Items?ids={item_id} (per-item fallback)")
+        single = client.post(f"/Playlists/{playlist_id}/Items", params={"ids": item_id, "userId": user_id})
+        if single.status_code == 404:
+            raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
+        if not single.is_success:
+            failures.append(f"{item_id}: {single.status_code} {single.text[-300:]}")
+    if failures:
+        raise RuntimeError(f"Jellyfin playlist sync failed for {len(failures)} item(s): {'; '.join(failures[:3])}")
+
+
+def jellyfin_playlist_entry_id(item: dict) -> str:
+    return str(item.get("PlaylistItemId") or item.get("PlaylistItemID") or "")
+
+
+def remove_jellyfin_playlist_entry_ids(client: httpx.Client, playlist_id: str, entry_ids: list[str]) -> int:
+    if not entry_ids:
+        return 0
+    response = client.delete(f"/Playlists/{playlist_id}/Items", params={"entryIds": ",".join(entry_ids)})
+    if response.status_code == 404:
+        raise JellyfinPlaylistMissing(f"Jellyfin playlist {playlist_id} was not found")
+    if response.status_code in {405, 501}:
+        return 0
+    response.raise_for_status()
+    return len(entry_ids)
+
+
+def remove_jellyfin_playlist_items(client: httpx.Client, _user_id: str, playlist_id: str, items: list[dict], keep_item_ids: set[str]) -> int:
+    entry_ids = [
+        jellyfin_playlist_entry_id(item)
+        for item in items
+        if item.get("Id") not in keep_item_ids and jellyfin_playlist_entry_id(item)
+    ]
+    return remove_jellyfin_playlist_entry_ids(client, playlist_id, entry_ids)
+
+
+def replace_jellyfin_playlist_items(client: httpx.Client, user_id: str, playlist_id: str, current_items: list[dict], desired_item_ids: list[str]) -> int:
+    entry_ids = [entry_id for entry_id in (jellyfin_playlist_entry_id(item) for item in current_items) if entry_id]
+    write_app_log(f"Playlist sync: replacing {playlist_id}: removing {len(entry_ids)} existing entry(s), adding {len(desired_item_ids)} desired")
+    removed = remove_jellyfin_playlist_entry_ids(client, playlist_id, entry_ids)
+    add_jellyfin_playlist_items(client, user_id, playlist_id, desired_item_ids)
+    return removed + len(desired_item_ids)
+
+
+def sync_playlist_from_jellyfin(session: Session, playlist: Playlist, jellyfin_items: list[dict]) -> int:
+    write_app_log(f"Playlist sync: pulling '{playlist.name}' from Jellyfin ({len(jellyfin_items)} Jellyfin item(s))")
+    next_entries: list[tuple[Track, int]] = []
+    for index, item in enumerate(jellyfin_items, start=1):
+        write_app_log(f"Playlist sync: matching Jellyfin item {index}/{len(jellyfin_items)}: {item.get('Name')!r} by {item.get('AlbumArtist') or item.get('Artists')}")
+        track = find_local_track_for_jellyfin_item(session, item)
+        if track:
+            next_entries.append((track, index))
+        else:
+            append_task_log(session, None, f"{playlist.name}: Jellyfin item {item.get('Name') or item.get('Id')} is not in Nudibranch yet", "warning")
+    current_entries = list(playlist.tracks)
+    current_by_track_id = {entry.track_id: entry for entry in current_entries}
+    next_track_ids = {track.id for track, _ in next_entries}
+    changes = 0
+    for entry in current_entries:
+        if entry.track_id not in next_track_ids:
+            session.delete(entry)
+            changes += 1
+    for track, position in next_entries:
+        entry = current_by_track_id.get(track.id)
+        if not entry:
+            session.add(PlaylistTrack(playlist_id=playlist.id, track_id=track.id, position=position))
+            changes += 1
+        elif entry.position != position:
+            entry.position = position
+            changes += 1
+    return changes
+
+
+def find_local_track_for_jellyfin_item(session: Session, item: dict) -> Track | None:
+    path = item.get("Path")
+    if path:
+        track = session.scalar(select(Track).where(Track.path == path))
+        if track:
+            return track
+    provider_ids = jellyfin_provider_ids(item)
+    recording_id = provider_ids.get("musicbrainztrack") or provider_ids.get("musicbrainzrecording")
+    if recording_id:
+        track = session.scalar(select(Track).where(func.lower(Track.musicbrainz_recording_id) == recording_id))
+        if track:
+            return track
+    name = item.get("Name")
+    if not name:
+        return None
+    candidates = list(
+        session.scalars(
+            select(Track)
+            .where(func.lower(Track.title) == name.casefold())
+            .options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    )
+    artist_names = jellyfin_artist_names(item)
+    album_name = normalize_match_text(item.get("Album"))
+    for track in candidates:
+        album = track.album
+        artist_match = not artist_names or normalize_match_text(album.artist.name if album and album.artist else None) in artist_names
+        album_match = not album_name or normalize_match_text(album.title if album else None) == album_name
+        duration_match = jellyfin_duration_matches(track, item)
+        if artist_match and album_match and duration_match:
+            return track
+    return None
+
+
+def find_jellyfin_audio_item(client: httpx.Client, user_id: str, track: Track) -> str | None:
+    response = client.get(
+        f"/Users/{user_id}/Items",
+        params={
+            "Recursive": "true",
+            "IncludeItemTypes": "Audio",
+            "SearchTerm": track.title,
+            "Fields": "Path,ProviderIds,RunTimeTicks,Artists,AlbumArtist,Album",
+            "Limit": "100",
+        },
+    )
+    response.raise_for_status()
+    best_item: dict | None = None
+    best_score = 0.0
+    for item in response.json().get("Items", []):
+        score = jellyfin_audio_match_score(track, item)
+        if score > best_score:
+            best_score = score
+            best_item = item
+    if best_item and best_score >= 0.65:
+        return best_item.get("Id")
+    return None
+
+
+def jellyfin_provider_ids(item: dict) -> dict[str, str]:
+    provider_ids = item.get("ProviderIds") or item.get("ProviderIDs") or {}
+    if not isinstance(provider_ids, dict):
+        return {}
+    return {normalize_match_text(key): normalize_match_text(value) for key, value in provider_ids.items() if value}
+
+
+def jellyfin_artist_names(item: dict) -> set[str]:
+    artists = item.get("Artists") or []
+    if isinstance(artists, str):
+        artists = [artists]
+    return {
+        normalize_match_text(value)
+        for value in [item.get("AlbumArtist"), item.get("Artist"), *artists]
+        if value
+    }
+
+
+def jellyfin_duration_ms(item: dict) -> int | None:
+    ticks = item.get("RunTimeTicks")
+    try:
+        return round(int(ticks) / 10000) if ticks is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def jellyfin_duration_matches(track: Track, item: dict) -> bool:
+    item_duration = jellyfin_duration_ms(item)
+    if not track.duration_ms or not item_duration:
+        return True
+    return abs(track.duration_ms - item_duration) <= 10000
+
+
+def _path_tail(value: str | None, segments: int = 3) -> str:
+    """Last few path segments, lowercased — a mount-root-agnostic file identity."""
+    parts = [p for p in re.split(r"[\\/]+", str(value or "").lower()) if p]
+    return "/".join(parts[-segments:])
+
+
+def jellyfin_audio_match_score(track: Track, item: dict) -> float:
+    item_path = str(item.get("Path") or "")
+    if track.path and item_path:
+        if item_path.lower() == str(track.path).lower():
+            return 1.0
+        # Mount-agnostic: Jellyfin and Nudibranch often mount the SAME library at different roots
+        # (e.g. Jellyfin /media/... vs Nudibranch /app/library/...), so the absolute paths never
+        # match and matching falls back to the brittle exact-title rule below — which leaves tracks
+        # whose Jellyfin title differs (feat./punctuation/remaster) permanently unmapped. Compare the
+        # trailing Artist/Album/file segments instead; identical across the shared volume.
+        track_tail = _path_tail(track.path)
+        if track_tail and track_tail == _path_tail(item_path):
+            return 0.97
+    provider_ids = jellyfin_provider_ids(item)
+    recording_id = normalize_match_text(track.musicbrainz_recording_id)
+    if recording_id and recording_id in {
+        provider_ids.get("musicbrainztrack"),
+        provider_ids.get("musicbrainzrecording"),
+    }:
+        return 0.98
+
+    title = normalize_match_text(track.title)
+    item_title = normalize_match_text(item.get("Name"))
+    if not title or title != item_title:
+        return 0.0
+
+    score = 0.45
+    album = track.album
+    artist_name = normalize_match_text(album.artist.name if album and album.artist else None)
+    item_artists = jellyfin_artist_names(item)
+    if artist_name and artist_name in item_artists:
+        score += 0.25
+    elif item_artists:
+        return 0.0
+
+    album_title = normalize_match_text(album.title if album else None)
+    item_album = normalize_match_text(item.get("Album"))
+    if album_title and item_album and album_title == item_album:
+        score += 0.2
+    elif item_album:
+        score -= 0.2
+
+    if jellyfin_duration_matches(track, item):
+        score += 0.1
+    else:
+        score -= 0.2
+    return score
+
+
+def run_search_candidates(session: Session, payload: dict, task: Task | None = None) -> dict:
+    batch_id = payload.get("batch_id")
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise ValueError("Batch not found for candidate search")
+    items = [i for i in batch.items if json.loads(i.payload_json or "{}").get("action") == "wishlist_request"]
+    if items:
+        process_wishlist_request_items(session, items, task)
+    # The intent batch is consumed once its requests have been turned into a candidate batch.
+    for item in batch.items:
+        if item.status in {ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing}:
+            item.status = ProposalStatus.completed
+    batch.status = ProposalStatus.completed
+    session.commit()
+    return {"searched": len(items)}
+
+
+def run_consolidate_folders(session: Session, _payload: dict, task: Task | None = None) -> dict:
+    albums = list(
+        session.scalars(
+            select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
+        )
+    )
+    batch = ProposalBatch(title="Consolidate album folders", kind=ProposalKind.file_move, tree_path="/library")
+    session.add(batch)
+    session.flush()
+    artist_items: dict[str, ProposalItem] = {}
+    album_items: dict[tuple[str, str], ProposalItem] = {}
+    created = 0
+    library_root = get_settings().library_path
+    for index, album in enumerate(albums):
+        if task is not None and index % 25 == 0:
+            update_task_progress(session, task, index, max(1, len(albums)), f"Checking {album.title}")
+        artist_name = album.artist.name if album.artist else "Unknown Artist"
+        canonical = (library_root / safe_path_part(artist_name, "Unknown Artist") / safe_path_part(album.title, "Unknown Album")).resolve()
+        misplaced = [t for t in album.tracks if t.path and Path(t.path).parent.resolve() != canonical]
+        if not misplaced:
+            continue
+        # Build artist>album grouping nodes (no action) lazily, then a relocate leaf per misplaced track.
+        a_item = artist_items.get(artist_name)
+        if not a_item:
+            a_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.file_move, payload_json=json.dumps({"artist": artist_name}))
+            session.add(a_item)
+            session.flush()
+            artist_items[artist_name] = a_item
+        al_key = (artist_name, album.title)
+        al_item = album_items.get(al_key)
+        if not al_item:
+            al_item = ProposalItem(batch_id=batch.id, parent_id=a_item.id, title=album.title, kind=ProposalKind.file_move, payload_json=json.dumps({"artist": artist_name, "album": album.title}))
+            session.add(al_item)
+            session.flush()
+            album_items[al_key] = al_item
+        for t in misplaced:
+            target = canonical / Path(t.path).name
+            session.add(ProposalItem(
+                batch_id=batch.id,
+                parent_id=al_item.id,
+                title=Path(t.path).name,
+                kind=ProposalKind.file_move,
+                old_value=t.path,
+                new_value=str(target),
+                payload_json=json.dumps({"action": "relocate_track", "track_id": t.id}),
+            ))
+            created += 1
+    if created == 0:
+        session.delete(batch)
+        write_app_log("Folder consolidation complete: all album tracks are already in one folder per album", level="info", event_type="tool_completed")
+        return {"albums_checked": len(albums), "moves": 0, "batch_id": None}
+    create_notification(session, title="Folder consolidation ready", body=f"{created} track file(s) can be moved into one folder per album — review in the Task Queue.", event_type="approval_needed", target_url="/task-queue")
+    return {"albums_checked": len(albums), "moves": created, "batch_id": batch.id}
+
+
+# ---------------------------------------------------------------------------
+# Podcasts
+# ---------------------------------------------------------------------------
+
+def podcast_folder_path(podcast: Podcast) -> Path:
+    return get_settings().podcasts_path / safe_path_part(podcast.title, "Unknown Podcast")
+
+
+def podcast_has_valid_local_cover(podcast: Podcast) -> bool:
+    cover_path = podcast.cover_path
+    if not cover_path or cover_path.startswith(("http://", "https://")):
+        return False
+    candidate = Path(cover_path)
+    return candidate.exists() and candidate.is_file()
+
+
+def ensure_podcast_cover(session: Session, podcast: Podcast) -> None:
+    """Download the feed's cover image into the podcast folder if we don't have a local one."""
+    if podcast_has_valid_local_cover(podcast) or not podcast.image_url:
+        return
+    folder = podcast_folder_path(podcast)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        # Escalates to curl on a block status, same as the feed fetch — podcast art is served from
+        # the same edge as the feed, so a host that fingerprints the client refuses both.
+        content, content_type = podcast_service.fetch_media(podcast.image_url, timeout=20)
+        if not content_type.casefold().startswith("image/"):
+            return
+        cover_path = folder / f"cover{cover_extension(content_type, podcast.image_url)}"
+        cover_path.write_bytes(content)
+        podcast.cover_path = str(cover_path)
+    except Exception as error:  # noqa: BLE001 - cover art must not block episode downloads.
+        append_task_log(session, None, f"{podcast.title}: podcast cover download failed: {error}", "warning")
+
+
+def notify_podcast_subscribers(session: Session, podcast: Podcast, episode: Episode) -> None:
+    """Create a user-scoped new-episode notification for every user who opted in for this podcast
+    (PodcastNotificationPref.enabled). Absent/false prefs get nothing — this is opt-in only.
+
+    ⚠️ Keyed and guarded per episode: "a new episode arrived" is one event per user by definition,
+    and duplicates were reaching the iOS tray as two identical rows.  The group_key alone is not
+    enough — `create_notification` *updates* a grouped row and clears `apns_delivered_at`, which
+    re-pushes it.  Checking first makes a second call a true no-op, so however this handler comes
+    to run twice for one episode (a re-leased long download, a purge-and-refetch, a retry after a
+    post-commit failure) it can still only produce the one row and the one push.
+    """
+    opted_in = list(
+        session.scalars(
+            select(PodcastNotificationPref.user_id).where(
+                PodcastNotificationPref.podcast_id == podcast.id,
+                PodcastNotificationPref.enabled.is_(True),
+            )
+        )
+    )
+    group_key = f"podcast-episode:{episode.id}"
+    for user_id in opted_in:
+        already_notified = session.scalar(
+            select(Notification.id)
+            .where(Notification.user_id == user_id, Notification.group_key == group_key)
+            .limit(1)
+        )
+        if already_notified:
+            continue
+        try:
+            create_notification(
+                session,
+                title=podcast.title,
+                body=f"New episode: {episode.title}",
+                event_type="podcast_episode_added",
+                target_url=f"/podcasts/{podcast.id}",
+                user_id=user_id,
+                deliver_web=True,
+                deliver_apns=True,
+                group_key=group_key,
+            )
+        except Exception:  # noqa: BLE001 - one user's notification must not abort the download handler.
+            write_app_log(f"Podcast notification failed for user {user_id}: {podcast.title}", "warning")
+
+
+def wake_devices_for_new_episode(session: Session, podcast: Podcast) -> None:
+    """Silent content-available push so devices download the episode without the app being opened.
+
+    Deliberately separate from `notify_podcast_subscribers`. That one is **opt-in per user per
+    podcast** and produces a banner; this one is the *mechanism* behind automatic downloading and
+    must reach every device regardless of whether anyone wants to be told about it. Tying the two
+    together meant a podcast with notifications off never woke the device at all, leaving the
+    hourly BGAppRefreshTask as the only trigger.
+
+    user_id is None so it targets every registered device, deliver_web is False so it never appears
+    in the in-app tray, and the event type is in SILENT_WAKE_EVENT_TYPES so it cannot be muted.
+    """
+    try:
+        create_notification(
+            session,
+            title="",
+            body="",
+            event_type="podcast_episode_available",
+            target_url=f"/podcasts/{podcast.id}",
+            user_id=None,
+            deliver_web=False,
+            deliver_apns=True,
+        )
+    except Exception:  # noqa: BLE001 - a failed wake must not abort the download handler.
+        write_app_log(f"Podcast wake push failed: {podcast.title}", "warning")
+
+
+def run_podcast_scan(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Refresh subscribed feeds and announce whatever is new.
+
+    ⚠️ **The scan is where a new episode becomes news.** That used to be the download handler, which
+    only ran once this server had fetched the audio; with nothing downloaded here, announcing from
+    anywhere else would mean new-episode notifications — and the silent wake that starts each
+    device's own download — simply stopped happening. `upsert_episodes` returns exactly the rows it
+    created, so an episode is announced once however often its feed is rescanned.
+    """
+    podcast_id = payload.get("podcast_id")
+    if podcast_id:
+        one = session.get(Podcast, podcast_id)
+        podcasts = [one] if one else []
+    else:
+        podcasts = list(session.scalars(select(Podcast).where(Podcast.enabled.is_(True))))
+    total = len(podcasts) or 1
+    scanned = 0
+    added = 0
+    for index, podcast in enumerate(podcasts):
+        if task:
+            update_task_progress(session, task, index, total, f"Scanning {podcast.title}")
+        try:
+            feed = podcast_service.fetch_feed(podcast.feed_url)
+            podcast_service.upsert_podcast(session, podcast.feed_url, feed)
+            created = podcast_service.upsert_episodes(session, podcast, podcast_service.parse_episodes(feed))
+            # Newest first, so a feed that adds several at once announces them in publish order.
+            new_episodes = sorted(
+                created,
+                key=lambda episode: episode.published_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+            session.commit()
+        except Exception as error:  # noqa: BLE001 - one bad feed must not fail the whole scan.
+            session.rollback()
+            podcast.last_error = str(error)[:500]
+            podcast.last_scanned_at = datetime.now(timezone.utc)
+            session.commit()
+            write_app_log(f"Podcast scan failed for {podcast.title}: {error}", "warning")
+            continue
+        scanned += 1
+        # A podcast otherwise shows no artwork until something else happens to fetch it; every
+        # scan — including the one subscribing enqueues immediately — backfills it.
+        ensure_podcast_cover(session, podcast)
+        session.commit()
+        if not new_episodes:
+            continue
+        added += len(new_episodes)
+        queue_automation_event(session, "podcast_episode_added")
+        for episode in new_episodes:
+            notify_podcast_subscribers(session, podcast, episode)
+        # One silent wake per podcast rather than per episode: it carries no episode id, and each
+        # device reconciles its whole download window when it lands.
+        wake_devices_for_new_episode(session, podcast)
+    return {"scanned": scanned, "added": added}
+
+
+TASK_HANDLERS = {
+    "propose_import": run_propose_import,
+    "execute_proposal_batch": run_execute_proposal_batch,
+    "ytdlp_download": run_ytdlp_download,
+    "sync_favorites_jellyfin": run_sync_favorites_jellyfin,
+    "migrate_native_playlists_to_jellyfin": run_migrate_native_playlists_to_jellyfin,
+    "playlist_mirror": run_playlist_mirror,
+    "jellyfin_scan": run_jellyfin_scan,
+    "check_files": run_check_files,
+    "check_duplicates": run_check_duplicates,
+    "check_lyrics": run_check_lyrics,
+    "check_musicbrainz_ids": run_check_musicbrainz_ids,
+    "check_album_covers": run_check_album_covers,
+    "check_artist_covers": run_check_artist_covers,
+    "refresh_covers": run_refresh_covers,
+    "check_missing_tracks": run_check_missing_tracks,
+    "check_non_lossless": run_check_non_lossless,
+    "check_audio_content": run_check_audio_content,
+    "requeue_replacement": run_requeue_replacement,
+    "apply_replaygain": run_apply_replaygain,
+    "backup_now": run_backup_now,
+    "restore_default": run_restore_default,
+    "restore_backup": run_restore_backup,
+    "clear_downloads": run_clear_downloads,
+    "search_candidates": run_search_candidates,
+    "consolidate_folders": run_consolidate_folders,
+    "enrich_imports": run_enrich_imports,
+    "create_pending_playlists": run_create_pending_playlists,
+    "podcast_scan": run_podcast_scan,
+}
+
+
+def check_mount_writability(session: Session) -> None:
+    """Probe the folders the download pipeline writes to and warn loudly if any is read-only.
+
+    Surfaces mount/permission problems (e.g. an NFS share that squashes the container's user) at
+    startup, instead of only after a full album has downloaded and fails to import.
+    """
+    settings = get_settings()
+    mounts = [
+        ("library", settings.library_path, True),
+        ("downloads", settings.downloads_path, True),
+        ("staging", settings.staging_path, False),
+    ]
+    for name, path, critical in mounts:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".nudibranch-writetest"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except Exception as error:  # noqa: BLE001 - report the problem, never crash the worker.
+            append_task_log(
+                session,
+                None,
+                f"Startup check: the {name} folder ({path}) is NOT writable: {error}. "
+                "Downloads can stage but imports/writes there will fail until the mount's "
+                "permissions are fixed (file ownership / the container's user, or the NFS share).",
+                "error" if critical else "warning",
+            )
+            if name == "library":
+                create_notification(
+                    session,
+                    title="Library folder is not writable",
+                    body=(
+                        f"The worker cannot write to the library folder ({path}). Downloaded "
+                        "tracks will stage but cannot be imported. Fix the mount's write permissions."
+                    ),
+                    event_type="task_failed",
+                    target_url="/downloads",
+                )
+        else:
+            append_task_log(session, None, f"Startup check: the {name} folder ({path}) is writable")
+    session.commit()
+
+
+async def worker_loop() -> None:
+    write_app_log(f"Worker starting (version {__version__})")
+    with SessionLocal() as session:
+        init_db(session)
+        check_mount_writability(session)
+        _upsert_setting(session, "mapping_run_count", "0")
+        _upsert_setting(session, "mapping_started_at", datetime.now(timezone.utc).isoformat())
+        session.commit()
+        recovered = recover_orphaned_tasks(session)
+        if recovered:
+            create_notification(
+                session,
+                title="Resumed interrupted work",
+                body=f"{recovered} task(s) interrupted by a restart were requeued to continue.",
+                event_type="task_started",
+                target_url="/activity",
+            )
+            session.commit()
+
+    last_download_scan = 0.0
+    last_download_scan_summary = ""
+    last_download_scan_log = 0.0
+    last_automation_tick = 0.0
+    last_pending_playlist_tick = 0.0
+    last_playlist_mirror_tick = 0.0
+    last_podcast_scan_tick = 0.0
+    last_deletion_prune_tick = 0.0
+    while True:
+        with SessionLocal() as session:
+            task = claim_next_task(session)
+            if not task:
+                if time.time() - last_download_scan > DOWNLOAD_SCAN_INTERVAL_SECONDS:
+                    try:
+                        scan_result = import_completed_downloads(session)
+                        if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
+                            summary = f"{scan_result.get('waiting', 0)}:{scan_result.get('ready', 0)}:{scan_result.get('failed', 0)}"
+                            # Log only when the picture changes — otherwise a persistent
+                            # "1 needing attention" logs every scan tick (every ~2 min) forever.
+                            if summary != last_download_scan_summary:
+                                append_task_log(
+                                    session,
+                                    None,
+                                    f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
+                                )
+                                last_download_scan_summary = summary
+                        else:
+                            last_download_scan_summary = ""
+                        cleanup_orphaned_download_batches(session)
+                        if scan_result.get("imported"):
+                            queue_automation_event(session, "download_complete")
+                        session.commit()
+                        fire_queued_automation_events(session)
+                    except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
+                        session.rollback()
+                        discard_queued_automation_events(session)
+                        write_app_log(f"Download scan failed: {type(error).__name__}: {error}", "error")
+                        create_notification(
+                            session,
+                            title="Download check needs attention",
+                            body="Nudibranch could not check active downloads. Open Activity for details.",
+                            event_type="task_completed",
+                            target_url="/activity",
+                            deliver_apns=False,
+                            group_key="system:download-scan",
+                        )
+                    last_download_scan = time.time()
+                if time.time() - last_automation_tick > AUTOMATION_TICK_SECONDS:
+                    try:
+                        from nudibranch.services.automations import run_due_automations
+
+                        run_due_automations(session)
+                    except Exception:  # noqa: BLE001 - scheduler must never stop the worker.
+                        session.rollback()
+                    last_automation_tick = time.time()
+                if time.time() - last_pending_playlist_tick > PENDING_PLAYLIST_TICK_SECONDS:
+                    # A playlist import whose tracks are all already in the library never imports
+                    # anything, so nothing triggers a sync_favorites run to create the playlist.
+                    # Process any deferred playlist here too (cheap: only touches Jellyfin when a
+                    # pending_playlist setting actually exists, and only for that playlist).
+                    try:
+                        if session.scalar(select(AppSetting.key).where(AppSetting.key.like("pending_playlist:%")).limit(1)):
+                            _try_create_pending_playlists(session)
+                    except Exception:  # noqa: BLE001 - never let pending-playlist work stop the worker.
+                        session.rollback()
+                    last_pending_playlist_tick = time.time()
+                if time.time() - last_playlist_mirror_tick > PLAYLIST_MIRROR_TICK_SECONDS:
+                    # Reconcile every Jellyfin-linked user's playlists on a timer, so a playlist
+                    # created (or edited, or deleted) in Jellyfin is picked up without waiting for
+                    # someone to open the Playlists screen. The same reconcile runs on read; this
+                    # is what makes it "at all times" rather than "next time a client asks".
+                    try:
+                        run_playlist_mirror(session, {})
+                    except Exception:  # noqa: BLE001 - never let the mirror stop the worker.
+                        session.rollback()
+                    last_playlist_mirror_tick = time.time()
+                if time.time() - last_podcast_scan_tick > PODCAST_SCAN_TICK_SECONDS:
+                    # Daily auto-scan: enqueue one dedup-safe podcast_scan when any feed is
+                    # subscribed. Fires on worker boot, then once a day. Users wanting a faster
+                    # cadence add a scan-podcasts automation.
+                    try:
+                        if session.scalar(select(Podcast.id).where(Podcast.enabled.is_(True)).limit(1)):
+                            enqueue_task(session, "podcast_scan", {})
+                            session.commit()
+                    except Exception:  # noqa: BLE001 - never let the podcast tick stop the worker.
+                        session.rollback()
+                    last_podcast_scan_tick = time.time()
+                if time.time() - last_deletion_prune_tick > DELETION_PRUNE_TICK_SECONDS:
+                    try:
+                        cutoff = datetime.now(timezone.utc) - LIBRARY_DELETION_RETENTION
+                        removed = session.query(LibraryDeletion).filter(
+                            LibraryDeletion.deleted_at < cutoff
+                        ).delete(synchronize_session=False)
+                        session.commit()
+                        if removed:
+                            write_app_log(f"Pruned {removed} library deletion tombstones", "info")
+                    except Exception as error:  # noqa: BLE001 - pruning must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Deletion tombstone prune failed: {error}", "warning")
+                    try:
+                        expire_stale_handoffs(session)
+                        session.commit()
+                    except Exception as error:  # noqa: BLE001 - housekeeping must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Handoff expiry sweep failed: {error}", "warning")
+                    last_deletion_prune_tick = time.time()
+                # The presence sweep that used to live here is gone on purpose: it took SQLite's
+                # single cross-process write lock every 30 seconds forever to mark abandoned
+                # sessions "stopped". Whether a session is still there is now derived at read time
+                # from its last_used_at, so nothing has to be written to find out.
+                try:
+                    await deliver_apns_notifications(session)
+                except Exception as error:  # noqa: BLE001 - push delivery must never stop the worker.
+                    session.rollback()
+                    write_app_log(f"Push delivery sweep failed: {error}", "warning")
+                await asyncio.sleep(2)
+                continue
+
+            if task.attempts >= MAX_TASK_ATTEMPTS:
+                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
+                fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
+                continue
+
+            try:
+                handler = TASK_HANDLERS.get(task.type)
+                if not handler:
+                    raise ValueError(f"No handler registered for task type {task.type}")
+                append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan"}:
+                    result = handler(session, task_to_payload(task), task)
+                else:
+                    result = handler(session, task_to_payload(task))
+                session.refresh(task)
+                if task.status == TaskStatus.canceled:
+                    append_task_log(session, task, f"{task.type} canceled", "warning")
+                    continue
+                completed_with_item_failures = bool(result.get("completed_with_item_failures"))
+                if result.get("errors") and not completed_with_item_failures:
+                    append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
+                    task.status = TaskStatus.failed
+                    task.result_json = json.dumps(result)
+                    task.error = result["errors"][0]
+                    task.lease_until = None
+                    session.commit()
+                else:
+                    append_task_log(
+                        session,
+                        task,
+                        f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}",
+                        "warning" if completed_with_item_failures else "info",
+                    )
+                    complete_task(session, task, result)
+                    if task.type == "jellyfin_scan":
+                        queue_automation_event(session, "scan_complete")
+                    if task.type == "ytdlp_download" and result.get("imported"):
+                        queue_automation_event(session, "download_complete")
+                    fire_queued_automation_events(session)
+            except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
+                try:
+                    session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
+                except Exception:  # noqa: BLE001
+                    pass
+                discard_queued_automation_events(session)
+                append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
+                try:
+                    create_notification(
+                        session,
+                        title=f"{task_notification_title(task.type)} couldn’t finish",
+                        body="Nudibranch could not finish this task. Open Activity for details.",
+                        event_type="task_failed",
+                        target_url="/activity",
+                    )
+                    fail_task(session, task, str(error))
+                except Exception:  # noqa: BLE001
+                    pass
+                if isinstance(error, (SystemExit, KeyboardInterrupt)):
+                    raise  # only exit the process for fatal OS signals
+
+
+def task_notification_title(task_type: str) -> str:
+    return {
+        "propose_import": "Import review",
+        "execute_proposal_batch": "Task queue item",
+        "sync_favorites_jellyfin": "Track remap",
+        "migrate_native_playlists_to_jellyfin": "Playlist migration",
+        "jellyfin_scan": "Jellyfin scan",
+        "check_files": "File check",
+        "check_duplicates": "Duplicate check",
+        "check_lyrics": "Lyrics check",
+        "check_album_covers": "Album cover check",
+        "check_artist_covers": "Artist cover check",
+        "refresh_covers": "Cover refresh",
+        "check_missing_tracks": "Missing tracks check",
+        "check_non_lossless": "Lossless check",
+        "check_musicbrainz_ids": "MusicBrainz info check",
+        "check_audio_content": "Audio content check",
+        "apply_replaygain": "ReplayGain",
+        "backup_now": "Backup",
+        "restore_default": "Restore",
+        "restore_backup": "Restore",
+        "clear_downloads": "Clear downloads",
+        "search_candidates": "Searching downloads",
+        "consolidate_folders": "Folder consolidation",
+        "enrich_imports": "Import enrichment",
+        "requeue_replacement": "Replacement search",
+        "create_pending_playlists": "Create playlist",
+        "podcast_scan": "Podcast scan",
+    }.get(task_type, task_type.replace("_", " ").title())
+
+
+def task_target_url(task_type: str) -> str:
+    if task_type in {"execute_proposal_batch", "search_candidates", "requeue_replacement"}:
+        return "/task-queue"
+    if task_type in {"propose_import"}:
+        return "/import"
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "refresh_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "apply_replaygain", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
+        return "/tools"
+    if task_type == "enrich_imports":
+        return "/library"
+    if task_type in {"create_pending_playlists", "migrate_native_playlists_to_jellyfin"}:
+        return "/playlists"
+    if task_type == "podcast_scan":
+        return "/podcasts"
+    return "/activity"
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(worker_loop())
+    except (SystemExit, KeyboardInterrupt):
+        write_app_log("Worker stopped (signal)")
+        raise
+    except Exception as error:  # noqa: BLE001
+        write_app_log(f"Worker crashed: {type(error).__name__}: {error}", level="error")
+        raise

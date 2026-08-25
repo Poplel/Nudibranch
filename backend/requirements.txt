@@ -1,0 +1,19 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+sqlalchemy==2.0.36
+pydantic-settings==2.7.1
+python-multipart==0.0.20
+httpx==0.28.1
+# h2 and PyJWT existed only for the direct APNS (.p8) path — HTTP/2 to Apple and the ES256 auth
+# token. Push is proxy-only now: plain HTTPS to the proxy, signed with the Ed25519 identity below.
+cryptography==44.0.0
+bcrypt==4.2.1
+rapidfuzz==3.10.1
+croniter==3.0.3
+mutagen==1.47.0
+# Cover art is stored square (services/cover_images.py); Pillow is the crop/re-encode.
+pillow==11.1.0
+yt-dlp[default,deno]==2026.6.9
+spotifyscraper==2.1.5
+beautifulsoup4==4.13.4
+feedparser==6.0.11
