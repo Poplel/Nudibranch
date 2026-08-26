@@ -3,6 +3,7 @@
 Nudibranch is a self-hosted music library and download manager. It may be operated as a standalone
 music player and downloader, or alongside an existing [Jellyfin](https://jellyfin.org) server.
 Nudibranch is split into two parts, a server that manages your library and downloads, and a client application for controlling the server and playing music. 
+
 For install instructions, and additional info, visit [nudibranch.poplel.xyz](https://nudibranch.poplel.xyz)
 
 ## About the name
