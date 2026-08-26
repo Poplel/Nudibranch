@@ -1,0 +1,82 @@
+services:
+  # Nudibranch backend API
+  api:
+    image: ghcr.io/poplel/nudibranch-api:latest
+    env_file: .env
+    command: ["uvicorn", "nudibranch.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    # Leave this commented out unless you're trying to run the api directly, or seperately from the client
+    #   - "8000:8000"
+    volumes:
+    # replace /path/to/your/files with the actual path
+      - ./app/config:/app/config # This puts the config in the install folder change ./app/config to somewhere else if you want them elsewhere, but probably leave it
+      - /path/to/your/files/import:/app/import # This is for importing your prexisting files, or external downloads
+      - /path/to/your/files/staging:/app/staging # this is where downloads go after downloading to get sorted and reviewed
+      - /path/to/your/files/library:/app/library # this is where your music actually lives
+      - /path/to/your/files/downloads:/app/downloads # this is where downloads come direct from slskd or ytdlp
+      - ./app/backups:/app/backups # this puts backups in the install folder, change ./app/backups to somewhere else if you want them elsewhere
+      - /path/to/your/files/podcasts:/app/podcasts # this is currently only used for cover art 
+    healthcheck:
+      test: ["CMD", "python", "-m", "nudibranch.healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  # Nudibranch backend worker
+  # Handles imports, enrichment, downloads, notifications, moving files, etc.
+  worker:
+    image: ghcr.io/poplel/nudibranch-api:latest
+    env_file: .env
+    command: ["python", "-m", "nudibranch.worker.main"]
+    depends_on:
+      api:
+        condition: service_healthy
+      slskd:
+        condition: service_started
+    volumes:
+      # THESE MUST MATCH WHAT YOU SET FOR THE API CONTAINER!!! It doesn't matter where they are, but they have to be the exact same!!!
+      # replace /path/to/your/files with the actual path
+      - ./app/config:/app/config
+      - /path/to/your/files/import:/app/import
+      - /path/to/your/files/staging:/app/staging
+      - /path/to/your/files/library:/app/library
+      - /path/to/your/files/downloads:/app/downloads
+      - ./app/backups:/app/backups
+      - /path/to/your/files/podcasts:/app/podcasts
+    restart: unless-stopped
+
+  # Nudibranch web UI client
+  web:
+    image: ghcr.io/poplel/nudibranch-web:latest
+    environment:
+      - NUDIBRANCH_API_URL=${NUDIBRANCH_API_URL:-http://api:8000}
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+
+  # slskd Soulseek client for downloading
+  slskd:
+    image: slskd/slskd:latest
+    environment:
+      - SLSKD_REMOTE_CONFIGURATION=true
+      - SLSKD_SLSK_USERNAME=${SLSKD_SLSK_USERNAME}
+      - SLSKD_SLSK_PASSWORD=${SLSKD_SLSK_PASSWORD}
+      - SLSKD_AUTH_USERNAME=${SLSKD_AUTH_USERNAME}
+      - SLSKD_AUTH_PASSWORD=${SLSKD_AUTH_PASSWORD}
+      - SLSKD_API_KEY=${SLSKD_API_KEY}
+      - SLSKD_SHARED_DIR=/music
+      - SLSKD_DOWNLOADS_DIR=/downloads
+      - SLSKD_INCOMPLETE_DIR=/incomplete
+    ports:
+      - "5030:5030"   # slskd web UI, optional, comment it out if you don't need access
+      - "50300:50300" # Soulseek listen port, this needs to be port forwarded for you to use slskd properly
+    volumes:
+      - ./app/slskd:/app
+      - /path/to/your/files/downloads:/downloads # THIS MUST BE THE SAME AS THE OTHER TWO CONTAINERS
+      - /path/to/your/files/library:/music # THIS MUST BE THE SAME AS THE OTHER TWO CONTAINERS, slsk is a sharing platform, this shares back
+      - ./app/slskd-incomplete:/incomplete
+    restart: unless-stopped
