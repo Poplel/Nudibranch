@@ -543,8 +543,8 @@ class ProposalItem(Base):
     suppress_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     batch: Mapped[ProposalBatch] = relationship(back_populates="items")
-    parent: Mapped["ProposalItem | None"] = relationship(remote_side=[id])
-    children: Mapped[list["ProposalItem"]] = relationship(cascade="all, delete-orphan")
+    parent: Mapped["ProposalItem | None"] = relationship(remote_side=[id], back_populates="children")
+    children: Mapped[list["ProposalItem"]] = relationship(back_populates="parent", cascade="all, delete-orphan")
 
 
 class Task(Base):
