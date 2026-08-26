@@ -1,0 +1,59 @@
+server {
+  listen 80;
+  server_name _;
+
+  root /usr/share/nginx/html;
+  index index.html;
+
+  # Audio uploads (import) can be large multi-file batches — nginx defaults to 1 MB
+  # and would 413 them otherwise.
+  client_max_body_size 4g;
+
+  # Compress JSON/text responses. The API returns everything uncompressed, and the
+  # library tree (~470 KB) is polled repeatedly — gzip cuts it ~6x, which matters a
+  # lot over the WAN tunnel where that bandwidth competes with audio streaming.
+  # gzip_proxied any → compress even though these come from the proxied upstream.
+  # Audio is served by the no-buffering stream location above and is not gzipped.
+  gzip on;
+  gzip_proxied any;
+  gzip_comp_level 5;
+  gzip_min_length 1024;
+  gzip_vary on;
+  gzip_types application/json application/javascript text/css text/plain
+             application/xml image/svg+xml;
+
+  # Audio streaming: relay straight through with no buffering so playback starts
+  # instantly and byte-range seeking works. The API itself serves HTTP ranges via
+  # FileResponse, so media is responsive even with no proxy in front at all — this
+  # block only stops the bundled proxy from re-buffering the stream.
+  location ~ ^/api/v1/library/tracks/[^/]+/stream$ {
+    proxy_pass ${NUDIBRANCH_API_URL};
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location /api/ {
+    proxy_pass ${NUDIBRANCH_API_URL}/api/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location /docs {
+    proxy_pass ${NUDIBRANCH_API_URL}/docs;
+  }
+
+  location /openapi.json {
+    proxy_pass ${NUDIBRANCH_API_URL}/api/v1/openapi.json;
+  }
+
+  location / {
+    try_files $uri /index.html;
+  }
+}
