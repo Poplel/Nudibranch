@@ -413,15 +413,23 @@ def _roll_up_container_status(batch: ProposalBatch) -> None:
 
 
 def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, actor_id: str | None = None) -> list[str]:
-    """Stop this work without destroying anything. Returns the ids actually cancelled.
+    """Stop this work. Returns the ids marked cancelled.
 
-    Distinct from `reject_items`, which deletes the subtree AND any downloaded files and tells the
-    requester their request was denied. A cancel means "not now": the rows stay, the wishlist entry
-    survives, and nothing on disk is thrown away beyond the partial transfer itself.
+    Distinct from `reject_items`, which is an approver's decline and tells the requester their
+    request was denied. A cancel is "not now" -- from whoever's item it is, requester or approver --
+    and per the 2026-09-21 product rule it is never a resting state: a cancelled item is deleted for
+    good, an emptied batch goes with it, and a cancelled wishlist request goes back to searching
+    rather than sitting there looking declined. This function only marks the state; the row/file
+    deletion, the empty-batch cleanup and the wishlist reset all happen in the worker's
+    `run_cancel_download_item`, AFTER it has told slskd/yt-dlp to stop and removed the partial file
+    -- deleting the row here, before the worker has looked up its transfer/manifest entry by it,
+    would hand the worker nothing to clean up with.
 
     ⚠️ Sets `selected = False` as well as the status. `queue_missing_manifest_download` re-queues
     any *selected* download item that has no manifest entry -- which is precisely the state a
     cancelled track is left in -- so without this the cancel is undone on the next ~3s scan tick.
+    `SETTLED_ITEM_STATUSES` (queue_state.py) includes `canceled` for the same reason, so nothing
+    re-queues it in the window between this call and the worker's delete either.
     """
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
@@ -444,7 +452,11 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         cancelled.append(item.id)
         if item.wishlist_item_id:
             wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
-            if wishlist_item and wishlist_item.status not in {"completed", "removed"}:
+            # ⚠️ "rejected" must be excluded here too, not just "completed"/"removed": the worker's
+            # reset (run_cancel_download_item) skips reviving a rejected/removed row, but it can
+            # only tell by reading THIS status -- overwriting a declined row to "canceled" here
+            # would erase the fact that it was ever declined and let the worker bring it back.
+            if wishlist_item and wishlist_item.status not in {"completed", "removed", "rejected"}:
                 wishlist_item.status = "canceled"
                 wishlist_item.stage = "canceled"
                 wishlist_item.status_changed_at = now
@@ -461,13 +473,15 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
                 if item.id not in cancelled:
                     cancelled.append(item.id)
         _roll_up_container_status(batch)
-    # A batch with nothing live left is finished, not pending forever.
+    # A batch with nothing live left is finished, not pending forever. `canceled`, not `rejected` --
+    # rejected means an approver declined the request, which is not what happened here, and this
+    # value is transient anyway: the worker deletes the batch outright once it has emptied it.
     if cancelled and all(
         item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}
         or not item.selected
         for item in _leaf_download_items(batch, None)
     ):
-        batch.status = ProposalStatus.rejected
+        batch.status = ProposalStatus.canceled
     session.commit()
     if cancelled:
         enqueue_task(session, "cancel_download_item", {"item_ids": cancelled})
@@ -475,11 +489,16 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
 
 
 def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mode: str = "next_candidate") -> list[str]:
-    """Put failed or cancelled downloads back in flight. Returns the ids actually retried.
+    """Put failed downloads back in flight. Returns the ids actually retried.
 
     ⚠️ Retry starts a download, so it is approval-equivalent and is gated like one -- a requester
     may cancel their own request but never retry it. The route enforces that; this function assumes
     the caller already checked.
+
+    ⚠️ `canceled` is deliberately NOT a retry target (it was, before 2026-09-21). A cancelled item
+    is now deleted outright by the worker's `run_cancel_download_item`, so by the time a retry could
+    reach it there is nothing here to put back in flight -- the wishlist row gets a fresh search
+    instead, which is retry's `research` mode in everything but name.
     """
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
@@ -489,7 +508,7 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     targets = _leaf_download_items(batch, item_ids)
     retried: list[str] = []
     for item in targets:
-        if item.status not in {ProposalStatus.failed, ProposalStatus.canceled}:
+        if item.status is not ProposalStatus.failed:
             continue
         payload = json.loads(item.payload_json or "{}")
         # Keep the history -- Issues should be able to say what was already tried -- but clear the
@@ -533,7 +552,11 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
                 # attention"), so a retry read as failed until the worker's next tick.
                 parent.stage = by_id[item_id].stage
                 parent_id = parent.parent_id
-        if batch.status in {ProposalStatus.failed, ProposalStatus.rejected, ProposalStatus.completed}:
+        # ⚠️ `canceled` belongs in this set for the same reason `rejected` used to before
+        # 2026-09-21: a batch can settle to `canceled` while still holding a `failed`-but-unselected
+        # item (cancel's "nothing live left" check treats unselected as settled too), and reviving
+        # that one item here must not leave a terminal batch status sitting on top of it.
+        if batch.status in {ProposalStatus.failed, ProposalStatus.rejected, ProposalStatus.canceled, ProposalStatus.completed}:
             batch.status = ProposalStatus.pending if mode == "research" else ProposalStatus.approved
         session.commit()
         enqueue_task(session, "retry_download_item", {"item_ids": retried, "mode": mode})

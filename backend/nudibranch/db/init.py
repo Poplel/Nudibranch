@@ -305,6 +305,7 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _migrate_permissions(session)
     _scrub_invalid_mbids(session)
     _drop_empty_rejected_batches(session)
+    _drop_canceled_leftovers(session)
     move_task_result_logs_to_app_log(session)
 
 
@@ -319,6 +320,28 @@ def _drop_empty_rejected_batches(session: Session) -> None:
         "DELETE FROM proposal_batches WHERE status = 'rejected' "
         "AND NOT EXISTS (SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id)"
     ))
+    session.commit()
+
+
+def _drop_canceled_leftovers(session: Session) -> None:
+    """One-time cleanup for the pre-2026-09-21 cancel behaviour.
+
+    Before that date, `cancel_items` left cancelled items sitting in the DB forever (instead of
+    deleting them once the worker had stopped their transfers) and marked a batch `rejected` -- not
+    `canceled` -- once everything in it had been cancelled, overloading "rejected" to mean two
+    different things. This deletes the leftover `canceled` item rows outright (their files are not
+    touched here -- a *live* cancel already removed those on disk; this migration only fixes rows a
+    completed cancel would already have cleaned up), then removes every `canceled` batch and every
+    `rejected` one, items and all. Idempotent: once nothing matches, both statements are no-ops.
+    """
+    # A `rejected` batch that still has items can only be one of those mislabeled cancels -- a real
+    # rejection deletes every item first -- so it goes whole, like a `canceled` one. Items are deleted
+    # explicitly because raw SQL here does not rely on SQLite enforcing the ON DELETE CASCADE.
+    session.execute(text(
+        "DELETE FROM proposal_items WHERE status = 'canceled' "
+        "OR batch_id IN (SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected'))"
+    ))
+    session.execute(text("DELETE FROM proposal_batches WHERE status IN ('canceled', 'rejected')"))
     session.commit()
 
 

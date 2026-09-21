@@ -28,7 +28,7 @@ from nudibranch.services.replaygain import measure_track_gain, write_replaygain_
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
-from nudibranch.services.proposals import approve_batch, item_ids_with_descendants
+from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -9657,12 +9657,15 @@ def _manifest_entries_for_items(item_ids: set[str]) -> list[dict]:
 
 
 def run_cancel_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
-    """Stop the real transfer behind a cancelled item and clean up after it.
+    """Stop the real transfer behind a cancelled item, then remove it for good.
 
-    The DB side already happened synchronously in `cancel_items` so the UI is instant; this is the
-    slow half -- telling slskd to drop the transfer, forgetting the manifest entry, and deleting the
-    partial file. Everything here is best-effort: a transfer slskd has already forgotten is not an
-    error, and the row is cancelled either way.
+    `cancel_items` already flipped these rows to `canceled` and unselected synchronously, so the UI
+    is instant and nothing re-queues them meanwhile; this is the slow half, and per the 2026-09-21
+    product rule ("cancelled means gone") it also does the actual deletion. Deletion happens HERE,
+    AFTER slskd/yt-dlp has been told to drop the transfer and the partial file is gone, not in
+    `cancel_items` -- the transfer/manifest lookups above key off the row (and the manifest entry,
+    keyed by item id), so deleting it first would leave nothing to look them up by. Everything up to
+    the delete is still best-effort: a transfer slskd has already forgotten is not an error.
     """
     item_ids = {str(i) for i in (payload.get("item_ids") or [])}
     if not item_ids:
@@ -9690,17 +9693,102 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
                 append_task_log(session, task, f"Could not remove canceled partial {path}: {error}", "warning")
         remove_download_manifest_entry(entry)
         removed += 1
+
+    # The destructive half. Gather batch/wishlist linkage before delete() expires it off the row.
+    items = [item for item_id in item_ids if (item := session.get(ProposalItem, item_id))]
+    batches: dict[str, ProposalBatch] = {}
+    wishlist_item_ids: set[str] = set()
+    for item in items:
+        if item.wishlist_item_id:
+            wishlist_item_ids.add(item.wishlist_item_id)
+        if item.batch_id and item.batch_id not in batches:
+            batch = session.get(ProposalBatch, item.batch_id)
+            if batch:
+                batches[item.batch_id] = batch
+        session.delete(item)
+    session.flush()
+
+    # A container (artist/album/track) left with no children by that deletion goes too -- the same
+    # cleanup `reject_items` runs -- and a batch left with no items at all follows it. So does a
+    # batch `cancel_items` settled as `canceled`: it can still hold unselected alternate candidates
+    # (or finished rows), which would otherwise keep a "canceled" husk in Issues forever. Deleting
+    # those rows never touches library files; only the cancelled leaves above had files to remove.
+    for batch in batches.values():
+        session.expire(batch, ["items"])
+        cleanup_empty_container_items(session, batch)
+        session.expire(batch, ["items"])
+        if not batch.items or batch.status == ProposalStatus.canceled:
+            session.delete(batch)
+    session.flush()
+
+    reset_canceled_wishlist_items(session, wishlist_item_ids)
     session.commit()
-    append_task_log(session, task, f"Canceled {len(item_ids)} download(s); cleaned {removed} transfer(s)")
+    append_task_log(
+        session, task, f"Canceled {len(item_ids)} download(s); cleaned {removed} transfer(s), removed {len(items)} row(s)"
+    )
     return {"canceled": len(item_ids), "cleaned": removed}
 
 
-def run_retry_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
-    """Put a failed or cancelled download back in flight.
+def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str]) -> None:
+    """A cancelled request is not declined -- put its wishlist row back to square one.
 
-    `cancel_items`/`retry_items` already reset the row; this clears the *physical* leftovers so the
-    retry starts clean. Without removing the old manifest entry the scan loop would see the item as
-    already in progress and never re-queue it.
+    Only once EVERY item this wishlist row still owns is gone: an album is many `ProposalItem`
+    download leaves sharing one `wishlist_item_id`, and cancelling a single track must not blow
+    away the wishlist row -- and re-search the whole album -- while its siblings are still
+    downloading under the same request. `rejected`/`removed` rows are a terminal human decision and
+    must never be revived by a cancel that happens to share their id.
+    """
+    if not wishlist_item_ids:
+        return
+    # Lazy: `api.routes` imports from `worker.main` elsewhere in the app, so importing it at module
+    # level here would be circular (see the `_jf_client`/`_mirror_pull` import a few thousand lines
+    # down for the same pattern).
+    from nudibranch.api.routes import wishlist_auto_search_enabled
+
+    auto_search = wishlist_auto_search_enabled(session)
+    now = datetime.now(timezone.utc)
+    for wishlist_item_id in wishlist_item_ids:
+        # NOT a plain existence check: `run_search_wishlist_item` marks its spent intent-batch
+        # items `completed` rather than deleting them, and every real download that finished is
+        # `completed` too, so both would permanently block this reset if not excluded here -- a
+        # wishlist item that ever auto-searched even once would never be eligible again.
+        still_live = session.scalar(
+            select(ProposalItem.id)
+            .where(ProposalItem.wishlist_item_id == wishlist_item_id)
+            .where(~ProposalItem.status.in_(queue_state.SETTLED_ITEM_STATUSES))
+            .limit(1)
+        )
+        if still_live:
+            continue
+        wishlist_item = session.get(WishlistItem, wishlist_item_id)
+        if not wishlist_item or wishlist_item.status in {"rejected", "removed"}:
+            continue
+        wishlist_item.batch_id = None
+        wishlist_item.item_id = None
+        wishlist_item.status_changed_at = now
+        if auto_search:
+            # The exact state a brand-new item gets in `create_wishlist_item` -- searching starts
+            # again immediately, with a fresh candidate batch. The old candidates are not reused.
+            wishlist_item.status = "searching"
+            wishlist_item.stage = ItemStage.searching.value
+        else:
+            wishlist_item.status = "wanted"
+            wishlist_item.stage = None
+        session.flush()
+        if auto_search:
+            # Enqueued after the flush, same reasoning as `create_wishlist_item`: the worker must
+            # not be able to claim `search_wishlist_item` before the row it reads exists as searching.
+            enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": wishlist_item.id})
+
+
+def run_retry_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Put a failed download back in flight.
+
+    (Only failed, since 2026-09-21 -- a cancelled item is deleted by `run_cancel_download_item`
+    rather than left around, so `retry_items` no longer produces one of these for a cancelled row.)
+    `retry_items` already reset the row; this clears the *physical* leftovers so the retry starts
+    clean. Without removing the old manifest entry the scan loop would see the item as already in
+    progress and never re-queue it.
     """
     item_ids = {str(i) for i in (payload.get("item_ids") or [])}
     mode = str(payload.get("mode") or "next_candidate")
