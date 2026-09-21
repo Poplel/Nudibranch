@@ -304,7 +304,22 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _migrate_library_timestamps(session)
     _migrate_permissions(session)
     _scrub_invalid_mbids(session)
+    _drop_empty_rejected_batches(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _drop_empty_rejected_batches(session: Session) -> None:
+    """Delete fully rejected batches left behind before rejection started removing them.
+
+    Rejecting deletes a batch's items, and since 2026-09-21 the reject route deletes the emptied
+    batch as well. Rows written before that remain as empty `rejected` husks in the Task Queue
+    history. Idempotent: once they are gone this matches nothing.
+    """
+    session.execute(text(
+        "DELETE FROM proposal_batches WHERE status = 'rejected' "
+        "AND NOT EXISTS (SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id)"
+    ))
+    session.commit()
 
 
 def _migrate_queue_state_columns(session: Session) -> None:

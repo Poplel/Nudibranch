@@ -4313,6 +4313,17 @@ def create_wishlist_item(
             track=payload.track,
         )
         return serialize_wishlist_item(existing)
+    # Requesting something again replaces its declined row rather than listing it twice.
+    for declined in session.scalars(
+        select(WishlistItem)
+        .where(WishlistItem.user_id == user.id)
+        .where(WishlistItem.kind == payload.kind)
+        .where(WishlistItem.artist == payload.artist)
+        .where(WishlistItem.album == payload.album)
+        .where(WishlistItem.track == payload.track)
+        .where(WishlistItem.status == "rejected")
+    ):
+        session.delete(declined)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
     auto_search = wishlist_auto_search_enabled(session)
@@ -6323,7 +6334,15 @@ def reject(
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
-    return serialize_batch(batch)
+    out = serialize_batch(batch)
+    # A fully rejected batch is gone for good: reject_items already removed its items and files, and
+    # the requester's wishlist row (status "rejected") is the only record of the decision. Keeping
+    # the empty batch would leave a husk in the Task Queue history with nothing on it to act on.
+    # Serialized first so the response keeps its shape (iOS decodes ProposalBatchDTO from it).
+    if batch.status == ProposalStatus.rejected and not batch.items:
+        session.delete(batch)
+        session.commit()
+    return out
 
 
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"], summary="List background tasks")
@@ -7113,7 +7132,9 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
 
 
 def terminal_wishlist_expired(item: WishlistItem) -> bool:
-    if item.status not in {"rejected", "completed", "removed"}:
+    # "rejected" deliberately never expires: a declined request stays on the requester's list until
+    # they remove it or request it again (which replaces it -- see create_wishlist_item).
+    if item.status not in {"completed", "removed"}:
         return False
     changed_at = item.status_changed_at or item.created_at
     if changed_at.tzinfo is None:
