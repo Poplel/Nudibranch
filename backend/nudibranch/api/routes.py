@@ -16,8 +16,10 @@ import httpx
 from sqlalchemy import case, delete, func, literal, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
-from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_permission, resolve_media_user
+from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_any_permission, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
+    CancelRequest,
+    RetryRequest,
     CoverFromURLRequest,
     AlbumLookupRequest,
     AutomationCreate,
@@ -118,6 +120,10 @@ from nudibranch.api.schemas import (
     EpisodeProgressIn,
     PaginatedEpisodes,
     PodcastNotificationIn,
+    CandidateOut,
+    FailureOut,
+    ProgressOut,
+    RequestRefOut,
 )
 from nudibranch.db.models import (
     Album,
@@ -155,6 +161,9 @@ from nudibranch.db.models import (
     User,
     UserPermission,
     WishlistItem,
+    ItemStage,
+    ProposalFlow,
+    QueueBucket,
 )
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
@@ -162,12 +171,13 @@ from nudibranch.services.cover_images import square_cover_bytes
 from nudibranch.services.auth import generate_token, hash_password, hash_token, token_prefix, verify_password
 from nudibranch.services.imports import discover_import_files, read_audio_metadata, safe_path_part, SUPPORTED_AUDIO_EXTENSIONS
 from nudibranch.services import podcasts as podcast_service
+from nudibranch.services import queue_state
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification, push_identity
-from nudibranch.services.proposals import approve_batch, reject_items, set_selection
+from nudibranch.services.proposals import ApprovalNotPermitted, approve_batch, cancel_items, reject_items, retry_items, set_selection
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
@@ -4289,7 +4299,7 @@ def create_wishlist_item(
         .where(WishlistItem.artist == payload.artist)
         .where(WishlistItem.album == payload.album)
         .where(WishlistItem.track == payload.track)
-        .where(WishlistItem.status.in_(["wanted", "review", "approved"]))
+        .where(WishlistItem.status.in_(["wanted", "searching", "review", "approved", "staged", "downloading"]))
     )
     if existing:
         write_app_log(
@@ -4305,9 +4315,22 @@ def create_wishlist_item(
         return serialize_wishlist_item(existing)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
+    auto_search = wishlist_auto_search_enabled(session)
+    if auto_search:
+        # Searching starts immediately, with no human step in between -- that is the whole point of
+        # the rework.  The APPROVAL gate has not moved to the client: the candidate batch this
+        # produces is created `pending` and still needs approvals:manage (or wishlist:approve_all)
+        # to become an actual download, so a discover-only user still cannot self-approve.
+        item.status = "searching"
+        item.stage = ItemStage.searching.value
     session.add(item)
     session.commit()
     session.refresh(item)
+    if auto_search:
+        # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
+        # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+        session.commit()
     write_app_log(
         "Wishlist item created",
         feature=payload.source or "wishlist",
@@ -4370,6 +4393,14 @@ def propose_wishlist_items(
     # this closes the matching server-side gap that let other clients call this directly.)
     user: User = Depends(require_permission(Permission.wishlist_approve_all)),
 ) -> ProposalBatchOut:
+    if wishlist_auto_search_enabled(session):
+        # Superseded: candidate search now starts automatically the moment something is wishlisted,
+        # and the approval gate moved to the Task Queue's Review bucket.  410 rather than 404 so an
+        # older client shows a legible message instead of "not found".
+        raise HTTPException(
+            status_code=410,
+            detail="Wishlist requests now search automatically; approve downloads in the Task Queue.",
+        )
     reconcile_stale_approved_wishlist_items(session, user)
     query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
     all_wanted_items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
@@ -4461,12 +4492,12 @@ def propose_wishlist_items(
             )
         wishlist_item.status = "review"
         wishlist_item.status_changed_at = datetime.now(timezone.utc)
-    notify_wishlist_decisions(session, items, "Wishlist request approved", "added to the task queue", "wishlist_approved", "/downloads")
+    notify_wishlist_decisions(session, items, "Download started", "is downloading", "wishlist_approved", "/requests")
     for denied_item in denied_items:
         denied_item.status = "rejected"
         denied_item.status_changed_at = datetime.now(timezone.utc)
     if denied_items:
-        notify_wishlist_decisions(session, denied_items, "Wishlist request denied", "not selected for download", "wishlist_denied", "/wishlist")
+        notify_wishlist_decisions(session, denied_items, "Request declined", "was not approved for download", "wishlist_denied", "/wishlist")
     session.commit()
     session.refresh(batch)
     enqueue_task(session, "search_candidates", {"batch_id": batch.id})
@@ -5988,25 +6019,74 @@ def approval_item_is_actionable(item: ProposalItem) -> bool:
     return False
 
 
+def resolve_requester_names(session: Session, batches: list[ProposalBatch]) -> dict[str, str]:
+    """Display names for every requester appearing in these batches, in one query.
+
+    Without this the UI shows a raw user id next to someone's request, which is exactly the kind of
+    implementation detail that must never reach a row (CLAUDE.md section 0).
+    """
+    ids = {item.requester_id for batch in batches for item in batch.items if item.requester_id}
+    if not ids:
+        return {}
+    rows = session.execute(select(User.id, User.display_name).where(User.id.in_(ids))).all()
+    return {row[0]: row[1] for row in rows}
+
+
+def filter_batches_for_bucket(
+    batches: list[ProposalBatch],
+    bucket: QueueBucket | None,
+    stages: set[ItemStage] | None = None,
+) -> list[ProposalBatch]:
+    """Narrow to a Task Queue bucket. Done in Python because `bucket` is derived, not stored."""
+    if bucket is None and not stages:
+        return batches
+    kept = []
+    for batch in batches:
+        flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+        batch_stage = queue_state.resolve_batch_stage(list(batch.items), batch.status)
+        if bucket is not None and queue_state.bucket_for(flow, batch_stage) is not bucket:
+            continue
+        if stages and batch_stage not in stages:
+            continue
+        kept.append(batch)
+    return kept
+
+
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")
 def list_approvals(
+    bucket: QueueBucket | None = None,
+    flow: ProposalFlow | None = None,
+    kind: ProposalKind | None = None,
+    requester: str | None = None,
+    include_settled: bool = False,
+    limit: int = 200,
+    offset: int = 0,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> list[ProposalBatchOut]:
-    batches = list(
-        session.scalars(
-            select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
-            .where(
-                ProposalBatch.status.in_(
-                    [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
-                )
-            )
-            .order_by(ProposalBatch.created_at.desc())
-        )
+    # No query params == exactly the previous behaviour, so existing clients are unaffected.
+    statuses = [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
+    if include_settled:
+        statuses = statuses + [ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled]
+    query = (
+        select(ProposalBatch)
+        .options(selectinload(ProposalBatch.items))
+        .where(ProposalBatch.status.in_(statuses))
     )
+    if flow is not None:
+        query = query.where(ProposalBatch.flow == flow)
+    if kind is not None:
+        query = query.where(ProposalBatch.kind == kind)
+    if requester:
+        query = query.where(
+            ProposalBatch.items.any(ProposalItem.requester_id == requester)
+        )
+    batches = list(session.scalars(query.order_by(ProposalBatch.created_at.desc())))
     batches = prune_settled_batches(session, batches)
-    return [serialize_batch(batch) for batch in batches]
+    batches = filter_batches_for_bucket(batches, bucket)
+    batches = batches[offset : offset + limit] if limit else batches[offset:]
+    names = resolve_requester_names(session, batches)
+    return [serialize_batch(batch, names) for batch in batches]
 
 
 @router.post("/approvals/{batch_id}/selection", tags=["approvals"], summary="Update approval item selection", response_model=ProposalBatchOut)
@@ -6028,13 +6108,208 @@ def approve(
     batch_id: str,
     payload: ProposalApproveRequest | None = None,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.approvals_manage)),
+    user: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> TaskOut:
     try:
-        task = approve_batch(session, batch_id, payload.item_ids if payload else None)
+        task = approve_batch(session, batch_id, payload.item_ids if payload else None, actor=user)
+    except ApprovalNotPermitted as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     return serialize_task(task)
+
+
+def prune_batch_to_requester(batch: ProposalBatch, requester_id: str) -> list[ProposalItem]:
+    """This requester's own items, plus the ancestor chain that gives them somewhere to hang.
+
+    A download batch is shared: `create_album_download_candidate_batch` groups several requests
+    into one batch, so handing a `discover`-only user the whole thing would leak other people's
+    requests.  Dropping the containers instead would dump candidate rows flat with no artist/album
+    to nest under, which is what the tree rendering needs.
+    """
+    by_id = {item.id: item for item in batch.items}
+    keep: set[str] = set()
+    for item in batch.items:
+        if item.requester_id != requester_id:
+            continue
+        keep.add(item.id)
+        parent_id = item.parent_id
+        while parent_id and parent_id in by_id and parent_id not in keep:
+            keep.add(parent_id)
+            parent_id = by_id[parent_id].parent_id
+    return [item for item in batch.items if item.id in keep]
+
+
+@router.get("/requests", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="My music requests and their progress")
+def list_requests(
+    bucket: QueueBucket | None = None,
+    include_settled: bool = False,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> list[ProposalBatchOut]:
+    """What the requester is waiting on.
+
+    This is the route that did not exist.  `GET /wishlist/approvals` decided visibility from a
+    TOP-LEVEL `payload_json["user_id"]`, but candidate items only ever carried it nested at
+    `payload["request"]["user_id"]` -- so a `discover`-only user got an empty list and had no way
+    to see their own request's candidates or progress at all.
+
+    An approver gets the unfiltered view of both request gates; everyone else gets their own items
+    with the ancestor chain kept.
+    """
+    statuses = [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
+    if include_settled:
+        statuses = statuses + [ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled]
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.status.in_(statuses))
+            .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
+            .order_by(ProposalBatch.created_at.desc())
+        )
+    )
+    batches = filter_batches_for_bucket(batches, bucket)
+
+    is_approver = user.is_admin or any(
+        permission.permission in {Permission.approvals_manage, Permission.wishlist_approve_all}
+        for permission in user.permissions
+    )
+    names = resolve_requester_names(session, batches)
+    out: list[ProposalBatchOut] = []
+    for batch in batches:
+        if is_approver:
+            out.append(serialize_batch(batch, names))
+            continue
+        mine = prune_batch_to_requester(batch, user.id)
+        if not mine:
+            continue
+        serialized = serialize_batch(batch, names)
+        keep_ids = {item.id for item in mine}
+        serialized.items = [item for item in serialized.items if item.id in keep_ids]
+        # A requester may stop their own request but never start one, and never retry -- retry
+        # restarts a download, so it is approval-equivalent and gated like one.
+        for item in serialized.items:
+            item.can_approve = False
+            item.can_retry = False
+        out.append(serialized)
+    return out
+
+
+@router.post("/requests/{batch_id}/approve", response_model=TaskOut, tags=["wishlist"], summary="Approve a music request")
+def approve_request(
+    batch_id: str,
+    payload: ProposalApproveRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
+) -> TaskOut:
+    """Approve a download request (gate a) -- the Review bucket's action.
+
+    Separate from `/approvals/{id}/approve` because it admits `wishlist:approve_all`, whose whole
+    job is approving other people's music.  It is scoped to `download_review` batches so that
+    permission can never reach a metadata, import or delete proposal, and `approve_batch` still
+    applies the anti-self-approval rule on top.
+    """
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Request not found")
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    if flow is not ProposalFlow.download_review:
+        raise HTTPException(status_code=403, detail="This endpoint only approves download requests")
+    try:
+        task = approve_batch(session, batch_id, payload.item_ids if payload else None, actor=user)
+    except ApprovalNotPermitted as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return serialize_task(task)
+
+
+def _may_act_on_request_batch(batch: ProposalBatch, user: User, *, require_approver: bool) -> None:
+    """Shared gate for retry/cancel on a request batch.
+
+    Cancel is available to the person who asked for it -- stopping your own request is not a
+    privileged act. Retry is NOT: it starts a download, so it is approval-equivalent and needs the
+    same permission approving does.
+    """
+    is_approver = user.is_admin or any(
+        permission.permission in {Permission.approvals_manage, Permission.wishlist_approve_all}
+        for permission in user.permissions
+    )
+    if is_approver:
+        return
+    if require_approver:
+        raise HTTPException(status_code=403, detail="Requires approvals:manage or wishlist:approve_all")
+    requesters = {item.requester_id for item in batch.items if item.requester_id}
+    if requesters and requesters != {user.id}:
+        # Batches are shared between requesters; cancelling one must not stop someone else's track.
+        raise HTTPException(status_code=403, detail="This request includes other people's items")
+    if not requesters:
+        raise HTTPException(status_code=403, detail="Requires approvals:manage")
+
+
+@router.post("/approvals/{batch_id}/cancel", response_model=ProposalBatchOut, tags=["approvals"], summary="Cancel queued or running downloads")
+def cancel_batch_items(
+    batch_id: str,
+    payload: CancelRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _may_act_on_request_batch(batch, user, require_approver=False)
+    try:
+        cancel_items(session, batch_id, payload.item_ids if payload else None, actor_id=user.id)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    session.refresh(batch)
+    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+
+
+@router.post("/approvals/{batch_id}/retry", response_model=ProposalBatchOut, tags=["approvals"], summary="Retry failed or cancelled downloads")
+def retry_batch_items(
+    batch_id: str,
+    payload: RetryRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _may_act_on_request_batch(batch, user, require_approver=True)
+    try:
+        retry_items(session, batch_id, payload.item_ids if payload else None, payload.mode if payload else "next_candidate")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    session.refresh(batch)
+    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+
+
+@router.post("/approvals/items/{item_id}/cancel", response_model=ProposalBatchOut, tags=["approvals"], summary="Cancel one item")
+def cancel_single_item(
+    item_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    item = session.get(ProposalItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return cancel_batch_items(item.batch_id, CancelRequest(item_ids=[item_id]), session, user)
+
+
+@router.post("/approvals/items/{item_id}/retry", response_model=ProposalBatchOut, tags=["approvals"], summary="Retry one item")
+def retry_single_item(
+    item_id: str,
+    payload: RetryRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    item = session.get(ProposalItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    mode = payload.mode if payload else "next_candidate"
+    return retry_batch_items(item.batch_id, RetryRequest(item_ids=[item_id], mode=mode), session, user)
 
 
 @router.post("/approvals/{batch_id}/reject", tags=["approvals"], summary="Reject proposal items", response_model=ProposalBatchOut)
@@ -6490,6 +6765,19 @@ def get_or_create_favorites(session: Session, user_id: str) -> Playlist:
     return playlist
 
 
+# Rollback switch for auto-search-on-wishlist (phase 3).  Default ON once both clients ship; set
+# the AppSetting to "0"/"false" to fall back to the old manual /wishlist/approvals flow without a
+# deploy, e.g. if auto-search turns out to hammer slskd.
+WISHLIST_AUTO_SEARCH_KEY = "wishlist_auto_search"
+
+
+def wishlist_auto_search_enabled(session: Session) -> bool:
+    setting = session.get(AppSetting, WISHLIST_AUTO_SEARCH_KEY)
+    if setting is None:
+        return True
+    return str(setting.value).strip().casefold() not in {"0", "false", "no", "off"}
+
+
 def set_app_setting(session: Session, key: str, value: str) -> None:
     setting = session.get(AppSetting, key)
     if not setting:
@@ -6728,10 +7016,77 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
     return sessions
 
 
-def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
-    status = item.status
+# The typed `stage` is authoritative, but `status` keeps its legacy vocabulary for one release so
+# clients whose label maps predate this change do not fall through to rendering a raw wire string.
+# Drop this mapping once both clients read `status_code`.
+_STAGE_TO_LEGACY_WISHLIST_STATUS: dict[ItemStage, str] = {
+    ItemStage.waiting: "wanted",
+    ItemStage.searching: "review",
+    ItemStage.awaiting_approval: "review",
+    ItemStage.approved: "approved",
+    ItemStage.queued: "downloading",
+    ItemStage.downloading: "downloading",
+    ItemStage.retrying: "downloading",
+    ItemStage.staging: "downloading",
+    ItemStage.verifying: "downloading",
+    ItemStage.staged: "approved",
+    ItemStage.importing: "approved",
+    ItemStage.completed: "completed",
+    ItemStage.failed: "review",
+    ItemStage.canceled: "rejected",
+    ItemStage.rejected: "rejected",
+}
+
+_WISHLIST_STAGE_LABELS: dict[ItemStage, str] = {
+    ItemStage.waiting: "Waiting",
+    ItemStage.searching: "Finding candidates",
+    ItemStage.awaiting_approval: "Awaiting approval",
+    ItemStage.approved: "Approved",
+    ItemStage.queued: "Queued",
+    ItemStage.downloading: "Downloading",
+    ItemStage.retrying: "Retrying",
+    ItemStage.staging: "Moving into place",
+    ItemStage.verifying: "Verifying",
+    # Deliberately not "Completed": the files exist but have NOT been approved into the library
+    # yet.  Reporting this as done is the bug where a rejected import still read "completed".
+    ItemStage.staged: "Downloaded - waiting for approval to add",
+    ItemStage.importing: "Adding to library",
+    ItemStage.completed: "In your library",
+    ItemStage.failed: "Needs attention",
+    ItemStage.canceled: "Canceled",
+    ItemStage.rejected: "Declined",
+}
+
+
+def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) -> ItemStage:
+    """The request's stage, preferring the denormalized cache the worker keeps current."""
+    if item.stage:
+        try:
+            return ItemStage(item.stage)
+        except ValueError:
+            pass
+    status = (item.status or "").casefold()
     if status == "approved" and downloading_ids and item.id in downloading_ids:
-        status = "downloading"
+        return ItemStage.downloading
+    return {
+        "wanted": ItemStage.waiting,
+        "searching": ItemStage.searching,
+        "review": ItemStage.awaiting_approval,
+        "awaiting_approval": ItemStage.awaiting_approval,
+        "approved": ItemStage.approved,
+        "downloading": ItemStage.downloading,
+        "staged": ItemStage.staged,
+        "completed": ItemStage.completed,
+        "rejected": ItemStage.rejected,
+        "canceled": ItemStage.canceled,
+        "failed": ItemStage.failed,
+        "removed": ItemStage.rejected,
+    }.get(status, ItemStage.waiting)
+
+
+def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
+    stage = wishlist_stage(item, downloading_ids)
+    label = _WISHLIST_STAGE_LABELS.get(stage, stage.value)
     return WishlistOut(
         id=item.id,
         user_id=item.user_id,
@@ -6740,7 +7095,18 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
         artist=item.artist,
         album=item.album,
         track=item.track,
-        status=status,
+        status=_STAGE_TO_LEGACY_WISHLIST_STATUS.get(stage, item.status),
+        stage=stage,
+        status_code=stage.value,
+        status_label=label,
+        batch_id=item.batch_id,
+        item_id=item.item_id,
+        progress=ProgressOut(
+            value=100.0 if stage is ItemStage.completed else 0.0,
+            label=label,
+            indeterminate=stage in (ItemStage.searching, ItemStage.verifying, ItemStage.importing),
+            stage=stage,
+        ),
         created_at=item.created_at,
         status_changed_at=item.status_changed_at or item.created_at,
     )
@@ -6843,7 +7209,7 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
     )
     for batch in batches:
         for item in batch.items:
-            if item.kind != ProposalKind.download or item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed}:
+            if item.kind != ProposalKind.download or item.status in (queue_state.SETTLED_ITEM_STATUSES | {ProposalStatus.failed}):
                 continue
             payload = json.loads(item.payload_json or "{}")
             # queue_download = slskd; queue_ytdlp_download = the YouTube fallback retry. Both
@@ -6902,6 +7268,9 @@ def notify_wishlist_decisions(
             event_type=event_type,
             target_url=target_url,
             user_id=user_id,
+            # Collapse repeat decisions for one person into a single row.  Keyed per user because
+            # these are addressed rows, not a broadcast, and there is no batch to key on here.
+            group_key=f"wishlist-decision:{event_type}:{user_id}",
         )
 
 
@@ -6976,30 +7345,84 @@ def count_admins(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(User).where(User.is_admin.is_(True))) or 0
 
 
-def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:
+def serialize_proposal_item(
+    item: ProposalItem,
+    flow: ProposalFlow,
+    requester_names: dict[str, str] | None = None,
+) -> ProposalItemOut:
+    """One item, with its stage/bucket/progress/candidate resolved server-side.
+
+    Every derived value is computed once, here, from a single payload parse -- the clients used to
+    each re-derive them by pattern-matching the payload's free text, which is how four different
+    status vocabularies grew.
+    """
+    payload = queue_state.payload_of(item)
+    stage = queue_state.resolve_stage(item, payload)
+    request_block = payload.get("request")
+    requester_id = item.requester_id or (
+        request_block.get("user_id") if isinstance(request_block, dict) else None
+    )
+    requester_name = (requester_names or {}).get(requester_id or "")
+    candidate = queue_state.candidate_out(payload)
+    failure = queue_state.failure_out(payload, stage)
+    request_ref = queue_state.request_out(item, payload, requester_name)
+    return ProposalItemOut(
+        id=item.id,
+        batch_id=item.batch_id,
+        parent_id=item.parent_id,
+        title=item.title,
+        kind=item.kind,
+        status=item.status,
+        selected=item.selected,
+        old_value=item.old_value,
+        new_value=item.new_value,
+        stage=stage,
+        status_code=stage.value,
+        status_label=queue_state.status_label(item, stage, payload),
+        bucket=queue_state.bucket_for(flow, stage),
+        action=payload.get("action") or None,
+        progress=ProgressOut(**queue_state.item_progress(item, stage, payload)),
+        candidate=CandidateOut(**candidate) if candidate else None,
+        failure=FailureOut(**failure) if failure else None,
+        request=RequestRefOut(**request_ref) if request_ref else None,
+        can_approve=queue_state.can_approve(stage),
+        can_retry=queue_state.can_retry(stage, flow),
+        can_cancel=queue_state.can_cancel(stage),
+        payload_json=item.payload_json,
+    )
+
+
+def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None = None) -> ProposalBatchOut:
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    items = list(batch.items)
+    stage = queue_state.resolve_batch_stage(items, batch.status)
+    requesters: list[RequestRefOut] = []
+    seen: set[str] = set()
+    for item in items:
+        payload = queue_state.payload_of(item)
+        ref = queue_state.request_out(item, payload, (requester_names or {}).get(item.requester_id or ""))
+        if not ref:
+            continue
+        key = str(ref.get("requester_id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        requesters.append(RequestRefOut(**ref))
     return ProposalBatchOut(
         id=batch.id,
         title=batch.title,
         kind=batch.kind,
         status=batch.status,
+        flow=flow,
+        stage=stage,
+        bucket=queue_state.bucket_for(flow, stage),
+        progress=ProgressOut(**queue_state.batch_progress(items, batch.status)),
+        requesters=requesters,
+        counts=queue_state.batch_counts(items),
         tree_path=batch.tree_path,
         created_at=batch.created_at,
         updated_at=batch.updated_at,
-        items=[
-            ProposalItemOut(
-                id=item.id,
-                batch_id=item.batch_id,
-                parent_id=item.parent_id,
-                title=item.title,
-                kind=item.kind,
-                status=item.status,
-                selected=item.selected,
-                old_value=item.old_value,
-                new_value=item.new_value,
-                payload_json=item.payload_json,
-            )
-            for item in batch.items
-        ],
+        items=[serialize_proposal_item(item, flow, requester_names) for item in items],
     )
 
 

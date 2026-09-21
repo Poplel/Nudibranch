@@ -171,3 +171,28 @@ def require_permission(permission: Permission):
 
     dependency.__nudibranch_permission__ = permission
     return dependency
+
+
+def require_any_permission(*permissions: Permission):
+    """Admit a user holding ANY of these permissions.
+
+    Needed because approving a music request is legitimately two different jobs: `approvals:manage`
+    (approve anything) and `wishlist:approve_all` (approve other people's music requests).  The
+    route only decides *entry*; the narrower rule -- that a `wishlist:approve_all` holder may not
+    approve a batch containing only their own requests -- is enforced in `approve_batch`, so it
+    cannot be bypassed by a future route that forgets it.
+    """
+
+    def dependency(user: User = Depends(get_current_user)) -> User:
+        if user.is_admin:
+            return user
+        held = {user_permission.permission for user_permission in user.permissions}
+        if held & set(permissions):
+            return user
+        names = " or ".join(permission.value for permission in permissions)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Requires {names}")
+
+    # The OpenAPI customisation reads a single permission; report the first as the headline one.
+    if permissions:
+        dependency.__nudibranch_permission__ = permissions[0]
+    return dependency

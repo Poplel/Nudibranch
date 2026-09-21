@@ -3,7 +3,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from nudibranch.db.models import NotificationStatus, ProposalKind, ProposalStatus, TaskStatus
+from nudibranch.db.models import (
+    ItemStage,
+    NotificationStatus,
+    ProposalFlow,
+    ProposalKind,
+    ProposalStatus,
+    QueueBucket,
+    TaskStatus,
+)
 
 
 class LoginRequest(BaseModel):
@@ -210,6 +218,15 @@ class LibraryTreeArtist(BaseModel):
     albums: list[LibraryTreeAlbum] = Field(default_factory=list)
 
 
+class ProgressOut(BaseModel):
+    """Truthful progress for any item of any kind. `value` is 0-100."""
+
+    value: float = 0.0
+    label: str = ""
+    indeterminate: bool = False
+    stage: ItemStage = ItemStage.waiting
+
+
 class WishlistCreate(BaseModel):
     kind: str = Field(pattern="^(artist|album|track)$")
     artist: str
@@ -223,6 +240,15 @@ class WishlistOut(WishlistCreate):
     user_id: str
     owner_name: str | None = None
     status: str
+    # Typed counterparts to the free-string `status` above, plus the first-class link to the work
+    # serving this request. `status` keeps its legacy vocabulary for one release so existing
+    # clients' label maps do not fall through to raw strings.
+    stage: ItemStage = ItemStage.waiting
+    status_code: str = ItemStage.waiting.value
+    status_label: str = ""
+    batch_id: str | None = None
+    item_id: str | None = None
+    progress: ProgressOut = Field(default_factory=ProgressOut)
     created_at: datetime
     status_changed_at: datetime
 
@@ -230,6 +256,51 @@ class WishlistOut(WishlistCreate):
 class WishlistApprovalRequest(BaseModel):
     item_ids: list[str] | None = None
     deny_unselected: bool = False
+
+
+class CandidateOut(BaseModel):
+    """One download candidate, typed.
+
+    Every field here was already computed by the matcher and stored on the item -- size, duration,
+    queue_length, free_upload_slots and upload_speed were simply dropped before reaching any UI,
+    which is exactly what a human needs to sanity-check a match the ranker got wrong.
+    """
+
+    username: str | None = None
+    filename: str | None = None
+    folder: str | None = None
+    size_bytes: int | None = None
+    duration_seconds: float | None = None
+    bitrate: int | None = None
+    format: str | None = None          # "FLAC", "MP3 320"
+    quality: str | None = None         # "lossless" | "lossy" | "unknown"
+    confidence: int | None = None      # 0-100
+    same_album_folder: bool = False
+    album_folder_rank: int | None = None
+    free_upload_slots: bool | None = None
+    queue_length: int | None = None
+    upload_speed: float | None = None
+
+
+class FailureOut(BaseModel):
+    """Why something failed, so a client never has to send the user to the task log."""
+
+    reason: str | None = None
+    retry_count: int = 0
+    auto_retry_exhausted: bool = False
+    retryable: bool = True
+    tried_candidates: int = 0
+
+
+class RequestRefOut(BaseModel):
+    """Who asked for this, and for what."""
+
+    artist: str | None = None
+    album: str | None = None
+    track: str | None = None
+    wishlist_item_id: str | None = None
+    requester_id: str | None = None
+    requester_name: str | None = None
 
 
 class ProposalItemOut(BaseModel):
@@ -242,6 +313,23 @@ class ProposalItemOut(BaseModel):
     selected: bool
     old_value: str | None = None
     new_value: str | None = None
+    # Typed state. `status_code` is `stage.value`; clients branch on it and render `status_label`,
+    # and must never pattern-match a status string again.
+    stage: ItemStage = ItemStage.waiting
+    status_code: str = ItemStage.waiting.value
+    status_label: str = ""
+    bucket: QueueBucket = QueueBucket.changes
+    action: str | None = None
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+    candidate: CandidateOut | None = None
+    failure: FailureOut | None = None
+    request: RequestRefOut | None = None
+    can_approve: bool = False
+    can_retry: bool = False
+    can_cancel: bool = False
+    # DEPRECATED, still sent: `ProposalItemDTO.payloadJson` is non-optional in shipped iOS builds,
+    # so removing this breaks decoding of the whole approvals response for every installed app.
+    # Drop only once both clients have shipped against the typed fields above.
     payload_json: str = "{}"
 
 
@@ -250,10 +338,32 @@ class ProposalBatchOut(BaseModel):
     title: str
     kind: ProposalKind
     status: ProposalStatus
+    # Which approval gate this is, and therefore which bucket it renders in.
+    flow: ProposalFlow = ProposalFlow.library_change
+    stage: ItemStage = ItemStage.waiting
+    bucket: QueueBucket = QueueBucket.changes
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+    # Distinct requesters across the batch's items, so an approver can see whose request this is
+    # without parsing anything -- and so a client can refuse to merge rows spanning two people.
+    requesters: list[RequestRefOut] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
+    # DEPRECATED alongside payload_json above: `ProposalBatchDTO.treePath` is non-optional on iOS.
     tree_path: str
     created_at: datetime
     updated_at: datetime
     items: list[ProposalItemOut]
+
+
+class RetryRequest(BaseModel):
+    item_ids: list[str] | None = None
+    # next_candidate: try the next ranked source. same_candidate: the same one again (a transient
+    # network failure). research: discard the candidates and search afresh -- this re-enters the
+    # approval gate rather than auto-starting, so a retry can never become a silent download.
+    mode: str = "next_candidate"
+
+
+class CancelRequest(BaseModel):
+    item_ids: list[str] | None = None
 
 
 class ProposalSelectionUpdate(BaseModel):
@@ -300,6 +410,9 @@ class NotificationOut(BaseModel):
     body: str
     event_type: str
     target_url: str | None
+    # Rows sharing a group_key are one workflow: the server upserts on it, and a client uses it to
+    # collapse a batch's lifetime into a single tray row instead of stacking one per stage.
+    group_key: str | None = None
     status: NotificationStatus
     deliver_web: bool
     deliver_apns: bool

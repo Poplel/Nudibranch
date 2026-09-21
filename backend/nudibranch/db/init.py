@@ -297,6 +297,7 @@ def ensure_lightweight_migrations(session: Session) -> None:
         # Per-pairing APNS proxy grant token (App Attest model); NULL = direct/legacy device.
         session.execute(text("ALTER TABLE mobile_devices ADD COLUMN proxy_grant TEXT"))
         session.commit()
+    _migrate_queue_state_columns(session)
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
@@ -304,6 +305,157 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _migrate_permissions(session)
     _scrub_invalid_mbids(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _migrate_queue_state_columns(session: Session) -> None:
+    """Add the Review/Issues/Changes state columns and backfill them from what already exists.
+
+    Idempotent, PRAGMA-guarded, and safe to re-run: each backfill only runs in the same branch
+    that just created its column, so a second pass is a no-op rather than a re-write.
+
+    NOTE on the raw-SQL backfills below: an `Enum()` column persists the enum MEMBER NAME, not its
+    value.  `ProposalFlow`'s names and values are deliberately identical, which is what makes
+    writing the literal strings here correct.  Do not add a member where they differ.
+    """
+
+    batch_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_batches)"))}
+    if batch_cols and "flow" not in batch_cols:
+        session.execute(
+            text(
+                "ALTER TABLE proposal_batches ADD COLUMN flow VARCHAR(32) "
+                "NOT NULL DEFAULT 'library_change'"
+            )
+        )
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_batches_flow ON proposal_batches(flow)")
+        )
+        # Gate (a): every download batch, whichever stage marker it happened to carry.
+        session.execute(
+            text(
+                "UPDATE proposal_batches SET flow = 'download_review' "
+                "WHERE kind = 'download' "
+                "AND tree_path IN ('/wishlist', '/task-queue', '/downloads')"
+            )
+        )
+        # Gate (b): the "add the staged files to the library" review, distinguished from an
+        # ordinary disk import only by its title -- there was never a typed marker for it.
+        session.execute(
+            text(
+                "UPDATE proposal_batches SET flow = 'library_review' "
+                "WHERE kind = 'import_files' AND tree_path = '/task-queue' "
+                "AND (title LIKE 'Add downloaded music to library%' "
+                "     OR title LIKE 'Add to library:%')"
+            )
+        )
+        session.commit()
+
+    item_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_items)"))}
+    if item_cols and "requester_id" not in item_cols:
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN requester_id VARCHAR NULL"))
+        session.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_proposal_items_requester_id "
+                "ON proposal_items(requester_id)"
+            )
+        )
+        session.commit()
+        _backfill_item_json_column(session, "requester_id", ("user_id",), ("request", "user_id"))
+    if item_cols and "wishlist_item_id" not in item_cols:
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN wishlist_item_id VARCHAR NULL"))
+        session.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_proposal_items_wishlist_item_id "
+                "ON proposal_items(wishlist_item_id)"
+            )
+        )
+        session.commit()
+        _backfill_item_json_column(
+            session, "wishlist_item_id", ("wishlist_item_id",), ("request", "wishlist_item_id")
+        )
+    if item_cols and "stage" not in item_cols:
+        # Denormalized cache of resolve_stage(); left NULL so the resolver's status/payload
+        # fallback answers for every pre-existing row until the worker next touches it.
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN stage VARCHAR(24) NULL"))
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_items_stage ON proposal_items(stage)")
+        )
+        session.commit()
+
+    wishlist_cols = {row[1] for row in session.execute(text("PRAGMA table_info(wishlist_items)"))}
+    if wishlist_cols and "batch_id" not in wishlist_cols:
+        # No backfill is possible -- this linkage never existed, and reconstructing it from the
+        # payload JSON would be guesswork.  NULL means "legacy row"; the read path falls back to
+        # the old scan for exactly those, for one release.
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN batch_id VARCHAR NULL"))
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_wishlist_items_batch_id ON wishlist_items(batch_id)")
+        )
+        session.commit()
+    if wishlist_cols and "item_id" not in wishlist_cols:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN item_id VARCHAR NULL"))
+        session.commit()
+    if wishlist_cols and "stage" not in wishlist_cols:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN stage VARCHAR(24) NULL"))
+        session.commit()
+
+
+def _backfill_item_json_column(
+    session: Session,
+    column: str,
+    top_key: tuple[str, ...],
+    nested_key: tuple[str, ...],
+) -> None:
+    """Lift a value out of proposal_items.payload_json into a real column.
+
+    Tries SQLite's json_extract first (one statement, no round trip).  JSON1 has been compiled in
+    by default since SQLite 3.38, but the deployed build is not something this code can assume, so
+    a plain Python loop is the fallback rather than a note in a plan.  The loop is bounded by the
+    number of live proposal items, which prune_settled_batches keeps small.
+    """
+
+    top = "$." + ".".join(top_key)
+    nested = "$." + ".".join(nested_key)
+    try:
+        session.execute(
+            text(
+                f"UPDATE proposal_items SET {column} = COALESCE("
+                f"  json_extract(payload_json, :top), json_extract(payload_json, :nested)) "
+                f"WHERE {column} IS NULL AND payload_json LIKE :needle"
+            ),
+            {"top": top, "nested": nested, "needle": f"%{top_key[-1]}%"},
+        )
+        session.commit()
+        return
+    except OperationalError:
+        session.rollback()
+
+    rows = session.execute(
+        text(
+            f"SELECT id, payload_json FROM proposal_items "
+            f"WHERE {column} IS NULL AND payload_json LIKE :needle"
+        ),
+        {"needle": f"%{top_key[-1]}%"},
+    ).fetchall()
+    for item_id, payload_json in rows:
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get(top_key[-1])
+        if value is None:
+            nested_obj = payload.get(nested_key[0])
+            if isinstance(nested_obj, dict):
+                value = nested_obj.get(nested_key[-1])
+        if value is None:
+            continue
+        session.execute(
+            text(f"UPDATE proposal_items SET {column} = :value WHERE id = :id"),
+            {"value": str(value), "id": item_id},
+        )
+    session.commit()
+
 
 
 # Columns carried over from the old per-user player_states table, paired with what to substitute

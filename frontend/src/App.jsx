@@ -5214,18 +5214,56 @@ function RemoveChoice({ title, onChoose, onCancel }) {
   );
 }
 
-function Approvals({ approvals, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
-  const groups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
+// Review / Issues / Changes, matching the iOS app exactly. The server decides which bucket each
+// batch is in (`ProposalBatchOut.bucket`) — the client only filters, so the two clients can never
+// disagree about where something lives.
+//
+// ⚠️ In-progress work deliberately stays in the bucket it belongs to rather than moving to an
+// "active" tab. A download that is running is still the thing you were reviewing, and pulling it
+// out to watch it is what made the old flow feel like chasing work between screens.
+const QUEUE_BUCKETS = [
+  { id: "review", label: "Review", empty: ["Nothing to review", "Requests with candidates land here, ready to approve."] },
+  { id: "issues", label: "Issues", empty: ["Nothing needs attention", "Failed or cancelled downloads appear here, with retry."] },
+  { id: "changes", label: "Changes", empty: ["No pending changes", "Metadata, artwork, imports and staged downloads land here."] },
+];
 
-  if (groups.length === 0) {
-    return <EmptyState title="No queued changes" body="Import scans, download searches, and maintenance actions will add review items here." />;
-  }
+function Approvals({ approvals, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
+  const [bucket, setBucket] = useState("review");
+  const counts = useMemo(() => {
+    const out = { review: 0, issues: 0, changes: 0 };
+    for (const batch of approvals) if (out[batch.bucket] != null) out[batch.bucket] += 1;
+    return out;
+  }, [approvals]);
+  const inBucket = useMemo(
+    // Fall back to `review` for a batch from an older API with no bucket, so nothing is invisible.
+    () => approvals.filter((batch) => (batch.bucket || "review") === bucket),
+    [approvals, bucket]
+  );
+  const groups = useMemo(() => groupApprovalBatches(inBucket), [inBucket]);
+  const active = QUEUE_BUCKETS.find((b) => b.id === bucket) || QUEUE_BUCKETS[0];
 
   return (
     <div className="approval-tree">
-      {groups.map((group) => (
-        <ApprovalBatch key={group.id} batch={group} selectedIds={selectedIds} onToggle={onToggle} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} onRemove={onRemove} />
-      ))}
+      {/* Reuses the Wishlist/Discover segmented control rather than inventing a second one. */}
+      <div className="workspace-tabs queue-buckets">
+        {QUEUE_BUCKETS.map((b) => (
+          <button
+            key={b.id}
+            type="button"
+            className={b.id === bucket ? "active" : ""}
+            onClick={() => setBucket(b.id)}
+          >
+            {b.label}{counts[b.id] ? ` (${counts[b.id]})` : ""}
+          </button>
+        ))}
+      </div>
+      {groups.length === 0 ? (
+        <EmptyState title={active.empty[0]} body={active.empty[1]} />
+      ) : (
+        groups.map((group) => (
+          <ApprovalBatch key={group.id} batch={group} selectedIds={selectedIds} onToggle={onToggle} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} onRemove={onRemove} />
+        ))
+      )}
     </div>
   );
 }
@@ -5265,7 +5303,9 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
         <div>
           <h2>{batch.title}</h2>
           <p>
-            {batch.status} · {selectedItems.length} of {batch.items.length} selected
+            {/* Was `{batch.status}` — a raw wire enum ("pending", "executing") rendered straight
+                into the UI. The server now sends a human label for exactly this. */}
+            {batch.progress?.label || batch.stage || batch.status} · {selectedItems.length} of {batch.items.length} selected
           </p>
         </div>
         <div className="approval-actions">
@@ -13173,22 +13213,34 @@ function shortPath(value) {
   return parts.slice(-2).join("/") || String(value);
 }
 
+// Candidate subtitle. Size and duration come straight off the typed `candidate` object now —
+// they always existed server-side and were dropped before reaching the UI, which is exactly the
+// information a human needs to sanity-check a match the ranker got wrong.
 function candidateMeta(item) {
-  const status = itemStatusMeta(item);
+  const c = item.candidate;
   const source = item.new_value ? ` · ${item.new_value}` : "";
-  if (["working", "done", "needs attention", "pending"].includes(status)) return `candidate${source}`;
-  return `${status}${source}`;
+  if (!c) return `${itemStatusMeta(item)}${source}`;
+  const parts = [];
+  if (c.confidence != null) parts.push(`${c.confidence}% match`);
+  if (c.same_album_folder) parts.push("same album folder");
+  if (c.format) parts.push(c.format);
+  if (c.size_bytes) parts.push(formatBytes(c.size_bytes));
+  // NOTE: the existing formatDuration takes MILLISECONDS, and the candidate carries seconds.
+  if (c.duration_seconds) parts.push(formatDuration(c.duration_seconds * 1000));
+  if (c.username) parts.push(c.username);
+  return parts.join(" · ");
 }
 
+// ⚠️ The server now supplies `status_label`; this is a fallback for rows from an older API only.
+// Do NOT reintroduce local status vocabulary here — three different ones ("working"/"done",
+// "Awaiting Download", and the raw enum in the batch header) is what made the queue unreadable.
 function itemStatusMeta(item) {
+  if (item.status_label) return item.status_label;
   const payload = parseJsonObject(item.payload_json);
   if (payload.status) return payload.status;
-  if (item.status === "executing") return "working";
-  if (item.status === "completed") return "done";
-  if (item.status === "failed") return "needs attention";
-  if (item.status === "rejected") return "rejected";
   return item.kind;
 }
+
 
 function downloadProgressSummary(approvals) {
   const batches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
@@ -13888,6 +13940,7 @@ function buildWishlistOwnerTree(items) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+// ⚠️ Fallback only. `WishlistOut.status_label` is authoritative; prefer `item.status_label`.
 function wishlistStatusLabel(status) {
   if (status === "downloading") return "Downloading…";
   if (status === "approved") return "Awaiting Download";

@@ -1,0 +1,487 @@
+"""One vocabulary for "what is happening to this proposal item, and where does it show".
+
+Before this module every client answered those questions for itself by pattern-matching free text
+out of `ProposalItem.payload_json` -- iOS had four disagreeing status->colour maps and the web had
+another three label functions, several of which rendered the raw wire enum ("wanted", "pending")
+straight into the UI.  Everything here is deliberately pure: it imports only the models and the
+standard library, so both `api/routes.py` and `worker/main.py` can use it with no import cycle.
+
+The three concepts are NOT interchangeable:
+
+* `ProposalFlow`  -- stored on the batch, fixed for its lifetime, says which approval gate it is.
+* `ItemStage`     -- the live fine-grained state; changes constantly.
+* `QueueBucket`   -- derived from the two, never stored (see `bucket_for`).
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Any, Iterable
+
+from nudibranch.db.models import (
+    ItemStage,
+    ProposalBatch,
+    ProposalFlow,
+    ProposalItem,
+    ProposalKind,
+    ProposalStatus,
+    QueueBucket,
+)
+
+LOSSLESS_AUDIO_EXTENSIONS = (".flac", ".wav", ".aiff", ".aif", ".alac")
+
+# Stage assigned when nothing more specific is known, per terminal ProposalStatus.
+_STATUS_TO_STAGE: dict[ProposalStatus, ItemStage] = {
+    ProposalStatus.rejected: ItemStage.rejected,
+    ProposalStatus.canceled: ItemStage.canceled,
+    ProposalStatus.completed: ItemStage.completed,
+    ProposalStatus.failed: ItemStage.failed,
+    ProposalStatus.approved: ItemStage.approved,
+}
+
+# The worker's own `download_progress_payload` stage vocabulary, mapped onto ItemStage.  Note
+# "verified" -> staged: the worker means "content check passed, sitting in staging", which is
+# exactly the thing awaiting gate (b).
+_PAYLOAD_STAGE_TO_ITEM_STAGE: dict[str, ItemStage] = {
+    "searching": ItemStage.searching,
+    "queued": ItemStage.queued,
+    "downloading": ItemStage.downloading,
+    "retrying": ItemStage.retrying,
+    "staging": ItemStage.staging,
+    "verifying": ItemStage.verifying,
+    "verified": ItemStage.staged,
+    "staged": ItemStage.staged,
+    "importing": ItemStage.importing,
+    "completed": ItemStage.completed,
+    "failed": ItemStage.failed,
+    "canceled": ItemStage.canceled,
+}
+
+# Download-manifest statuses (.nudibranch-downloads.json) onto ItemStage.  The manifest itself is
+# never read by the API -- the worker mirrors it into ProposalItem.stage -- but the mapping lives
+# here so there is exactly one translation table.
+MANIFEST_STATUS_TO_STAGE: dict[str, ItemStage] = {
+    "queued": ItemStage.queued,
+    "downloading": ItemStage.downloading,
+    "retrying": ItemStage.retrying,
+    "staged": ItemStage.staging,
+    "verifying": ItemStage.verifying,
+    "verified": ItemStage.staged,
+    "failed": ItemStage.failed,
+    "completed": ItemStage.completed,
+    "rejected": ItemStage.canceled,
+    "rejected_removed": ItemStage.canceled,
+}
+
+_STAGE_DEFAULT_LABEL: dict[ItemStage, str] = {
+    ItemStage.waiting: "waiting",
+    ItemStage.searching: "finding candidates",
+    ItemStage.awaiting_approval: "awaiting approval",
+    ItemStage.approved: "approved",
+    ItemStage.queued: "queued",
+    ItemStage.downloading: "downloading",
+    ItemStage.retrying: "retrying",
+    ItemStage.staging: "moving into place",
+    ItemStage.verifying: "verifying",
+    ItemStage.staged: "ready to add",
+    ItemStage.importing: "adding to library",
+    ItemStage.completed: "done",
+    ItemStage.failed: "needs attention",
+    ItemStage.canceled: "canceled",
+    ItemStage.rejected: "rejected",
+}
+
+# Rough completion for a stage with no numeric progress of its own, so a row is never a dead 0%
+# bar while real work is happening.
+_STAGE_DEFAULT_PROGRESS: dict[ItemStage, float] = {
+    ItemStage.waiting: 0.0,
+    ItemStage.searching: 0.0,
+    ItemStage.awaiting_approval: 0.0,
+    ItemStage.approved: 0.0,
+    ItemStage.queued: 0.0,
+    ItemStage.downloading: 0.0,
+    ItemStage.retrying: 0.0,
+    ItemStage.staging: 100.0,
+    ItemStage.verifying: 100.0,
+    ItemStage.staged: 100.0,
+    ItemStage.importing: 100.0,
+    ItemStage.completed: 100.0,
+    ItemStage.failed: 0.0,
+    ItemStage.canceled: 0.0,
+    ItemStage.rejected: 0.0,
+}
+
+_INDETERMINATE_STAGES = frozenset(
+    {ItemStage.searching, ItemStage.verifying, ItemStage.importing, ItemStage.staging, ItemStage.retrying}
+)
+
+# Worst-wins ordering for rolling child stages up to a container.  "Worst" means "most in need of
+# a human": a batch with one failed track is a failed batch even if ten others finished.
+_STAGE_SEVERITY: list[ItemStage] = [
+    ItemStage.failed,
+    ItemStage.awaiting_approval,
+    ItemStage.retrying,
+    ItemStage.searching,
+    ItemStage.downloading,
+    ItemStage.queued,
+    ItemStage.verifying,
+    ItemStage.staging,
+    ItemStage.importing,
+    ItemStage.staged,
+    ItemStage.approved,
+    ItemStage.waiting,
+    ItemStage.canceled,
+    ItemStage.rejected,
+    ItemStage.completed,
+]
+
+_DOWNLOAD_ACTIONS = frozenset({"queue_download", "queue_ytdlp_download"})
+
+# "This item is settled -- do not reconsider, re-queue or re-dispatch it."
+#
+# ⚠️ `canceled` MUST be in here. `queue_missing_manifest_download` re-queues any download item that
+# is still live and has no manifest entry, which is exactly the shape a just-cancelled track has --
+# so a cancel that only cleared the manifest would be undone within one ~3s scan tick.  Cancel also
+# sets `selected = False`, and most call sites check that first; this set is the second line, so the
+# behaviour survives a future change that stops consulting `selected`.
+SETTLED_ITEM_STATUSES = frozenset(
+    {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}
+)
+
+# Stages a human can still approve from.  Anything else is either already moving or finished, and
+# the clients grey it out rather than letting it be re-approved.
+APPROVABLE_STAGES = frozenset({ItemStage.awaiting_approval, ItemStage.waiting, ItemStage.failed})
+
+# Stages where stopping the work still means something.
+CANCELABLE_STAGES = frozenset(
+    {
+        ItemStage.waiting,
+        ItemStage.searching,
+        ItemStage.awaiting_approval,
+        ItemStage.approved,
+        ItemStage.queued,
+        ItemStage.downloading,
+        ItemStage.retrying,
+        ItemStage.staged,
+    }
+)
+
+
+def payload_of(item: ProposalItem) -> dict:
+    """Parse an item's payload once.  Callers should reuse the result, never re-parse per field."""
+    try:
+        payload = json.loads(item.payload_json or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def is_lossless_filename(filename: str) -> bool:
+    return str(filename or "").lower().endswith(LOSSLESS_AUDIO_EXTENSIONS)
+
+
+def candidate_format_label(candidate: dict) -> str:
+    """Terse format/quality label for one candidate (e.g. "FLAC", "MP3 320").
+
+    Moved here from worker/main.py so the label the UI shows and the label the worker logs are
+    computed by the same code.
+    """
+    name = str(candidate.get("filename") or "")
+    ext = Path(name.replace("\\", "/")).suffix.lower().lstrip(".")
+    label = ext.upper() if ext else str(candidate.get("quality") or "").upper()
+    if not is_lossless_filename(name):
+        try:
+            bitrate = int(candidate.get("bitrate") or 0)
+        except (TypeError, ValueError):
+            bitrate = 0
+        if bitrate:
+            label = f"{label} {bitrate}".strip()
+    return label
+
+
+def resolve_stage(item: ProposalItem, payload: dict | None = None) -> ItemStage:
+    """The item's live stage.  First match wins; see the module docstring for why this ordering.
+
+    The denormalized `item.stage` column is trusted when present because the worker writes it at
+    the moment it changes something -- it is fresher than anything derivable here.
+    """
+    # ⚠️ ORDER MATTERS. A TERMINAL `status` beats the cache, always.
+    #
+    # `stage` is a denormalized convenience written at creation and refreshed by the worker, so it
+    # goes stale the moment a path forgets to update it — and it was masking real outcomes: a
+    # candidate sitting at `status=failed` still reported `awaiting_approval` because that was its
+    # creation-time cache value, so a failed download looked like it was waiting for a human.
+    # `status` is written by the core engine and is authoritative when it is terminal; the cache
+    # only refines a non-terminal status (queued vs downloading vs verifying).
+    if item.status in _STATUS_TO_STAGE and item.status is not ProposalStatus.approved:
+        return _STATUS_TO_STAGE[item.status]
+
+    if item.stage:
+        try:
+            return ItemStage(item.stage)
+        except ValueError:
+            pass  # unknown cache value: fall through and recompute rather than trust it
+
+    data = payload if payload is not None else payload_of(item)
+    progress = data.get("download_progress")
+    if isinstance(progress, dict):
+        mapped = _PAYLOAD_STAGE_TO_ITEM_STAGE.get(str(progress.get("stage") or "").casefold())
+        if mapped is not None:
+            return mapped
+
+    if item.status is ProposalStatus.approved:
+        return ItemStage.approved
+    if item.status is ProposalStatus.executing:
+        if item.kind is ProposalKind.download:
+            return ItemStage.queued
+        return ItemStage.importing
+    if item.status is ProposalStatus.pending:
+        action = str(data.get("action") or "")
+        if item.kind is ProposalKind.download and action in _DOWNLOAD_ACTIONS:
+            return ItemStage.awaiting_approval
+        if item.kind is ProposalKind.download and not action:
+            # A download container with no candidates attached yet is still being searched -- that
+            # is the window that used to show nothing at all between "wishlisted" and "ready".
+            return ItemStage.searching if not item.children else ItemStage.awaiting_approval
+        return ItemStage.awaiting_approval
+    return ItemStage.waiting
+
+
+def bucket_for(flow: ProposalFlow | str | None, stage: ItemStage) -> QueueBucket:
+    """The single derivation of which Task Queue tab something belongs in.
+
+    Deliberately not stored: `issues` flips on every failure, retry and cancel, so a column would
+    mean a write on each of those in the hot download loop and would drift the first time a code
+    path forgot one.
+    """
+    if stage in (ItemStage.failed, ItemStage.canceled):
+        return QueueBucket.issues
+    resolved = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+    if resolved is ProposalFlow.download_review:
+        return QueueBucket.review
+    return QueueBucket.changes
+
+
+def _coerce_flow(flow: str | None) -> ProposalFlow:
+    try:
+        return ProposalFlow(str(flow))
+    except ValueError:
+        return ProposalFlow.library_change
+
+
+def status_label(item: ProposalItem, stage: ItemStage, payload: dict | None = None) -> str:
+    """Human-readable status.  The worker's own free text wins when it exists -- it is more
+    specific ("downloading 42% - 2 of 5 downloaded") than any generic stage name."""
+    data = payload if payload is not None else payload_of(item)
+    existing = data.get("status")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    return _STAGE_DEFAULT_LABEL.get(stage, stage.value)
+
+
+def item_progress(item: ProposalItem, stage: ItemStage, payload: dict | None = None) -> dict:
+    """`{value, label, indeterminate, stage}` for any item of any kind.
+
+    Non-download proposals had no progress at all before this -- they now get a synthesized floor
+    from their stage, so a long metadata or import apply shows movement instead of a frozen row.
+    """
+    data = payload if payload is not None else payload_of(item)
+    raw = data.get("download_progress")
+    value: float | None = None
+    indeterminate: bool | None = None
+    label: str | None = None
+    if isinstance(raw, dict):
+        for key in ("value", "progress"):
+            candidate = raw.get(key)
+            if isinstance(candidate, (int, float)):
+                value = max(0.0, min(100.0, float(candidate)))
+                break
+        if isinstance(raw.get("indeterminate"), bool):
+            indeterminate = raw["indeterminate"]
+        if isinstance(raw.get("label"), str) and raw["label"].strip():
+            label = raw["label"].strip()
+    if value is None:
+        value = _STAGE_DEFAULT_PROGRESS.get(stage, 0.0)
+    if indeterminate is None:
+        indeterminate = stage in _INDETERMINATE_STAGES
+    return {
+        "value": value,
+        "label": label or status_label(item, stage, data),
+        "indeterminate": bool(indeterminate),
+        "stage": stage,
+    }
+
+
+def candidate_out(payload: dict) -> dict | None:
+    """Project the stored candidate dict onto the wire shape.
+
+    Everything here already exists on the candidate the matcher produced; size, duration,
+    queue_length, free_upload_slots and upload_speed were simply dropped before reaching any UI,
+    which is why a human could never sanity-check a match the ranker got wrong.
+    """
+    candidate = payload.get("candidate")
+    if not isinstance(candidate, dict) or not candidate:
+        return None
+
+    def _int(key: str) -> int | None:
+        try:
+            raw = candidate.get(key)
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _float(key: str) -> float | None:
+        try:
+            raw = candidate.get(key)
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "username": candidate.get("username"),
+        "filename": candidate.get("filename"),
+        "folder": candidate.get("folder"),
+        "size_bytes": _int("size"),
+        "duration_seconds": _float("duration"),
+        "bitrate": _int("bitrate"),
+        "format": candidate_format_label(candidate) or None,
+        "quality": candidate.get("quality"),
+        "confidence": _int("confidence"),
+        "same_album_folder": bool(candidate.get("same_album_folder")),
+        "album_folder_rank": _int("album_folder_rank"),
+        "free_upload_slots": candidate.get("free_upload_slots"),
+        "queue_length": _int("queue_length"),
+        "upload_speed": _float("upload_speed"),
+    }
+
+
+def failure_out(payload: dict, stage: ItemStage) -> dict | None:
+    """Why this failed, in a form a client can render without reading the task log."""
+    if stage not in (ItemStage.failed, ItemStage.retrying):
+        return None
+    tried = payload.get("failed_candidates")
+    try:
+        retry_count = int(payload.get("retry_count") or 0)
+    except (TypeError, ValueError):
+        retry_count = 0
+    exhausted = bool(payload.get("auto_retry_exhausted"))
+    return {
+        "reason": payload.get("retry_reason") or payload.get("failure_reason"),
+        "retry_count": retry_count,
+        "auto_retry_exhausted": exhausted,
+        "retryable": True,
+        "tried_candidates": len(tried) if isinstance(tried, (list, tuple)) else 0,
+    }
+
+
+def request_out(item: ProposalItem, payload: dict, requester_name: str | None = None) -> dict | None:
+    """Who asked for this and what they asked for.  Prefers the real columns over the payload."""
+    request = payload.get("request")
+    request = request if isinstance(request, dict) else {}
+    requester_id = item.requester_id or request.get("user_id") or payload.get("user_id")
+    wishlist_item_id = (
+        item.wishlist_item_id or request.get("wishlist_item_id") or payload.get("wishlist_item_id")
+    )
+    artist = request.get("artist") or payload.get("artist")
+    album = request.get("album") or payload.get("album")
+    track = request.get("track") or payload.get("track")
+    if not any((requester_id, wishlist_item_id, artist, album, track)):
+        return None
+    return {
+        "artist": artist,
+        "album": album,
+        "track": track,
+        "wishlist_item_id": wishlist_item_id,
+        "requester_id": requester_id,
+        "requester_name": requester_name,
+    }
+
+
+def rollup_items(items: Iterable[ProposalItem]) -> list[ProposalItem]:
+    """The items that actually represent work, for rollup purposes.
+
+    ⚠️ Unselected alternate candidates are excluded. A download batch keeps roughly five candidates
+    per track and selects one, so four out of five sit at `awaiting_approval` forever — and since
+    that outranks `downloading` in the severity order, a batch that was actively transferring
+    reported "awaiting approval" the whole time. They are options, not outstanding work.
+    """
+    materialized = list(items)
+    working = [item for item in materialized if item.selected]
+    return working or materialized
+
+
+# Batch statuses that end the batch. Once one is set it beats anything its rows say — the same rule
+# as `resolve_stage`, one level up.
+_TERMINAL_BATCH_STAGE: dict[ProposalStatus, ItemStage] = {
+    ProposalStatus.rejected: ItemStage.rejected,
+    ProposalStatus.canceled: ItemStage.canceled,
+    ProposalStatus.completed: ItemStage.completed,
+}
+
+
+def resolve_batch_stage(items: Iterable[ProposalItem], batch_status: ProposalStatus | None = None) -> ItemStage:
+    """Worst-wins rollup over the items that represent real work.
+
+    ⚠️ A terminal `batch_status` wins outright. Rows can be left behind a settled batch (containers
+    rejected before `_roll_up_container_status` existed still sit at `pending`), and rolling those
+    up made a rejected batch report "awaiting approval" in Review.
+    """
+    if batch_status in _TERMINAL_BATCH_STAGE:
+        return _TERMINAL_BATCH_STAGE[batch_status]
+    stages = [resolve_stage(item) for item in rollup_items(items)]
+    if not stages:
+        return ItemStage.waiting
+    present = set(stages)
+    for stage in _STAGE_SEVERITY:
+        if stage in present:
+            return stage
+    return ItemStage.waiting
+
+
+def batch_progress(items: Iterable[ProposalItem], batch_status: ProposalStatus | None = None) -> dict:
+    """Mean leaf progress plus the rolled-up stage.
+
+    Read-only by contract: this runs at serialize time on a GET, and a GET must not write.
+    """
+    materialized = rollup_items(items)
+    leaves = [item for item in materialized if not item.children] or materialized
+    stage = resolve_batch_stage(materialized, batch_status)
+    if not leaves:
+        return {"value": 0.0, "label": _STAGE_DEFAULT_LABEL[stage], "indeterminate": False, "stage": stage}
+    total = 0.0
+    for item in leaves:
+        data = payload_of(item)
+        total += float(item_progress(item, resolve_stage(item, data), data)["value"])
+    done = sum(1 for item in leaves if resolve_stage(item) is ItemStage.completed)
+    return {
+        "value": total / len(leaves),
+        "label": f"{done} of {len(leaves)}",
+        "indeterminate": stage in _INDETERMINATE_STAGES,
+        "stage": stage,
+    }
+
+
+def batch_counts(items: Iterable[ProposalItem]) -> dict[str, int]:
+    """Per-stage tallies, so a client can render "3 need you, 5 downloading" without walking the
+    tree itself."""
+    counts: dict[str, int] = {"total": 0}
+    for item in items:
+        counts["total"] += 1
+        key = resolve_stage(item).value
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def can_approve(stage: ItemStage) -> bool:
+    return stage in APPROVABLE_STAGES
+
+
+def can_cancel(stage: ItemStage) -> bool:
+    return stage in CANCELABLE_STAGES
+
+
+def can_retry(stage: ItemStage, flow: ProposalFlow | str | None) -> bool:
+    """Retry restarts a download, so it exists only on the download gate."""
+    resolved = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+    return resolved is ProposalFlow.download_review and stage in (ItemStage.failed, ItemStage.canceled)

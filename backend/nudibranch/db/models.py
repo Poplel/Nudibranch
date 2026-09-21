@@ -61,6 +61,67 @@ class ProposalStatus(str, enum.Enum):
     executing = "executing"
     completed = "completed"
     failed = "failed"
+    # Distinct from `rejected` on purpose: "the user stopped this" is not "an approver declined
+    # it".  `rejected` deletes the subtree, deletes downloaded files, and fires a requester-facing
+    # "request denied" notification -- none of which is right for a cancel.  Adding the member
+    # needs no DDL: SQLAlchemy 2.x `Enum()` defaults to create_constraint=False, so the SQLite
+    # column is a bare VARCHAR with no CHECK (verified 2026-09-18).
+    canceled = "canceled"
+
+
+class ProposalFlow(str, enum.Enum):
+    """Which approval gate a batch belongs to -- replaces `tree_path`'s de-facto stage duty.
+
+    Stored, and fixed for a batch's whole life.  Contrast `ItemStage` (changes constantly) and
+    `QueueBucket` (derived, never stored).
+
+    NOTE: member name == member value for every member, and that is load-bearing -- `db/init.py`
+    backfills this column with raw SQL, and an `Enum()` column persists the member NAME, not the
+    value (see CLAUDE-server-notes.md section 49).  Keep them identical.
+    """
+
+    download_review = "download_review"   # gate (a): candidates -> approve to download
+    library_review = "library_review"     # gate (b): staged files -> approve to add to library
+    library_change = "library_change"     # metadata/artwork/lyrics/moves/deletes/playlists/imports
+
+
+class ItemStage(str, enum.Enum):
+    """The truthful fine-grained state of one proposal item.
+
+    Written to the denormalized `ProposalItem.stage` / `WishlistItem.stage` cache columns (plain
+    String, not Enum, so the name/value trap above cannot bite) and resolved for the wire by
+    `services/queue_state.resolve_stage`.  Name == value here too, for the same reason.
+    """
+
+    waiting = "waiting"                      # created, nothing started
+    searching = "searching"                  # slskd candidate search in flight
+    awaiting_approval = "awaiting_approval"  # a human must act (gate a or b)
+    approved = "approved"                    # approved, worker has not picked it up
+    queued = "queued"                        # accepted by slskd / queued for yt-dlp, no bytes yet
+    downloading = "downloading"
+    retrying = "retrying"
+    staging = "staging"                      # transfer done, file moving into staging
+    verifying = "verifying"                  # content verification running
+    staged = "staged"                        # verified + staged, awaiting gate (b)
+    importing = "importing"                  # applying: import, tag write, move, delete, playlist
+    completed = "completed"
+    failed = "failed"
+    canceled = "canceled"
+    rejected = "rejected"
+
+
+class QueueBucket(str, enum.Enum):
+    """Which Task Queue tab an item shows in.  DERIVED, never stored.
+
+    `issues` is a pure function of live status and flips on every failure, retry and cancel --
+    storing it would mean a write on every transition in the hot download loop and guaranteed
+    drift the first time a code path forgot.  `ProposalFlow` is stored precisely because it does
+    not change.  The single derivation lives in `services/queue_state.bucket_for`.
+    """
+
+    review = "review"
+    changes = "changes"
+    issues = "issues"
 
 
 class TaskStatus(str, enum.Enum):
@@ -372,6 +433,12 @@ class WishlistItem(Base):
     album: Mapped[str | None] = mapped_column(String(255))
     track: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="wanted", nullable=False)
+    # Direct link to the proposal batch/item serving this request.  NULL for rows created before
+    # this existed -- those fall through to the legacy JSON-scan path for one release.
+    batch_id: Mapped[str | None] = mapped_column(String, index=True)
+    item_id: Mapped[str | None] = mapped_column(String)
+    # Same denormalized-cache rule as ProposalItem.stage above: plain String on purpose.
+    stage: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
@@ -517,6 +584,13 @@ class ProposalBatch(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     kind: Mapped[ProposalKind] = mapped_column(Enum(ProposalKind), nullable=False)
     status: Mapped[ProposalStatus] = mapped_column(Enum(ProposalStatus), default=ProposalStatus.pending, nullable=False)
+    # Which approval gate this batch belongs to, and therefore which Task Queue bucket it renders
+    # in.  Supersedes `tree_path`, which was an untyped free string doing double duty as a UI
+    # grouping key AND a de-facto workflow-stage marker ("/wishlist", "/task-queue", "/downloads").
+    # `tree_path` is retained for one release because shipped clients still read it.
+    flow: Mapped[ProposalFlow] = mapped_column(
+        Enum(ProposalFlow), default=ProposalFlow.library_change, nullable=False, index=True
+    )
     tree_path: Mapped[str] = mapped_column(Text, default="/", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
@@ -537,6 +611,17 @@ class ProposalItem(Base):
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    # First-class linkage back to who asked for this and which wishlist row it serves.  Both were
+    # previously only discoverable by string-matching nested JSON inside `payload_json`, which made
+    # "what am I waiting on" an O(batches x items) json.loads scan on every GET /wishlist -- and
+    # which silently failed for candidate items, whose user id sits at payload["request"]["user_id"]
+    # rather than the top level.  Write these at EVERY creation site.
+    requester_id: Mapped[str | None] = mapped_column(String, index=True)
+    wishlist_item_id: Mapped[str | None] = mapped_column(String, index=True)
+    # Denormalized cache of `services.queue_state.resolve_stage`, written by the worker so the API
+    # can filter buckets in SQL instead of in Python.  Deliberately a plain String, NOT Enum(...):
+    # it is a cache parsed at the boundary, and String sidesteps the member-name persistence trap.
+    stage: Mapped[str | None] = mapped_column(String(24), index=True)
     # Vestigial: rejection-suppression was removed from every client and from the API.  Nothing
     # has written this since, so it is always NULL.  Kept only because dropping a column needs a
     # migration that buys nothing; do not reintroduce reads of it.
