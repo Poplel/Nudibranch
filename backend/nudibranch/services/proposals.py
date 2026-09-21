@@ -450,16 +450,10 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         item.stage = "canceled"
         item.selected = False
         cancelled.append(item.id)
-        if item.wishlist_item_id:
-            wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
-            # ⚠️ "rejected" must be excluded here too, not just "completed"/"removed": the worker's
-            # reset (run_cancel_download_item) skips reviving a rejected/removed row, but it can
-            # only tell by reading THIS status -- overwriting a declined row to "canceled" here
-            # would erase the fact that it was ever declined and let the worker bring it back.
-            if wishlist_item and wishlist_item.status not in {"completed", "removed", "rejected"}:
-                wishlist_item.status = "canceled"
-                wishlist_item.stage = "canceled"
-                wishlist_item.status_changed_at = now
+        # ⚠️ The wishlist row is deliberately NOT touched here. A cancelled request is never shown
+        # as cancelled: the worker's `reset_canceled_wishlist_items` sends it back to searching once
+        # none of its work is live. Writing "canceled" here stranded the row whenever other work
+        # under the same request was still live, because the reset then (rightly) skipped it.
     if cancelled:
         # Stop the search still feeding this batch BEFORE rolling up, or it re-populates behind us.
         wishlist_ids = {item.wishlist_item_id for item in batch.items if item.wishlist_item_id}

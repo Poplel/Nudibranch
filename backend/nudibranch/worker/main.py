@@ -9735,7 +9735,7 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
     Only once EVERY item this wishlist row still owns is gone: an album is many `ProposalItem`
     download leaves sharing one `wishlist_item_id`, and cancelling a single track must not blow
     away the wishlist row -- and re-search the whole album -- while its siblings are still
-    downloading under the same request. `rejected`/`removed` rows are a terminal human decision and
+    downloading under the same request. `rejected`/`removed`/`completed` rows are settled for good and
     must never be revived by a cancel that happens to share their id.
     """
     if not wishlist_item_ids:
@@ -9761,7 +9761,7 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
         if still_live:
             continue
         wishlist_item = session.get(WishlistItem, wishlist_item_id)
-        if not wishlist_item or wishlist_item.status in {"rejected", "removed"}:
+        if not wishlist_item or wishlist_item.status in {"rejected", "removed", "completed"}:
             continue
         wishlist_item.batch_id = None
         wishlist_item.item_id = None
