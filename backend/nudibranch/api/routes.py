@@ -6203,9 +6203,17 @@ def list_requests(
     )
     names = resolve_requester_names(session, batches)
     out: list[ProposalBatchOut] = []
+    can_manage = user_has_permission(user, Permission.approvals_manage)
     for batch in batches:
         if is_approver:
-            out.append(serialize_batch(batch, names))
+            serialized = serialize_batch(batch, names)
+            flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+            if not can_manage and flow is not ProposalFlow.download_review:
+                # `wishlist:approve_all` approves download requests only (`/requests/{id}/approve`
+                # 403s anything else), so "Add to library" must not advertise an approve it can't do.
+                for item in serialized.items:
+                    item.can_approve = False
+            out.append(serialized)
             continue
         mine = prune_batch_to_requester(batch, user.id)
         if not mine:
