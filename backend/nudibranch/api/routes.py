@@ -1560,7 +1560,9 @@ def _store_session_queue(row: AccountPlaybackSession, items: list[PlaybackSnapsh
     """
     _validate_session_items(items)
     clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id) for i in items]
-    encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json()
+    # exclude_none: every absent title/artist/album_id is ~50 bytes of nulls, which alone pushed a
+    # full-size queue past the payload cap.
+    encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json(exclude_none=True)
     if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Queue is too large")
     if encoded != row.queue_json:
@@ -2013,7 +2015,7 @@ def transfer_account_session(
         _validate_session_items(snapshot.items)
         if not 0 <= snapshot.current_index < len(snapshot.items):
             raise HTTPException(status_code=400, detail="current_index is outside the queue")
-        encoded = snapshot.model_dump_json()
+        encoded = snapshot.model_dump_json(exclude_none=True)
         if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
             raise HTTPException(status_code=413, detail="Queue is too large")
         handoff = PlaybackHandoff(

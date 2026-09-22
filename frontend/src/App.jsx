@@ -69,10 +69,8 @@ const DEVICE_LABEL_KEY = "nudibranch_device_label";
 
 // ── The account's shared playback session (§A1b) ──
 // A longer local queue is published as a window around the current item, and every index this tab
-// reports is re-based onto that window. ⚠ Below the server's SESSION_MAX_ITEMS (5000) on purpose:
-// the server stores each item with its null title/artist/album_id fields, ~122 bytes apiece, so 5000
-// uuid-keyed items encode to ~610 KB and trip its 512 KB payload cap with a 413. 4000 fit.
-const SESSION_MAX_ITEMS = 4000;
+// reports is re-based onto that window. Matches the server's SESSION_MAX_ITEMS.
+const SESSION_MAX_ITEMS = 5000;
 const SESSION_LOOK_BACK = 400;
 // The `session_id` the docked player sees for an orphaned session, which belongs to no device.
 const ACCOUNT_SESSION_ROW = "account-session";
