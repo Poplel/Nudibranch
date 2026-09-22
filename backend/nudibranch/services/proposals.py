@@ -223,7 +223,10 @@ def item_ids_with_descendants(items: list[ProposalItem], root_ids: set[str]) -> 
 
 def remove_rejected_download_files(items: list[ProposalItem]) -> int:
     settings = get_settings()
-    downloads_root = settings.downloads_path.resolve()
+    # ⚠️ Finished downloads are staged under `staging/downloads/<batch>/`, NOT the downloads folder,
+    # so checking only `downloads_path` meant a rejected or cancelled "Add to library" file was never
+    # removed at all. Both roots are ours to clean; nothing outside them is ever touched.
+    roots = [settings.downloads_path.resolve(), (settings.staging_path / "downloads").resolve()]
     removed = 0
     seen_paths: set[Path] = set()
     for item in items:
@@ -232,13 +235,14 @@ def remove_rejected_download_files(items: list[ProposalItem]) -> int:
         file_path = Path(item.old_value).resolve()
         if file_path in seen_paths:
             continue
-        if downloads_root not in [file_path, *file_path.parents]:
+        root = next((root for root in roots if root in file_path.parents), None)
+        if root is None:
             continue
         seen_paths.add(file_path)
         if not file_path.is_file():
             continue
         file_path.unlink()
-        prune_empty_download_dirs(file_path.parent, downloads_root)
+        prune_empty_download_dirs(file_path.parent, root)
         removed += 1
     return removed
 
