@@ -327,11 +327,17 @@ def cleanup_empty_container_items(session: Session, batch: ProposalBatch) -> Non
 # --- retry / cancel -----------------------------------------------------------------------------
 
 
-def _leaf_download_items(batch: ProposalBatch, item_ids: list[str] | None) -> list[ProposalItem]:
+def _leaf_download_items(
+    batch: ProposalBatch, item_ids: list[str] | None, include_staged: bool = False
+) -> list[ProposalItem]:
     """Download leaves under the given ids (or the whole batch), expanded to descendants.
 
     Expanding means "cancel this album" and "cancel this track" are the same call with a different
     id, rather than two code paths that can disagree.
+
+    `include_staged` adds gate-(b) leaves: downloaded files staged for "Add to library"
+    (`import_files` items carrying the file in `old_value`). Cancel wants them -- a request can be
+    cancelled after it downloaded -- but retry must not, since there is no transfer to restart.
     """
     if item_ids:
         wanted = item_ids_with_descendants(batch.items, set(item_ids))
@@ -342,6 +348,8 @@ def _leaf_download_items(batch: ProposalBatch, item_ids: list[str] | None) -> li
     for item in scope:
         payload = json.loads(item.payload_json or "{}")
         if payload.get("action") in {"queue_download", "queue_ytdlp_download"}:
+            leaves.append(item)
+        elif include_staged and item.kind == ProposalKind.import_files and item.old_value:
             leaves.append(item)
     return leaves
 
@@ -441,7 +449,7 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
-    targets = _leaf_download_items(batch, item_ids)
+    targets = _leaf_download_items(batch, item_ids, include_staged=True)
     now = datetime.now(timezone.utc)
     cancelled: list[str] = []
     for item in targets:
@@ -466,7 +474,7 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         wishlist_ids = {item.wishlist_item_id for item in batch.items if item.wishlist_item_id}
         _stop_feeding_tasks(session, batch, wishlist_ids)
         # Anything the search added while we were cancelling is still live; sweep it too.
-        for item in _leaf_download_items(batch, None):
+        for item in _leaf_download_items(batch, None, include_staged=True):
             if item.status not in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}:
                 item.status = ProposalStatus.canceled
                 item.stage = "canceled"
@@ -480,7 +488,7 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
     if cancelled and all(
         item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}
         or not item.selected
-        for item in _leaf_download_items(batch, None)
+        for item in _leaf_download_items(batch, None, include_staged=True)
     ):
         batch.status = ProposalStatus.canceled
     session.commit()

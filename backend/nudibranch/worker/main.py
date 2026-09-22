@@ -28,7 +28,7 @@ from nudibranch.services.replaygain import measure_track_gain, write_replaygain_
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
-from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants
+from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, remove_rejected_download_files
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -9696,6 +9696,9 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
 
     # The destructive half. Gather batch/wishlist linkage before delete() expires it off the row.
     items = [item for item_id in item_ids if (item := session.get(ProposalItem, item_id))]
+    # A cancelled "Add to library" leaf has no transfer; its file is already staged in downloads.
+    # Same removal `reject_items` does; download leaves are skipped by it (wrong kind).
+    removed += remove_rejected_download_files(items)
     batches: dict[str, ProposalBatch] = {}
     wishlist_item_ids: set[str] = set()
     for item in items:
