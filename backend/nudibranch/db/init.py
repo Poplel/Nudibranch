@@ -306,6 +306,7 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _scrub_invalid_mbids(session)
     _drop_empty_rejected_batches(session)
     _drop_canceled_leftovers(session)
+    _fail_completed_batches_with_failed_items(session)
     move_task_result_logs_to_app_log(session)
 
 
@@ -319,6 +320,21 @@ def _drop_empty_rejected_batches(session: Session) -> None:
     session.execute(text(
         "DELETE FROM proposal_batches WHERE status = 'rejected' "
         "AND NOT EXISTS (SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id)"
+    ))
+    session.commit()
+
+
+def _fail_completed_batches_with_failed_items(session: Session) -> None:
+    """Re-mark batches that were stored `completed` although a selected item failed.
+
+    Before 2026-09-22 the worker wrote `completed` once every item result had settled, failures
+    included. Reads already project those as failed, but list filters work on the stored status, so
+    the failure never showed in Issues. Idempotent: once fixed, nothing matches.
+    """
+    session.execute(text(
+        "UPDATE proposal_batches SET status = 'failed' WHERE status = 'completed' AND EXISTS ("
+        "SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id "
+        "AND proposal_items.selected = 1 AND proposal_items.status = 'failed')"
     ))
     session.commit()
 
