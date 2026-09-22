@@ -5586,6 +5586,14 @@ def tool_jellyfin_scan(
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
 
 
+@router.post("/tools/rescan-slskd-shares", response_model=TaskOut, tags=["tools"], summary="Rescan Soulseek shares")
+def tool_rescan_slskd_shares(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.tools_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {}))
+
+
 @router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
 def tool_remap_tracks(
     session: Session = Depends(get_session),

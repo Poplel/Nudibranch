@@ -35,7 +35,7 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services import content_verify
 from nudibranch.services.content_verify import verify_audio_content
-from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
+from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, rescan_slskd_shares, search_slskd_detailed, transfer_state_category
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
@@ -71,6 +71,11 @@ PODCAST_SCAN_TICK_SECONDS = 86400
 # instead, so keeping them longer just grows the table.
 DELETION_PRUNE_TICK_SECONDS = 86400
 AUTOMATION_EVENT_SESSION_KEY = "nudibranch:automation-events"
+# Debounce for the post-import Soulseek share rescan (see maybe_queue_slskd_rescan): a batch
+# approval can import dozens of tracks through import_file_to_library in one task, and each one
+# would otherwise queue its own rescan. The "regular" cadence is the seeded 6-hourly automation
+# (§ automations.py); this just gets newly imported tracks shared sooner, cheaply.
+SLSKD_RESCAN_DEBOUNCE_SECONDS = 1800
 
 
 def expire_stale_handoffs(session: Session) -> int:
@@ -125,6 +130,33 @@ def fire_queued_automation_events(session: Session) -> None:
             session.rollback()
             append_task_log(session, None, f"Automation event '{event}' failed: {error}", "error")
 
+
+
+def maybe_queue_slskd_rescan(session: Session) -> None:
+    """Debounced trigger: queue a Soulseek share rescan after a track lands in the library.
+
+    slskd's share index doesn't follow the library folder on its own (see rescan_slskd_shares),
+    so a freshly imported/downloaded track is invisible to other Soulseek users until something
+    rescans. The 6-hourly seeded automation is the regular cadence; this just gets a track shared
+    sooner without hammering slskd — `_upsert_setting` records the last time this queued one, and
+    a batch of imports within SLSKD_RESCAN_DEBOUNCE_SECONDS collapses to a single queued task
+    (both the timestamp bump and the enqueue live in the caller's transaction, so a rollback undoes
+    them together rather than leaving a debounce window with nothing actually queued).
+    """
+    settings = integration_settings(session)
+    if not settings.get("slskd_url") or not settings.get("slskd_api_key"):
+        return
+    now = datetime.now(timezone.utc)
+    setting = session.get(AppSetting, "slskd_rescan_last_queued_at")
+    if setting and setting.value:
+        try:
+            last_queued = datetime.fromisoformat(setting.value)
+        except ValueError:
+            last_queued = None
+        if last_queued and (now - last_queued).total_seconds() < SLSKD_RESCAN_DEBOUNCE_SECONDS:
+            return
+    _upsert_setting(session, "slskd_rescan_last_queued_at", now.isoformat())
+    enqueue_task(session, "rescan_slskd_shares", {})
 
 
 def _upsert_setting(session: Session, key: str, value: str) -> None:
@@ -1332,6 +1364,7 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
     session.add(track)
     session.flush()
     queue_track_for_enrichment(track.id)
+    maybe_queue_slskd_rescan(session)
 
 
 def apply_metadata_item(session: Session, item: ProposalItem) -> None:
@@ -7632,6 +7665,23 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
     return {"requested": True}
 
 
+def run_rescan_slskd_shares(session: Session, _payload: dict) -> dict:
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    if not slskd_url or not api_key:
+        raise ValueError("slskd URL and API key are required")
+    result = rescan_slskd_shares(slskd_url, api_key)
+    write_app_log(
+        f"Soulseek share rescan requested: {result.get('files')} file(s) in {result.get('directories')} "
+        f"director{'y' if result.get('directories') == 1 else 'ies'}"
+        + (" (scan in progress)" if result.get("scanning") else ""),
+        level="info",
+        event_type="tool_completed",
+    )
+    return result
+
+
 def run_check_files(session: Session, _payload: dict) -> dict:
     discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
     settings = get_settings()
@@ -10239,6 +10289,7 @@ TASK_HANDLERS = {
     "migrate_native_playlists_to_jellyfin": run_migrate_native_playlists_to_jellyfin,
     "playlist_mirror": run_playlist_mirror,
     "jellyfin_scan": run_jellyfin_scan,
+    "rescan_slskd_shares": run_rescan_slskd_shares,
     "check_files": run_check_files,
     "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
@@ -10514,6 +10565,7 @@ def task_notification_title(task_type: str) -> str:
         "sync_favorites_jellyfin": "Track remap",
         "migrate_native_playlists_to_jellyfin": "Playlist migration",
         "jellyfin_scan": "Jellyfin scan",
+        "rescan_slskd_shares": "Soulseek share rescan",
         "check_files": "File check",
         "check_duplicates": "Duplicate check",
         "check_lyrics": "Lyrics check",
@@ -10546,7 +10598,7 @@ def task_target_url(task_type: str) -> str:
         return "/task-queue"
     if task_type in {"propose_import"}:
         return "/import"
-    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "refresh_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "apply_replaygain", "jellyfin_scan", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
+    if task_type in {"check_files", "check_duplicates", "check_lyrics", "check_album_covers", "check_artist_covers", "refresh_covers", "check_missing_tracks", "check_non_lossless", "check_musicbrainz_ids", "check_audio_content", "apply_replaygain", "jellyfin_scan", "rescan_slskd_shares", "sync_favorites_jellyfin", "backup_now", "restore_default", "restore_backup", "clear_downloads", "consolidate_folders"}:
         return "/tools"
     if task_type == "enrich_imports":
         return "/library"

@@ -8009,6 +8009,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin re-scans filles.", "jellyfin-scan", "tools:manage"],
+    ["Rescan Soulseek shares", "Ask slskd to reindex its shared folders so newly imported tracks become downloadable by others.", "rescan-slskd-shares", "tools:manage"],
     ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs if playlists are not working.", "remap-tracks", "tools:manage"],
     ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "tools:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "tools:manage"],
@@ -8111,6 +8112,7 @@ function parseCronToSimple(cron) {
 
 const TOOL_OPTIONS = [
   ["Scan Jellyfin", "jellyfin-scan"],
+  ["Rescan Soulseek shares", "rescan-slskd-shares"],
   ["Remap tracks", "remap-tracks"],
   ["Find missing album tracks", "check-missing-tracks"],
   ["Check files", "check-files"],

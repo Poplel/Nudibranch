@@ -31,6 +31,7 @@ from nudibranch.services.tasks import enqueue_task
 # and then errors on every run.
 TOOL_TASK_TYPES = {
     "jellyfin-scan": "jellyfin_scan",
+    "rescan-slskd-shares": "rescan_slskd_shares",
     "remap-tracks": "sync_favorites_jellyfin",
     "check-files": "check_files",
     "check-duplicates": "check_duplicates",
