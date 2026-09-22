@@ -5885,12 +5885,22 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
                 item for item in batch.items
                 if item.selected and approval_item_is_actionable(item)
             ]
+            # ⚠️ Settled is not the same as completed. A batch whose selected work FAILED is marked
+            # failed and kept in the list, because it belongs in Issues. This used to write
+            # `completed` and drop it, which is how every exhausted request vanished from Issues.
+            any_failed = any(item.selected and item.status is ProposalStatus.failed for item in batch.items)
             if actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
-                batch.status = ProposalStatus.completed
-                settled.add(batch.id)
+                if any_failed:
+                    batch.status = ProposalStatus.failed
+                else:
+                    batch.status = ProposalStatus.completed
+                    settled.add(batch.id)
             elif not actionable_items and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
-                batch.status = ProposalStatus.completed
-                settled.add(batch.id)
+                if any_failed:
+                    batch.status = ProposalStatus.failed
+                else:
+                    batch.status = ProposalStatus.completed
+                    settled.add(batch.id)
         elif batch.kind != ProposalKind.download:
             # An empty non-download batch is an abandoned/failed tool run — safe to retire.
             batch.status = ProposalStatus.completed
@@ -5901,7 +5911,7 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
             # than any plausible in-flight search is a dead leftover and can be retired too.
             batch.status = ProposalStatus.completed
             settled.add(batch.id)
-    if settled:
+    if session.dirty:
         session.commit()
     return [batch for batch in batches if batch.id not in settled]
 
