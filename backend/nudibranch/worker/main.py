@@ -1113,6 +1113,28 @@ def complete_linked_wishlist_item(session: Session, item: ProposalItem) -> None:
         )
 
 
+def fail_linked_wishlist_item(session: Session, item: ProposalItem) -> None:
+    """Mark a linked request's wishlist row failed once its download is genuinely exhausted.
+
+    ⚠️ Call this ONLY where nothing else is going to move the track forward (no yt-dlp fallback
+    queued, no candidates left to try). `retry_items`/`process_wishlist_request_items` already
+    advance the row through `searching`/`downloading`/`retrying` for anything still live, and this
+    must not race those. Without this, the row's own `stage` cache -- set once at approval or by a
+    manual retry -- never gets touched again, so a request that failed for good kept reading
+    "Retrying" forever: a denormalized cache outranking the column it caches, the same class of bug
+    `resolve_stage` fixed for `ProposalItem`.
+    """
+    wishlist_item_id = item.wishlist_item_id or (json.loads(item.payload_json or "{}")).get("wishlist_item_id")
+    if not wishlist_item_id:
+        return
+    wishlist_item = session.get(WishlistItem, wishlist_item_id)
+    if not wishlist_item or wishlist_item.status in {"removed", "completed", "rejected", "canceled"}:
+        return
+    wishlist_item.status = "failed"
+    wishlist_item.stage = ItemStage.failed.value
+    wishlist_item.status_changed_at = datetime.now(timezone.utc)
+
+
 def find_library_track(session: Session, artist_name: str, album_title: str, title: str):
     """Return an existing library Track with the same artist + album + title, else None.
 
@@ -2728,6 +2750,29 @@ def queue_existing_retry_candidate(
     return False
 
 
+def settle_replaced_candidate_item(session: Session, item: ProposalItem, candidate: dict) -> None:
+    """Resolve the sibling candidate row a just-abandoned transfer was swapped in from, if any.
+
+    `queue_existing_retry_candidate` sets a sibling's status to `executing` the instant it is
+    swapped into `item` as the live transfer -- but every later outcome (success or failure) is
+    tracked on `item` itself, which keeps being re-pointed at whichever candidate is live. Nothing
+    ever told the sibling row its transfer ended, so it was left reading `executing` forever, long
+    after the candidate it stood in for had failed and moved on.
+    """
+    if not item.parent_id or not candidate or not item.parent:
+        return
+    identity = candidate_identity(candidate)
+    for sibling in item.parent.children:
+        if sibling.id == item.id or sibling.status != ProposalStatus.executing:
+            continue
+        sibling_payload = json.loads(sibling.payload_json or "{}")
+        if sibling_payload.get("action") != "queue_download":
+            continue
+        if candidate_identity(sibling_payload.get("candidate") or {}) == identity:
+            sibling.status = ProposalStatus.failed
+            break
+
+
 def retry_download_entry(
     session: Session,
     batch: ProposalBatch,
@@ -2765,9 +2810,11 @@ def retry_download_entry(
     # Delete the old download file so slskd doesn't accumulate "(1)" dedup suffixes on retry.
     delete_stale_download_file(entry)
     if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
+        settle_replaced_candidate_item(session, item, current_candidate)
         return exhaust_download_retries(session, item, entry, reason, failed_candidates, retry_count)
     if not download_slot_available(available_slots):
         return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
+    settle_replaced_candidate_item(session, item, current_candidate)
     retry_count += 1
     request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
     append_task_log(session, None, f"{item.title}: {reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", "warning")
@@ -2936,6 +2983,9 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
             return False
         except Exception as error:  # noqa: BLE001 - fall through to a needs-attention notice.
             append_task_log(session, None, f"{label}: could not queue YouTube fallback: {error}", "error")
+    # Nothing else is going to move this track forward -- sync the linked wishlist row now,
+    # rather than leaving it on whatever live-looking stage it last cached.
+    fail_linked_wishlist_item(session, item)
     # Keyed on the batch, NOT the track: without a group_key this fired one full alert per failed
     # track, so a bad album produced a wall of identical banners.  Same key as every other stage of
     # this batch, so the existing row updates in place.
@@ -6661,6 +6711,9 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
         failed_payload["error"] = str(error)
         item.payload_json = json.dumps(failed_payload)
         append_task_log(session, task, f"yt-dlp: download failed for '{query}': {error}", "error")
+        # The YouTube fallback was the last resort (see exhaust_download_retries) -- nothing else
+        # will retry this track, so the linked wishlist row must follow it to failure now.
+        fail_linked_wishlist_item(session, item)
         create_notification(
             session,
             title="Download completed with an issue",

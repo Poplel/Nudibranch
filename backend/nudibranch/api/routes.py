@@ -4313,7 +4313,7 @@ def create_wishlist_item(
             track=payload.track,
         )
         return serialize_wishlist_item(existing)
-    # Requesting something again replaces its declined row rather than listing it twice.
+    # Requesting something again replaces its declined (or failed) row rather than listing it twice.
     for declined in session.scalars(
         select(WishlistItem)
         .where(WishlistItem.user_id == user.id)
@@ -4321,7 +4321,7 @@ def create_wishlist_item(
         .where(WishlistItem.artist == payload.artist)
         .where(WishlistItem.album == payload.album)
         .where(WishlistItem.track == payload.track)
-        .where(WishlistItem.status == "rejected")
+        .where(WishlistItem.status.in_(["rejected", "failed"]))
     ):
         session.delete(declined)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
@@ -7088,14 +7088,30 @@ _WISHLIST_STAGE_LABELS: dict[ItemStage, str] = {
 }
 
 
+# A terminal legacy `status` always wins over the `stage` cache below -- the same ordering
+# `resolve_stage` uses for `ProposalItem`, and for the same reason: the cache is written once (at
+# approval, or by a retry) and nothing revisits it once the request stops being live, so a request
+# that later failed or was declined could keep reading its last live stage ("Retrying") forever.
+_WISHLIST_TERMINAL_STATUS_STAGE: dict[str, ItemStage] = {
+    "completed": ItemStage.completed,
+    "rejected": ItemStage.rejected,
+    "removed": ItemStage.rejected,
+    "canceled": ItemStage.canceled,
+    "failed": ItemStage.failed,
+}
+
+
 def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) -> ItemStage:
-    """The request's stage, preferring the denormalized cache the worker keeps current."""
+    """The request's stage. A terminal `status` beats the cache; otherwise the denormalized `stage`
+    the worker keeps current is preferred, same as `resolve_stage` does for `ProposalItem`."""
+    status = (item.status or "").casefold()
+    if status in _WISHLIST_TERMINAL_STATUS_STAGE:
+        return _WISHLIST_TERMINAL_STATUS_STAGE[status]
     if item.stage:
         try:
             return ItemStage(item.stage)
         except ValueError:
             pass
-    status = (item.status or "").casefold()
     if status == "approved" and downloading_ids and item.id in downloading_ids:
         return ItemStage.downloading
     return {

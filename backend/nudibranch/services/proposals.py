@@ -504,6 +504,38 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
     return cancelled
 
 
+def _next_untried_candidate(item: ProposalItem) -> ProposalItem | None:
+    """The best still-untried sibling candidate for a failed download leaf, or None.
+
+    Every candidate for a track is its own sibling `ProposalItem` under the same parent, created
+    `pending` and left there until something actually uses it: the one originally selected moves to
+    `approved`/`executing`/`failed` as it runs, and one the worker's own in-flight replacement
+    search swaps in later is settled to `executing`/`failed` too (see the worker's
+    `settle_replaced_candidate_item`). A sibling still sitting at `pending` has therefore never been
+    tried by anything -- no need to replay `failed_candidates` history to work that out.
+    """
+    if not item.parent:
+        return None
+    untried = [
+        sibling
+        for sibling in item.parent.children
+        if sibling.id != item.id
+        and sibling.kind == ProposalKind.download
+        and sibling.status is ProposalStatus.pending
+        and json.loads(sibling.payload_json or "{}").get("action") == "queue_download"
+    ]
+    if not untried:
+        return None
+
+    def _candidate_rank(sibling: ProposalItem) -> int:
+        try:
+            return int(json.loads(sibling.payload_json or "{}").get("candidate_index", 9999))
+        except (TypeError, ValueError):
+            return 9999
+
+    return min(untried, key=_candidate_rank)
+
+
 def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mode: str = "next_candidate") -> list[str]:
     """Put failed downloads back in flight. Returns the ids actually retried.
 
@@ -526,7 +558,31 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     for item in targets:
         if item.status is not ProposalStatus.failed:
             continue
-        payload = json.loads(item.payload_json or "{}")
+        # `next_candidate` means switch to a different, never-tried sibling candidate -- it must
+        # NOT just reset this same failed item and hope. Before this, both modes did exactly the
+        # same thing: reset the failed item and let the worker re-queue its own already-failing
+        # candidate, so "next candidate" only advanced if the worker's own in-flight replacement
+        # search happened to find something (and exhausted it all over again if not).
+        target = item
+        if mode == "next_candidate":
+            alternate = _next_untried_candidate(item)
+            if alternate is not None:
+                item.selected = False
+                target = alternate
+            else:
+                # Nothing left to switch to, and no live search either -- that is `research`'s
+                # job. Recording this as exhausted right away, instead of quietly re-queuing the
+                # same doomed candidate, is what lets the wishlist row's stage follow it to failure
+                # instead of reading "Retrying" forever (queue_state's rule: a denormalized cache
+                # must never outrank the column it caches).
+                if item.wishlist_item_id:
+                    wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
+                    if wishlist_item and wishlist_item.status not in {"removed", "completed", "rejected", "canceled"}:
+                        wishlist_item.status = "failed"
+                        wishlist_item.stage = "failed"
+                        wishlist_item.status_changed_at = datetime.now(timezone.utc)
+                continue
+        payload = json.loads(target.payload_json or "{}")
         # Keep the history -- Issues should be able to say what was already tried -- but clear the
         # flags that make the worker treat this as finished.
         if payload.get("failed_candidates"):
@@ -535,15 +591,15 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         payload.pop("auto_retry_exhausted", None)
         payload.pop("retry_reason", None)
         payload["status"] = "retrying"
-        item.payload_json = json.dumps(payload)
+        target.payload_json = json.dumps(payload)
         # `research` re-enters gate (a): it throws away the candidates and searches again, so a
         # human picks from the new ones. It must NOT auto-approve.
-        item.status = ProposalStatus.pending if mode == "research" else ProposalStatus.approved
-        item.stage = "awaiting_approval" if mode == "research" else "retrying"
-        item.selected = True
-        retried.append(item.id)
-        if item.wishlist_item_id:
-            wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
+        target.status = ProposalStatus.pending if mode == "research" else ProposalStatus.approved
+        target.stage = "awaiting_approval" if mode == "research" else "retrying"
+        target.selected = True
+        retried.append(target.id)
+        if target.wishlist_item_id:
+            wishlist_item = session.get(WishlistItem, target.wishlist_item_id)
             if wishlist_item:
                 wishlist_item.status = "review" if mode == "research" else "downloading"
                 wishlist_item.stage = "awaiting_approval" if mode == "research" else "retrying"
