@@ -9673,16 +9673,14 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
     entries = _manifest_entries_for_items(item_ids)
     transfers, _ = slskd_transfer_lookup(session, entries) if entries else ({}, None)
     removed = 0
+    stopped = 0
     for entry in entries:
         item = session.get(ProposalItem, entry.get("item_id"))
-        candidate = entry.get("candidate") or {}
-        key = (
-            str(candidate.get("username") or ""),
-            str(entry.get("basename") or ""),
-            str(entry.get("item_id") or ""),
-        )
-        if item:
-            cancel_existing_slskd_transfer(session, transfers.get(key), item, "canceled by user")
+        # ⚠️ Must be the same key `slskd_transfer_lookup` builds. A hand-rolled
+        # (username, basename, item_id) tuple here never matched, so a cancel removed the row and the
+        # manifest entry but left the real slskd transfer downloading, untracked, into the folder.
+        if item and cancel_existing_slskd_transfer(session, transfers.get(manifest_entry_key(entry)), item, "canceled by user"):
+            stopped += 1
         # Delete the partial before forgetting the entry -- afterwards there is nothing left
         # pointing at the file and it would sit in the downloads folder forever.
         path = entry.get("path")
@@ -9727,9 +9725,9 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
     reset_canceled_wishlist_items(session, wishlist_item_ids)
     session.commit()
     append_task_log(
-        session, task, f"Canceled {len(item_ids)} download(s); cleaned {removed} transfer(s), removed {len(items)} row(s)"
+        session, task, f"Canceled {len(item_ids)} download(s); stopped {stopped} slskd transfer(s), cleared {removed} manifest entr(ies), removed {len(items)} row(s)"
     )
-    return {"canceled": len(item_ids), "cleaned": removed}
+    return {"canceled": len(item_ids), "cleaned": removed, "stopped": stopped}
 
 
 def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str]) -> None:
