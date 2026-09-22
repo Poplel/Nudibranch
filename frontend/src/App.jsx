@@ -55,7 +55,6 @@ import {
   Sun,
   Trash2,
   Upload,
-  UserCheck,
   Users,
   Wrench,
   X,
@@ -83,6 +82,9 @@ const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint
 // Nav order mirrors the iOS app's: the four things you reach for constantly first, then the
 // management pages. "Discover" is not its own page any more — searching for music and tracking
 // what you asked for are one flow, so both live under Wishlist (see WishlistWorkspace).
+// "Approvals" is gone: other users' wishlist requests now surface inside the Task Queue's
+// Review bucket alongside the candidates they produce, instead of a third, differently-named
+// queue (matches the iOS rebuild -- see CLAUDE-wip-requests-rework.md).
 const navItems = [
   ["Home", House],
   ["Library", Music],
@@ -90,7 +92,6 @@ const navItems = [
   ["Podcasts", Mic2],
   ["Playlists", FileAudio],
   ["Import/Add", HardDriveUpload],
-  ["Approvals", UserCheck],
   ["Task Queue", ListChecks],
   ["Activity", Database],
   ["Tools", Wrench],
@@ -104,7 +105,6 @@ const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the library.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
   Wishlist: "Search for music and track what you have requested.",
-  Approvals: "Review other users' wishlist requests.",
   "Task Queue": "Review requested changes before they run.",
   Playlists: "Create, import, and manage playlists.",
   Podcasts: "Subscribe to podcasts and play episodes.",
@@ -315,7 +315,10 @@ function App() {
   const [appLogs, setAppLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
-  const [wishlistApprovals, setWishlistApprovals] = useState([]);
+  // The requester's own batches (GET /requests) -- also doubles as the Task Queue's data
+  // source for a wishlist:approve_all holder who lacks approvals:manage (GET /approvals is
+  // admin-only; /requests admits wishlist:approve_all and returns the same bucketed shape).
+  const [requests, setRequests] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [users, setUsers] = useState([]);
   const [jellyfinUsers, setJellyfinUsers] = useState(null);
@@ -328,7 +331,6 @@ function App() {
   const [importAlbumSearchOpen, setImportAlbumSearchOpen] = useState(false);
   const [importDownloadRequests, setImportDownloadRequests] = useState([]);
   const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
-  const [approvalsInspectorActions, setApprovalsInspectorActions] = useState(null);
   const [playlistInspectorActions, setPlaylistInspectorActions] = useState(null);
   const [podcastInspectorActions, setPodcastInspectorActions] = useState(null);
   const [mappingSyncStats, setMappingSyncStats] = useState(null);
@@ -405,7 +407,7 @@ function App() {
   );
   const visibleNavItems = useMemo(() => navItems.filter(([label]) => canViewPage(user, label)), [user]);
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
-  const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing");
+  const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing") || requests.some((batch) => batch.status === "executing");
   const unreadNotifications = useMemo(() => notifications.filter((notification) => notification.status === "unread"), [notifications]);
   const activeSeverity = useMemo(
     () => unreadNotifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
@@ -540,10 +542,10 @@ function App() {
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
       refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
-      if (hasPermission(user, "discover")) {
-        refreshWishlist();
-        refreshWishlistApprovals();
-      }
+      if (hasPermission(user, "discover")) refreshWishlist();
+      // /requests is the requester's own progress feed AND the Task Queue's data source for a
+      // wishlist:approve_all holder who lacks approvals:manage (GET /approvals 403s for them).
+      if (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all")) refreshRequests();
       if (hasPermission(user, "activity:read")) refreshUserPlayback();
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
@@ -674,14 +676,16 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
+      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, requestData, approvalData, playlistData, backupData] = await Promise.all([
         api("/permissions"),
         hasPermission(me, "library:view") ? api("/library/tree") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
         api("/notifications"),
         hasPermission(me, "discover") ? api("/wishlist") : Promise.resolve([]),
-        hasPermission(me, "discover") ? api("/wishlist/approvals") : Promise.resolve([]),
+        // /requests is the requester's own progress feed AND the Task Queue's data source for a
+        // wishlist:approve_all holder who lacks approvals:manage (GET /approvals is admin-only).
+        hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all") ? api("/requests") : Promise.resolve([]),
         hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
         hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
         hasPermission(me, "tools:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
@@ -694,7 +698,7 @@ function App() {
       handleCompletedTaskEffects(taskData, { emit: false });
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
-      setWishlistApprovals(wishlistApprovalData);
+      setRequests(requestData);
       setApprovals(approvalData);
       setPlaylists(playlistData);
       setBackups(backupData.backups || []);
@@ -1118,11 +1122,11 @@ function App() {
     }
   }
 
-  async function refreshWishlistApprovals() {
+  async function refreshRequests() {
     try {
-      setWishlistApprovals(await api("/wishlist/approvals"));
+      setRequests(await api("/requests"));
     } catch {
-      // Wishlist approval polling is best-effort.
+      // Requests polling is best-effort.
     }
   }
 
@@ -1175,23 +1179,51 @@ function App() {
     }
   }
 
-  async function submitWishlistApprovals(itemIds = null, options = {}) {
+  // Re-request a declined or failed wishlist item: the server matches on kind/artist/album/track
+  // and replaces the old row (deletes the stale "rejected"/"failed" one and starts a fresh search),
+  // so this is just a plain create with the same fields, not a special endpoint.
+  async function requestWishlistItemAgain(item) {
+    return createWishlistItem({ kind: item.kind, artist: item.artist, album: item.album, track: item.track, source: "wishlist" });
+  }
+
+  // Stop this work without destroying the request -- the wishlist row goes back to searching
+  // (server-side), unlike reject/decline. Available to the requester on their own batch and to
+  // any approver on anyone's (server enforces both via `_may_act_on_request_batch`).
+  async function cancelApprovalItems(items) {
     setLoading(true);
     try {
-      const wantedItems = itemIds?.length ? wishlist.filter((item) => itemIds.includes(item.id)) : wishlist.filter((item) => item.status === "wanted");
-      const batch = await api("/wishlist/approvals", {
-        method: "POST",
-        body: JSON.stringify({ item_ids: itemIds?.length ? itemIds : null, deny_unselected: Boolean(options.denyUnselected) }),
-      });
-      setWishlistApprovals((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
-      await refreshApprovals();
-      const wishlistData = await api("/wishlist");
-      setWishlist(wishlistData);
-      setToast({ title: "Wishlist review queued", body: `${wantedItems.length} wishlist items were submitted.` });
-      return batch;
-    } catch (wishlistError) {
-      notify("Wishlist review failed", wishlistError.message, "ui_error");
-      throw wishlistError;
+      const itemsByBatch = groupBy(items, (item) => item.batch_id);
+      for (const [batchId, batchItems] of itemsByBatch) {
+        await api(`/approvals/${batchId}/cancel`, {
+          method: "POST",
+          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
+        });
+      }
+      setToast({ title: "Canceled", body: "The selected work was stopped." });
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
+    } catch (cancelError) {
+      notify("Cancel failed", cancelError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // mode: "next_candidate" (try the next ranked source) | "same_candidate" | "research" (discard
+  // candidates and search again -- re-enters the approval gate, never auto-starts a download).
+  async function retryApprovalItems(items, mode = "next_candidate") {
+    setLoading(true);
+    try {
+      const itemsByBatch = groupBy(items, (item) => item.batch_id);
+      for (const [batchId, batchItems] of itemsByBatch) {
+        await api(`/approvals/${batchId}/retry`, {
+          method: "POST",
+          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), mode }),
+        });
+      }
+      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : "Trying the next candidate." });
+      await Promise.all([refreshApprovals(), refreshRequests()]);
+    } catch (retryError) {
+      notify("Retry failed", retryError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -3149,7 +3181,11 @@ function App() {
     }
   }
 
-  async function approveItems(items) {
+  // `viaRequests`: a wishlist:approve_all holder without approvals:manage can't call
+  // `/approvals/{id}/selection` or `/approvals/{id}/approve` (both admin-only) -- they approve
+  // through `/requests/{id}/approve` instead, which is scoped server-side to download_review
+  // batches and needs no separate select step (the server prefers whatever item_ids it's given).
+  async function approveItems(items, { viaRequests = false } = {}) {
     setLoading(true);
     try {
       const batchIds = [...new Set(items.map((item) => item.batch_id))];
@@ -3157,14 +3193,16 @@ function App() {
       const itemsByBatch = groupBy(items, (item) => item.batch_id);
       for (const [batchId, batchItems] of itemsByBatch) {
         const ids = batchItems.map((item) => item.id);
-        // Select exactly what we're running (select-only — deselections are never pushed, so a
-        // checkbox change can't cancel an already-running download), then approve those ids.
-        await api(`/approvals/${batchId}/selection`, {
-          method: "POST",
-          body: JSON.stringify({ item_ids: ids, selected: true }),
-        });
+        if (!viaRequests) {
+          // Select exactly what we're running (select-only — deselections are never pushed, so a
+          // checkbox change can't cancel an already-running download), then approve those ids.
+          await api(`/approvals/${batchId}/selection`, {
+            method: "POST",
+            body: JSON.stringify({ item_ids: ids, selected: true }),
+          });
+        }
         createdTasks.push(
-          await api(`/approvals/${batchId}/approve`, {
+          await api(`/${viaRequests ? "requests" : "approvals"}/${batchId}/approve`, {
             method: "POST",
             body: JSON.stringify({ item_ids: ids }),
           }),
@@ -3172,7 +3210,7 @@ function App() {
       }
       setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
       setToast({ title: "Tasks queued", body: `${batchIds.length} change groups were sent to the task queue.` });
-      await refreshApprovals();
+      await Promise.all([refreshApprovals(), refreshRequests()]);
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
       notify("Task queue failed", approvalError.message, "ui_error");
@@ -3192,7 +3230,7 @@ function App() {
         });
       }
       setToast({ title: "Changes rejected", body: "Selected items were removed from the queue." });
-      await refreshApprovals();
+      await Promise.all([refreshApprovals(), refreshRequests()]);
     } catch (rejectError) {
       notify("Reject failed", rejectError.message, "ui_error");
     } finally {
@@ -3428,12 +3466,16 @@ function App() {
             {page === "Task Queue" && (
               <Approvals
                 approvals={approvals}
+                requests={requests}
+                user={user}
                 selectedIds={selectedApprovalIds}
                 onToggle={toggleApprovalItems}
                 onSelectOnly={selectOnlyApprovalItem}
                 onApprove={approveItems}
                 onReject={rejectItems}
                 onRemove={(item) => rejectItems([item])}
+                onCancel={cancelApprovalItems}
+                onRetry={retryApprovalItems}
               />
             )}
             {page === "Import/Add" && (
@@ -3497,7 +3539,6 @@ function App() {
               <WishlistWorkspace
                 user={user}
                 wishlist={wishlist}
-                approvals={wishlistApprovals}
                 onSearch={searchDiscover}
                 onFetchTracks={fetchDiscoverAlbumTracks}
                 onQueue={queueDiscoverDownloads}
@@ -3505,20 +3546,11 @@ function App() {
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onRemoveMany={removeWishlistItems}
-                onSubmit={submitWishlistApprovals}
+                onCancel={cancelApprovalItems}
+                onRequestAgain={requestWishlistItemAgain}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
                 onInspectorActionsChange={setWishlistInspectorActions}
-              />
-            )}
-            {page === "Approvals" && (
-              <WishlistApprovalsView
-                wishlist={wishlist}
-                user={user}
-                onRemove={removeWishlistItem}
-                onRemoveMany={removeWishlistItems}
-                onSubmit={submitWishlistApprovals}
-                onInspectorActionsChange={setApprovalsInspectorActions}
               />
             )}
             {page === "Playlists" && (
@@ -3573,7 +3605,7 @@ function App() {
                 onInitialPodcastConsumed={() => setPodcastOpenRequest(null)}
               />
             )}
-            {!["Home", "Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Approvals", "Playlists", "Podcasts", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
+            {!["Home", "Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Podcasts", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
             </>
             )}
           </section>
@@ -3589,6 +3621,7 @@ function App() {
             importFiles={importFiles}
             importDownloadRequests={importDownloadRequests}
             approvals={approvals}
+            requests={requests}
             wishlist={wishlist}
             playlists={playlists}
             queueItemCount={queueItemCount}
@@ -3618,7 +3651,6 @@ function App() {
                   !(pendingPlaylistName && pendingPlaylistOriginalTracks && pendingPlaylistOriginalTracks.length > 0)),
             }}
             wishlistActions={wishlistInspectorActions}
-            approvalsActions={approvalsInspectorActions}
             playlistActions={playlistInspectorActions}
             podcastActions={podcastInspectorActions}
             mappingSyncStats={mappingSyncStats}
@@ -5227,17 +5259,56 @@ const QUEUE_BUCKETS = [
   { id: "changes", label: "Changes", empty: ["No pending changes", "Metadata, artwork, imports and staged downloads land here."] },
 ];
 
-function Approvals({ approvals, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
+// Two presses to run a batch: the first arms the button, the second commits within a few
+// seconds. Cheaper than a confirmation dialog for something done often, but still refuses to
+// fire on one stray click. Matches the iOS ConfirmButton (Components/ConfirmButton.swift) — it
+// disarms on a timeout and whenever `resetKey` changes (selection, bucket, lock state).
+function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, onConfirm, icon: Icon }) {
+  const [armed, setArmed] = useState(false);
+  const timeoutRef = useRef(null);
+
+  useEffect(() => {
+    setArmed(false);
+    window.clearTimeout(timeoutRef.current);
+  }, [resetKey, disabled]);
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  function handleClick() {
+    if (armed) {
+      window.clearTimeout(timeoutRef.current);
+      setArmed(false);
+      onConfirm();
+      return;
+    }
+    setArmed(true);
+    timeoutRef.current = window.setTimeout(() => setArmed(false), 4000);
+  }
+
+  return (
+    <button className={`primary${armed ? " action-ready" : ""}`} onClick={handleClick} disabled={disabled}>
+      {Icon && <Icon size={16} />}
+      {armed ? confirmLabel : label}
+    </button>
+  );
+}
+
+function Approvals({ approvals, requests, user, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove, onCancel, onRetry }) {
+  const isFullApprover = hasPermission(user, "approvals:manage");
+  // GET /approvals is admin-only. A wishlist:approve_all holder without approvals:manage reads
+  // the Task Queue off GET /requests instead — its is_approver branch returns the same bucketed
+  // shape for the two request flows (download_review + library_review); see
+  // CLAUDE-wip-requests-rework.md.
+  const source = isFullApprover ? approvals : requests;
   const [bucket, setBucket] = useState("review");
   const counts = useMemo(() => {
     const out = { review: 0, issues: 0, changes: 0 };
-    for (const batch of approvals) if (out[batch.bucket] != null) out[batch.bucket] += 1;
+    for (const batch of source) if (out[batch.bucket] != null) out[batch.bucket] += 1;
     return out;
-  }, [approvals]);
+  }, [source]);
   const inBucket = useMemo(
     // Fall back to `review` for a batch from an older API with no bucket, so nothing is invisible.
-    () => approvals.filter((batch) => (batch.bucket || "review") === bucket),
-    [approvals, bucket]
+    () => source.filter((batch) => (batch.bucket || "review") === bucket),
+    [source, bucket]
   );
   const groups = useMemo(() => groupApprovalBatches(inBucket), [inBucket]);
   const active = QUEUE_BUCKETS.find((b) => b.id === bucket) || QUEUE_BUCKETS[0];
@@ -5261,26 +5332,46 @@ function Approvals({ approvals, selectedIds, onToggle, onSelectOnly, onApprove, 
         <EmptyState title={active.empty[0]} body={active.empty[1]} />
       ) : (
         groups.map((group) => (
-          <ApprovalBatch key={group.id} batch={group} selectedIds={selectedIds} onToggle={onToggle} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} onRemove={onRemove} />
+          <ApprovalBatch
+            key={group.id}
+            batch={group}
+            isFullApprover={isFullApprover}
+            selectedIds={selectedIds}
+            onToggle={onToggle}
+            onSelectOnly={onSelectOnly}
+            onApprove={onApprove}
+            onReject={onReject}
+            onRemove={onRemove}
+            onCancel={onCancel}
+            onRetry={onRetry}
+          />
         ))
       )}
     </div>
   );
 }
 
-function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
+function ApprovalBatch({ batch, isFullApprover, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove, onCancel, onRetry }) {
   const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
   const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
   const itemById = useMemo(() => new Map(batch.items.map((item) => [item.id, item])), [batch.items]);
   const selectedItems = batch.items.filter((item) => selectedIds.has(item.id));
-  const selectedExecutableItems = selectedItems.filter(isExecutableApprovalItem);
+  const selectedExecutableItems = useMemo(
+    () => selectedItems.filter((item) => isExecutableApprovalItem(item, isFullApprover)),
+    [selectedItems, isFullApprover]
+  );
   const allSelected = batch.items.length > 0 && batch.items.every((item) => selectedIds.has(item.id));
   const locked = batch.status === "executing";
   // Only the SELECTED items gate the Run button — a still-searching row you haven't picked
   // shouldn't block running the ones you have.
   const selectedSearching = selectedItems.some(isCandidateSearchItem);
   const runDisabled = locked || selectedExecutableItems.length === 0 || selectedSearching;
+  // Batch-wide convenience alongside the per-row actions in the tree below (ApprovalNode) —
+  // useful for "cancel this whole failed album at once" without ticking every leaf.
+  const cancelableItems = useMemo(() => batch.items.filter((item) => item.can_cancel), [batch.items]);
+  const retryableItems = useMemo(() => batch.items.filter((item) => item.can_retry), [batch.items]);
+  const approveResetKey = `${batch.id}:${isFullApprover}:${selectedExecutableItems.map((item) => item.id).sort().join(",")}`;
 
   const prevBatchId = useRef(null);
   useEffect(() => {
@@ -5309,13 +5400,29 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
           </p>
         </div>
         <div className="approval-actions">
+          {cancelableItems.length > 0 && (
+            <button className="secondary" onClick={() => onCancel(cancelableItems)} title="Stop this work — the request stays and searches again">
+              <Ban size={16} />
+              Cancel ({cancelableItems.length})
+            </button>
+          )}
+          {retryableItems.length > 0 && (
+            <button className="secondary" onClick={() => onRetry(retryableItems, "next_candidate")} title="Try the next candidate for everything that failed">
+              <RefreshCw size={16} />
+              Retry ({retryableItems.length})
+            </button>
+          )}
           <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
             Reject selected
           </button>
-          <button className="primary" onClick={() => onApprove(selectedExecutableItems)} disabled={runDisabled}>
-            <Check size={16} />
-            {locked ? "Running" : selectedSearching ? "Waiting for candidates" : "Run selected"}
-          </button>
+          <ConfirmButton
+            icon={Check}
+            label={locked ? "Running" : selectedSearching ? "Waiting for candidates" : "Run selected"}
+            confirmLabel="Confirm run"
+            resetKey={approveResetKey}
+            disabled={runDisabled}
+            onConfirm={() => onApprove(selectedExecutableItems, { viaRequests: !isFullApprover })}
+          />
         </div>
       </div>
       <div className="bulk-row">
@@ -5345,6 +5452,8 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
           onSelectOnly={onSelectOnly}
           onReject={onReject}
           onRemove={onRemove}
+          onCancel={onCancel}
+          onRetry={onRetry}
           openCandidatePickers={openCandidatePickers}
           setOpenCandidatePickers={setOpenCandidatePickers}
           itemById={itemById}
@@ -5365,6 +5474,8 @@ function ApprovalNode({
   onSelectOnly,
   onReject,
   onRemove,
+  onCancel,
+  onRetry,
   allowBranchDelete = false,
   openCandidatePickers,
   setOpenCandidatePickers,
@@ -5446,6 +5557,24 @@ function ApprovalNode({
             <Trash2 size={14} />
           </button>
         )}
+        {/* Cancel — stop this now, the request survives (not destructive). Retry — two of the
+            server's three modes, matching what the iOS context menu offers: the next ranked
+            candidate, or discard everything and search again. */}
+        {onCancel && item.can_cancel && (
+          <button className="row-icon-button" onClick={() => onCancel([item])} title="Cancel — the request stays and searches again">
+            <Ban size={14} />
+          </button>
+        )}
+        {onRetry && item.can_retry && (
+          <>
+            <button className="row-icon-button" onClick={() => onRetry([item], "next_candidate")} title="Retry with the next candidate">
+              <RefreshCw size={14} />
+            </button>
+            <button className="row-icon-button" onClick={() => onRetry([item], "research")} title="Discard candidates and search again">
+              <Search size={14} />
+            </button>
+          </>
+        )}
         {onRemove && item.status !== "executing" && (
           <button className="row-icon-button" onClick={() => onRemove(item)} title="Remove from queue">
             <X size={14} />
@@ -5473,6 +5602,8 @@ function ApprovalNode({
             onSelectOnly={onSelectOnly}
             onReject={onReject}
             onRemove={onRemove}
+            onCancel={onCancel}
+            onRetry={onRetry}
             allowBranchDelete={allowBranchDelete}
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
@@ -5929,8 +6060,8 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, approvals, onSearch, onFetchTracks, onQueue, apiKey,
-  onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
+  user, wishlist, onSearch, onFetchTracks, onQueue, apiKey,
+  onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
 }) {
   const [tab, setTab] = useState("discover");
   const ownCount = useMemo(
@@ -5973,12 +6104,12 @@ function WishlistWorkspace({
       <div className="workspace-tabpanel" hidden={tab !== "requests"}>
         <WishlistView
           wishlist={wishlist}
-          approvals={approvals}
           user={user}
           onAdd={onAdd}
           onRemove={onRemove}
           onRemoveMany={onRemoveMany}
-          onSubmit={onSubmit}
+          onCancel={onCancel}
+          onRequestAgain={onRequestAgain}
           onSearchAlbums={onSearchAlbums}
           onLookupAlbum={onLookupAlbum}
           onInspectorActionsChange={onInspectorActionsChange}
@@ -5989,17 +6120,14 @@ function WishlistWorkspace({
 }
 
 // Personal wishlist only — always scoped to the viewer's own items, regardless of permission.
-// Other users' requests live entirely on the separate Approvals page (WishlistApprovalsView
-// below), never mixed in here, even for a wishlist:approve_all holder viewing their own list.
-function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
+// Other users' requests live in the Task Queue's Review bucket instead (for an approver) — there
+// is no separate Approvals page any more (superseded 2026-09, see CLAUDE-wip-requests-rework.md).
+function WishlistView({ wishlist, user, onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const [selectedItems, setSelectedItems] = useState(() => new Set());
-  const canApproveAll = hasPermission(user, "wishlist:approve_all");
   const ownWishlist = useMemo(() => wishlist.filter((item) => item.user_id === user.id), [wishlist, user.id]);
   const tree = useMemo(() => buildWishlistTree(ownWishlist), [ownWishlist]);
-  const wantedItems = useMemo(() => ownWishlist.filter((item) => item.status === "wanted"), [ownWishlist]);
   const treeKey = useMemo(
     () => tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
     [tree],
@@ -6008,8 +6136,7 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
   useEffect(() => {
     setOpenArtists(new Set(tree.map((artist) => artist.name)));
     setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
-    setSelectedItems(new Set(wantedItems.map((item) => item.id)));
-  }, [treeKey, wantedItems.length]);
+  }, [treeKey]);
 
   async function addAlbumToWishlist(album) {
     if (album.tracks?.length) {
@@ -6024,13 +6151,10 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
 
   useEffect(() => {
     onInspectorActionsChange?.({
-      selectedCount: selectedItems.size,
-      canApproveAll,
       onToggleAlbumSearch: () => setAlbumSearchOpen((value) => !value),
-      onSubmitSelected: canApproveAll ? () => onSubmit([...selectedItems], { denyUnselected: true }) : null,
     });
     return () => onInspectorActionsChange?.(null);
-  }, [selectedItems.size, canApproveAll]);
+  }, [onInspectorActionsChange]);
 
   return (
     <div className="wishlist-view">
@@ -6050,97 +6174,15 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
               setOpenAlbums(new Set());
             }}
           />
-          {tree.map((artist) => renderWishlistArtist(artist, 0, "", openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany))}
+          {tree.map((artist) => renderWishlistArtist(artist, 0, openArtists, setOpenArtists, openAlbums, setOpenAlbums, onRemove, onRemoveMany, onCancel, onRequestAgain))}
         </div>
       )}
     </div>
   );
 }
 
-// Other users' wishlist requests, for a wishlist:approve_all holder to review and queue for
-// download. The viewer's own items never appear here — they're on the Wishlist page instead.
-function WishlistApprovalsView({ wishlist, user, onRemove, onRemoveMany, onSubmit, onInspectorActionsChange }) {
-  const [openOwners, setOpenOwners] = useState(() => new Set());
-  const [openArtists, setOpenArtists] = useState(() => new Set());
-  const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const [selectedItems, setSelectedItems] = useState(() => new Set());
-  const othersWishlist = useMemo(() => wishlist.filter((item) => item.user_id !== user.id), [wishlist, user.id]);
-  const ownerTree = useMemo(() => buildWishlistOwnerTree(othersWishlist), [othersWishlist]);
-  const wantedItems = useMemo(() => othersWishlist.filter((item) => item.status === "wanted"), [othersWishlist]);
-  const treeKey = useMemo(
-    () => ownerTree.map((owner) => `${owner.name}:${owner.artists.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|")}`).join("|"),
-    [ownerTree],
-  );
-
-  useEffect(() => {
-    setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
-    setOpenArtists(new Set(ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`))));
-    setOpenAlbums(
-      new Set(
-        ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))).flatMap(
-          ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId}:${artist.name}/${album.name}`),
-        ),
-      ),
-    );
-    setSelectedItems(new Set(wantedItems.map((item) => item.id)));
-  }, [treeKey, wantedItems.length]);
-
-  useEffect(() => {
-    onInspectorActionsChange?.({
-      selectedCount: selectedItems.size,
-      onSubmitSelected: () => onSubmit([...selectedItems], { denyUnselected: true }),
-    });
-    return () => onInspectorActionsChange?.(null);
-  }, [selectedItems.size]);
-
-  return (
-    <div className="wishlist-view">
-      {othersWishlist.length === 0 ? (
-        <EmptyState title="No requests waiting" body="Other users' requests will appear here for approval." />
-      ) : (
-        <div className="tree">
-          <TreeToolbar
-            expanded={openArtists.size > 0 || openAlbums.size > 0}
-            onExpand={() => {
-              setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
-              setOpenArtists(new Set(ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`))));
-              setOpenAlbums(
-                new Set(
-                  ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))).flatMap(
-                    ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId}:${artist.name}/${album.name}`),
-                  ),
-                ),
-              );
-            }}
-            onCollapse={() => {
-              setOpenOwners(new Set());
-              setOpenArtists(new Set());
-              setOpenAlbums(new Set());
-            }}
-          />
-          {ownerTree.map((owner) => (
-            <div key={owner.id}>
-              <TreeRow
-                icon={Users}
-                open={openOwners.has(owner.id)}
-                title={owner.name}
-                meta={`${owner.itemCount} items`}
-                onToggle={() => toggleSet(setOpenOwners, owner.id)}
-              />
-              {openOwners.has(owner.id) &&
-                owner.artists.map((artist) =>
-                  renderWishlistArtist(artist, 1, owner.id, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany),
-                )}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany) {
-  const artistId = `${prefix ? `${prefix}:` : ""}${artist.name}`;
+function renderWishlistArtist(artist, depth, openArtists, setOpenArtists, openAlbums, setOpenAlbums, onRemove, onRemoveMany, onCancel, onRequestAgain) {
+  const artistId = artist.name;
   return (
     <div key={`${depth}:${artistId}`}>
       <div className="tree-action-row library-row-actions">
@@ -6178,42 +6220,46 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
                 (album.tracks.length > 0 ? (
                   album.tracks.map((track) => (
                     <div className={`tree-action-row library-row-actions wishlist-row${track.status === "removed" ? " removed" : ""}`} key={track.id}>
-                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistStatusLabel(track.status)} />
-                      <DownloadBranchToggle
-                        checked={selectedItems.has(track.id)}
-                        disabled={track.status !== "wanted"}
-                        onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
-                        title="Select wishlist track"
-                      />
-                      {track.status !== "removed" && (
-                        <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
-                          <X size={15} />
-                        </button>
-                      )}
+                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistItemStatusLabel(track)} />
+                      <WishlistRowActions item={track} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />
                     </div>
                   ))
                 ) : (
                   <div className={`tree-action-row library-row-actions wishlist-row${album.request?.status === "removed" ? " removed" : ""}`}>
-                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={wishlistStatusLabel(album.request?.status || "wanted")} />
-                    {album.request && (
-                      <DownloadBranchToggle
-                        checked={selectedItems.has(album.request.id)}
-                        disabled={album.request.status !== "wanted"}
-                        onChange={(checked) => toggleWishlistItem(setSelectedItems, album.request.id, checked)}
-                        title="Select wishlist request"
-                      />
-                    )}
-                    {album.request && album.request.status !== "removed" && (
-                      <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
-                        <X size={15} />
-                      </button>
-                    )}
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request ? wishlistItemStatusLabel(album.request) : "Awaiting Approval"} />
+                    {album.request && <WishlistRowActions item={album.request} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />}
                   </div>
                 ))}
             </div>
           );
         })}
     </div>
+  );
+}
+
+// Cancel (while the request is actively searching/downloading), Request again (once declined or
+// failed), Remove — never more than the two that make sense for the row's current stage.
+function WishlistRowActions({ item, onRemove, onCancel, onRequestAgain }) {
+  const active = isWishlistItemActive(item);
+  const needsRequestAgain = ["rejected", "failed"].includes(item.stage);
+  return (
+    <>
+      {active && item.batch_id && (
+        <button className="row-icon-button" onClick={() => onCancel([{ id: item.item_id || item.id, batch_id: item.batch_id }])} title="Cancel — the request stays and searches again">
+          <Ban size={15} />
+        </button>
+      )}
+      {needsRequestAgain && (
+        <button className="row-icon-button" onClick={() => onRequestAgain(item)} title="Request again">
+          <RefreshCw size={15} />
+        </button>
+      )}
+      {item.status !== "removed" && (
+        <button className="row-icon-button" onClick={() => onRemove(item.id)} title="Remove">
+          <X size={15} />
+        </button>
+      )}
+    </>
   );
 }
 
@@ -7644,8 +7690,9 @@ function canViewPage(user, page) {
   if (page === "Library") return hasPermission(user, "library:view") || hasPermission(user, "library:edit");
   if (page === "Import/Add") return hasPermission(user, "import:run");
   if (page === "Wishlist") return hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all");
-  if (page === "Approvals") return hasPermission(user, "wishlist:approve_all");
-  if (page === "Task Queue") return hasPermission(user, "approvals:manage");
+  // wishlist:approve_all admits the Task Queue too, since Review (music requests awaiting
+  // approval) is where those requests live now -- there's no separate Approvals page any more.
+  if (page === "Task Queue") return hasPermission(user, "approvals:manage") || hasPermission(user, "wishlist:approve_all");
   if (page === "Playlists") return hasPermission(user, "playlists:manage");
   if (page === "Podcasts") return hasPermission(user, "podcasts:manage");
   if (page === "Activity") return hasPermission(user, "activity:read");
@@ -11018,6 +11065,7 @@ function Inspector({
   importFiles,
   importDownloadRequests,
   approvals,
+  requests,
   wishlist,
   playlists,
   queueItemCount,
@@ -11026,7 +11074,6 @@ function Inspector({
   downloadProgress,
   importActions,
   wishlistActions,
-  approvalsActions,
   playlistActions,
   podcastActions,
   mappingSyncStats,
@@ -11042,6 +11089,7 @@ function Inspector({
     importFiles,
     importDownloadRequests,
     approvals,
+    requests,
     wishlist,
     user,
     playlists,
@@ -11197,20 +11245,6 @@ function Inspector({
             <Plus size={16} />
             Add album
           </button>
-          {wishlistActions.canApproveAll && (
-            <button className="primary" onClick={wishlistActions.onSubmitSelected} disabled={wishlistActions.selectedCount === 0}>
-              <ListChecks size={16} />
-              Add selected to task queue
-            </button>
-          )}
-        </div>
-      )}
-      {page === "Approvals" && approvalsActions && (
-        <div className="inspector-actions">
-          <button className="primary" onClick={approvalsActions.onSubmitSelected} disabled={approvalsActions.selectedCount === 0}>
-            <ListChecks size={16} />
-            Add selected to task queue
-          </button>
         </div>
       )}
       {page === "Import/Add" && playlistImportActions && (
@@ -11313,6 +11347,7 @@ function inspectorStats({
   importFiles = [],
   importDownloadRequests = [],
   approvals = [],
+  requests = [],
   wishlist = [],
   user = null,
   playlists = [],
@@ -11331,7 +11366,10 @@ function inspectorStats({
     return { summary: `${selected} selected · ${ready} ready`, rows: musicStatRows(stats) };
   }
   if (page === "Task Queue") {
-    const stats = countApprovalMusic(approvals.filter((batch) => batch.status !== "executing"));
+    // Same source rule as the <Approvals> component itself: GET /approvals is admin-only, so a
+    // wishlist:approve_all holder without approvals:manage reads the Task Queue off /requests.
+    const source = hasPermission(user, "approvals:manage") ? approvals : requests;
+    const stats = countApprovalMusic(source.filter((batch) => batch.status !== "executing"));
     return {
       summary: `${queueSelectionCount} selected · ${queueItemCount} ready`,
       rows: musicStatRows(stats),
@@ -11340,10 +11378,6 @@ function inspectorStats({
   if (page === "Wishlist") {
     const own = user ? wishlist.filter((item) => item.user_id === user.id) : wishlist;
     return { summary: "", rows: musicStatRows(countWishlistMusic(own)) };
-  }
-  if (page === "Approvals") {
-    const others = user ? wishlist.filter((item) => item.user_id !== user.id) : wishlist;
-    return { summary: "", rows: musicStatRows(countWishlistMusic(others)) };
   }
   if (page === "Playlists") {
     const stats = countPlaylistMusic(playlists);
@@ -11451,8 +11485,15 @@ function isReadyApprovalItem(item) {
   return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
 }
 
-function isExecutableApprovalItem(item) {
+// `isFullApprover=false` means the caller only has wishlist:approve_all, not approvals:manage --
+// that permission's own approve route (`POST /requests/{id}/approve`) is scoped server-side to
+// download_review batches, so an item whose bucket isn't "review" (a library_review/library_change
+// item can carry `can_approve=true` too -- that flag is stage-only, not actor-scoped) must not be
+// offered here even though the flag says yes. See CLAUDE-wip-requests-rework.md "server gap".
+function isExecutableApprovalItem(item, isFullApprover = true) {
   if (["executing", "completed", "rejected"].includes(item.status)) return false;
+  if (item.can_approve === false) return false;
+  if (!isFullApprover && item.bucket && item.bucket !== "review") return false;
   const payload = parseJsonObject(item.payload_json);
   if (item.kind === "import_files") return Boolean(item.old_value && item.new_value);
   if (item.kind === "metadata") return Boolean(payload.target_type);
@@ -13920,41 +13961,38 @@ function buildWishlistTree(items) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function buildWishlistOwnerTree(items) {
-  const ownerMap = new Map();
-  items.forEach((item) => {
-    if (item.status === "removed") return;
-    const ownerId = item.user_id || "unknown";
-    if (!ownerMap.has(ownerId)) {
-      ownerMap.set(ownerId, { id: ownerId, name: item.owner_name || "Unknown User", items: [] });
-    }
-    ownerMap.get(ownerId).items.push(item);
-  });
-  return [...ownerMap.values()]
-    .map((owner) => ({
-      ...owner,
-      itemCount: owner.items.length,
-      artists: buildWishlistTree(owner.items),
-    }))
-    .filter((owner) => owner.itemCount > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
-}
-
-// ⚠️ Fallback only. `WishlistOut.status_label` is authoritative; prefer `item.status_label`.
+// ⚠️ Fallback only, for a wishlist row from an older API with no `status_label`. Never call this
+// directly on a fresh row — prefer `wishlistItemStatusLabel(item)`, which reads the server's own
+// label first (WishlistOut.status_label is authoritative; stage/status_code are its typed form).
 function wishlistStatusLabel(status) {
   if (status === "downloading") return "Downloading…";
   if (status === "approved") return "Awaiting Download";
   if (status === "completed") return "Completed";
-  if (status === "rejected") return "Rejected";
+  if (status === "rejected") return "Declined";
   if (status === "review" || status === "wanted") return "Awaiting Approval";
   if (status === "removed") return "Removed";
   return status || "Awaiting Approval";
 }
 
+function wishlistItemStatusLabel(item) {
+  return item.status_label || wishlistStatusLabel(item.status);
+}
+
+// Stages where the linked download batch is doing something a Cancel would actually stop.
+// Declined ("rejected"), failed, completed and removed rows have nothing left to cancel.
+const ACTIVE_WISHLIST_STAGES = new Set([
+  "searching", "awaiting_approval", "approved", "queued", "downloading", "retrying",
+  "staging", "verifying", "staged",
+]);
+
+function isWishlistItemActive(item) {
+  return ACTIVE_WISHLIST_STAGES.has(item.stage);
+}
+
 function wishlistAlbumMeta(album) {
   const count = album.tracks.length || (album.request ? 1 : 0);
   const statuses = new Set(
-    [...album.tracks.map((track) => track.status), album.request?.status].filter(Boolean).map(wishlistStatusLabel),
+    [...album.tracks, album.request].filter(Boolean).map(wishlistItemStatusLabel),
   );
   const label = count === 1 ? "request" : "requests";
   return `${count} ${label}${statuses.size ? ` · ${[...statuses].join(", ")}` : ""}`;
@@ -13965,15 +14003,6 @@ function toggleSet(setter, value) {
     const next = new Set(current);
     if (next.has(value)) next.delete(value);
     else next.add(value);
-    return next;
-  });
-}
-
-function toggleWishlistItem(setter, id, checked) {
-  setter((current) => {
-    const next = new Set(current);
-    if (checked) next.add(id);
-    else next.delete(id);
     return next;
   });
 }
