@@ -67,6 +67,53 @@ const TOKEN_KEY = "nudibranch_api_key";
 const APPEARANCE_LAST_KEY = "nudibranch_appearance_last";
 const DEVICE_LABEL_KEY = "nudibranch_device_label";
 
+// ── The account's shared playback session (§A1b) ──
+// A longer local queue is published as a window around the current item, and every index this tab
+// reports is re-based onto that window. ⚠ Below the server's SESSION_MAX_ITEMS (5000) on purpose:
+// the server stores each item with its null title/artist/album_id fields, ~122 bytes apiece, so 5000
+// uuid-keyed items encode to ~610 KB and trip its 512 KB payload cap with a 413. 4000 fit.
+const SESSION_MAX_ITEMS = 4000;
+const SESSION_LOOK_BACK = 400;
+// The `session_id` the docked player sees for an orphaned session, which belongs to no device.
+const ACCOUNT_SESSION_ROW = "account-session";
+
+function queueItemId(item) {
+  return item?._episodeId || item?.id;
+}
+
+function toSnapshotItem(item) {
+  return {
+    type: item?._kind === "episode" ? "episode" : "track",
+    id: queueItemId(item),
+    podcast_id: item?._podcastId || null,
+  };
+}
+
+/// Order and identity only. Two queues with the same key publish the same shared queue.
+function sessionQueueKeyOf(queue) {
+  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}:${queueItemId(item)}`).join("|");
+}
+
+function snapshotItemsKey(items) {
+  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}:${item.id}`).join("|");
+}
+
+/// The part of a local queue that is published, and where the current item sits in it.
+function sessionWindow(queue, index) {
+  const length = queue.length;
+  const anchor = Math.min(Math.max(index, 0), Math.max(0, length - 1));
+  const start = Math.max(0, Math.min(anchor - SESSION_LOOK_BACK, length - SESSION_MAX_ITEMS));
+  const slice = queue.slice(start, start + SESSION_MAX_ITEMS);
+  return { start, length: slice.length, index: slice.length ? anchor - start : 0, items: slice.map(toSnapshotItem) };
+}
+
+/// The server's 409s nest their code one level down (`{"detail":{"detail":"owned"}}`), except
+/// `claim_lost`, which is a plain string.
+function sessionErrorCode(data) {
+  const detail = data?.detail;
+  return typeof detail === "string" ? detail : (detail?.detail || null);
+}
+
 // Stable per-browser device label so re-logins reuse one session instead of
 // piling up a fresh "Web" session every time (backend dedupes by device_label).
 function getDeviceLabel() {
@@ -310,6 +357,15 @@ function App() {
   const lastEpisodeProgressRef = useRef(null);
   const commandPollingRef = useRef(false);
   const commandPollNowRef = useRef(null);
+  // Shared-session plumbing (§A1b). Claims and queue publishes run strictly one after another on
+  // `sessionOpChainRef`: two claims racing each other could leave the server holding the older one,
+  // and the tab would then read its own claim as lost and stop.
+  const sessionOpChainRef = useRef(Promise.resolve());
+  const sessionClaimsInFlightRef = useRef(0);
+  const lastPublishedKeyRef = useRef(null);
+  const sessionRecoverAtRef = useRef(0);
+  const sessionRefreshNowRef = useRef(null);
+  const sessionReleaseRef = useRef(null);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
@@ -373,6 +429,33 @@ function App() {
   const activeRemoteSession = remoteSessions.find(
     (r) => !r.current && r.presence === "live" && (r.status === "playing" || r.status === "paused"),
   );
+  // ── The account's shared playback session (§A1b) ──
+  // Declared up here beside `activeRemoteSession` for the same temporal-dead-zone reason: the docked
+  // player's mount condition and `playerDocked` read what these derive.
+  /// GET /player/session, without its items. Null until first read, and while cross-device playback
+  /// is off.
+  const [accountSession, setAccountSession] = useState(null);
+  /// The `updated_at` of an orphaned session the user closed in this tab. It stays hidden here until
+  /// the session changes, and is never hidden anywhere else.
+  const [orphanDismissedAt, setOrphanDismissedAt] = useState(null);
+  /// This tab's claim on the shared session: `{ id, start, length }`, where `start`/`length` describe
+  /// the window of the local queue it published. MEMORY ONLY: a reloaded tab has nothing playing, so
+  /// it starts as a viewer or as the resumer of an orphan.
+  const sessionClaimRef = useRef(null);
+  const remotePlaybackOn = user?.remote_playback_enabled !== false;
+  /// An ORPHAN is a session nobody holds a valid claim on (or one this very session held before a
+  /// reload lost its claim id). It is shown paused where it was left, and Play here claims it.
+  /// ⚠ A remote that is genuinely PLAYING still wins the dock: that is what the account is listening
+  /// to right now, whatever the shared row says.
+  const orphanSession = remotePlaybackOn && !currentTrack && accountSession
+    && (accountSession.queue_length || 0) > 0
+    && (!accountSession.claim_valid || (accountSession.you_own && !sessionClaimRef.current))
+    && !(orphanDismissedAt && orphanDismissedAt === accountSession.updated_at)
+    && activeRemoteSession?.status !== "playing"
+    ? { ...accountSession, session_id: ACCOUNT_SESSION_ROW, status: "paused", _orphan: true }
+    : null;
+  /// What the docked player shows when nothing plays here: the orphan, or another live session.
+  const displayedRemote = orphanSession || activeRemoteSession || null;
   const [playerPopped, setPlayerPopped] = useState(false);
   const [playerDockHeight, setPlayerDockHeight] = useState(0);
   const [playerToastHeight, setPlayerToastHeight] = useState(0);
@@ -429,7 +512,16 @@ function App() {
     : -1;
   // The remote dock occupies the same slot and the same height variables, so anything keyed on
   // "a player is docked" has to count it too — otherwise content sits under it.
-  const playerDocked = (playerOpen && !playerPopped) || Boolean(!playerOpen && activeRemoteSession);
+  const playerDocked = (playerOpen && !playerPopped) || Boolean(!playerOpen && displayedRemote);
+  /// The latest values the shared-session code needs from inside async work and timers, which would
+  /// otherwise close over a stale render.
+  const sessionLiveRef = useRef({});
+  sessionLiveRef.current = { playerQueue, currentTrackIndex, shuffle, repeat, token, remotePlaybackOn, accountSession };
+  /// Fingerprint of the local queue's CONTENTS (order included, playhead excluded): the owner
+  /// republishes the shared queue only when this changes.
+  const sessionQueueKey = useMemo(() => sessionQueueKeyOf(playerQueue), [playerQueue]);
+  /// A paused orphan changes nothing on its own, so it is not worth the fast poll or the clock tick.
+  const liveRemoteViewers = orphanSession ? 0 : remoteViewers;
   const appearanceVars = useMemo(() => buildAppearanceVars(dark, accentColor, backgroundTint), [dark, accentColor, backgroundTint]);
   const nextAudioUrl = useMemo(() => {
     const next = playerQueue[currentTrackIndex + 1];
@@ -666,6 +758,8 @@ function App() {
   }
 
   function logout() {
+    // While the token still works: a signed-out tab is nobody's player.
+    releaseSessionClaim();
     localStorage.removeItem(TOKEN_KEY);
     setToken("");
     setUser(null);
@@ -2019,10 +2113,13 @@ function App() {
     // forwardQueueAddition already applies to Add to Queue / Play Next.
     if (!opts.localOnly && forwardPlayToRemote(queue, wantShuffle)) return;
     if (opts.shuffle != null) setShuffle(Boolean(opts.shuffle));
+    // A fresh play here makes this tab the account's player. ⚠ Not awaited: audio never waits for
+    // the claim, and a claim that fails is retried by the next "playing" report.
+    claimFreshSession(queue, 0, wantShuffle);
     setPlayerQueue(queue);
     setPlayerOpen(true);
     setQueueOpen(false);
-    await loadPlayerTrack(queue[0]);
+    await loadPlayerTrack(queue[0], queue);
   }
 
   function resolvePlayableFromLibrary(targetType, targetId) {
@@ -2217,64 +2314,578 @@ function App() {
     return undefined;
   }
 
-  /// Adopt a queue handed over by another of this account's sessions.
-  ///
-  /// ⚠ Returns "retry" for a transient failure so the poll loop leaves the command PENDING. A
-  /// handoff carries a queue rather than an instruction, so acking a network blip would drop
-  /// someone's playback with nothing to recover from. It is bounded by the server's five-minute
-  /// expiry, after which the fetch 410s — a permanent outcome, which acks.
-  async function adoptHandoff(handoffId) {
-    if (!handoffId) return undefined;
-    let handoff;
+  // ── The account's shared playback session (§A1b) ─────────────────────────────────────────────
+  //
+  // One queue and one position per account, stored on the server and outliving every tab. The tab
+  // that plays it holds a CLAIM (`sessionClaimRef`) and sends it on every /player/status; every
+  // other device views it through the same remote player that already existed.
+  // ⚠ None of this touches the remote clock, the assertions or the seek path. An OWNED session is
+  // still driven through the command channel, exactly as before; only an ORPHAN, which has nobody
+  // to command, is edited on the server directly (`/player/session/edit`).
+
+  /// A request whose failure is an answer (409 claim_lost / owned / queue_changed) rather than an
+  /// error — `api()` flattens those into a message string. Throws only on a network failure.
+  async function sessionRequest(path, body, method = "POST") {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionLiveRef.current.token}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => null);
+    return { ok: response.ok, status: response.status, data };
+  }
+
+  /// Newer-or-equal wins, so a slow poll landing after an edit's answer cannot put the old state back.
+  function applyAccountSession(data) {
+    if (!data) return;
+    const { items, claim_id: _claimId, ...row } = data;
+    setAccountSession((previous) => {
+      const before = Date.parse(previous?.updated_at || "") || 0;
+      const after = Date.parse(row.updated_at || "") || 0;
+      return before && after && after < before ? previous : row;
+    });
+  }
+
+  const refreshAccountSession = useCallback(async () => {
+    if (!sessionLiveRef.current.remotePlaybackOn) { setAccountSession(null); return; }
     try {
-      handoff = await api(`/player/handoffs/${encodeURIComponent(handoffId)}`);
-    } catch (error) {
-      // 404/410 are permanent (gone, expired, already taken); anything else is worth another poll.
-      const permanent = /\b(404|410)\b/.test(String(error?.message || ""));
-      return permanent ? undefined : "retry";
+      applyAccountSession(await api("/player/session"));
+    } catch {
+      /* ambient, like the sessions poll */
     }
-    const snapshot = handoff?.snapshot;
-    if (!snapshot?.items?.length) return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api]);
 
-    const tracks = await resolveSnapshotItems(snapshot.items);
-    if (tracks.length === 0) {
-      // Leave the local queue exactly as it was — a handoff that cannot play here must not also
-      // destroy what this device already had.
-      await api(`/player/handoffs/${encodeURIComponent(handoffId)}/rejected`, {
+  /// Run claims and publishes strictly in order (see `sessionOpChainRef`).
+  function runSessionOp(fn) {
+    const run = sessionOpChainRef.current.then(fn);
+    sessionOpChainRef.current = run.catch(() => {});
+    return run;
+  }
+
+  /// Claim the shared session. `apply` runs inside the serialized op, BEFORE the in-flight count
+  /// drops, so no report can observe a half-installed claim. Resolves with the claim response.
+  function claimSession(snapshot, apply) {
+    sessionClaimsInFlightRef.current += 1;
+    return runSessionOp(async () => {
+      try {
+        const result = await sessionRequest("/player/session/claim", snapshot ? { snapshot } : {});
+        if (!result.ok || !result.data?.claim_id) throw new Error(`claim refused (${result.status})`);
+        apply?.(result.data);
+        return result.data;
+      } finally {
+        sessionClaimsInFlightRef.current -= 1;
+      }
+    });
+  }
+
+  function sessionSnapshot(win, positionSeconds, playing, shuffleOn, repeatMode) {
+    return {
+      version: 1,
+      items: win.items,
+      current_index: win.index,
+      position_seconds: Math.max(0, positionSeconds || 0),
+      playing,
+      shuffle: Boolean(shuffleOn),
+      repeat: repeatMode,
+    };
+  }
+
+  /// A fresh local play: this tab takes the session and replaces its queue.
+  function claimFreshSession(queue, index = 0, shuffleOn = shuffle) {
+    if (!sessionLiveRef.current.remotePlaybackOn || !queue?.length) return;
+    const win = sessionWindow(queue, index);
+    const key = sessionQueueKeyOf(queue);
+    claimSession(sessionSnapshot(win, 0, true, shuffleOn, sessionLiveRef.current.repeat), (data) => {
+      sessionClaimRef.current = { id: data.claim_id, start: win.start, length: win.length };
+      lastPublishedKeyRef.current = key;
+      applyAccountSession(data);
+    }).catch(() => { /* the next "playing" report retries — maybeRecoverSessionClaim */ });
+  }
+
+  /// Publish this tab's queue as the shared one. Only the owner may, and it is authoritative while it
+  /// holds the claim — edits from other devices reach it as commands and come back out through here.
+  function publishSessionQueue({ force = false } = {}) {
+    return runSessionOp(async () => {
+      const claim = sessionClaimRef.current;
+      const live = sessionLiveRef.current;
+      if (!claim || !live.remotePlaybackOn) return;
+      const key = sessionQueueKeyOf(live.playerQueue);
+      if (!force && key === lastPublishedKeyRef.current) return;
+      const win = sessionWindow(live.playerQueue, live.currentTrackIndex);
+      const ctl = playbackControlRef.current;
+      const result = await sessionRequest("/player/session/queue", {
+        claim_id: claim.id,
+        snapshot: sessionSnapshot(win, ctl?.position?.(), Boolean(ctl?.isPlaying?.()), live.shuffle, live.repeat),
+      });
+      if (result.status === 409) { handleSessionClaimLost(claim.id); return; }
+      if (!result.ok) return;
+      if (sessionClaimRef.current?.id === claim.id) {
+        sessionClaimRef.current = { ...claim, start: win.start, length: win.length };
+      }
+      lastPublishedKeyRef.current = key;
+      applyAccountSession(result.data);
+    }).catch(() => {});
+  }
+
+  /// Stop here and show whatever now holds the session. Playback MOVED, so this stops rather than
+  /// pauses. ⚠ `playerOpen` stays true: unmounting the player would throw away the form it was in —
+  /// docked, fullscreen or popped out — at the moment the music moved. The view follows the playback.
+  function followSharedSession() {
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+    playbackControlRef.current?.stop?.();
+    unshuffledQueueRef.current = null;
+    setPlayerQueue([]);
+    setCurrentTrack(null);
+    setAudioUrl("");
+    setPlayerOpen(true);
+    // After the element's own pause event has reported "paused", so the last word is "stopped" and
+    // this tab is not listed as a paused session someone could resume.
+    setTimeout(() => reportPlayerStatus(null, "stopped", { queue_length: 0, current_index: 0 }), 400);
+    setToast({ title: "Playback moved", body: "Continues on another device." });
+    refreshRemoteSessions();
+    refreshAccountSession();
+  }
+
+  /// ⚠ Acts only when the claim a request was SENT with is still this tab's current one. Claiming
+  /// again (Play here, adopt_session while already the owner) mints a new id, and answers to requests
+  /// carrying the superseded one arrive afterwards — obeying those would stop our own playback.
+  function handleSessionClaimLost(claimId) {
+    const claim = sessionClaimRef.current;
+    if (!claim || claim.id !== claimId || sessionClaimsInFlightRef.current > 0) return;
+    followSharedSession();
+  }
+
+  /// The dying gasp. With `keepalive` it outlives the page (`pagehide`); sendBeacon cannot carry the
+  /// Authorization header, so it is a fetch.
+  function releaseSessionClaim({ keepalive = false } = {}) {
+    const claim = sessionClaimRef.current;
+    if (!claim) return;
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+    const live = sessionLiveRef.current;
+    const relative = live.currentTrackIndex - claim.start;
+    const body = {
+      claim_id: claim.id,
+      position_seconds: Math.max(0, playbackControlRef.current?.position?.() || 0),
+      ...(relative >= 0 && relative < claim.length ? { current_index: relative } : {}),
+    };
+    try {
+      fetch(`${API_BASE}/player/session/release`, {
         method: "POST",
-        body: JSON.stringify({ reason: "nothing_resolved" }),
+        keepalive,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${live.token}` },
+        body: JSON.stringify(body),
       }).catch(() => {});
-      notify("Playback not moved", "Nothing in that queue is available here.", "ui_notice");
-      return undefined;
+    } catch {
+      /* the claim lapses on its own after five silent minutes */
     }
+  }
+  sessionReleaseRef.current = releaseSessionClaim;
 
-    // Start where the sender was, or at the first item after it that resolved here.
-    const wantedId = snapshot.items[snapshot.current_index]?.id;
-    let startIndex = tracks.findIndex((t) => (t._episodeId || t.id) === wantedId);
-    if (startIndex < 0) {
-      const laterIds = new Set(snapshot.items.slice(snapshot.current_index + 1).map((i) => i.id));
-      startIndex = tracks.findIndex((t) => laterIds.has(t._episodeId || t.id));
+  /// Playing with no claim — a claim that failed on a network blip, or a page restored from the
+  /// back/forward cache after its dying gasp. The rule (§A1b): a device that is validly PLAYING the
+  /// session elsewhere wins and this tab follows it; otherwise this tab claims with its own queue.
+  function maybeRecoverSessionClaim() {
+    const live = sessionLiveRef.current;
+    if (!live.remotePlaybackOn || sessionClaimRef.current || sessionClaimsInFlightRef.current > 0) return;
+    if (!live.playerQueue.length) return;
+    const now = Date.now();
+    if (now - sessionRecoverAtRef.current < 30000) return;
+    sessionRecoverAtRef.current = now;
+    (async () => {
+      const read = await sessionRequest("/player/session", undefined, "GET");
+      if (!read.ok || sessionClaimRef.current || sessionClaimsInFlightRef.current > 0) return;
+      const shared = read.data;
+      if (shared?.claim_valid && !shared.you_own && shared.status === "playing") {
+        followSharedSession();
+        return;
+      }
+      const current = sessionLiveRef.current;
+      const win = sessionWindow(current.playerQueue, current.currentTrackIndex);
+      const key = sessionQueueKeyOf(current.playerQueue);
+      const ctl = playbackControlRef.current;
+      await claimSession(
+        sessionSnapshot(win, ctl?.position?.(), true, current.shuffle, current.repeat),
+        (data) => {
+          sessionClaimRef.current = { id: data.claim_id, start: win.start, length: win.length };
+          lastPublishedKeyRef.current = key;
+          applyAccountSession(data);
+        },
+      );
+    })().catch(() => {});
+  }
+
+  /// Turn the shared queue's items into playable rows, ALIGNED with the items (null where one cannot
+  /// be played here). The web has no library mirror, so titles come from the in-memory library tree
+  /// where it has the track, and otherwise from the server's resolver.
+  async function playablesFromSessionItems(items) {
+    const libraryTracks = new Map();
+    const wanted = new Set(items.filter((item) => item.type !== "episode").map((item) => item.id));
+    if (wanted.size > 0) {
+      for (const artist of library || []) {
+        for (const album of artist.albums || []) {
+          for (const track of album.tracks || []) {
+            if (wanted.has(track.id)) libraryTracks.set(track.id, hydrateTrack(track, artist, album));
+          }
+        }
+      }
     }
+    const titles = new Map();
+    for (const item of items) if (item.title) titles.set(item.id, item);
+    for (const row of remoteQueue) {
+      if (row.title && !titles.has(row.id)) titles.set(row.id, { title: row.title, artist: row._artist, album_id: row._albumId });
+    }
+    const unresolved = items.some((item) => !titles.has(item.id) && !libraryTracks.has(item.id));
+    if (unresolved) {
+      try {
+        const fresh = await api("/player/session?queue=1&resolve=true");
+        for (const item of fresh?.items || []) if (item.title) titles.set(item.id, item);
+      } catch {
+        /* whatever resolved already still plays */
+      }
+    }
+    return items.map((item) => {
+      const known = titles.get(item.id);
+      if (item.type === "episode") {
+        // Built from the ids alone: the stream is the server's relay, so no podcast lookup is needed.
+        // No `_resumeMs`, deliberately — the session says where the listener is, not the episode.
+        if (!known) return null;
+        return {
+          id: item.id,
+          title: known.title,
+          _kind: "episode",
+          _episodeId: item.id,
+          _streamPath: `/podcasts/episodes/${encodeURIComponent(item.id)}/stream`,
+          _artist: known.artist || "Podcast",
+          _album: known.artist || "Podcast",
+          _podcastId: item.podcast_id || null,
+          _coverUrl: item.podcast_id && token
+            ? `${API_BASE}/podcasts/${encodeURIComponent(item.podcast_id)}/cover?api_key=${encodeURIComponent(token)}`
+            : "",
+          _resumeMs: 0,
+          _durationMs: 0,
+        };
+      }
+      const fromLibrary = libraryTracks.get(item.id);
+      if (fromLibrary) return fromLibrary;
+      if (!known) return null;
+      return { id: item.id, title: known.title, album_id: known.album_id || undefined, _artist: known.artist || "", _album: "" };
+    });
+  }
+
+  /// Install a claimed session's queue and play it from where the session was.
+  async function playClaimedSession(data, { position = true } = {}) {
+    const items = data.items || [];
+    const resolved = await playablesFromSessionItems(items);
+    const tracks = resolved.filter(Boolean);
+    if (tracks.length === 0) {
+      sessionClaimRef.current = { id: data.claim_id, start: 0, length: items.length };
+      releaseSessionClaim();
+      notify("Playback", "Nothing in that queue is available here.", "ui_notice");
+      return false;
+    }
+    const wantIndex = Math.min(Math.max(data.current_index || 0, 0), Math.max(0, items.length - 1));
+    let startIndex = -1;
+    let exact = false;
+    let at = 0;
+    resolved.forEach((entry, i) => {
+      if (!entry) return;
+      if (i === wantIndex) { startIndex = at; exact = true; } else if (startIndex < 0 && i > wantIndex) startIndex = at;
+      at += 1;
+    });
     if (startIndex < 0) startIndex = 0;
-
+    // Everything resolved: what plays here IS the shared queue, so there is nothing to republish.
+    // Otherwise this tab's shorter queue is published, since the owner is authoritative.
+    sessionClaimRef.current = { id: data.claim_id, start: 0, length: tracks.length === items.length ? items.length : tracks.length };
+    lastPublishedKeyRef.current = tracks.length === items.length ? sessionQueueKeyOf(tracks) : null;
+    applyAccountSession(data);
+    setOrphanDismissedAt(null);
+    // Already in playback order, and the pre-shuffle order was never shared, so there is nothing to
+    // restore: set the flag without reshuffling.
+    unshuffledQueueRef.current = null;
+    setShuffle(Boolean(data.shuffle));
+    setRepeat(["off", "one", "all"].includes(data.repeat) ? data.repeat : "off");
     setPlayerQueue(tracks);
     setPlayerOpen(true);
-    // An adopted queue arrives already in playback order and its pre-shuffle order stayed on the
-    // sending device, so there is nothing to restore. setShuffleState's off-branch handles a null
-    // snapshot by leaving the queue as it is, which is the right degradation.
-    unshuffledQueueRef.current = null;
-    setShuffleState(Boolean(snapshot.shuffle));
-    setRepeat(["off", "one", "all"].includes(snapshot.repeat) ? snapshot.repeat : "off");
-    await loadPlayerTrack(tracks[startIndex]);
-    if (snapshot.position_seconds > 0) seekWithRetry(Math.round(snapshot.position_seconds));
-    // The SERVER decides whether to start playing — it decays autoplay for a handoff collected late,
-    // so audio never starts on a device the user has since walked away from.
-    if (handoff.autoplay_effective === false) {
-      setTimeout(() => playbackControlRef.current?.pause?.(), 0);
+    setQueueOpen(false);
+    await loadPlayerTrack(tracks[startIndex], tracks);
+    if (position && exact && data.position_seconds > 0) seekWithRetry(data.position_seconds);
+    if (tracks.length !== items.length) publishSessionQueue({ force: true });
+    return true;
+  }
+
+  /// Take the stored session here: Play on an orphan, "Play here", or an adopt_session. The server
+  /// stops whichever device held it. Returns "retry" for a transient failure.
+  async function takeSharedSession({ quiet = false } = {}) {
+    if (!sessionLiveRef.current.remotePlaybackOn) return "done";
+    return whileAdopting(async () => {
+      let data;
+      try {
+        data = await claimSession(null, dropSupersededClaim);
+      } catch {
+        if (!quiet) notify("Playback", "Couldn't start playback here.", "ui_error");
+        return "retry";
+      }
+      await playClaimedSession(data);
+      return "done";
+    });
+  }
+
+  /// A claim being installed counts as in flight until its queue is playing: until then no answer
+  /// about an older claim may stop this tab, and no "playing" report may claim with the old queue.
+  async function whileAdopting(fn) {
+    sessionClaimsInFlightRef.current += 1;
+    try {
+      return await fn();
+    } finally {
+      sessionClaimsInFlightRef.current -= 1;
     }
-    await api(`/player/handoffs/${encodeURIComponent(handoffId)}/adopted`, { method: "POST" }).catch(() => {});
-    setToast({ title: "Playback moved here", body: `From ${handoff.from_device_label || "another device"}.` });
+  }
+
+  /// A new claim replaces whatever this tab held, even before its queue is installed.
+  function dropSupersededClaim() {
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+  }
+
+  /// adopt_session: another device sent the session here. With a handoff it carries a queue to play
+  /// instead (someone watching this tab played an album "here"); without one it moves the stored
+  /// session. ⚠ "retry" leaves the command pending — it carries playback, and the server's two-minute
+  /// expiry on the command is what bounds the retry.
+  async function adoptSharedSession(cmd) {
+    if (!sessionLiveRef.current.remotePlaybackOn) return undefined;
+    if (cmd.target_type !== "handoff") {
+      const outcome = await takeSharedSession({ quiet: true });
+      return outcome === "retry" ? "retry" : undefined;
+    }
+    return whileAdopting(() => adoptSnapshotHandoff(cmd));
+  }
+
+  async function adoptSnapshotHandoff(cmd) {
+    let read;
+    try {
+      read = await sessionRequest(`/player/handoffs/${encodeURIComponent(cmd.target_id || "")}`, undefined, "GET");
+    } catch {
+      return "retry";
+    }
+    if (read.status === 404 || read.status === 410) return undefined;
+    if (!read.ok) return "retry";
+    const snapshot = read.data?.snapshot;
+    if (!snapshot?.items?.length) return undefined;
+    let data;
+    try {
+      data = await claimSession(snapshot, dropSupersededClaim);
+    } catch {
+      return "retry";
+    }
+    const played = await playClaimedSession(data, { position: true });
+    await api(`/player/handoffs/${encodeURIComponent(cmd.target_id)}/${played ? "adopted" : "rejected"}`, {
+      method: "POST",
+      ...(played ? {} : { body: JSON.stringify({ reason: "nothing_resolved" }) }),
+    }).catch(() => {});
     return undefined;
+  }
+
+  /// enqueue_next / enqueue_end: another device added to the queue this tab is playing. Same ack
+  /// discipline as adopt_session: it carries items, so a network blip must not drop them.
+  async function adoptEnqueue(handoffId, next) {
+    if (!handoffId) return undefined;
+    let read;
+    try {
+      read = await sessionRequest(`/player/handoffs/${encodeURIComponent(handoffId)}`, undefined, "GET");
+    } catch {
+      return "retry";
+    }
+    if (read.status === 404 || read.status === 410) return undefined;
+    if (!read.ok) return "retry";
+    const items = read.data?.snapshot?.items || [];
+    if (items.length === 0) return undefined;
+    // Ids from the library tree and the podcast feeds, not the session resolver: these items are not
+    // in the shared queue yet, so the resolver knows nothing about them.
+    const tracks = await resolveSnapshotItems(items);
+    const outcome = tracks.length ? "adopted" : "rejected";
+    if (tracks.length) {
+      if (!currentTrack) {
+        await playTracks(tracks, { localOnly: true });
+      } else {
+        const anchor = currentTrackIndex;
+        setPlayerQueue((current) => {
+          const at = next && anchor >= 0 && anchor < current.length ? anchor + 1 : current.length;
+          return [...current.slice(0, at), ...tracks, ...current.slice(at)];
+        });
+      }
+    }
+    await api(`/player/handoffs/${encodeURIComponent(handoffId)}/${outcome}`, {
+      method: "POST",
+      ...(tracks.length ? {} : { body: JSON.stringify({ reason: "nothing_resolved" }) }),
+    }).catch(() => {});
+    return undefined;
+  }
+
+  /// The published window's index → this tab's own queue.
+  function localQueueIndex(index) {
+    return (sessionClaimRef.current?.start || 0) + index;
+  }
+
+  /// Remove one entry, by position. Removing the current item continues with whatever took its
+  /// place, and removing the last one stops — the same as the apps.
+  function removeQueueEntryAt(index) {
+    if (index < 0 || index >= playerQueue.length) return undefined;
+    const remaining = playerQueue.filter((_, i) => i !== index);
+    if (index !== currentTrackIndex) {
+      setPlayerQueue(remaining);
+      return undefined;
+    }
+    if (remaining.length === 0) {
+      playbackControlRef.current?.stop?.();
+      setPlayerQueue([]);
+      setCurrentTrack(null);
+      setAudioUrl("");
+      return undefined;
+    }
+    setPlayerQueue(remaining);
+    return loadPlayerTrack(remaining[Math.min(index, remaining.length - 1)], remaining);
+  }
+
+  /// Move one entry. ⚠ `destination` has the apps' list-move meaning — the slot BEFORE removal, from
+  /// 0 to the queue's length — because the iOS receiver defines what a `move` command means.
+  function moveQueueEntry(from, destination) {
+    if (from < 0 || from >= playerQueue.length || destination < 0 || destination > playerQueue.length) return;
+    const next = [...playerQueue];
+    const [moving] = next.splice(from, 1);
+    const insertion = Math.min(Math.max(destination - (from < destination ? 1 : 0), 0), next.length);
+    next.splice(insertion, 0, moving);
+    setPlayerQueue(next);
+  }
+
+  /// Edit an ORPHANED session in place. `versioned` sends `base_version`, so an index can never land
+  /// on a different item than the one the user saw; a seek or a mode change names no index and
+  /// would only be refused for nothing.
+  async function orphanEdit(body, { versioned = false, optimistic = null } = {}) {
+    const shared = sessionLiveRef.current.accountSession;
+    if (optimistic) setAccountSession((previous) => (previous ? { ...previous, ...optimistic } : previous));
+    try {
+      const result = await sessionRequest(
+        "/player/session/edit",
+        versioned ? { ...body, base_version: shared?.queue_version ?? 0 } : body,
+      );
+      if (result.ok) {
+        applyAccountSession(result.data);
+        return true;
+      }
+      const code = sessionErrorCode(result.data);
+      // "owned": a device took the session since we looked — an insert still means the same thing
+      // there, so it goes on as the ordinary queue addition. Anything else re-reads and stops.
+      const owner = result.data?.detail?.owner_session_id;
+      if (code === "owned" && owner && body.items?.length) {
+        enqueueOnRemote(owner, body.items, body.op === "insert_next");
+      } else if (code !== "owned" && code !== "queue_changed") {
+        notify("Remote playback", "That change didn't go through.", "ui_error");
+      }
+    } catch {
+      notify("Remote playback", "That change didn't go through.", "ui_error");
+    }
+    setRemoteQueueSession(null);
+    refreshAccountSession();
+    refreshRemoteSessions();
+    return false;
+  }
+
+  /// Transport on an orphan. Play takes it here; everything else just moves the stored session.
+  function orphanCommand(action, positionSeconds) {
+    const shared = sessionLiveRef.current.accountSession;
+    if (!shared) return undefined;
+    if (action === "resume" || action === "play") return takeSharedSession();
+    if (action === "seek" && positionSeconds !== undefined) {
+      const target = Math.max(0, positionSeconds);
+      return orphanEdit({ op: "seek", position_seconds: target }, { optimistic: { position_seconds: target } });
+    }
+    if (action === "previous" && (shared.position_seconds || 0) > 3) {
+      return orphanEdit({ op: "seek", position_seconds: 0 }, { optimistic: { position_seconds: 0 } });
+    }
+    if (action === "next" || action === "previous") {
+      const index = (shared.current_index || 0) + (action === "next" ? 1 : -1);
+      if (index < 0 || index >= (shared.queue_length || 0)) return undefined;
+      return orphanEdit({ op: "jump", index }, { versioned: true });
+    }
+    // Closing it hides it in this tab only. Sessions never go away (§A1b).
+    if (action === "stop") setOrphanDismissedAt(shared.updated_at || null);
+    return undefined;
+  }
+
+  function orphanMode({ loop, shuffle: shuffleOn } = {}) {
+    const body = { op: "state" };
+    const optimistic = {};
+    if (loop !== undefined) { body.repeat = loop; optimistic.repeat = loop; }
+    if (shuffleOn !== undefined) { body.shuffle = shuffleOn; optimistic.shuffle = shuffleOn; }
+    return orphanEdit(body, { optimistic });
+  }
+
+  /// A row clicked in an orphan's queue plays it, here — there is no other device to play it on.
+  async function orphanQueueJump(queueIndex) {
+    if (await orphanEdit({ op: "jump", index: queueIndex }, { versioned: true })) await takeSharedSession();
+  }
+
+  /// Apply a queue edit to the displayed remote/orphan list at once, re-numbering the rows so a
+  /// second click before the next read still addresses the item the user sees.
+  function editRemoteQueueLocally(edit) {
+    setRemoteQueue((rows) => edit([...rows]).map((row, at) => ({ ...row, _remoteIndex: at })));
+  }
+
+  function orphanQueueRemove(queueIndex) {
+    editRemoteQueueLocally((rows) => rows.filter((row) => row._remoteIndex !== queueIndex));
+    return orphanEdit({ op: "remove", index: queueIndex }, { versioned: true });
+  }
+
+  /// "Play next" on an orphan. The edit route's `to_index` is the slot AFTER removal.
+  function orphanQueuePlayNext(queueIndex, currentIndex) {
+    if (queueIndex === currentIndex || queueIndex === currentIndex + 1) return undefined;
+    const toIndex = queueIndex < currentIndex ? currentIndex : currentIndex + 1;
+    editRemoteQueueLocally((rows) => {
+      const [moving] = rows.splice(queueIndex, 1);
+      rows.splice(toIndex, 0, moving);
+      return rows;
+    });
+    return orphanEdit({ op: "move", index: queueIndex, to_index: toIndex }, { versioned: true });
+  }
+
+  /// Where the docked player's remote actions go: the orphan's edits, or the live session's commands.
+  function remoteCommandForView(action, positionSeconds) {
+    if (orphanSession) return orphanCommand(action, positionSeconds);
+    return activeRemoteSession ? remoteCommand(activeRemoteSession.session_id, action, positionSeconds) : undefined;
+  }
+
+  /// Send the session to a named device (`adopt_session`). It claims on receipt and that claim stops
+  /// whoever holds it now, so nothing stops here — a target that never wakes costs nothing.
+  async function sendSharedSessionTo(device) {
+    // The target resumes from the stored position; bring it up to the second first.
+    if (sessionClaimRef.current) await publishSessionQueue({ force: true });
+    let result = null;
+    try {
+      result = await sessionRequest("/player/session/transfer", { to_session_id: device.session_id });
+    } catch {
+      result = null;
+    }
+    if (result?.ok) {
+      setToast({ title: "Playback moving", body: `Continues on ${result.data?.to_device_label || deviceDisplayName(device)}.` });
+    } else {
+      notify("Playback not moved", sessionTransferError(result, device), "ui_error");
+    }
+    refreshRemoteSessions();
+    refreshAccountSession();
+  }
+
+  function sessionTransferError(result, device) {
+    if (sessionErrorCode(result?.data) === "device_unreachable") {
+      return `${result.data.detail.device_label || deviceDisplayName(device)} isn't reachable right now.`;
+    }
+    return "That device didn't accept the queue.";
+  }
+
+  async function playSharedSessionHere() {
+    if ((await takeSharedSession()) === "done") refreshRemoteSessions();
   }
 
   /// Resolve a snapshot's ids into playable rows, PRESERVING SNAPSHOT ORDER — the order is part of
@@ -2353,14 +2964,20 @@ function App() {
     // nobody asked for.
     if (action === "state") return undefined;
     if (action === "seek") return seekWithRetry(Number(cmd.position_seconds) || 0);
-    if (action === "adopt_handoff") return adoptHandoff(cmd.target_id);
-    // Another of this account's sessions clicked a row in what it sees as OUR published queue
-    // (the web queue panel's remote-jump, and the app's own queue view). The index is into the
-    // full local queue this session actually holds, not into any windowed copy — loadPlayerTrack
-    // re-derives currentTrackIndex from the track id, same as a local queue-row click does.
+    if (action === "adopt_session") return adoptSharedSession(cmd);
+    if (action === "enqueue_next" || action === "enqueue_end") return adoptEnqueue(cmd.target_id, action === "enqueue_next");
+    // Another of this account's devices edited what it sees as the shared queue — which is the
+    // window this tab PUBLISHED, so each index is re-based onto the local queue first. Every edit that
+    // changes the queue's contents is republished by the session-queue effect, so the far end sees it.
     if (action === "jump" && typeof cmd.queue_index === "number") {
-      const track = playerQueue[cmd.queue_index];
+      const track = playerQueue[localQueueIndex(cmd.queue_index)];
       return track ? loadPlayerTrack(track) : undefined;
+    }
+    if (action === "remove" && typeof cmd.queue_index === "number") {
+      return removeQueueEntryAt(localQueueIndex(cmd.queue_index));
+    }
+    if (action === "move" && typeof cmd.queue_index === "number" && typeof cmd.queue_to_index === "number") {
+      return moveQueueEntry(localQueueIndex(cmd.queue_index), localQueueIndex(cmd.queue_to_index));
     }
     if (isPlay) {
       let tracks = resolvePlayableFromLibrary(cmd.target_type, cmd.target_id);
@@ -2456,19 +3073,22 @@ function App() {
     return Math.max(advanced, reported);
   }
 
-  // The queue a remote session published. Fetched once per session rather than per poll: it changes
-  // only when that session's queue does, and `enqueueOnRemote` clears the marker to force a re-read.
+  // The shared queue, for the docked player's list when it shows another device or an orphan.
+  // Keyed on `queue_version`, which the server bumps only when the queue's CONTENTS change, so it is
+  // read once per change rather than per poll; clearing the marker (`setRemoteQueueSession(null)`)
+  // still forces a re-read after an edit this tab sent.
+  const remoteQueueKey = displayedRemote && accountSession ? `account:${accountSession.queue_version ?? 0}` : null;
   useEffect(() => {
-    const sessionId = activeRemoteSession?.session_id;
-    if (!token || !sessionId) { setRemoteQueue([]); return undefined; }
-    if (remoteQueueSession === sessionId) return undefined;
+    if (!token || !remoteQueueKey) { setRemoteQueue([]); return undefined; }
+    if (remoteQueueSession === remoteQueueKey) return undefined;
     let cancelled = false;
     (async () => {
       try {
-        const snapshot = await api(`/player/sessions/${encodeURIComponent(sessionId)}/queue?resolve=true`);
+        const snapshot = await api("/player/session?queue=1&resolve=true");
         if (cancelled) return;
-        // Shaped like a local queue entry so the player's list renders it without branching.
-        const index = Math.max(0, snapshot?.current_index || 0);
+        applyAccountSession(snapshot);
+        // Shaped like a local queue entry so the player's list renders it without branching. Which
+        // row is current is NOT baked in here: it moves on every report, not on a queue change.
         setRemoteQueue((snapshot?.items || []).map((item, at) => ({
           id: item.id,
           title: item.title || "Unknown track",
@@ -2476,35 +3096,75 @@ function App() {
           _album: "",
           _albumId: item.album_id || null,
           _kind: item.type === "episode" ? "episode" : "track",
+          _podcastId: item.podcast_id || null,
           _remoteIndex: at,
-          _remoteCurrent: at === index,
         })));
-        setRemoteQueueSession(sessionId);
+        // Marked with the version it actually returned, which may already be newer than the key.
+        setRemoteQueueSession(`account:${snapshot?.queue_version ?? 0}`);
       } catch {
-        if (!cancelled) { setRemoteQueue([]); setRemoteQueueSession(sessionId); }
+        if (!cancelled) { setRemoteQueue([]); setRemoteQueueSession(remoteQueueKey); }
       }
     })();
     return () => { cancelled = true; };
-  }, [token, activeRemoteSession?.session_id, remoteQueueSession, api]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, remoteQueueKey, remoteQueueSession, api]);
+
+  /// The list the docked player shows, with the current row taken from the session's LIVE index
+  /// (the owner's latest report), not from when the list was fetched.
+  const remoteCurrentIndex = accountSession ? (accountSession.current_index ?? -1) : -1;
+  const remoteQueueView = useMemo(
+    () => remoteQueue.map((row) => (row._remoteCurrent === (row._remoteIndex === remoteCurrentIndex)
+      ? row
+      : { ...row, _remoteCurrent: row._remoteIndex === remoteCurrentIndex })),
+    [remoteQueue, remoteCurrentIndex],
+  );
 
   // Only ticks while something is actually showing live remote state, so an idle tab does no work.
   useEffect(() => {
-    if (remoteViewers === 0) return undefined;
+    if (liveRemoteViewers === 0) return undefined;
     const timer = setInterval(() => setRemoteClockTick((t) => t + 1), 500);
     return () => clearInterval(timer);
-  }, [remoteViewers]);
+  }, [liveRemoteViewers]);
 
   // ⚠ Deliberately NOT gated on this tab being idle. Playing something here is no reason to lose
   // the ability to see and drive what is playing elsewhere. The RATE adapts instead: two seconds
-  // while a remote surface is open, ten otherwise.
+  // while a remote surface is open, ten otherwise. The shared session rides the same timer — it is
+  // what says whether there is an orphan to show and when the shared queue changed.
+  sessionRefreshNowRef.current = () => { refreshRemoteSessions(); refreshAccountSession(); };
   useEffect(() => {
     if (!token || !user?.id) return undefined;
-    if (document.visibilityState === "visible") refreshRemoteSessions();
+    if (document.visibilityState === "visible") { refreshRemoteSessions(); refreshAccountSession(); }
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible") refreshRemoteSessions();
-    }, remoteViewers > 0 ? 2000 : 10000);
+      if (document.visibilityState === "visible") { refreshRemoteSessions(); refreshAccountSession(); }
+    }, liveRemoteViewers > 0 ? 2000 : 10000);
     return () => clearInterval(timer);
-  }, [token, user?.id, remoteViewers, refreshRemoteSessions]);
+  }, [token, user?.id, liveRemoteViewers, remotePlaybackOn, refreshRemoteSessions, refreshAccountSession]);
+
+  // The owner republishes the shared queue after ANY change to its contents — local edits and the
+  // ones other devices sent as commands alike. Debounced, so a burst of edits is one write.
+  useEffect(() => {
+    if (!sessionClaimRef.current && sessionClaimsInFlightRef.current === 0) return undefined;
+    if (sessionQueueKey === lastPublishedKeyRef.current) return undefined;
+    const timer = setTimeout(() => publishSessionQueue(), 700);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionQueueKey]);
+
+  // The dying gasp. `pagehide`, not `beforeunload`: it also fires when a phone browser discards a
+  // tab, and it is the one a back/forward-cache restore pairs with. A restored page has no claim any
+  // more, and its next "playing" report claims again (maybeRecoverSessionClaim).
+  useEffect(() => {
+    function onPageHide() { sessionReleaseRef.current?.({ keepalive: true }); }
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, []);
+
+  // Cross-device playback switched off, or signed out: this tab stops being anyone's player.
+  useEffect(() => {
+    if (remotePlaybackOn && token) return;
+    sessionReleaseRef.current?.();
+    setAccountSession(null);
+  }, [remotePlaybackOn, token]);
 
   /// Read back quickly for a short window after acting, rather than once at a guessed delay.
   ///
@@ -2569,16 +3229,48 @@ function App() {
         method: "POST",
         body: JSON.stringify({ action: "jump", device_id: sessionId, queue_index: queueIndex }),
       });
-      // The published queue copy's current_index is now stale; force a re-fetch once the far end
-      // has had a beat to collect the command (up to its 4s poll interval), act, report the new
-      // track (which flags its queue hash stale) and re-publish — so the queue panel's highlighted
-      // row catches up. Two staggered attempts cover both a fast and a worst-case poll cycle.
-      setTimeout(() => setRemoteQueueSession(null), 1500);
-      setTimeout(() => setRemoteQueueSession(null), 5000);
+      // The highlighted row follows the shared session's current_index, which moves as soon as the
+      // far end reports its new track: re-read the session once it has had a beat to collect the
+      // command (up to its 4s poll), rather than refetching the whole queue.
+      setTimeout(() => refreshAccountSession(), 1500);
+      setTimeout(() => refreshAccountSession(), 5000);
       confirmRemoteSoon();
     } catch {
       notify("Remote playback", "That device didn't accept the command.", "ui_error");
     }
+  }
+
+  /// Remove or reorder in another session's queue. The remote queue is editable from any device
+  /// (§A1b): the owner applies the command and republishes, and the list here updates at once and is
+  /// corrected by the re-read that the new `queue_version` triggers.
+  async function remoteQueueEdit(sessionId, body, applyLocally) {
+    editRemoteQueueLocally(applyLocally);
+    try {
+      await api("/player/commands", { method: "POST", body: JSON.stringify({ ...body, device_id: sessionId }) });
+      setTimeout(() => setRemoteQueueSession(null), 5000);
+      confirmRemoteSoon();
+    } catch {
+      setRemoteQueueSession(null);
+      notify("Remote playback", "That device didn't accept the queue change.", "ui_error");
+    }
+  }
+
+  function remoteQueueRemove(sessionId, queueIndex) {
+    return remoteQueueEdit(sessionId, { action: "remove", queue_index: queueIndex },
+      (rows) => rows.filter((row) => row._remoteIndex !== queueIndex));
+  }
+
+  /// "Play next": move the row to just after the current one. `queue_to_index` has the list-move
+  /// meaning the receivers share — the slot before removal (see `moveQueueEntry`).
+  function remoteQueuePlayNext(sessionId, queueIndex, currentIndex) {
+    if (queueIndex === currentIndex || queueIndex === currentIndex + 1) return undefined;
+    const landing = queueIndex < currentIndex ? currentIndex : currentIndex + 1;
+    return remoteQueueEdit(sessionId, { action: "move", queue_index: queueIndex, queue_to_index: currentIndex + 1 },
+      (rows) => {
+        const [moving] = rows.splice(queueIndex, 1);
+        rows.splice(landing, 0, moving);
+        return rows;
+      });
   }
 
   /// Change shuffle or repeat on another session without also sending it a transport action.
@@ -2631,114 +3323,6 @@ function App() {
     }
   }
 
-  /// A cheap fingerprint of the queue and where we are in it.
-  ///
-  /// ⚠ Covers ORDER and position-in-queue, deliberately not elapsed seconds: the stored copy exists
-  /// so another device can move this queue, and only needs re-sending when the queue itself changes.
-  /// Including the playhead would re-upload it on every heartbeat, which is what the hash avoids.
-  function queueHash() {
-    const parts = [String(currentTrackIndex), String(shuffle), repeat];
-    for (const item of playerQueue) parts.push(item._episodeId || item.id);
-    const joined = parts.join("|");
-    let hash = 0;
-    for (let i = 0; i < joined.length; i++) {
-      hash = ((hash << 5) - hash + joined.charCodeAt(i)) | 0;
-    }
-    return String(hash);
-  }
-
-  /// Publish this tab's queue so another device can move it. The local queue stays authoritative —
-  /// nothing ever reads this copy back to play from.
-  function publishQueue() {
-    if (playerQueue.length === 0) return;
-    api("/player/queue", {
-      method: "POST",
-      body: JSON.stringify({ hash: queueHash(), snapshot: buildQueueSnapshot() }),
-    }).catch(() => {});
-  }
-
-  /// The queue as ids, windowed. "Play library" really does page an entire library in here while the
-  /// server caps a transfer, so send what surrounds the current position and re-base the index.
-  function buildQueueSnapshot() {
-    const MAX = 500;
-    const LOOK_BACK = 50;
-    const anchorIndex = Math.min(Math.max(currentTrackIndex, 0), Math.max(0, playerQueue.length - 1));
-    const start = Math.max(0, Math.min(anchorIndex - LOOK_BACK, Math.max(0, playerQueue.length - MAX)));
-    const slice = playerQueue.slice(start, start + MAX);
-    return {
-      version: 1,
-      items: slice.map((item) => ({
-        type: item._kind === "episode" ? "episode" : "track",
-        id: item._episodeId || item.id,
-        podcast_id: item._podcastId || null,
-      })),
-      current_index: anchorIndex - start,
-      position_seconds: Math.round(playbackControlRef.current?.position?.() || 0),
-      playing: playbackControlRef.current?.isPlaying?.() || false,
-      shuffle,
-      repeat,
-    };
-  }
-
-  /// Hand this tab's queue to another session.
-  ///
-  /// ⚠ Local playback stops only AFTER the server accepts. Every refusal arrives in this request, so
-  /// a failed transfer costs nothing — stopping first would throw the queue away to find out.
-  async function transferPlaybackTo(sessionId, deviceLabel) {
-    if (playerQueue.length === 0) return;
-    // ⚠ One snapshot builder, not two. This used to carry its own copy of the windowing arithmetic,
-    // which is exactly how the two drifted: publish kept the position and transfer sent a zero.
-    const snapshot = buildQueueSnapshot();
-    try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({ to_session_id: sessionId, autoplay: snapshot.playing, snapshot }),
-      });
-      // Playback moved: stop rather than pause, so this tab becomes the idle remote showing the
-      // device that now owns the queue.
-      reportPlayerStatus(currentTrack, "stopped");
-      playbackControlRef.current?.stop?.();
-      setPlayerQueue([]);
-      setCurrentTrack(null);
-      // ⚠ `playerOpen` deliberately STAYS true. Closing it unmounts the player, which throws away
-      // whatever form it was in — docked, fullscreen or popped out — at the exact moment the user
-      // moved the music. The view should follow the playback, not the device: the same component
-      // stays mounted and re-renders against the session that now holds the queue.
-      setPlayerOpen(true);
-      setToast({ title: "Playback moved", body: `Continues on ${result?.to_device_label || deviceLabel || "that device"}.` });
-      refreshRemoteSessions();
-    } catch (error) {
-      // The server refuses an unreachable target before anything moves, so say which device and when
-      // it was last seen rather than reporting a failure the user cannot act on.
-      const detail = parseTransferError(error);
-      notify("Playback not moved", detail, "ui_error");
-      refreshRemoteSessions();
-    }
-  }
-
-  function parseTransferError(error) {
-    try {
-      const body = JSON.parse(String(error?.message || "{}"));
-      const inner = body?.detail;
-      if (inner?.detail === "device_unreachable") {
-        const label = inner.device_label || "That device";
-        if (inner.last_seen_at) {
-          return `${label} isn't reachable. Last seen ${fmtTimeAgo(inner.last_seen_at)}.`;
-        }
-        return `${label} isn't reachable right now.`;
-      }
-    } catch { /* fall through */ }
-    return "That device didn't accept the queue.";
-  }
-
-  /// The session whose queue a pick would move: whatever is actually playing, wherever it is,
-  /// falling back to this tab.
-  function playbackSourceSession() {
-    return remoteSessions.find((r) => r.presence === "live" && r.status === "playing")
-      || remoteSessions.find((r) => r.presence === "live" && (r.status === "playing" || r.status === "paused"))
-      || remoteSessions.find((r) => r.current);
-  }
-
   function deviceDisplayName(device) {
     // The current session is named for what it IS. Repeating this machine's own name in a picker
     // reads as a duplicate row rather than as "here".
@@ -2746,15 +3330,19 @@ function App() {
     return device.device_label || "Another device";
   }
 
-  /// "Play on" rows, shared by the docked player and the idle dock so the two cannot offer different
-  /// things. Picking a device MOVES playback there from wherever it is — you are not limited to
-  /// moving this tab's own queue. Unreachable devices are listed and DISABLED with a "last seen"
-  /// line: a picker that omits a device the user owns reads as broken.
+  /// Device rows, shared by the docked player and the idle dock so the two cannot offer different
+  /// things. What moves is the account's shared session, wherever it is — owned or orphaned — so you
+  /// are not limited to moving this tab's own queue. "Play here" claims it (the server stops the old
+  /// owner); "Play on X" sends it there (`adopt_session`), and X's claim stops the old owner.
+  /// Unreachable devices are listed and DISABLED with a "last seen" line: a picker that omits a
+  /// device the user owns reads as broken.
   function deviceMenuItems() {
     if (remoteSessions.length === 0) {
       return [{ label: "No sessions signed in", disabled: true }];
     }
-    const source = playbackSourceSession();
+    const shared = accountSession;
+    const ownerId = shared?.claim_valid ? shared.owner?.session_id : null;
+    const hasSession = Boolean(sessionClaimRef.current) || (shared?.queue_length || 0) > 0;
     return remoteSessions.map((device) => {
       const label = deviceDisplayName(device);
       if (device.presence === "unreachable") {
@@ -2763,54 +3351,31 @@ function App() {
           disabled: true,
         };
       }
-      const isSource = source && device.session_id === source.session_id
-        && (device.status === "playing" || device.status === "paused");
-      if (isSource) {
+      // This session can be the recorded owner without holding the claim (a reload lost the id), and
+      // then it has to be able to take the session back.
+      const isOwner = device.session_id === ownerId && (!device.current || Boolean(sessionClaimRef.current));
+      if (isOwner) {
         return { label: `${label} — ${device.status === "playing" ? "playing" : "paused"}`, disabled: true };
+      }
+      if (device.current) {
+        return { label: "Play here", disabled: !hasSession, action: () => playSharedSessionHere() };
       }
       return {
         label: `Play on ${label}`,
-        disabled: !source,
-        action: () => movePlaybackTo(source, device),
+        disabled: !hasSession,
+        action: () => sendSharedSessionTo(device),
       };
     });
-  }
-
-  /// Move playback from any session to any other.
-  ///
-  /// When the source is this tab the queue travels with the request and local playback stops on the
-  /// 200. When it is another device the server already holds that session's published queue and tells
-  /// it to stop itself — which is what lets this tab move a phone's music to a Mac it isn't.
-  async function movePlaybackTo(source, target) {
-    if (!source || source.session_id === target.session_id) return;
-    if (source.current) {
-      await transferPlaybackTo(target.session_id, deviceDisplayName(target));
-      return;
-    }
-    try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({
-          from_session_id: source.session_id,
-          to_session_id: target.session_id,
-          autoplay: source.status === "playing",
-        }),
-      });
-      setToast({
-        title: "Playback moved",
-        body: `Now on ${result?.to_device_label || deviceDisplayName(target)}.`,
-      });
-    } catch (error) {
-      notify("Playback not moved", parseTransferError(error), "ui_error");
-    }
-    refreshRemoteSessions();
   }
 
   // Returning to a backgrounded tab should not wait out a throttled interval before noticing a
   // queue that was handed here while it was hidden.
   useEffect(() => {
     function onVisible() {
-      if (document.visibilityState === "visible") commandPollNowRef.current?.();
+      if (document.visibilityState !== "visible") return;
+      commandPollNowRef.current?.();
+      // ...and to re-read the shared session: an orphan to show, or a queue that changed meanwhile.
+      sessionRefreshNowRef.current?.();
     }
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
@@ -2829,11 +3394,11 @@ function App() {
         for (const cmd of cmds || []) {
           let outcome;
           try { outcome = await remoteExecRef.current?.(cmd); } catch { /* keep going */ }
-          // ⚠ The one command that may be left unacked. A handoff carries a QUEUE rather than an
-          // instruction, so acking a transient network failure would drop someone's playback with
-          // nothing to retry from. Bounded by the server's five-minute handoff expiry, after which
-          // the fetch 410s — a permanent outcome, which acks. Remove that expiry and this retries
-          // forever.
+          // ⚠ The only commands that may be left unacked: adopt_session and enqueue_* carry PLAYBACK
+          // (a session to take, items to add) rather than an instruction, so acking a transient
+          // network failure would drop it with nothing to retry from. Bounded server-side — an
+          // adopt_session expires after two minutes, and an enqueue's handoff 410s after five, a
+          // permanent outcome which acks. Remove those expiries and this retries forever.
           if (outcome === "retry") continue;
           await api(`/player/commands/${cmd.id}/ack`, { method: "POST" }).catch(() => {});
         }
@@ -2859,15 +3424,19 @@ function App() {
   /// song obviously means "put it after what I'm listening to" — starting a second, silent player
   /// here is never what was asked for.
   function forwardQueueAddition(tracks, next) {
-    if (currentTrack || !activeRemoteSession) return false;
+    if (currentTrack) return false;
     const items = (tracks || [])
       .filter((track) => track?.id || track?._episodeId)
-      .map((track) => ({
-        type: track._kind === "episode" ? "episode" : "track",
-        id: track._episodeId || track.id,
-        podcast_id: track._podcastId || null,
-      }));
+      .map(toSnapshotItem);
     if (items.length === 0) return false;
+    // An orphan is the queue on screen, so the addition goes into it — nobody is playing it to
+    // command, and it resumes with the addition wherever Play is pressed next.
+    if (orphanSession) {
+      orphanEdit({ op: next ? "insert_next" : "insert_end", items });
+      setToast({ title: next ? "Playing next" : "Queue updated", body: "Added to the paused queue." });
+      return true;
+    }
+    if (!activeRemoteSession) return false;
     enqueueOnRemote(activeRemoteSession.session_id, items, next);
     setToast({
       title: next ? "Playing next" : "Queue updated",
@@ -2885,22 +3454,18 @@ function App() {
   /// which flips `remote` to null and is why pause/skip/resume looked broken afterwards: the
   /// docked player had quietly switched from controlling the other session to controlling this
   /// tab's own, mostly-empty local queue).
+  /// ⚠ Not while an ORPHAN is on screen: nobody is playing it, so Play means play it here, and the
+  /// fresh play claims (`claimFreshSession`).
   function forwardPlayToRemote(queue, wantShuffle) {
-    if (currentTrack || !activeRemoteSession) return false;
-    // Same cap `buildQueueSnapshot` uses for an already-loaded queue (mirrors the server's
-    // HANDOFF_MAX_ITEMS) — starting fresh at index 0, there is no "look back" to preserve, so this
-    // just takes the head. A library-sized "Shuffle all" started remotely still needs to fit.
-    const MAX = 500;
+    if (currentTrack || orphanSession || !activeRemoteSession) return false;
+    // Starting fresh at index 0 there is no "look back" to preserve, so this just takes the head, up
+    // to what the shared session holds. A library-sized "Shuffle all" started remotely still fits.
     const items = queue
       .filter((track) => track?.id || track?._episodeId)
-      .slice(0, MAX)
-      .map((track) => ({
-        type: track._kind === "episode" ? "episode" : "track",
-        id: track._episodeId || track.id,
-        podcast_id: track._podcastId || null,
-      }));
+      .slice(0, SESSION_MAX_ITEMS)
+      .map(toSnapshotItem);
     if (items.length === 0) return false;
-    transferSnapshotToRemote(activeRemoteSession.session_id, {
+    playSnapshotOnRemote(activeRemoteSession, {
       version: 1,
       items,
       current_index: 0,
@@ -2908,28 +3473,28 @@ function App() {
       playing: true,
       shuffle: wantShuffle,
       repeat,
-    }, activeRemoteSession.device_label);
+    });
     return true;
   }
 
-  /// Push a freshly-built snapshot (not this tab's own queue — nothing is playing here) to another
-  /// session and have it start playing. Reuses `/player/transfer`, the same endpoint the explicit
-  /// "Play on {device}" picker uses, with `autoplay: true`; unlike `transferPlaybackTo` there is no
-  /// local playback to stop first, since this tab was only ever viewing the remote card.
-  async function transferSnapshotToRemote(sessionId, snapshot, deviceLabel) {
+  /// Have another device play a freshly built snapshot. It rides `adopt_session` with a handoff: the
+  /// target claims WITH the snapshot, which replaces the shared queue in the same write that makes it
+  /// the owner. Nothing plays locally first, so there is nothing to stop here.
+  async function playSnapshotOnRemote(device, snapshot) {
+    let result = null;
     try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({ to_session_id: sessionId, autoplay: true, snapshot }),
-      });
-      setToast({ title: "Now playing", body: `Playing on ${result?.to_device_label || deviceLabel || "that device"}.` });
-      setRemoteQueueSession(null);
-      refreshRemoteSessions();
-      confirmRemoteSoon();
-    } catch (error) {
-      notify("Playback not started", parseTransferError(error), "ui_error");
-      refreshRemoteSessions();
+      result = await sessionRequest("/player/session/transfer", { to_session_id: device.session_id, snapshot });
+    } catch {
+      result = null;
     }
+    if (result?.ok) {
+      setToast({ title: "Now playing", body: `Playing on ${result.data?.to_device_label || deviceDisplayName(device)}.` });
+      confirmRemoteSoon();
+    } else {
+      notify("Playback not started", sessionTransferError(result, device), "ui_error");
+    }
+    refreshRemoteSessions();
+    refreshAccountSession();
   }
 
   function addTracksToPlayerQueue(tracks) {
@@ -2940,9 +3505,12 @@ function App() {
     setPlayerQueue((current) => [...current, ...playable]);
     setPlayerOpen(true);
     if (nothingPlaying) {
-      // Nothing is playing yet — start the first added track instead of sitting idle.
+      // Nothing is playing yet — start the first added track instead of sitting idle. That is a
+      // fresh play, so it claims the shared session like one.
+      const queue = [...playerQueue, ...playable];
+      claimFreshSession(queue, playerQueue.length);
       setQueueOpen(false);
-      loadPlayerTrack(playable[0]);
+      loadPlayerTrack(playable[0], queue);
     } else {
       setToast({ title: "Queue updated", body: `${playable.length} track${playable.length === 1 ? "" : "s"} added locally.` });
     }
@@ -2973,7 +3541,10 @@ function App() {
     });
   }
 
-  async function loadPlayerTrack(track) {
+  /// `queue` is the queue the track is being played FROM, for a caller that has just replaced it
+  /// and cannot wait for the state to land. Reference first, like `currentTrackIndex`, so a queue
+  /// holding the same track twice reports the occurrence actually playing.
+  async function loadPlayerTrack(track, queue = playerQueue) {
     if (!track?.id) return;
     try {
       setAudioUrl(trackStreamUrl(track, token));
@@ -2981,7 +3552,9 @@ function App() {
       // Podcast episodes track their own per-user resume position (see the resume effect)
       // and don't log a track play; library tracks record a play.
       if (track._kind !== "episode") recordPlay(track.id);
-      reportPlayerStatus(track, "playing", { queue_length: playerQueue.length || 1, current_index: Math.max(0, playerQueue.findIndex((queuedTrack) => queuedTrack.id === track.id)) });
+      const byReference = queue.indexOf(track);
+      const index = byReference >= 0 ? byReference : queue.findIndex((queuedTrack) => queuedTrack.id === track.id);
+      reportPlayerStatus(track, "playing", { queue_length: queue.length || 1, current_index: Math.max(0, index) });
     } catch (playError) {
       notify("Playback failed", playError.message, "ui_error");
     }
@@ -3001,6 +3574,20 @@ function App() {
   function reportPlayerStatus(track = currentTrack, status = "stopped", details = {}) {
     if (!user?.id) return;
     const isEpisode = track?._kind === "episode";
+    // The owner reports with its claim, and its index RE-BASED onto the window it published, so
+    // `current_index` always addresses the shared queue (§A1b).
+    const claim = remotePlaybackOn ? sessionClaimRef.current : null;
+    let queueLength = details.queue_length ?? playerQueue.length;
+    let currentIndex = details.current_index ?? Math.max(0, currentTrackIndex);
+    if (claim) {
+      const relative = currentIndex - claim.start;
+      if ((relative < 0 || relative >= claim.length) && playerQueue.length > 0) {
+        // Played past the edge of the published window: publish a new one around here.
+        publishSessionQueue({ force: true });
+      }
+      currentIndex = Math.min(Math.max(relative, 0), Math.max(0, claim.length - 1));
+      queueLength = claim.length;
+    }
     api("/player/status", {
       method: "POST",
       body: JSON.stringify({
@@ -3010,22 +3597,23 @@ function App() {
         artist: track?._artist || null,
         album: track?._album || null,
         status,
-        queue_length: details.queue_length ?? playerQueue.length,
-        current_index: details.current_index ?? Math.max(0, currentTrackIndex),
+        queue_length: queueLength,
+        current_index: currentIndex,
         position_seconds: details.position_seconds ?? null,
         duration_seconds: details.duration_seconds ?? null,
         shuffle,
         repeat,
         client: "web",
-        queue_hash: queueHash(),
+        ...(claim ? { claim_id: claim.id } : {}),
       }),
     })
       .then((reply) => {
-        // The server only asks when its stored copy disagrees with the hash we sent, so an unchanged
-        // queue is never re-uploaded however long it plays.
-        if (reply?.queue_stale) publishQueue();
+        // Another device claimed the session: stop, and follow it. Ignored for a claim this tab has
+        // since replaced itself (handleSessionClaimLost).
+        if (claim && reply?.claim_lost) handleSessionClaimLost(claim.id);
       })
       .catch(() => {});
+    if (status === "playing" && !claim) maybeRecoverSessionClaim();
     if (isEpisode && details.position_seconds != null) {
       reportEpisodeProgress(track, details.position_seconds, details.duration_seconds);
     }
@@ -3315,19 +3903,30 @@ function App() {
               separate remote dock, and it drifted immediately — different controls, no queue, no
               favourite, its own layout. The player takes a `remote` prop instead and reads its
               display and transport from that; the audio engine below is simply idle. */}
-          {(playerOpen || activeRemoteSession) && (
+          {(playerOpen || displayedRemote) && (
             <AudioPlayer
               headerActions={topbarUtilityActions}
-              remote={currentTrack ? null : activeRemoteSession}
-              remotePosition={activeRemoteSession ? interpolatedRemotePosition(activeRemoteSession) : 0}
-              remoteQueue={remoteQueue}
+              remote={currentTrack ? null : displayedRemote}
+              // An orphan does not move, so its position is simply where it was left. A live
+              // session's is the interpolated clock, untouched.
+              remotePosition={orphanSession
+                ? (orphanSession.position_seconds || 0)
+                : activeRemoteSession ? interpolatedRemotePosition(activeRemoteSession) : 0}
+              remoteQueue={remoteQueueView}
               onRemoteLive={(delta) => setRemoteViewers((n) => Math.max(0, n + delta))}
-              onRemoteCommand={(action, positionSeconds) =>
-                activeRemoteSession && remoteCommand(activeRemoteSession.session_id, action, positionSeconds)}
-              onRemoteMode={(mode) =>
-                activeRemoteSession && remoteMode(activeRemoteSession.session_id, mode)}
-              onRemoteQueueJump={(queueIndex) =>
-                activeRemoteSession && remoteQueueJump(activeRemoteSession.session_id, queueIndex)}
+              onRemoteCommand={remoteCommandForView}
+              onRemoteMode={(mode) => (orphanSession
+                ? orphanMode(mode)
+                : activeRemoteSession && remoteMode(activeRemoteSession.session_id, mode))}
+              onRemoteQueueJump={(queueIndex) => (orphanSession
+                ? orphanQueueJump(queueIndex)
+                : activeRemoteSession && remoteQueueJump(activeRemoteSession.session_id, queueIndex))}
+              onRemoteQueueRemove={(queueIndex) => (orphanSession
+                ? orphanQueueRemove(queueIndex)
+                : activeRemoteSession && remoteQueueRemove(activeRemoteSession.session_id, queueIndex))}
+              onRemoteQueuePlayNext={(queueIndex) => (orphanSession
+                ? orphanQueuePlayNext(queueIndex, remoteCurrentIndex)
+                : activeRemoteSession && remoteQueuePlayNext(activeRemoteSession.session_id, queueIndex, remoteCurrentIndex))}
               controlRef={playbackControlRef}
               equalizer={equalizer}
               currentTrack={currentTrack}
@@ -3362,6 +3961,9 @@ function App() {
               diagnostics={playerDiagnostics}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
+                // Closing the player leaves the session where it is, paused, for any device to
+                // resume — the claim goes, the session does not (§A1b).
+                releaseSessionClaim();
                 setPlayerOpen(false);
               }}
             />
@@ -3372,7 +3974,7 @@ function App() {
               complaint once the player moved into the topbar. Only one of the two renders at
               a time; the notification tray's outside-click ref only ever attaches to whichever
               copy is actually mounted. */}
-          {!(playerOpen || activeRemoteSession) && (
+          {!(playerOpen || displayedRemote) && (
             <div className="topbar-side topbar-side-right">{topbarUtilityActions}</div>
           )}
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
@@ -11776,6 +12378,8 @@ function AudioPlayer({
   onRemoteCommand,
   onRemoteMode,
   onRemoteQueueJump,
+  onRemoteQueueRemove,
+  onRemoteQueuePlayNext,
   onRemoteLive,
 }) {
   // Double-buffer: two audio elements. One is "active" (audible); the other
@@ -12715,15 +13319,23 @@ function AudioPlayer({
   }
 
   function queueList() {
-    // A remote queue is listed AND jumpable (via the "jump" command, `queue_index` into the far
-    // end's own queue) — but never reordered/removed from here: those actions (move/remove) would
-    // still appear to work locally and be contradicted by the next poll, which a plain jump is not
-    // (the far end reports its new current track, which is exactly what this view then reflects).
+    // The remote queue is the account's SHARED queue, and it is editable from any device (§A1b):
+    // jump, remove and "play next" (a move) go to the owner as commands, or to the server's copy
+    // when nobody holds it. `_remoteIndex` is each row's position in that shared queue. The owner
+    // applies the edit and republishes, so the list here is corrected by the next read.
     if (isRemote) {
       return remoteQueue
         .filter((track) => !track._remoteCurrent)
         .map((track, index) => (
-          <div className="queue-entry" key={`${track.id}:${index}`}>
+          <div
+            className="queue-entry"
+            key={`${track.id}:${index}`}
+            onContextMenu={(event) => openQueueMenu(event, [
+              onRemoteQueueJump && { label: "Play", action: () => onRemoteQueueJump(track._remoteIndex) },
+              onRemoteQueuePlayNext && { label: "Play next", action: () => onRemoteQueuePlayNext(track._remoteIndex) },
+              onRemoteQueueRemove && { label: "Remove from queue", danger: true, action: () => onRemoteQueueRemove(track._remoteIndex) },
+            ].filter(Boolean))}
+          >
             {onRemoteQueueJump ? (
               <button className="queue-play-btn" onClick={() => onRemoteQueueJump(track._remoteIndex)}>
                 <strong>{track.title}</strong>
@@ -12734,6 +13346,11 @@ function AudioPlayer({
                 <strong>{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </span>
+            )}
+            {onRemoteQueueRemove && (
+              <button className="queue-remove-btn" onClick={(e) => { e.stopPropagation(); onRemoteQueueRemove(track._remoteIndex); }} title="Remove from queue">
+                <X size={12} />
+              </button>
             )}
           </div>
         ));
