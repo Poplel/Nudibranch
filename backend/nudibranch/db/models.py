@@ -759,6 +759,53 @@ class PlaybackHandoff(Base):
     error: Mapped[str | None] = mapped_column(String(64))
 
 
+class AccountPlaybackSession(Base):
+    """The account's ONE shared playback session: a queue and a position that outlive every device.
+
+    One row per user, created on first use and never deleted. What comes and goes is the CLAIM — the
+    right of one device session to play it. A claim is valid while its owner keeps reporting and is
+    not idle; see `_claim_valid` in routes.py. ⚠ Validity is derived at read time and never written:
+    a lapsed claim keeps `claim_id`/`owner_session_id` so the holder, returning from a stretch
+    offline, wins the session back — unless another device claimed it meanwhile, which replaces
+    `claim_id`. Only a new claim or an explicit release (the app's dying gasp) changes the owner.
+
+    Per-device `session_player_states` rows still exist and still answer the two-clock questions
+    (§31); this row answers "what is the account listening to, and who may play it".
+    """
+
+    __tablename__ = "account_playback_sessions"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    # A PlaybackSnapshot of ids only, the whole queue (capped far above the transfer cap).
+    queue_json: Mapped[str | None] = mapped_column(Text)
+    #: Bumped on every change to the queue's CONTENTS, so a viewer refetches only when it moved.
+    queue_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    queue_length: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    position_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: When `position_seconds` was true. A viewer of a PLAYING session interpolates from here.
+    position_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="stopped", nullable=False)
+    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
+    track_id: Mapped[str | None] = mapped_column(ForeignKey("tracks.id", ondelete="SET NULL"))
+    episode_id: Mapped[str | None] = mapped_column(ForeignKey("episodes.id", ondelete="SET NULL"))
+    title: Mapped[str | None] = mapped_column(String(255))
+    artist: Mapped[str | None] = mapped_column(String(255))
+    album: Mapped[str | None] = mapped_column(String(255))
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    claim_id: Mapped[str | None] = mapped_column(String(64))
+    owner_session_id: Mapped[str | None] = mapped_column(String(64))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    owner_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When the session last stopped PLAYING; NULL while it plays. Drives the idle lapse.
+    paused_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    track: Mapped["Track | None"] = relationship(foreign_keys=[track_id])
+    episode: Mapped["Episode | None"] = relationship(foreign_keys=[episode_id])
+
+
 class Automation(Base):
     __tablename__ = "automations"
 

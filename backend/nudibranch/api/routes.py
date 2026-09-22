@@ -69,10 +69,17 @@ from nudibranch.api.schemas import (
     PlaybackHandoffRejection,
     PlaybackQueueUpload,
     PlaybackSnapshot,
+    PlaybackSnapshotItem,
     PlaybackTransferOut,
     PlaybackEnqueueRequest,
     PlaybackTransferRequest,
     PlayerSessionOut,
+    AccountSessionOut,
+    AccountSessionOwner,
+    SessionClaimRequest,
+    SessionEditRequest,
+    SessionQueuePublish,
+    SessionReleaseRequest,
     PlayerStateUpdate,
     PlaylistTrackOut,
     PlaylistImportRequest,
@@ -149,6 +156,8 @@ from nudibranch.db.models import (
     PlaylistShare,
     PlaylistTrack,
     PlaybackHandoff,
+    AccountPlaybackSession,
+    uuid_str,
     ProposalBatch,
     ProposalItem,
     ProposalKind,
@@ -976,15 +985,28 @@ def update_player_status(
         state.playback_started_at = now
     state.reported_at = now
     state.updated_at = now
+    # The shared session (§A1b). A report carrying a claim updates it — and re-validates a lapsed
+    # claim, which is how a device returning from offline keeps the session when nobody else took it.
+    # A claim that no longer matches means another device took over: the client stops and follows.
+    claim_lost = False
+    queue_version = None
+    if payload.claim_id:
+        account = session.get(AccountPlaybackSession, user.id)
+        if account is None or account.claim_id != payload.claim_id:
+            claim_lost = True
+        else:
+            _apply_claimed_report(account, state, payload, now)
+            queue_version = account.queue_version or 0
     session.commit()
-    if state.status == "playing":
+    # Ownership is the claim for a client that has one; the start-time tiebreak is for older ones.
+    if state.status == "playing" and not payload.claim_id:
         _resolve_playback_ownership(session, user)
     # The hash handshake: the client is the authority on its own queue and never reads this copy back
     # to play from. It sends what its queue currently hashes to, and only uploads the queue itself
     # when the server says the stored copy disagrees — so a queue that plays for an hour unchanged is
     # never re-sent, while a reordered one is picked up on the next heartbeat.
     queue_stale = bool(payload.queue_hash) and payload.queue_hash != state.queue_hash
-    return {"ok": True, "queue_stale": queue_stale}
+    return {"ok": True, "queue_stale": queue_stale, "claim_lost": claim_lost, "queue_version": queue_version}
 
 
 def _resolve_playback_ownership(session: Session, user: User) -> None:
@@ -1194,6 +1216,8 @@ def create_player_command(
         raise HTTPException(status_code=400, detail="Use POST /player/transfer to move playback")
     # Same reasoning: these name a handoff row holding a queue, and only /player/enqueue mints one
     # after validating the items and the target.
+    if action == "adopt_session":
+        raise HTTPException(status_code=400, detail="Use POST /player/session/transfer to move playback")
     if action in {"enqueue_next", "enqueue_end"}:
         raise HTTPException(status_code=400, detail="Use POST /player/enqueue to add to a queue")
     target_type = payload.target_type
@@ -1813,7 +1837,8 @@ def list_player_commands(
     expired = False
     for command in rows:
         created = as_utc(command.created_at) or now
-        if command.action not in carries_payload and (now - created) > COMMAND_TTL:
+        ttl = ADOPT_SESSION_TTL if command.action == "adopt_session" else COMMAND_TTL
+        if command.action not in carries_payload and (now - created) > ttl:
             command.status = "expired"
             command.consumed_at = now
             expired = True
@@ -1836,6 +1861,542 @@ def ack_player_command(
         command.consumed_at = datetime.now(timezone.utc)
         session.commit()
     return {"ok": True}
+
+
+# ── The account's shared playback session (§A1b) ────────────────────────────────
+#
+# One queue and one position per account, stored here and outliving every device. A device session
+# CLAIMS it to play it; everyone else views it and drives it remotely. Remote control of an owned
+# session is the ordinary command channel above (transport, seek, jump/remove/move, enqueue) — the
+# owner applies the command and republishes. Only an ORPHANED session, with nobody to command, is
+# edited here directly.
+
+#: A claim whose owner has said nothing for this long is lapsed — force-quit, crashed, offline.
+CLAIM_SILENCE_TIMEOUT = timedelta(minutes=5)
+#: ...and so is one that has not been PLAYING for this long. A paused session left alone is up for
+#: grabs, so the next device to press Play takes it rather than remote-controlling a sleeping one.
+CLAIM_IDLE_TIMEOUT = timedelta(minutes=5)
+# A shared session is meant to be resumed in full, so it is capped far above a transfer (500).
+SESSION_MAX_ITEMS = 5000
+SESSION_MAX_PAYLOAD_BYTES = 512 * 1024
+#: How long a pushed "take over the session" stays deliverable to a backgrounded target.
+ADOPT_SESSION_TTL = timedelta(minutes=2)
+
+
+def _claim_valid(row: "AccountPlaybackSession | None", now: datetime | None = None) -> bool:
+    """Whether the stored claim still entitles its owner to play the session.
+
+    ⚠ Derived, never written. A lapsed claim keeps its `claim_id` on purpose: the holder, returning
+    from a stretch offline, re-validates it simply by reporting again — unless another device claimed
+    in the meantime, which replaced the id. Nothing may clear a claim for having lapsed.
+    """
+    if row is None or not row.owner_session_id or not row.claim_id:
+        return False
+    now = now or datetime.now(timezone.utc)
+    heard = row.owner_reported_at or row.claimed_at
+    if heard is None or as_utc(heard) < now - CLAIM_SILENCE_TIMEOUT:
+        return False
+    if row.status == "playing":
+        return True
+    idle_since = row.paused_since or heard
+    return as_utc(idle_since) >= now - CLAIM_IDLE_TIMEOUT
+
+
+def _account_session(session: Session, user_id: str) -> AccountPlaybackSession:
+    row = session.get(AccountPlaybackSession, user_id)
+    if row is None:
+        row = AccountPlaybackSession(user_id=user_id, queue_version=0, status="stopped")
+        session.add(row)
+        session.flush()
+    return row
+
+
+def _session_snapshot(row: AccountPlaybackSession) -> PlaybackSnapshot:
+    if row.queue_json:
+        try:
+            return PlaybackSnapshot.model_validate_json(row.queue_json)
+        except Exception:  # noqa: BLE001 - a corrupt copy is an empty queue, not a 500 on every poll.
+            pass
+    return PlaybackSnapshot(items=[], current_index=0, position_seconds=0.0, playing=False)
+
+
+def _validate_session_items(items: list[PlaybackSnapshotItem]) -> None:
+    if len(items) > SESSION_MAX_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Queue exceeds {SESSION_MAX_ITEMS} items")
+    for item in items:
+        if item.type not in {"track", "episode"}:
+            raise HTTPException(status_code=400, detail="Queue items must be tracks or episodes")
+        if not item.id or len(item.id) > 64:
+            raise HTTPException(status_code=400, detail="Queue item ids are missing or too long")
+
+
+def _store_session_queue(row: AccountPlaybackSession, items: list[PlaybackSnapshotItem]) -> None:
+    """Replace the stored queue, bumping `queue_version` only when its CONTENTS changed.
+
+    Ids only: display titles are the viewer's to resolve (from its mirror, or `resolve=true`).
+    """
+    _validate_session_items(items)
+    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id) for i in items]
+    encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json()
+    if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Queue is too large")
+    if encoded != row.queue_json:
+        row.queue_json = encoded
+        row.queue_version = (row.queue_version or 0) + 1
+    row.queue_length = len(clean)
+    if row.queue_length == 0:
+        row.current_index = 0
+    else:
+        row.current_index = max(0, min(row.current_index or 0, row.queue_length - 1))
+
+
+def _set_session_current(session: Session, row: AccountPlaybackSession) -> None:
+    """Derive the now-playing display from the item at `current_index` — the library wins (§31)."""
+    items = _session_snapshot(row).items
+    item = items[row.current_index] if 0 <= (row.current_index or 0) < len(items) else None
+    row.track_id = row.episode_id = None
+    row.title = row.artist = row.album = None
+    row.duration_seconds = None
+    if item is None:
+        return
+    if item.type == "episode":
+        episode = session.get(Episode, item.id)
+        if episode:
+            podcast = episode.podcast
+            row.episode_id = episode.id
+            row.title = episode.title
+            row.artist = (podcast.author or podcast.title) if podcast else None
+            row.album = podcast.title if podcast else None
+            row.duration_seconds = round(episode.duration_ms / 1000) if episode.duration_ms else None
+        return
+    track = session.get(Track, item.id)
+    if track:
+        row.track_id = track.id
+        row.title = track.title
+        row.artist = track.album.artist.name if track.album and track.album.artist else None
+        row.album = track.album.title if track.album else None
+        row.duration_seconds = round(track.duration_ms / 1000) if track.duration_ms else None
+
+
+def _resolve_snapshot_titles(session: Session, items: list[PlaybackSnapshotItem]) -> None:
+    """Fill titles in for the WEB, which has no library mirror. One query per kind, never per item."""
+    track_ids = [item.id for item in items if item.type != "episode"]
+    episode_ids = [item.id for item in items if item.type == "episode"]
+    tracks = {
+        row.id: row for row in session.scalars(select(Track).where(Track.id.in_(track_ids)))
+    } if track_ids else {}
+    episodes = {
+        row.id: row for row in session.scalars(select(Episode).where(Episode.id.in_(episode_ids)))
+    } if episode_ids else {}
+    for item in items:
+        if item.type == "episode":
+            episode = episodes.get(item.id)
+            if episode:
+                item.title = episode.title
+                item.artist = episode.podcast.title if episode.podcast else None
+            continue
+        track = tracks.get(item.id)
+        if track:
+            item.title = track.title
+            item.artist = track.album.artist.name if track.album and track.album.artist else None
+            item.album_id = track.album_id
+
+
+def _serialize_account_session(
+    session: Session,
+    row: AccountPlaybackSession,
+    auth_session: AuthSession | None,
+    *,
+    include_items: bool = False,
+    resolve: bool = False,
+    claim_id: str | None = None,
+) -> AccountSessionOut:
+    now = datetime.now(timezone.utc)
+    valid = _claim_valid(row, now)
+    owner = None
+    if valid:
+        owner_row = session.get(AuthSession, row.owner_session_id)
+        owner = AccountSessionOwner(
+            session_id=row.owner_session_id,
+            device_label=owner_row.device_label if owner_row else None,
+            client=owner_row.client if owner_row else None,
+        )
+        status_value = row.status
+    else:
+        # An orphan is shown where it was left, paused, so any device can press Play and take it.
+        status_value = "paused" if (row.queue_length or 0) > 0 else "stopped"
+    items = None
+    if include_items:
+        items = _session_snapshot(row).items
+        if resolve:
+            _resolve_snapshot_titles(session, items)
+    episode = session.get(Episode, row.episode_id) if row.episode_id else None
+    track = session.get(Track, row.track_id) if row.track_id else None
+    return AccountSessionOut(
+        status=status_value,
+        owner=owner,
+        claim_valid=valid,
+        you_own=bool(valid and auth_session is not None and row.owner_session_id == auth_session.id),
+        claim_id=claim_id,
+        queue_version=row.queue_version or 0,
+        queue_length=row.queue_length or 0,
+        current_index=row.current_index or 0,
+        position_seconds=float(row.position_seconds or 0.0),
+        position_at=as_utc(row.position_at) if row.position_at else None,
+        shuffle=bool(row.shuffle),
+        repeat=row.repeat or "off",
+        track_id=row.track_id,
+        episode_id=row.episode_id,
+        podcast_id=episode.podcast_id if episode else None,
+        album_id=track.album_id if track else None,
+        title=row.title,
+        artist=row.artist,
+        album=row.album,
+        duration_seconds=row.duration_seconds,
+        updated_at=as_utc(row.updated_at) if row.updated_at else None,
+        items=items,
+    )
+
+
+def _apply_claimed_report(
+    row: AccountPlaybackSession, state: SessionPlayerState, payload: PlayerStateUpdate, now: datetime
+) -> None:
+    """Fold the claim holder's /player/status heartbeat into the shared session.
+
+    The per-device row has already resolved display fields against the library, so they are copied
+    rather than derived a second time. Reporting also re-validates a soft-lapsed claim — that is the
+    "claim holder wins when it comes back" rule.
+    """
+    previous = row.status
+    row.status = state.status
+    if row.status == "playing":
+        row.paused_since = None
+    elif previous == "playing" or row.paused_since is None:
+        row.paused_since = now
+    if row.queue_length:
+        row.current_index = max(0, min(payload.current_index, row.queue_length - 1))
+    row.position_seconds = float(payload.position_seconds or 0)
+    row.position_at = now
+    row.shuffle = state.shuffle
+    row.repeat = state.repeat
+    row.track_id = state.track_id
+    row.episode_id = state.episode_id
+    row.title = state.title
+    row.artist = state.artist
+    row.album = state.album
+    row.duration_seconds = state.duration_seconds
+    row.owner_session_id = state.session_id
+    row.owner_reported_at = now
+    row.updated_at = now
+
+
+def _stop_previous_owner(session: Session, user: User, owner_session_id: str, new_label: str | None) -> None:
+    """Tell a displaced owner to stop, ONCE — the same send-once guard ownership resolution uses."""
+    already = session.scalar(
+        select(PlaybackCommand.id).where(
+            PlaybackCommand.user_id == user.id,
+            PlaybackCommand.device_id == owner_session_id,
+            PlaybackCommand.status == "pending",
+            PlaybackCommand.action == "stop",
+        )
+    )
+    if already:
+        return
+    session.add(PlaybackCommand(user_id=user.id, device_id=owner_session_id, action="stop", status="pending"))
+    session.commit()
+    try:
+        create_notification(
+            session,
+            title="Playback moved",
+            body=f"Now on {new_label or 'another device'}",
+            event_type="remote_playback_command",
+            target_url="/player",
+            user_id=user.id,
+            deliver_apns=True,
+            deliver_web=False,
+            device_id=apns_device_for_session(session, user.id, owner_session_id),
+        )
+    except Exception:  # noqa: BLE001 - the stop stands even if the wake cannot be sent.
+        pass
+
+
+@router.get(
+    "/player/session",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Read my account's shared playback session",
+)
+def get_account_session(
+    queue: bool = False,
+    resolve: bool = False,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """What the account is listening to, where it was left, and who (if anyone) holds the claim.
+
+    ⚠ A read never writes: an account that has never played gets an empty projection, not a row.
+    """
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None:
+        return AccountSessionOut(status="stopped")
+    return _serialize_account_session(session, row, auth_session, include_items=queue, resolve=resolve)
+
+
+@router.post(
+    "/player/session/claim",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Take the shared session so this device plays it",
+)
+def claim_account_session(
+    payload: SessionClaimRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """Make the caller the owner. Always succeeds — pressing Play, or "Play here", is a steal.
+
+    Without a snapshot the stored queue is taken where it was left; with one (a fresh play) it is
+    replaced. A previous VALID owner elsewhere is sent one stop. The response carries the new
+    `claim_id`, which the caller must send on every report after, and the whole queue.
+    """
+    origin = _require_session(auth_session)
+    now = datetime.now(timezone.utc)
+    row = _account_session(session, user.id)
+    previous_owner = row.owner_session_id if _claim_valid(row, now) else None
+    if payload.snapshot is not None:
+        snap = payload.snapshot
+        if snap.items and not 0 <= snap.current_index < len(snap.items):
+            raise HTTPException(status_code=400, detail="current_index is outside the queue")
+        _store_session_queue(row, snap.items)
+        row.current_index = snap.current_index if snap.items else 0
+        row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
+        row.shuffle = bool(snap.shuffle)
+        row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
+    elif previous_owner and row.status == "playing" and row.position_at:
+        # Taking a session that is playing right now: resume where it IS, not where it last said.
+        advanced = (row.position_seconds or 0.0) + (now - as_utc(row.position_at)).total_seconds()
+        if row.duration_seconds:
+            advanced = min(advanced, float(row.duration_seconds))
+        row.position_seconds = max(0.0, advanced)
+    row.claim_id = uuid_str()
+    row.owner_session_id = origin.id
+    row.claimed_at = now
+    row.owner_reported_at = now
+    row.position_at = now
+    # Claimed to be played: viewers see it playing at once rather than after the first heartbeat.
+    # A claimer that fails to start says "paused" in its next report.
+    row.status = "playing" if (row.queue_length or 0) > 0 else "stopped"
+    row.paused_since = None if row.status == "playing" else now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    if previous_owner and previous_owner != origin.id:
+        _stop_previous_owner(session, user, previous_owner, origin.device_label)
+    return _serialize_account_session(session, row, auth_session, include_items=True, claim_id=row.claim_id)
+
+
+@router.post(
+    "/player/session/release",
+    tags=["users"],
+    summary="Give up the claim on the shared session (the app's dying gasp)",
+)
+def release_account_session(
+    payload: SessionReleaseRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Idempotent and always 200: a gasp that arrives after someone else claimed changes nothing."""
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None or not payload.claim_id or row.claim_id != payload.claim_id:
+        return {"ok": True, "released": False}
+    now = datetime.now(timezone.utc)
+    if payload.position_seconds is not None:
+        row.position_seconds = max(0.0, float(payload.position_seconds))
+    if payload.current_index is not None and row.queue_length:
+        row.current_index = max(0, min(payload.current_index, row.queue_length - 1))
+        _set_session_current(session, row)
+    row.claim_id = None
+    row.owner_session_id = None
+    row.status = "paused" if (row.queue_length or 0) > 0 else "stopped"
+    row.paused_since = now
+    row.position_at = now
+    row.updated_at = now
+    session.commit()
+    return {"ok": True, "released": True}
+
+
+@router.post(
+    "/player/session/queue",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Publish the claim holder's queue to the shared session",
+    responses={409: {"description": "claim_lost — another device holds the session now"}},
+)
+def publish_account_session_queue(
+    payload: SessionQueuePublish,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """The owner is authoritative for its queue while it holds the claim; this simply stores it.
+
+    Other devices' edits reach an owned session as COMMANDS to the owner, which applies them and
+    publishes here — so there is never a second writer to reconcile against.
+    """
+    origin = _require_session(auth_session)
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None or row.claim_id != payload.claim_id:
+        raise HTTPException(status_code=409, detail="claim_lost")
+    snap = payload.snapshot
+    if snap.items and not 0 <= snap.current_index < len(snap.items):
+        raise HTTPException(status_code=400, detail="current_index is outside the queue")
+    now = datetime.now(timezone.utc)
+    _store_session_queue(row, snap.items)
+    row.current_index = snap.current_index if snap.items else 0
+    row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
+    row.position_at = now
+    row.shuffle = bool(snap.shuffle)
+    row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
+    row.owner_session_id = origin.id
+    row.owner_reported_at = now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    return _serialize_account_session(session, row, auth_session)
+
+
+@router.post(
+    "/player/session/edit",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Edit the shared session while no device holds it",
+    responses={409: {"description": "owned (send a command to the owner instead) or queue_changed"}},
+)
+def edit_account_session(
+    payload: SessionEditRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """Queue, position and mode edits for an ORPHANED session, which has nobody to command.
+
+    ⚠ Refused while a claim is valid: the owner is the only writer of an owned session, and every one
+    of these has a command-channel equivalent that reaches it (jump/remove/move/seek/state, and
+    /player/enqueue for inserts).
+    """
+    now = datetime.now(timezone.utc)
+    row = _account_session(session, user.id)
+    if _claim_valid(row, now):
+        raise HTTPException(status_code=409, detail={"detail": "owned", "owner_session_id": row.owner_session_id})
+    if payload.base_version is not None and payload.base_version != (row.queue_version or 0):
+        raise HTTPException(status_code=409, detail={"detail": "queue_changed", "queue_version": row.queue_version or 0})
+    op = (payload.op or "").strip().lower()
+    items = list(_session_snapshot(row).items)
+    current = row.current_index or 0
+
+    def index_ok(value: int | None) -> int:
+        if value is None or not 0 <= value < len(items):
+            raise HTTPException(status_code=400, detail="index is outside the queue")
+        return value
+
+    if op in {"insert_next", "insert_end"}:
+        new_items = payload.items or []
+        if not new_items:
+            raise HTTPException(status_code=400, detail="Nothing to queue")
+        at = len(items) if (op == "insert_end" or not items) else current + 1
+        items[at:at] = new_items
+        _store_session_queue(row, items)
+    elif op == "remove":
+        index = index_ok(payload.index)
+        items.pop(index)
+        if index < current:
+            current -= 1
+        elif index == current:
+            row.position_seconds = 0.0
+        row.current_index = current
+        _store_session_queue(row, items)
+    elif op == "move":
+        index = index_ok(payload.index)
+        to_index = index_ok(payload.to_index)
+        items.insert(to_index, items.pop(index))
+        if index == current:
+            current = to_index
+        elif index < current <= to_index:
+            current -= 1
+        elif to_index <= current < index:
+            current += 1
+        row.current_index = current
+        _store_session_queue(row, items)
+    elif op == "jump":
+        row.current_index = index_ok(payload.index)
+        row.position_seconds = 0.0
+    elif op == "seek":
+        if payload.position_seconds is None:
+            raise HTTPException(status_code=400, detail="position_seconds is required")
+        limit = float(row.duration_seconds) if row.duration_seconds else None
+        target = max(0.0, float(payload.position_seconds))
+        row.position_seconds = min(target, limit) if limit else target
+    elif op == "state":
+        if payload.shuffle is not None:
+            row.shuffle = bool(payload.shuffle)
+        if payload.repeat in {"off", "one", "all"}:
+            row.repeat = payload.repeat
+    else:
+        raise HTTPException(status_code=400, detail="Unknown op")
+    row.position_at = now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    return _serialize_account_session(session, row, auth_session)
+
+
+@router.post(
+    "/player/session/transfer",
+    tags=["users"],
+    summary="Ask another of my devices to take over the shared session",
+    responses={404: {"description": "Not a session of yours"}, 409: {"description": "Unreachable"}},
+)
+def transfer_account_session(
+    payload: PlaybackTransferRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> dict:
+    """Push the session to a named device. The target CLAIMS it on receipt, and that claim stops the
+    current owner — so nothing here stops anybody, and a target that never wakes costs nothing.
+    Only `to_session_id` is read; the session is the payload.
+    """
+    _require_session(auth_session)
+    target = session.scalar(
+        select(AuthSession).where(AuthSession.id == payload.to_session_id, AuthSession.user_id == user.id)
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="No such device session")
+    presence = _session_presence(session.get(SessionPlayerState, target.id), target.last_used_at)
+    if presence == "unreachable":
+        raise HTTPException(status_code=409, detail={"detail": "device_unreachable", "device_label": target.device_label})
+    command = PlaybackCommand(
+        user_id=user.id, device_id=target.id, action="adopt_session", target_type="session", status="pending",
+    )
+    session.add(command)
+    session.commit()
+    try:
+        create_notification(
+            session,
+            title="Playback moved",
+            body=f"Continue on {target.device_label or 'this device'}",
+            event_type="remote_playback_command",
+            target_url="/player",
+            user_id=user.id,
+            deliver_apns=True,
+            deliver_web=False,
+            device_id=apns_device_for_session(session, user.id, target.id),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "command_id": command.id, "to_device_label": target.device_label}
 
 
 # ── Play history (local PlayEvent + best-effort Jellyfin report) ───────────────

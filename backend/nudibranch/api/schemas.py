@@ -172,6 +172,9 @@ class PlayerStateUpdate(BaseModel):
     # What the caller's queue currently hashes to. The server answers `queue_stale` when its
     # stored copy disagrees, which is the client's cue to publish the queue itself.
     queue_hash: str | None = None
+    # The account-session claim this device believes it holds (§A1b). Present only on a client that
+    # plays the shared session; a report without it keeps the per-device behaviour of old clients.
+    claim_id: str | None = None
 
 
 class LibraryTreeTrack(BaseModel):
@@ -1061,3 +1064,75 @@ class MarkEpisodesPlayedIn(BaseModel):
     # before the caller's currently-oldest played episode (a backlog catch-up action) and is a
     # no-op when nothing is played yet.
     scope: Literal["all", "before_oldest_played"] = "all"
+
+
+class AccountSessionOwner(BaseModel):
+    session_id: str
+    device_label: str | None = None
+    client: str | None = None
+
+
+class AccountSessionOut(BaseModel):
+    """The account's one shared playback session, as the caller may honestly see it.
+
+    ⚠ With no VALID claim, `owner` is null and `status` is projected as "paused" (a stopped session
+    with nothing queued stays "stopped"): an orphaned session is shown where it was left, and Play on
+    any device claims it. `position_at` is when `position_seconds` was true; only a session that is
+    owned AND playing should be interpolated forward from it.
+    """
+
+    status: str
+    owner: AccountSessionOwner | None = None
+    claim_valid: bool = False
+    you_own: bool = False
+    #: Returned only to the caller that just claimed — it must send it on every report after.
+    claim_id: str | None = None
+    queue_version: int = 0
+    queue_length: int = 0
+    current_index: int = 0
+    position_seconds: float = 0.0
+    position_at: datetime | None = None
+    shuffle: bool = False
+    repeat: str = "off"
+    track_id: str | None = None
+    episode_id: str | None = None
+    podcast_id: str | None = None
+    album_id: str | None = None
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    duration_seconds: int | None = None
+    updated_at: datetime | None = None
+    #: Only with `?queue=1` (and always on a claim).
+    items: list[PlaybackSnapshotItem] | None = None
+
+
+class SessionClaimRequest(BaseModel):
+    # Omit to take the stored queue where it was left (Play on an orphan, "Play here"). Send one for a
+    # fresh play, which replaces the queue.
+    snapshot: PlaybackSnapshot | None = None
+
+
+class SessionReleaseRequest(BaseModel):
+    claim_id: str
+    position_seconds: float | None = None
+    current_index: int | None = None
+
+
+class SessionQueuePublish(BaseModel):
+    claim_id: str
+    snapshot: PlaybackSnapshot
+
+
+class SessionEditRequest(BaseModel):
+    # insert_next | insert_end | remove | move | jump | seek | state | clear
+    op: str
+    items: list[PlaybackSnapshotItem] | None = None
+    index: int | None = None
+    to_index: int | None = None
+    position_seconds: float | None = None
+    shuffle: bool | None = None
+    repeat: str | None = None
+    # When set, the edit is refused with 409 if the queue has changed since the caller read it, so an
+    # index can never land on the wrong item.
+    base_version: int | None = None
