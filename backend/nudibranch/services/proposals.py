@@ -153,8 +153,15 @@ def reject_items(session: Session, batch_id: str, item_ids: list[str] | None) ->
             wishlist_item = session.get(WishlistItem, wishlist_item_id)
             if wishlist_item:
                 owner_id = item.requester_id or payload.get("user_id") or wishlist_item.user_id
-                if owner_id:
-                    rejected_wishlist_items.setdefault(owner_id, []).append(str(item.title))
+                # Name the REQUEST, once -- not each rejected row. Item titles include the artist and
+                # album containers and every candidate's raw slskd path, which is what the
+                # requester's "Request declined" body used to list.
+                request_name = " – ".join(
+                    part for part in (wishlist_item.artist, wishlist_item.track or wishlist_item.album) if part
+                )
+                names = rejected_wishlist_items.setdefault(owner_id, []) if owner_id else None
+                if names is not None and request_name not in names:
+                    names.append(request_name)
                 wishlist_item.status = "rejected"
                 wishlist_item.stage = "rejected"
                 wishlist_item.status_changed_at = datetime.now(timezone.utc)
