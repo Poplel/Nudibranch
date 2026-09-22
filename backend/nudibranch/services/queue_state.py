@@ -411,6 +411,32 @@ def rollup_items(items: Iterable[ProposalItem]) -> list[ProposalItem]:
     return working or materialized
 
 
+def library_review_title(items: Iterable[ProposalItem]) -> str:
+    """The "Add to library: <artists>" title for a `library_review` batch, derived live.
+
+    `ProposalBatch.title` is written once, at staging time (`present_staged_downloads_for_library_
+    review`), and nothing rewrites it afterwards -- so it goes stale the moment an item leaves the
+    batch (cancel, reject, partial approve, cleanup). This recomputes it from whatever items are
+    passed in, the same way the bucket and stage are never stored either. Callers pass the batch's
+    full item list for the batch-level title, or a requester's pruned subset (see
+    `prune_batch_to_requester`) so a shared batch names only the artists in THAT view.
+
+    Distinct artists come from the batch's artist-level container items -- root `import_files` rows
+    with no parent, carrying `{"artist": ...}` in their payload -- the same shape
+    `present_staged_downloads_for_library_review` builds them in.
+    """
+    artists: set[str] = set()
+    for item in items:
+        if item.parent_id is not None:
+            continue
+        artist = payload_of(item).get("artist")
+        if isinstance(artist, str) and artist:
+            artists.add(artist)
+    distinct = sorted(a for a in artists if a != "Unknown Artist") or ["Unknown Artist"]
+    label = ", ".join(distinct[:3]) + (" & more" if len(distinct) > 3 else "")
+    return f"Add to library: {label}"
+
+
 # Batch statuses that end the batch. Once one is set it beats anything its rows say — the same rule
 # as `resolve_stage`, one level up.
 _TERMINAL_BATCH_STAGE: dict[ProposalStatus, ItemStage] = {
@@ -423,13 +449,20 @@ _TERMINAL_BATCH_STAGE: dict[ProposalStatus, ItemStage] = {
 def resolve_batch_stage(items: Iterable[ProposalItem], batch_status: ProposalStatus | None = None) -> ItemStage:
     """Worst-wins rollup over the items that represent real work.
 
-    ⚠️ A terminal `batch_status` wins outright. Rows can be left behind a settled batch (containers
-    rejected before `_roll_up_container_status` existed still sit at `pending`), and rolling those
-    up made a rejected batch report "awaiting approval" in Review.
+    ⚠️ A terminal `batch_status` wins outright -- EXCEPT `completed`, which must still lose to a
+    failed selected leaf. `run_execute_proposal_batch` used to write `completed` once every item
+    result was "settled", even when settling meant failed, so a stored `completed` here is not
+    trustworthy on its own: the same "a denormalized cache must never outrank the column it
+    caches" rule applies one level up, with `status` playing the cache's role against the rows it
+    summarizes. Rows can otherwise be left behind a settled batch (containers rejected before
+    `_roll_up_container_status` existed still sit at `pending`), and rolling those up made a
+    rejected batch report "awaiting approval" in Review.
     """
+    stages = [resolve_stage(item) for item in rollup_items(items)]
+    if batch_status is ProposalStatus.completed and ItemStage.failed in stages:
+        return ItemStage.failed
     if batch_status in _TERMINAL_BATCH_STAGE:
         return _TERMINAL_BATCH_STAGE[batch_status]
-    stages = [resolve_stage(item) for item in rollup_items(items)]
     if not stages:
         return ItemStage.waiting
     present = set(stages)

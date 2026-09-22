@@ -6177,6 +6177,21 @@ def list_requests(
             .options(selectinload(ProposalBatch.items))
             .where(ProposalBatch.status.in_(statuses))
             .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
+            # `/wishlist` is the throwaway "Request: X" intent batch `run_search_wishlist_item`
+            # retires as `completed` once it has spawned the real candidate batch (and the legacy
+            # `propose_wishlist_items` equivalent) -- never a batch a requester actually acts on.
+            # With `include_settled=true` it would otherwise surface as a second, "completed" row
+            # for a request whose real batch may still be failing or in progress. Only the SETTLED
+            # one is hidden -- while it is still searching it is the requester's "Finding
+            # candidates" row. ⚠️ Written NULL-safe: a bare `tree_path != "/wishlist"` is NULL (so
+            # false) for batches with no tree_path, and would silently drop them.
+            .where(
+                or_(
+                    ProposalBatch.tree_path.is_(None),
+                    ProposalBatch.tree_path != "/wishlist",
+                    ProposalBatch.status != ProposalStatus.completed,
+                )
+            )
             .order_by(ProposalBatch.created_at.desc())
         )
     )
@@ -6198,6 +6213,12 @@ def list_requests(
         serialized = serialize_batch(batch, names)
         keep_ids = {item.id for item in mine}
         serialized.items = [item for item in serialized.items if item.id in keep_ids]
+        flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+        if flow is ProposalFlow.library_review:
+            # The batch-level title names every artist in the shared batch; a requester must only
+            # see the artists in THEIR OWN pruned view, or e.g. a Daft Punk requester would read
+            # "Add to library: Daft Punk, Nirvana" for a Nirvana track they never asked for.
+            serialized.title = queue_state.library_review_title(mine)
         # A requester may stop their own request but never start one, and never retry -- retry
         # restarts a download, so it is approval-equivalent and gated like one.
         for item in serialized.items:
@@ -7187,18 +7208,21 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
     if not items:
         return
     active_ids = active_wishlist_download_ids(session)
-    # A download that finished is no longer "active", so an item whose download COMPLETED must
-    # be marked completed — otherwise an item that downloaded + imported reverts to "Awaiting
-    # Approval" (the queue_download item went terminal, reconcile then demoted approved→wanted).
-    # Keyed on the exact wishlist_item_id carried by the download item, so it works even when
+    # A download that finished is no longer "active", so without this branch the demotion below
+    # would read it as an abandoned download and knock it back to "wanted". But a completed
+    # DOWNLOAD only means the file reached staging (gate a) -- it is NOT in the library yet, so
+    # this must land on "staged", never "completed": `complete_linked_wishlist_item` is the one
+    # place "completed" is written, and only at the real library import. Keyed on the exact
+    # wishlist_item_id carried by the download item, so it works even when
     # mark_matching_wishlist_completed missed it on fuzzy metadata (deluxe titles, feat., quotes).
     completed_ids = completed_wishlist_download_ids(session)
     changed = False
     now = datetime.now(timezone.utc)
     for item in items:
         if item.id in completed_ids:
-            if item.status != "completed":
-                item.status = "completed"
+            if item.status not in {"staged", "completed"}:
+                item.status = "staged"
+                item.stage = ItemStage.staged.value
                 item.status_changed_at = now
                 changed = True
             continue
@@ -7213,7 +7237,9 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
 
 
 def completed_wishlist_download_ids(session: Session) -> set[str]:
-    """Wishlist item ids whose linked download ProposalItem has completed (downloaded+imported).
+    """Wishlist item ids whose linked download ProposalItem has completed -- i.e. downloaded and
+    verified into staging. ⚠️ NOT "in the library": that needs gate (b) too, so callers must land
+    this on "staged", never "completed" (see `reconcile_stale_approved_wishlist_items`).
 
     Only count ACTUAL download leaves (queue_download / queue_ytdlp_download). A completed
     `wishlist_request` item just means the candidate search ran — search_candidates marks the
@@ -7456,9 +7482,10 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
             continue
         seen.add(key)
         requesters.append(RequestRefOut(**ref))
+    title = queue_state.library_review_title(items) if flow is ProposalFlow.library_review else batch.title
     return ProposalBatchOut(
         id=batch.id,
-        title=batch.title,
+        title=title,
         kind=batch.kind,
         status=batch.status,
         flow=flow,

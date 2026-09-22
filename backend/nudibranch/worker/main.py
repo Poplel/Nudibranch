@@ -881,8 +881,16 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         or item.status in (queue_state.SETTLED_ITEM_STATUSES | {ProposalStatus.failed, ProposalStatus.executing})
         for item in result_items
     )
+    # A batch is only honestly "completed" if every selected leaf actually completed. "Settled"
+    # also covers a leaf that settled as failed, and that used to fall straight into `completed`
+    # here -- `resolve_batch_stage` then treats a stored `completed` as an unconditional terminal
+    # override, so the failure silently disappeared from Issues. One failed selected leaf now
+    # makes the whole batch `failed` instead.
+    any_result_failed = any(item.selected and item.status == ProposalStatus.failed for item in result_items)
     if open_downloads:
         batch.status = ProposalStatus.executing
+    elif item_results_settled and any_result_failed:
+        batch.status = ProposalStatus.failed
     elif item_results_settled:
         # Item-level misses (for example, lyrics not found) are a completed batch result rather
         # than a crashed task. Users get explicit passed/failed counts and the batch leaves the
@@ -891,7 +899,11 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     elif errors:
         batch.status = ProposalStatus.failed
     elif all(item.status in (queue_state.SETTLED_ITEM_STATUSES | {ProposalStatus.failed}) or not item.selected for item in batch.items):
-        batch.status = ProposalStatus.completed
+        batch.status = (
+            ProposalStatus.failed
+            if any(item.selected and item.status == ProposalStatus.failed for item in batch.items)
+            else ProposalStatus.completed
+        )
     else:
         batch.status = ProposalStatus.pending
     session.commit()
@@ -4340,13 +4352,30 @@ def mark_matching_wishlist_completed(session: Session, metadata: dict) -> None:
     # This matcher works on artist/album/title text, so an unrelated disk import of the same song
     # could otherwise mark someone's tracked request "completed" on a coincidence, overriding the
     # authoritative link. Legacy rows (no `item_id`) still need it.
-    candidates = list(
+    #
+    # ⚠️ `item_id IS NULL` is NOT the same as "no live request". `reset_canceled_wishlist_items`
+    # clears `item_id` the moment a cancelled request starts a fresh search, so a row can read
+    # exactly like a legacy row while a brand-new `ProposalItem` is already in flight under it
+    # (linked via `wishlist_item_id`, which the reset path never touches). Exclude anything still
+    # carried on a live item, or a coincidental text match could complete a request whose real
+    # download hasn't even finished yet.
+    live_linked_ids = set(
         session.scalars(
+            select(ProposalItem.wishlist_item_id)
+            .where(ProposalItem.wishlist_item_id.is_not(None))
+            .where(~ProposalItem.status.in_(queue_state.SETTLED_ITEM_STATUSES))
+            .distinct()
+        )
+    )
+    candidates = [
+        item
+        for item in session.scalars(
             select(WishlistItem)
             .where(WishlistItem.status.in_(["wanted", "review", "approved", "searching", "staged"]))
             .where(WishlistItem.item_id.is_(None))
         )
-    )
+        if item.id not in live_linked_ids
+    ]
     matched = False
     for item in candidates:
         same_artist = normalize_match_text(item.artist) == artist
