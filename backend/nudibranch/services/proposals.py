@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.models import (
+    ItemStage,
     Permission,
     TaskStatus,
     ProposalBatch,
@@ -93,6 +94,14 @@ def approve_batch(
         # track the user explicitly stopped -- that is what makes a cancel stick.
         if item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
             item.status = ProposalStatus.approved
+            # The requester's row leaves "Awaiting approval" the moment someone says yes. The
+            # worker takes it from here as the download moves (`mirror_download_stage_to_wishlist`).
+            if item.wishlist_item_id:
+                wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
+                if wishlist_item and wishlist_item.status in {"review", "searching", "wanted"}:
+                    wishlist_item.status = "approved"
+                    wishlist_item.stage = ItemStage.approved.value
+                    wishlist_item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
     return enqueue_task(session, "execute_proposal_batch", {"batch_id": batch_id})
 

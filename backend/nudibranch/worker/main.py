@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 from sqlalchemy import func, select, update
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, object_session, selectinload
 
 from nudibranch import __version__
 from nudibranch.core.config import get_settings
@@ -4998,7 +4998,34 @@ def cache_item_stage(item: ProposalItem, progress_stage: str | None) -> None:
     try:
         item.stage = (mapped or ItemStage(str(progress_stage))).value
     except ValueError:
-        pass
+        return
+    mirror_download_stage_to_wishlist(item, ItemStage(item.stage))
+
+
+# Stages a live download passes through that the requester's wishlist row should show as they
+# happen. Staged, completed and failed each have their own writer (the staging step,
+# `complete_linked_wishlist_item`, `fail_linked_wishlist_item`), so they are not mirrored here.
+_WISHLIST_MIRRORED_STAGES = frozenset(
+    {ItemStage.queued, ItemStage.downloading, ItemStage.retrying, ItemStage.verifying, ItemStage.staging}
+)
+
+
+def mirror_download_stage_to_wishlist(item: ProposalItem, stage: ItemStage) -> None:
+    """Keep the linked wishlist row's stage in step with the download it is waiting on.
+
+    ⚠️ Nothing used to write it between approval and staging, so a requester watched "Awaiting
+    approval" for the whole download.
+    """
+    if stage not in _WISHLIST_MIRRORED_STAGES or not item.selected or not item.wishlist_item_id:
+        return
+    session = object_session(item)
+    wishlist_item = session.get(WishlistItem, item.wishlist_item_id) if session else None
+    if not wishlist_item or wishlist_item.status in {"completed", "removed", "rejected", "failed", "staged"}:
+        return
+    if wishlist_item.stage != stage.value:
+        wishlist_item.status = "downloading"
+        wishlist_item.stage = stage.value
+        wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
 def download_progress_payload(status: str, *, stage: str | None = None, progress: float | None = None, indeterminate: bool | None = None) -> dict:
