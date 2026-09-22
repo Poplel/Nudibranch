@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Compass,
   Database,
   FileAudio,
@@ -123,6 +124,9 @@ function getDeviceLabel() {
   return label;
 }
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
+// Minutes a playback claim survives with nothing playing before the session is up for grabs.
+// 0 means it never expires. Matches the server's own default for a new account.
+const DEFAULT_CLAIM_TIMEOUT_MINUTES = 5;
 
 // Nav order mirrors the iOS app's: the four things you reach for constantly first, then the
 // management pages. "Discover" is not its own page any more — searching for music and tracking
@@ -327,6 +331,10 @@ function App() {
   const [accentColor, setAccentColor] = useState(initialAppearance.accentColor);
   const [backgroundTint, setBackgroundTint] = useState(initialAppearance.backgroundTint);
   const [crossfadeDuration, setCrossfadeDuration] = useState(0.5);
+  // Account-level playback settings, saved through the same PUT /me/appearance as the colours.
+  // Both are REQUIRED in that body — leaving either out is a 422.
+  const [remotePlaybackEnabled, setRemotePlaybackEnabled] = useState(true);
+  const [claimTimeoutMinutes, setClaimTimeoutMinutes] = useState(DEFAULT_CLAIM_TIMEOUT_MINUTES);
   // Device-local, like iOS — the EQ is a property of these speakers/headphones, not the account.
   const [equalizer, setEqualizer] = useState(readStoredEqualizer);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
@@ -440,7 +448,7 @@ function App() {
   /// the window of the local queue it published. MEMORY ONLY: a reloaded tab has nothing playing, so
   /// it starts as a viewer or as the resumer of an orphan.
   const sessionClaimRef = useRef(null);
-  const remotePlaybackOn = user?.remote_playback_enabled !== false;
+  const remotePlaybackOn = Boolean(user?.remote_playback_enabled);
   /// An ORPHAN is a session nobody holds a valid claim on (or one this very session held before a
   /// reload lost its claim id). It is shown paused where it was left, and Play here claims it.
   /// ⚠ A remote that is genuinely PLAYING still wins the dock: that is what the account is listening
@@ -469,23 +477,6 @@ function App() {
   const appearanceSaveVersion = useRef(0);
 
   const theme = dark ? "app dark" : "app";
-  const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
-  const queueSelectionCount = useMemo(
-    () => queueGroups.reduce((total, group) => total + group.items.filter((item) => item.selected).length, 0),
-    [queueGroups],
-  );
-  const queueItemCount = useMemo(
-    () => queueGroups.reduce((total, group) => total + group.items.length, 0),
-    [queueGroups],
-  );
-  const queueGroupCount = queueGroups.length;
-  const queueSummary = useMemo(
-    () =>
-      queueItemCount === 0
-        ? "No queued changes."
-        : `${queueSelectionCount} of ${queueItemCount} visible changes selected across ${queueGroupCount} group${queueGroupCount === 1 ? "" : "s"}.`,
-    [queueGroupCount, queueItemCount, queueSelectionCount],
-  );
   const visibleNavItems = useMemo(() => navItems.filter(([label]) => canViewPage(user, label)), [user]);
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
   const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing") || requests.some((batch) => batch.status === "executing");
@@ -660,7 +651,9 @@ function App() {
     setDark(user.theme === "dark");
     setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
     setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
-    setCrossfadeDuration(user.crossfade_duration ?? 0.5);
+    setCrossfadeDuration(user.crossfade_duration);
+    setRemotePlaybackEnabled(user.remote_playback_enabled);
+    setClaimTimeoutMinutes(user.playback_claim_timeout_minutes);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -672,23 +665,34 @@ function App() {
 
   useEffect(() => {
     if (!user?.id || !appearanceReady) return;
+    // ⚠️ `remote_playback_enabled` and `playback_claim_timeout_minutes` are REQUIRED by
+    // PUT /me/appearance — a body without them is a 422 — so every save carries the whole set.
     const appearance = {
       theme: dark ? "dark" : "light",
       accent_color: accentColor,
       background_tint: backgroundTint,
       crossfade_duration: crossfadeDuration,
+      remote_playback_enabled: remotePlaybackEnabled,
+      playback_claim_timeout_minutes: claimTimeoutMinutes,
     };
     if (
-      (user.theme || "light") === appearance.theme &&
-      (user.accent_color || DEFAULT_APPEARANCE.accentColor) === appearance.accent_color &&
-      (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint &&
-      (user.crossfade_duration ?? 0.5) === appearance.crossfade_duration
+      user.theme === appearance.theme &&
+      user.accent_color === appearance.accent_color &&
+      user.background_tint === appearance.background_tint &&
+      user.crossfade_duration === appearance.crossfade_duration &&
+      user.remote_playback_enabled === appearance.remote_playback_enabled &&
+      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes
     ) {
       return;
     }
     const timeout = window.setTimeout(() => saveOwnAppearance(appearance), 250);
     return () => window.clearTimeout(timeout);
-  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration, appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration]);
+  }, [
+    user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration,
+    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes,
+    appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration,
+    remotePlaybackEnabled, claimTimeoutMinutes,
+  ]);
 
   useEffect(() => {
     if (!token || !user) return;
@@ -1281,17 +1285,20 @@ function App() {
   // Stop this work without destroying the request -- the wishlist row goes back to searching
   // (server-side), unlike reject/decline. Available to the requester on their own batch and to
   // any approver on anyone's (server enforces both via `_may_act_on_request_batch`).
+  // One bulk route for any set of ids, across any number of batches (`POST /approvals/cancel`),
+  // and idempotent — so a selection spanning several albums is one request, not one per batch.
   async function cancelApprovalItems(items) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const itemsByBatch = groupBy(items, (item) => item.batch_id);
-      for (const [batchId, batchItems] of itemsByBatch) {
-        await api(`/approvals/${batchId}/cancel`, {
-          method: "POST",
-          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
-        });
-      }
-      setToast({ title: "Canceled", body: "The selected work was stopped." });
+      const result = await api("/approvals/cancel", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
+      });
+      setToast({
+        title: "Canceled",
+        body: `${result.canceled} item${result.canceled === 1 ? "" : "s"} stopped. The requests stay and search again.`,
+      });
       await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
     } catch (cancelError) {
       notify("Cancel failed", cancelError.message, "ui_error");
@@ -3710,48 +3717,68 @@ function App() {
   // Task Queue selection is LOCAL UI state — toggling a checkbox never touches the backend.
   // It only decides what gets sent when "Run selected" is clicked, keeping selection
   // independent from what is actually running/downloading.
-  const [selectedApprovalIds, setSelectedApprovalIds] = useState(() => new Set());
-  const knownApprovalIdsRef = useRef(new Set());
+  //
+  // ⚠️ Selection is kept PER TAB (the user's choice, 2026-09-22): Review, Issues and Changes each
+  // remember their own set, and Approve/Reject only ever read the VISIBLE tab's set. A single
+  // global set let ticks made on one tab ride along with an approve on another.
+  const [queueBucket, setQueueBucket] = useState("review");
+  const [queueSelection, setQueueSelection] = useState(emptyQueueSelection);
+  const knownApprovalKeysRef = useRef(new Set());
+  const queueSource = hasPermission(user, "approvals:manage") ? approvals : requests;
 
-  // Reconcile local selection whenever the approvals list refreshes (polled ~2.5s):
-  //  - newly-appeared items seed from the server's default `selected` (fresh candidates come in
-  //    checked, preserving the old auto-select behaviour),
-  //  - ids that vanished (search finished/moved, item rejected/completed) are dropped,
-  //  - the user's own local toggles on still-present items are preserved.
+  // Reconcile local selection whenever the queue refreshes (polled ~2.5s), per tab:
+  //  - an item newly seen in a tab seeds from the server's default `selected` (fresh candidates
+  //    come in checked),
+  //  - ids that left the tab (search finished, rejected, completed, moved to Issues) are dropped,
+  //  - the user's own toggles on still-present items are preserved.
+  // It reconciles against the list the Task Queue actually renders: GET /approvals for a full
+  // approver, GET /requests otherwise. Reconciling against /approvals alone emptied a
+  // wishlist:approve_all holder's selection on every poll, because /approvals is empty for them.
   useEffect(() => {
-    const currentIds = new Set();
-    const seeds = [];
-    for (const batch of approvals) {
+    const current = { review: new Set(), issues: new Set(), changes: new Set() };
+    const seeds = { review: [], issues: [], changes: [] };
+    const keys = new Set();
+    for (const batch of queueSource) {
+      const ids = current[batch.bucket];
+      if (!ids) continue;
       for (const item of batch.items) {
-        currentIds.add(item.id);
-        if (!knownApprovalIdsRef.current.has(item.id) && item.selected) seeds.push(item.id);
+        ids.add(item.id);
+        const key = `${batch.bucket}:${item.id}`;
+        keys.add(key);
+        if (!knownApprovalKeysRef.current.has(key) && item.selected) seeds[batch.bucket].push(item.id);
       }
     }
-    setSelectedApprovalIds((prev) => {
-      const next = new Set();
-      let changed = false;
-      for (const id of prev) { if (currentIds.has(id)) next.add(id); else changed = true; }
-      for (const id of seeds) { if (!next.has(id)) { next.add(id); changed = true; } }
-      return changed ? next : prev;
+    setQueueSelection((prev) => {
+      let anyChanged = false;
+      const out = {};
+      for (const bucket of Object.keys(current)) {
+        const next = new Set();
+        let changed = false;
+        for (const id of prev[bucket]) { if (current[bucket].has(id)) next.add(id); else changed = true; }
+        for (const id of seeds[bucket]) { if (!next.has(id)) { next.add(id); changed = true; } }
+        out[bucket] = changed ? next : prev[bucket];
+        anyChanged = anyChanged || changed;
+      }
+      return anyChanged ? out : prev;
     });
-    knownApprovalIdsRef.current = currentIds;
-  }, [approvals]);
+    knownApprovalKeysRef.current = keys;
+  }, [queueSource]);
 
-  function toggleApprovalItems(itemIds, selected) {
-    setSelectedApprovalIds((prev) => {
-      const next = new Set(prev);
+  function toggleApprovalItems(bucket, itemIds, selected) {
+    setQueueSelection((prev) => {
+      const next = new Set(prev[bucket]);
       for (const id of itemIds) { if (selected) next.add(id); else next.delete(id); }
-      return next;
+      return { ...prev, [bucket]: next };
     });
   }
 
   // Candidate picker: choose exactly one file among a track's alternates (local only).
-  function selectOnlyApprovalItem(siblingIds, itemId) {
-    setSelectedApprovalIds((prev) => {
-      const next = new Set(prev);
+  function selectOnlyApprovalItem(bucket, siblingIds, itemId) {
+    setQueueSelection((prev) => {
+      const next = new Set(prev[bucket]);
       for (const id of siblingIds) next.delete(id);
       next.add(itemId);
-      return next;
+      return { ...prev, [bucket]: next };
     });
   }
 
@@ -3768,57 +3795,58 @@ function App() {
   }
 
   // `viaRequests`: a wishlist:approve_all holder without approvals:manage can't call
-  // `/approvals/{id}/selection` or `/approvals/{id}/approve` (both admin-only) -- they approve
-  // through `/requests/{id}/approve` instead, which is scoped server-side to download_review
-  // batches and needs no separate select step (the server prefers whatever item_ids it's given).
+  // `/approvals/{id}/approve` (admin-only) -- they approve through `/requests/{id}/approve`
+  // instead, which is scoped server-side to download_review batches.
+  //
+  // ⚠️ No `/selection` call first: naming an id in the approve body SELECTS it server-side, and
+  // the extra round trip per batch was pure latency. Approve never silently no-ops either — it
+  // answers 409 when nothing in the selection can be approved — so report what happened.
   async function approveItems(items, { viaRequests = false } = {}) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const batchIds = [...new Set(items.map((item) => item.batch_id))];
       const createdTasks = [];
       const itemsByBatch = groupBy(items, (item) => item.batch_id);
       for (const [batchId, batchItems] of itemsByBatch) {
-        const ids = batchItems.map((item) => item.id);
-        if (!viaRequests) {
-          // Select exactly what we're running (select-only — deselections are never pushed, so a
-          // checkbox change can't cancel an already-running download), then approve those ids.
-          await api(`/approvals/${batchId}/selection`, {
-            method: "POST",
-            body: JSON.stringify({ item_ids: ids, selected: true }),
-          });
-        }
         createdTasks.push(
           await api(`/${viaRequests ? "requests" : "approvals"}/${batchId}/approve`, {
             method: "POST",
-            body: JSON.stringify({ item_ids: ids }),
+            body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
           }),
         );
       }
       setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
-      setToast({ title: "Tasks queued", body: `${batchIds.length} change groups were sent to the task queue.` });
-      await Promise.all([refreshApprovals(), refreshRequests()]);
+      setToast({
+        title: "Approved",
+        body: `${items.length} item${items.length === 1 ? "" : "s"} were sent to the task queue.`,
+      });
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
-      notify("Task queue failed", approvalError.message, "ui_error");
+      notify("Approve failed", approvalError.message, "ui_error");
     } finally {
       setLoading(false);
     }
   }
 
-  async function rejectItems(items) {
+  // Remove ALWAYS implies cancel (the user, 2026-09-22), and `POST /approvals/remove` does both
+  // server-side in that order — rejecting a downloading item without cancelling first left the
+  // transfer running with nothing in the queue pointing at it.
+  async function removeApprovalItems(items) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const itemsByBatch = groupBy(items, (item) => item.batch_id);
-      for (const [batchId, batchItems] of itemsByBatch) {
-        await api(`/approvals/${batchId}/reject`, {
-          method: "POST",
-          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
-        });
-      }
-      setToast({ title: "Changes rejected", body: "Selected items were removed from the queue." });
-      await Promise.all([refreshApprovals(), refreshRequests()]);
-    } catch (rejectError) {
-      notify("Reject failed", rejectError.message, "ui_error");
+      const result = await api("/approvals/remove", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
+      });
+      setToast({
+        title: "Removed",
+        body: `${result.removed} item${result.removed === 1 ? "" : "s"} taken off the queue.`,
+      });
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
+    } catch (removeError) {
+      notify("Remove failed", removeError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -4018,7 +4046,7 @@ function App() {
               />
             ) : (
             <>
-            <PanelHeader page={page} queueSummary={queueSummary} displayName={user?.display_name} />
+            <PanelHeader page={page} displayName={user?.display_name} />
             {page === "Home" && (
               <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} />
             )}
@@ -4068,12 +4096,13 @@ function App() {
                 approvals={approvals}
                 requests={requests}
                 user={user}
-                selectedIds={selectedApprovalIds}
-                onToggle={toggleApprovalItems}
-                onSelectOnly={selectOnlyApprovalItem}
+                bucket={queueBucket}
+                onBucketChange={setQueueBucket}
+                selectedIds={queueSelection[queueBucket]}
+                onToggle={(ids, selected) => toggleApprovalItems(queueBucket, ids, selected)}
+                onSelectOnly={(siblingIds, itemId) => selectOnlyApprovalItem(queueBucket, siblingIds, itemId)}
                 onApprove={approveItems}
-                onReject={rejectItems}
-                onRemove={(item) => rejectItems([item])}
+                onRemove={removeApprovalItems}
                 onCancel={cancelApprovalItems}
                 onRetry={retryApprovalItems}
               />
@@ -4110,6 +4139,10 @@ function App() {
                 setDark={setDark}
                 crossfadeDuration={crossfadeDuration}
                 setCrossfadeDuration={setCrossfadeDuration}
+                remotePlaybackEnabled={remotePlaybackEnabled}
+                setRemotePlaybackEnabled={setRemotePlaybackEnabled}
+                claimTimeoutMinutes={claimTimeoutMinutes}
+                setClaimTimeoutMinutes={setClaimTimeoutMinutes}
                 equalizer={equalizer}
                 setEqualizer={setEqualizer}
                 onSaveSearchThreshold={saveSearchThreshold}
@@ -4224,8 +4257,7 @@ function App() {
             requests={requests}
             wishlist={wishlist}
             playlists={playlists}
-            queueItemCount={queueItemCount}
-            queueSelectionCount={queueSelectionCount}
+            queueSelectionCount={queueSelection[queueBucket].size}
             tasks={tasks}
             downloadProgress={downloadProgressSummary(approvals)}
             importActions={{
@@ -4401,8 +4433,8 @@ function TrayItem({ title, body, tone = "normal" }) {
   );
 }
 
-function PanelHeader({ page, queueSummary, displayName }) {
-  const description = page === "Task Queue" ? queueSummary : pageDescriptions[page];
+function PanelHeader({ page, displayName }) {
+  const description = pageDescriptions[page];
   let heading = page;
   if (page === "Home") {
     const hour = new Date().getHours();
@@ -5859,6 +5891,10 @@ const QUEUE_BUCKETS = [
   { id: "changes", label: "Changes", empty: ["No pending changes", "Metadata, artwork, imports and staged downloads land here."] },
 ];
 
+function emptyQueueSelection() {
+  return { review: new Set(), issues: new Set(), changes: new Set() };
+}
+
 // Two presses to run a batch: the first arms the button, the second commits within a few
 // seconds. Cheaper than a confirmation dialog for something done often, but still refuses to
 // fire on one stray click. Matches the iOS ConfirmButton (Components/ConfirmButton.swift) — it
@@ -5892,26 +5928,42 @@ function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, on
   );
 }
 
-function Approvals({ approvals, requests, user, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove, onCancel, onRetry }) {
+function Approvals({ approvals, requests, user, bucket, onBucketChange, selectedIds, onToggle, onSelectOnly, onApprove, onRemove, onCancel, onRetry }) {
   const isFullApprover = hasPermission(user, "approvals:manage");
   // GET /approvals is admin-only. A wishlist:approve_all holder without approvals:manage reads
   // the Task Queue off GET /requests instead — its is_approver branch returns the same bucketed
   // shape for the two request flows (download_review + library_review); see
   // CLAUDE-wip-requests-rework.md.
   const source = isFullApprover ? approvals : requests;
-  const [bucket, setBucket] = useState("review");
-  const counts = useMemo(() => {
-    const out = { review: 0, issues: 0, changes: 0 };
-    for (const batch of source) if (out[batch.bucket] != null) out[batch.bucket] += 1;
-    return out;
-  }, [source]);
+  // ⚠️ No counts on the tabs. "Review (12)" counted batches, which read as a number of things to
+  // review and was wrong often enough to mislead (the user, 2026-09-22). Do not bring it back.
   const inBucket = useMemo(
-    // Fall back to `review` for a batch from an older API with no bucket, so nothing is invisible.
-    () => source.filter((batch) => (batch.bucket || "review") === bucket),
+    () => source.filter((batch) => batch.bucket === bucket),
     [source, bucket]
   );
   const groups = useMemo(() => groupApprovalBatches(inBucket), [inBucket]);
   const active = QUEUE_BUCKETS.find((b) => b.id === bucket) || QUEUE_BUCKETS[0];
+
+  // Every row rendered in this tab, and the subset a "Select all" should tick: one candidate per
+  // track rather than all five alternates, matching what ApprovalNode actually draws.
+  const allItems = useMemo(() => groups.flatMap((group) => group.items), [groups]);
+  const visibleItems = useMemo(() => visibleQueueItems(groups, selectedIds), [groups, selectedIds]);
+  const selectedItems = useMemo(() => allItems.filter((item) => selectedIds.has(item.id)), [allItems, selectedIds]);
+  // Approve sends only rows that are real work AND that the server says may be approved now —
+  // never a grouping row, and never a still-searching one. A row that cannot be approved is
+  // simply skipped, so one stuck request can no longer stop the whole selection from running.
+  const approvableItems = useMemo(
+    () => selectedItems.filter((item) => isExecutableApprovalItem(item, isFullApprover)),
+    [selectedItems, isFullApprover]
+  );
+  const cancelableItems = useMemo(() => selectedItems.filter((item) => item.can_cancel), [selectedItems]);
+  const allSelected = visibleItems.length > 0 && visibleItems.every((item) => selectedIds.has(item.id));
+  const approveResetKey = `${bucket}:${approvableItems.map((item) => item.id).sort().join(",")}`;
+
+  function toggleSelectAll() {
+    if (allSelected) onToggle(allItems.map((item) => item.id), false);
+    else onToggle(visibleItems.map((item) => item.id), true);
+  }
 
   return (
     <div className="approval-tree">
@@ -5922,12 +5974,57 @@ function Approvals({ approvals, requests, user, selectedIds, onToggle, onSelectO
             key={b.id}
             type="button"
             className={b.id === bucket ? "active" : ""}
-            onClick={() => setBucket(b.id)}
+            onClick={() => onBucketChange(b.id)}
           >
-            {b.label}{counts[b.id] ? ` (${counts[b.id]})` : ""}
+            {b.label}
           </button>
         ))}
       </div>
+      {/* ⚠️ The ONLY approve/reject/cancel/remove controls that read a selection, and they read
+          this tab's selection alone (App keeps one set per tab). Batch headers carry only
+          whole-batch retry/cancel, so no button on this screen can act on a row you cannot see. */}
+      {groups.length > 0 && (
+        /* .batch-header, not .bulk-row: that one is a four-column grid shaped for a tree row. */
+        <div className="batch-header queue-actions">
+          <div className="approval-actions">
+            <button className="secondary" onClick={toggleSelectAll}>
+              {allSelected ? "Deselect all" : "Select all"}
+            </button>
+            <p>{selectedItems.length} selected</p>
+          </div>
+          <div className="approval-actions">
+            <button
+              className="secondary"
+              onClick={() => onCancel(cancelableItems)}
+              disabled={cancelableItems.length === 0}
+              title="Stop this work — the requests stay and search again"
+            >
+              <Ban size={16} />
+              Cancel
+            </button>
+            {/* Remove implies cancel — the server stops live transfers, deletes the partial
+                files, then drops the rows and any batch they emptied. */}
+            <button
+              className="secondary"
+              onClick={() => onRemove(selectedItems)}
+              disabled={selectedItems.length === 0}
+              title="Cancel if running, then remove from the queue"
+            >
+              <X size={16} />
+              Remove
+            </button>
+            <ConfirmButton
+              icon={Check}
+              label="Approve selected"
+              confirmLabel="Confirm approve"
+              resetKey={approveResetKey}
+              disabled={approvableItems.length === 0}
+              onConfirm={() => onApprove(approvableItems, { viaRequests: !isFullApprover })}
+            />
+          </div>
+        </div>
+      )}
+
       {groups.length === 0 ? (
         <EmptyState title={active.empty[0]} body={active.empty[1]} />
       ) : (
@@ -5935,12 +6032,9 @@ function Approvals({ approvals, requests, user, selectedIds, onToggle, onSelectO
           <ApprovalBatch
             key={group.id}
             batch={group}
-            isFullApprover={isFullApprover}
             selectedIds={selectedIds}
             onToggle={onToggle}
             onSelectOnly={onSelectOnly}
-            onApprove={onApprove}
-            onReject={onReject}
             onRemove={onRemove}
             onCancel={onCancel}
             onRetry={onRetry}
@@ -5951,27 +6045,19 @@ function Approvals({ approvals, requests, user, selectedIds, onToggle, onSelectO
   );
 }
 
-function ApprovalBatch({ batch, isFullApprover, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove, onCancel, onRetry }) {
+function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onRemove, onCancel, onRetry }) {
   const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
-  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
+  // parent item id → the id of the candidate row whose button opened the picker.
+  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Map());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
-  const itemById = useMemo(() => new Map(batch.items.map((item) => [item.id, item])), [batch.items]);
   const selectedItems = batch.items.filter((item) => selectedIds.has(item.id));
-  const selectedExecutableItems = useMemo(
-    () => selectedItems.filter((item) => isExecutableApprovalItem(item, isFullApprover)),
-    [selectedItems, isFullApprover]
-  );
-  const allSelected = batch.items.length > 0 && batch.items.every((item) => selectedIds.has(item.id));
-  const locked = batch.status === "executing";
-  // Only the SELECTED items gate the Run button — a still-searching row you haven't picked
-  // shouldn't block running the ones you have.
-  const selectedSearching = selectedItems.some(isCandidateSearchItem);
-  const runDisabled = locked || selectedExecutableItems.length === 0 || selectedSearching;
+  const groupVisibleItems = useMemo(() => visibleQueueItems([batch], selectedIds), [batch, selectedIds]);
+  const allSelected = groupVisibleItems.length > 0 && groupVisibleItems.every((item) => selectedIds.has(item.id));
   // Batch-wide convenience alongside the per-row actions in the tree below (ApprovalNode) —
-  // useful for "cancel this whole failed album at once" without ticking every leaf.
-  const cancelableItems = useMemo(() => batch.items.filter((item) => item.can_cancel), [batch.items]);
+  // useful for "retry this whole failed album at once" without ticking every leaf. Approve,
+  // reject, cancel-selected and remove-selected all live in the tab's bulk bar instead, so that
+  // a selection made on one tab can never be acted on from another.
   const retryableItems = useMemo(() => batch.items.filter((item) => item.can_retry), [batch.items]);
-  const approveResetKey = `${batch.id}:${isFullApprover}:${selectedExecutableItems.map((item) => item.id).sort().join(",")}`;
 
   const prevBatchId = useRef(null);
   useEffect(() => {
@@ -5993,36 +6079,17 @@ function ApprovalBatch({ batch, isFullApprover, selectedIds, onToggle, onSelectO
       <div className="batch-header">
         <div>
           <h2>{batch.title}</h2>
-          <p>
-            {/* Was `{batch.status}` — a raw wire enum ("pending", "executing") rendered straight
-                into the UI. The server now sends a human label for exactly this. */}
-            {batch.progress?.label || batch.stage || batch.status} · {selectedItems.length} of {batch.items.length} selected
-          </p>
+          {/* No status line and no item total: a group merges several server batches, so there is
+              no single stage to print (each row carries the server's own `status_label`), and
+              "N of M" read as a to-do count — the count the user had removed. */}
         </div>
         <div className="approval-actions">
-          {cancelableItems.length > 0 && (
-            <button className="secondary" onClick={() => onCancel(cancelableItems)} title="Stop this work — the request stays and searches again">
-              <Ban size={16} />
-              Cancel ({cancelableItems.length})
-            </button>
-          )}
           {retryableItems.length > 0 && (
             <button className="secondary" onClick={() => onRetry(retryableItems, "next_candidate")} title="Try the next candidate for everything that failed">
               <RefreshCw size={16} />
               Retry ({retryableItems.length})
             </button>
           )}
-          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
-            Reject selected
-          </button>
-          <ConfirmButton
-            icon={Check}
-            label={locked ? "Running" : selectedSearching ? "Waiting for candidates" : "Run selected"}
-            confirmLabel="Confirm run"
-            resetKey={approveResetKey}
-            disabled={runDisabled}
-            onConfirm={() => onApprove(selectedExecutableItems, { viaRequests: !isFullApprover })}
-          />
         </div>
       </div>
       <div className="bulk-row">
@@ -6030,7 +6097,9 @@ function ApprovalBatch({ batch, isFullApprover, selectedIds, onToggle, onSelectO
           <input
             type="checkbox"
             checked={allSelected}
-            onChange={(event) => onToggle(batch.items.map((item) => item.id), event.target.checked)}
+            onChange={(event) => (event.target.checked
+              ? onToggle(groupVisibleItems.map((item) => item.id), true)
+              : onToggle(batch.items.map((item) => item.id), false))}
           />
           Select all
         </label>
@@ -6050,13 +6119,11 @@ function ApprovalBatch({ batch, isFullApprover, selectedIds, onToggle, onSelectO
           selectedIds={selectedIds}
           onToggle={onToggle}
           onSelectOnly={onSelectOnly}
-          onReject={onReject}
           onRemove={onRemove}
           onCancel={onCancel}
           onRetry={onRetry}
           openCandidatePickers={openCandidatePickers}
           setOpenCandidatePickers={setOpenCandidatePickers}
-          itemById={itemById}
           key={item.id}
         />
       ))}
@@ -6072,15 +6139,12 @@ function ApprovalNode({
   selectedIds,
   onToggle,
   onSelectOnly,
-  onReject,
   onRemove,
   onCancel,
   onRetry,
-  allowBranchDelete = false,
   openCandidatePickers,
   setOpenCandidatePickers,
   depth = 0,
-  itemById,
 }) {
   const children = childrenById.get(item.id) || [];
   const metadataChanges = metadataChangeRows(item);
@@ -6091,37 +6155,49 @@ function ApprovalNode({
   const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.new_value || sibling.old_value)) : [];
   const hasAlternateCandidates = siblingCandidates.length > 1;
   const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
+  // ⚠️ Keyed by the row that OPENED the picker, not just by the parent: with a parent-only key
+  // every sibling in the group rendered the "hide" state at once, so five rows all claimed to be
+  // the open menu (the user, 2026-09-22).
   const pickerOpen = leafDownloadCandidate && hasAlternateCandidates && openCandidatePickers?.has(item.parent_id);
+  const ownsPicker = pickerOpen && openCandidatePickers?.get(item.parent_id) === item.id;
   const firstSelectedSibling = siblingCandidates.find((sibling) => selectedIds?.has(sibling.id));
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
-  const statusMeta = itemStatusMeta(item);
+  // What ticking THIS row means: the rows it draws, one candidate per track rather than every
+  // alternate. Unticking drops the whole subtree, hidden alternates included, so nothing
+  // invisible can stay selected.
+  const branchIds = leafDownloadCandidate ? [item.id] : visibleBranchIds(item, childrenById, selectedIds);
+  const selectedInBranch = branchIds.filter((id) => selectedIds?.has(id)).length;
+  const checked = selectedInBranch === branchIds.length;
+  const partiallyChecked = selectedInBranch > 0 && !checked;
   // file_move / delete leaves carry old_value (from) + new_value (to) — show the move.
   const isFileMoveLeaf = (item.kind === "file_move" || item.kind === "delete") && children.length === 0 && Boolean(item.new_value);
   const hasDownloadCandidateChildren = children.some((child) => {
     const grandchildren = childrenById.get(child.id) || [];
     return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
   });
-  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? downloadStatusProgressForItem(item) : null;
+  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? item.progress : null;
   if (hiddenAlternateCandidate) return null;
 
-  function updateChecked(checked) {
-    // Selection is local UI state (a global id set), so toggling just adds/removes ids — no
-    // per-batch grouping or backend call. Checking a candidate leaf picks only that file.
-    if (leafDownloadCandidate && checked) {
+  function updateChecked(nextChecked) {
+    // Selection is local UI state (one id set per tab), so toggling just adds/removes ids — no
+    // backend call. Checking a candidate leaf picks only that file.
+    if (leafDownloadCandidate && nextChecked) {
       onSelectOnly?.(siblingIds, item.id);
     } else {
-      onToggle?.(descendantIds, checked);
+      onToggle?.(nextChecked ? branchIds : descendantIds, nextChecked);
     }
   }
 
   return (
     <>
       <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
+        {/* ⚠️ Never disabled. Every row has to be selectable — including one stuck "finding
+            candidates" and one already executing — or the only way to clear it is row by row. */}
         <input
           type="checkbox"
-          checked={selectedIds?.has(item.id) || false}
-          disabled={item.status === "executing"}
+          checked={checked}
+          ref={(node) => { if (node) node.indeterminate = partiallyChecked; }}
           onChange={(event) => updateChecked(event.target.checked)}
         />
         <button
@@ -6141,20 +6217,15 @@ function ApprovalNode({
         <small title={isFileMoveLeaf ? `${item.old_value || "?"} → ${item.new_value || "?"}` : undefined}>
           {isFileMoveLeaf
             ? `${shortPath(item.old_value)} → ${shortPath(item.new_value)}`
-            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}
+            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : item.status_label}
         </small>
-        {leafDownloadCandidate && hasAlternateCandidates && (
+        {leafDownloadCandidate && hasAlternateCandidates && (!pickerOpen || ownsPicker) && (
           <button
             className="row-icon-button"
-            onClick={() => toggleSet(setOpenCandidatePickers, item.parent_id)}
-            title={pickerOpen ? "Hide candidates" : "Choose candidate"}
+            onClick={() => toggleCandidatePicker(setOpenCandidatePickers, item.parent_id, item.id)}
+            title={ownsPicker ? "Hide candidates" : "Choose candidate"}
           >
-            <Pencil size={14} />
-          </button>
-        )}
-        {allowBranchDelete && !leafDownloadCandidate && (
-          <button className="row-icon-button danger" onClick={() => onReject?.([item])} title="Delete branch and files">
-            <Trash2 size={14} />
+            {ownsPicker ? <ChevronUp size={14} /> : <Pencil size={14} />}
           </button>
         )}
         {/* Cancel — stop this now, the request survives (not destructive). Retry — two of the
@@ -6175,8 +6246,8 @@ function ApprovalNode({
             </button>
           </>
         )}
-        {onRemove && item.status !== "executing" && (
-          <button className="row-icon-button" onClick={() => onRemove(item)} title="Remove from queue">
+        {onRemove && (
+          <button className="row-icon-button" onClick={() => onRemove([item])} title="Cancel if running, then remove from the queue">
             <X size={14} />
           </button>
         )}
@@ -6200,16 +6271,13 @@ function ApprovalNode({
             selectedIds={selectedIds}
             onToggle={onToggle}
             onSelectOnly={onSelectOnly}
-            onReject={onReject}
             onRemove={onRemove}
             onCancel={onCancel}
             onRetry={onRetry}
-            allowBranchDelete={allowBranchDelete}
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
             depth={depth + 1}
-            itemById={itemById}
-            key={child.id}
+              key={child.id}
           />
         ))}
     </>
@@ -6819,13 +6887,13 @@ function renderWishlistArtist(artist, depth, openArtists, setOpenArtists, openAl
               {openAlbums.has(albumId) &&
                 (album.tracks.length > 0 ? (
                   album.tracks.map((track) => (
-                    <div className={`tree-action-row library-row-actions wishlist-row${track.status === "removed" ? " removed" : ""}`} key={track.id}>
+                    <div className="tree-action-row library-row-actions wishlist-row" key={track.id}>
                       <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistItemStatusLabel(track)} />
                       <WishlistRowActions item={track} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />
                     </div>
                   ))
                 ) : (
-                  <div className={`tree-action-row library-row-actions wishlist-row${album.request?.status === "removed" ? " removed" : ""}`}>
+                  <div className="tree-action-row library-row-actions wishlist-row">
                     <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request ? wishlistItemStatusLabel(album.request) : "Awaiting Approval"} />
                     {album.request && <WishlistRowActions item={album.request} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />}
                   </div>
@@ -6854,11 +6922,9 @@ function WishlistRowActions({ item, onRemove, onCancel, onRequestAgain }) {
           <RefreshCw size={15} />
         </button>
       )}
-      {item.status !== "removed" && (
-        <button className="row-icon-button" onClick={() => onRemove(item.id)} title="Remove">
-          <X size={15} />
-        </button>
-      )}
+      <button className="row-icon-button" onClick={() => onRemove(item.id)} title="Remove">
+        <X size={15} />
+      </button>
     </>
   );
 }
@@ -10268,6 +10334,10 @@ function SettingsPanel({
   setDark,
   crossfadeDuration,
   setCrossfadeDuration,
+  remotePlaybackEnabled,
+  setRemotePlaybackEnabled,
+  claimTimeoutMinutes,
+  setClaimTimeoutMinutes,
   equalizer,
   setEqualizer,
   onSaveSearchThreshold,
@@ -10359,6 +10429,42 @@ function SettingsPanel({
             onChange={(event) => setSearchThreshold(Number(event.target.value) / 100)}
             onMouseUp={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
             onTouchEnd={() => onSaveSearchThreshold && onSaveSearchThreshold(searchThreshold)}
+          />
+        </label>
+      </section>
+      <section className="settings-section">
+        <h2>Playback</h2>
+        <label className="setting-row">
+          <span>
+            Cross-device playback
+            <small>Let this account's players hand playback between them, and show what is playing elsewhere.</small>
+          </span>
+          <button className="secondary compact" onClick={() => setRemotePlaybackEnabled((value) => !value)}>
+            {remotePlaybackEnabled ? "On" : "Off"}
+          </button>
+        </label>
+        <label className="setting-row">
+          <span>
+            Session timeout
+            <small>
+              {claimTimeoutMinutes === 0
+                ? "A paused player keeps the session until something else claims it."
+                : `A paused player keeps the session for ${claimTimeoutMinutes} minute${claimTimeoutMinutes === 1 ? "" : "s"}, then another device can take it.`}
+              {" "}Zero means never.
+            </small>
+          </span>
+          <input
+            type="number"
+            min="0"
+            max="1440"
+            step="1"
+            value={claimTimeoutMinutes}
+            disabled={!remotePlaybackEnabled}
+            onChange={(event) => {
+              const minutes = Math.round(Number(event.target.value));
+              if (!Number.isFinite(minutes)) return;
+              setClaimTimeoutMinutes(Math.max(0, Math.min(1440, minutes)));
+            }}
           />
         </label>
       </section>
@@ -11670,7 +11776,6 @@ function Inspector({
   requests,
   wishlist,
   playlists,
-  queueItemCount,
   queueSelectionCount,
   tasks,
   downloadProgress,
@@ -11695,7 +11800,6 @@ function Inspector({
     wishlist,
     user,
     playlists,
-    queueItemCount,
     queueSelectionCount,
     tasks,
     mappingSyncStats,
@@ -11923,7 +12027,7 @@ function Inspector({
         </div>
       )}
       <ActiveWorkBar tasks={tasks} />
-      {stats.rows.length > 0 && (
+      {(stats.rows.length > 0 || stats.summary) && (
         <div className="metadata-grid inspector-stats">
           {stats.summary && (
             <>
@@ -11953,7 +12057,6 @@ function inspectorStats({
   wishlist = [],
   user = null,
   playlists = [],
-  queueItemCount = 0,
   queueSelectionCount = 0,
   tasks = [],
   mappingSyncStats = null,
@@ -11968,13 +12071,12 @@ function inspectorStats({
     return { summary: `${selected} selected · ${ready} ready`, rows: musicStatRows(stats) };
   }
   if (page === "Task Queue") {
-    // Same source rule as the <Approvals> component itself: GET /approvals is admin-only, so a
-    // wishlist:approve_all holder without approvals:manage reads the Task Queue off /requests.
-    const source = hasPermission(user, "approvals:manage") ? approvals : requests;
-    const stats = countApprovalMusic(source.filter((batch) => batch.status !== "executing"));
+    // ⚠️ Selection only. The old "N ready" (and the artist/album/track rollup beside it) counted
+    // whatever happened to be in the queue and read as a number of things to review — the count
+    // the user had removed from the tabs for being wrong (2026-09-22).
     return {
-      summary: `${queueSelectionCount} selected · ${queueItemCount} ready`,
-      rows: musicStatRows(stats),
+      summary: `${queueSelectionCount} selected`,
+      rows: [],
     };
   }
   if (page === "Wishlist") {
@@ -12035,20 +12137,9 @@ function countImportMusic(files = [], requests = []) {
   return countMusicRefs(refs);
 }
 
-function countApprovalMusic(batches = [], downloadsOnly = false) {
-  const items = downloadsOnly ? visibleDownloadItems(batches) : batches.flatMap((batch) => batch.items || []);
-  const leaves = lowestLevelItems(items);
-  const actionLeaves = leaves.filter((item) => !["artist", "album"].includes(item.kind));
-  const selected = actionLeaves.filter((item) => item.selected).length;
-  const ready = actionLeaves.filter((item) => item.selected && isReadyApprovalItem(item)).length;
-  return { ...countMusicRefs(actionLeaves.map(itemMusicRef)), selected, ready };
-}
-
 function countWishlistMusic(items = []) {
   return countMusicRefs(
-    items
-      .filter((item) => item.status !== "removed")
-      .map((item) => ({ artist: item.artist, album: item.album, track: item.track || item.title })),
+    items.map((item) => ({ artist: item.artist, album: item.album, track: item.track || item.title })),
   );
 }
 
@@ -12072,43 +12163,18 @@ function countMusicRefs(refs = []) {
   return { artists: artists.size, albums: albums.size, tracks };
 }
 
-function itemMusicRef(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const request = payload.request || payload;
-  return {
-    artist: request.artist || payload.artist,
-    album: request.album || payload.album,
-    track: request.track || request.title || payload.track || payload.title || item.title,
-  };
-}
-
-function isReadyApprovalItem(item) {
-  const status = String(itemStatusMeta(item) || item.status || "").toLowerCase();
-  return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
-}
-
+// What "Approve selected" may send. Two server-computed flags decide it now: `actionable` (a real
+// change, not an artist/album/track grouping row) and `can_approve` (this row is at a stage where
+// approving means something — including a `staged` library_review item waiting to be added).
+//
 // `isFullApprover=false` means the caller only has wishlist:approve_all, not approvals:manage --
 // that permission's own approve route (`POST /requests/{id}/approve`) is scoped server-side to
-// download_review batches, so an item whose bucket isn't "review" (a library_review/library_change
-// item can carry `can_approve=true` too -- that flag is stage-only, not actor-scoped) must not be
-// offered here even though the flag says yes. See CLAUDE-wip-requests-rework.md "server gap".
+// download_review batches, so an item whose bucket isn't "review" must not be offered here even
+// though the flag says yes. See CLAUDE-wip-requests-rework.md "server gap".
 function isExecutableApprovalItem(item, isFullApprover = true) {
-  if (["executing", "completed", "rejected"].includes(item.status)) return false;
-  if (item.can_approve === false) return false;
-  if (!isFullApprover && item.bucket && item.bucket !== "review") return false;
-  const payload = parseJsonObject(item.payload_json);
-  if (item.kind === "import_files") return Boolean(item.old_value && item.new_value);
-  if (item.kind === "metadata") return Boolean(payload.target_type);
-  if (["delete", "file_move", "playlist", "download", "lyrics"].includes(item.kind)) return Boolean(payload.action);
-  return false;
-}
-
-function isCandidateSearchItem(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const status = String(payload.status || item.status || "").toLowerCase();
-  if (!status) return false;
-  if (/candidate ready|review ready|ready|approved|completed|done|failed|needs attention|rejected/.test(status)) return false;
-  return /searching|preparing/.test(status) && /candidate|download|slskd|track/.test(status);
+  if (!item.actionable || !item.can_approve) return false;
+  if (!isFullApprover && item.bucket !== "review") return false;
+  return true;
 }
 
 function Toast({ title, body, onClose }) {
@@ -13795,14 +13861,14 @@ function groupApprovalBatches(batches) {
 
     // Prune empty grouping branches for the DOWNLOAD group only: an album whose
     // candidates have all been consumed would otherwise leave its grouping rows
-    // lingering here empty. Keep only download items that are actionable themselves (have a
-    // payload action or are failed) or are ancestors of such items. Other kinds (metadata,
-    // import_files, lyrics, artwork) carry no "action" and must NOT be pruned.
+    // lingering here empty. Keep only download items the server marks `actionable` (real work,
+    // not an artist/album/track container) or failed, plus their ancestors. Other kinds
+    // (metadata, import_files, lyrics, artwork) must NOT be pruned.
     if (group.id === "type:download") {
       const byId = new Map(group.items.map((i) => [i.id, i]));
       const actionableIds = new Set(
         group.items
-          .filter((i) => Boolean(parseJsonObject(i.payload_json).action) || i.status === "failed")
+          .filter((i) => i.actionable || i.status === "failed")
           .map((i) => i.id)
       );
       const keepIds = new Set();
@@ -13835,6 +13901,60 @@ function siblingItems(item, childrenById) {
   return [item];
 }
 
+// Which rows the Task Queue actually DRAWS for these groups: every item except the alternate
+// download candidates ApprovalNode collapses behind the candidate picker. "Select all" ticks
+// exactly this, so approving a selection can never queue five copies of the same track.
+// ⚠️ The chosen sibling must be picked the same way ApprovalNode picks it (a locally selected
+// sibling first, then the first one) or Select all ticks a different row than the one on screen.
+function visibleQueueItems(groups, selectedIds) {
+  return groups.flatMap((group) => {
+    const tree = buildItemTree(group.items);
+    const hidden = new Set();
+    for (const siblings of tree.childrenById.values()) {
+      const candidates = siblings.filter(
+        (item) => item.kind === "download"
+          && (tree.childrenById.get(item.id) || []).length === 0
+          && (item.old_value || item.new_value),
+      );
+      if (candidates.length < 2) continue;
+      const chosen = candidates.find((item) => selectedIds?.has(item.id)) || candidates[0];
+      for (const candidate of candidates) if (candidate.id !== chosen.id) hidden.add(candidate.id);
+    }
+    return group.items.filter((item) => !hidden.has(item.id));
+  });
+}
+
+// The same rule for one branch: this row plus every descendant that is drawn under it.
+function visibleBranchIds(item, childrenById, selectedIds) {
+  const children = childrenById.get(item.id) || [];
+  const candidates = children.filter(
+    (child) => child.kind === "download"
+      && (childrenById.get(child.id) || []).length === 0
+      && (child.old_value || child.new_value),
+  );
+  const chosenId = candidates.length > 1
+    ? (candidates.find((child) => selectedIds?.has(child.id)) || candidates[0]).id
+    : null;
+  const ids = [item.id];
+  for (const child of children) {
+    if (chosenId && candidates.includes(child)) {
+      if (child.id === chosenId) ids.push(child.id);
+    } else {
+      ids.push(...visibleBranchIds(child, childrenById, selectedIds));
+    }
+  }
+  return ids;
+}
+
+function toggleCandidatePicker(setOpenCandidatePickers, parentId, itemId) {
+  setOpenCandidatePickers((prev) => {
+    const next = new Map(prev);
+    if (next.has(parentId)) next.delete(parentId);
+    else next.set(parentId, itemId);
+    return next;
+  });
+}
+
 function visibleDownloadItems(batches) {
   return batches.flatMap((batch) => {
     const tree = buildItemTree(batch.items);
@@ -13850,12 +13970,6 @@ function visibleDownloadItems(batches) {
       return !leafCandidate || candidateIds.has(item.id);
     });
   });
-}
-
-function isDownloadActionItem(item) {
-  if (item.kind !== "download") return false;
-  const payload = parseJsonObject(item.payload_json);
-  return ["queue_download", "queue_ytdlp_download", "wishlist_request"].includes(payload.action);
 }
 
 function lowestLevelItems(items) {
@@ -13877,7 +13991,7 @@ function shortPath(value) {
 function candidateMeta(item) {
   const c = item.candidate;
   const source = item.new_value ? ` · ${item.new_value}` : "";
-  if (!c) return `${itemStatusMeta(item)}${source}`;
+  if (!c) return `${item.status_label}${source}`;
   const parts = [];
   if (c.confidence != null) parts.push(`${c.confidence}% match`);
   if (c.same_album_folder) parts.push("same album folder");
@@ -13889,20 +14003,12 @@ function candidateMeta(item) {
   return parts.join(" · ");
 }
 
-// ⚠️ The server now supplies `status_label`; this is a fallback for rows from an older API only.
-// Do NOT reintroduce local status vocabulary here — three different ones ("working"/"done",
-// "Awaiting Download", and the raw enum in the batch header) is what made the queue unreadable.
-function itemStatusMeta(item) {
-  if (item.status_label) return item.status_label;
-  const payload = parseJsonObject(item.payload_json);
-  if (payload.status) return payload.status;
-  return item.kind;
-}
-
-
+// The inspector's Downloads card: one bar across everything the download gate has approved and is
+// now working through. Every branch reads the server's `stage` — a client must never pattern-match
+// a status string again (that is how four status vocabularies grew; see queue_state.py).
 function downloadProgressSummary(approvals) {
-  const batches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && isDownloadActionItem(item));
+  const batches = approvals.filter((batch) => batch.flow === "download_review" && batch.status !== "pending");
+  const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && item.actionable);
   if (leaves.length === 0) return null;
   let downloading = 0;
   let retried = 0;
@@ -13916,43 +14022,35 @@ function downloadProgressSummary(approvals) {
   let verified = 0;
   let partial = 0;
   for (const item of leaves) {
-    const status = itemStatusMeta(item);
-    const lower = String(status || "").toLowerCase();
-    const payload = parseJsonObject(item.payload_json);
-    const structuredProgress = downloadStatusProgressForItem(item);
-    const hasRetried = /retry|retried|replacement|stalled/.test(lower) || (payload.failed_candidates || []).length > 0;
-    if (hasRetried) retried += 1;
-    if (item.status === "failed" || /need attention|failed|mismatch|could not be verified/.test(lower)) {
+    const stage = item.stage;
+    if (stage === "retrying" || (item.failure?.tried_candidates || 0) > 0) retried += 1;
+    if (stage === "failed" || stage === "canceled") {
       failed += 1;
-      continue;
-    }
-    if (item.status === "completed" || /verified|importing/.test(lower)) {
+    } else if (stage === "completed" || stage === "importing") {
       finished += 1;
       verified += 1;
       partial += 100;
-      continue;
-    }
-    if (/downloaded|staged|verifying/.test(lower)) {
+    } else if (stage === "staged") {
       finished += 1;
-      if (/verifying/.test(lower)) verifying += 1;
       partial += 100;
-      continue;
-    }
-    if (/candidate ready|candidate|pending/.test(lower) || item.status === "pending" || item.status === "approved") {
+    } else if (stage === "verifying") {
+      finished += 1;
+      verifying += 1;
+      partial += 100;
+    } else if (stage === "staging") {
+      staging += 1;
+      partial += item.progress.indeterminate ? 0 : item.progress.value;
+    } else if (stage === "downloading") {
+      downloading += 1;
+      partial += item.progress.indeterminate ? 0 : item.progress.value;
+    } else if (stage === "queued" || stage === "retrying") {
+      queued += 1;
+    } else if (stage === "searching") {
+      waiting += 1;
+    } else {
+      // waiting / awaiting_approval / approved: chosen, nothing started.
       selected += 1;
-      continue;
     }
-    const progress = structuredProgress || downloadStatusProgress(status);
-    if (progress) {
-      if (progress.stage === "downloading" || /downloading\s+\d+(?:\.\d+)?%/.test(lower)) downloading += 1;
-      else if (["staging", "transferring", "importing"].includes(progress.stage)) staging += 1;
-      else if (progress.stage === "verifying") verifying += 1;
-      else if (progress.stage === "queued") queued += 1;
-      else waiting += 1;
-      partial += progress.indeterminate ? 0 : progress.value;
-      continue;
-    }
-    selected += 1;
   }
   const total = leaves.length;
   if (verified === total && failed === 0) return null;
@@ -13978,42 +14076,6 @@ function downloadProgressSummary(approvals) {
     indeterminate: !notStarted && downloading > 0 && partial === 0,
     label,
     detail: `${queued} queued · ${downloading} downloading · ${staging} staging · ${retried} retried · ${finished} finished · ${failed} failed`,
-  };
-}
-
-function downloadStatusProgress(status) {
-  if (!status) return null;
-  const text = String(status);
-  const match = text.match(/downloading\s+(\d+(?:\.\d+)?)%/i);
-  if (match) {
-    return { value: Number(match[1]), label: text, indeterminate: false };
-  }
-  if (/verifying with musicbrainz/i.test(text)) {
-    return { value: 0, label: text, indeterminate: true };
-  }
-  if (/downloaded|staged|verified|importing/i.test(text)) {
-    return { value: 100, label: text, indeterminate: false };
-  }
-  const ratio = text.match(/(?:downloading|verifying)\s+(\d+(?:\.\d+)?)%/i);
-  if (ratio) {
-    return { value: Number(ratio[1]), label: text, indeterminate: false };
-  }
-  if (/download initialized|download queued|moving completed file|checking slskd|searching for slskd|slskd .*queued|slskd .*remote|reports complete/i.test(text)) {
-    return { value: 0, label: text, indeterminate: false };
-  }
-  return null;
-}
-
-function downloadStatusProgressForItem(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const progress = payload.download_progress;
-  if (!progress || typeof progress !== "object") return downloadStatusProgress(payload.status);
-  const value = Number(progress.value ?? progress.progress ?? 0);
-  return {
-    value: Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0,
-    label: progress.label || payload.status || itemStatusMeta(item),
-    indeterminate: Boolean(progress.indeterminate),
-    stage: progress.stage || "queued",
   };
 }
 
@@ -14543,7 +14605,6 @@ function groupRequestedAlbums(albums) {
 function buildWishlistTree(items) {
   const artistMap = new Map();
   items.forEach((item) => {
-    if (item.status === "removed") return;
     const artistName = item.artist || "Unknown Artist";
     const albumName = item.album || "Singles";
     if (!artistMap.has(artistName)) {
@@ -14578,21 +14639,11 @@ function buildWishlistTree(items) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-// ⚠️ Fallback only, for a wishlist row from an older API with no `status_label`. Never call this
-// directly on a fresh row — prefer `wishlistItemStatusLabel(item)`, which reads the server's own
-// label first (WishlistOut.status_label is authoritative; stage/status_code are its typed form).
-function wishlistStatusLabel(status) {
-  if (status === "downloading") return "Downloading…";
-  if (status === "approved") return "Awaiting Download";
-  if (status === "completed") return "Completed";
-  if (status === "rejected") return "Declined";
-  if (status === "review" || status === "wanted") return "Awaiting Approval";
-  if (status === "removed") return "Removed";
-  return status || "Awaiting Approval";
-}
-
+// `WishlistOut.status_label` is the only status vocabulary. The old local map (six strings that
+// disagreed with the server's own) is gone with the legacy `status` field — read `stage` when you
+// need to branch, and render `status_label` when you need words.
 function wishlistItemStatusLabel(item) {
-  return item.status_label || wishlistStatusLabel(item.status);
+  return item.status_label;
 }
 
 // Stages where the linked download batch is doing something a Cancel would actually stop.
