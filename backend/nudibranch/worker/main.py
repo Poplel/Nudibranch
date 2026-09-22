@@ -9984,6 +9984,17 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
                     task,
                     existing_batch=item.batch,
                 )
+                # The search has attached fresh candidates. The old leaf was only kept as a
+                # "finding candidates" placeholder; it is itself a stale candidate that already
+                # failed, and leaving it selected meant approval downloaded it AND the new pick
+                # (seen live: Bohemian Rhapsody staged twice, one a live recording).
+                batch = item.batch
+                session.delete(item)
+                session.flush()
+                if batch is not None:
+                    session.expire(batch, ["items"])
+                    cleanup_empty_container_items(session, batch)
+                session.commit()
                 retried += 1
             except Exception as error:  # noqa: BLE001 - a failed re-search is a needs-attention row
                 append_task_log(session, task, f"{item.title}: re-search failed: {error}", "error")
