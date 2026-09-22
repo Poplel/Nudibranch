@@ -169,9 +169,6 @@ class PlayerStateUpdate(BaseModel):
     @classmethod
     def _known_client(cls, value: str | None) -> str | None:
         return value if value in {"ios", "mac", "web"} else None
-    # What the caller's queue currently hashes to. The server answers `queue_stale` when its
-    # stored copy disagrees, which is the client's cue to publish the queue itself.
-    queue_hash: str | None = None
     # The account-session claim this device believes it holds (§A1b). Present only on a client that
     # plays the shared session; a report without it keeps the per-device behaviour of old clients.
     claim_id: str | None = None
@@ -752,27 +749,6 @@ class PlaybackSnapshot(BaseModel):
     repeat: str = "off"
 
 
-class PlaybackQueueUpload(BaseModel):
-    """A session publishing its own queue so a THIRD device can move it somewhere.
-
-    The client remains the authority on its queue and never plays from this copy; it exists only so
-    playback can be moved between two sessions without waking the source.
-    """
-
-    hash: str
-    snapshot: PlaybackSnapshot
-
-
-class PlaybackTransferRequest(BaseModel):
-    to_session_id: str
-    autoplay: bool = True
-    # Omit to move the CALLER's own queue. Naming another session moves that session's stored queue
-    # instead, which is what lets any device move playback between two others.
-    from_session_id: str | None = None
-    # Omit when moving another session's queue — the server uses the copy that session published.
-    snapshot: PlaybackSnapshot | None = None
-
-
 class PlaybackEnqueueRequest(BaseModel):
     to_session_id: str
     # "next" inserts after whatever is playing there; "end" appends.
@@ -797,7 +773,6 @@ class PlaybackHandoffOut(BaseModel):
     created_at: datetime
     expires_at: datetime
     from_device_label: str | None = None
-    autoplay_effective: bool | None = None
     snapshot: PlaybackSnapshot | None = None
 
 
@@ -1110,6 +1085,12 @@ class AccountSessionOut(BaseModel):
 class SessionClaimRequest(BaseModel):
     # Omit to take the stored queue where it was left (Play on an orphan, "Play here"). Send one for a
     # fresh play, which replaces the queue.
+    snapshot: PlaybackSnapshot | None = None
+
+
+class SessionTransferRequest(BaseModel):
+    to_session_id: str
+    # Omit to send the stored session; send one to have the target play THIS instead.
     snapshot: PlaybackSnapshot | None = None
 
 

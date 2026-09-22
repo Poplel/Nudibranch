@@ -254,22 +254,6 @@ class SessionPlayerState(Base):
     repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     # Indexed because reads pick a user's newest report and sort on this column.
     reported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
-    #: When this session last STARTED playing (transitioned into it), not when it last reported.
-    #: ⚠ This is what breaks the tie when two sessions both believe they are playing. It cannot be
-    #: "most recent report", because a device that has gone offline stops reporting while genuinely
-    #: still playing — and it is exactly that device which must keep the session if nothing else has
-    #: started since. Whoever started last owns playback.
-    playback_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # The session's queue, so playback can be moved from ANY online session to any other without the
-    # source having to be woken to hand it over.
-    #
-    # ⚠ The client stays the authority on its own queue — it never reads this back to play from. The
-    # copy exists only so a THIRD device can move that queue somewhere. `queue_hash` is what keeps
-    # that cheap: status reports carry the client's hash, and the server only asks for a fresh upload
-    # when the two disagree, so an unchanged queue is never re-sent however long it plays.
-    queue_json: Mapped[str | None] = mapped_column(Text)
-    queue_hash: Mapped[str | None] = mapped_column(String(64))
-    queue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # "ios" | "mac" | "web" — which client shape reported, for labelling a session in a device list.
     client: Mapped[str | None] = mapped_column(String(16))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -750,7 +734,6 @@ class PlaybackHandoff(Base):
     command_id: Mapped[str | None] = mapped_column(String(64))
     payload_json: Mapped[str | None] = mapped_column(Text)
     item_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    autoplay: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # pending | adopted | expired | rejected
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)

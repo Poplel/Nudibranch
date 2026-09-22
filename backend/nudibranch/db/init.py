@@ -244,20 +244,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
         # Set at login so a device that has never played still shows correctly in a device picker.
         session.execute(text("ALTER TABLE auth_sessions ADD COLUMN client VARCHAR(16) NULL"))
         session.commit()
-    sps_cols = {row[1] for row in session.execute(text("PRAGMA table_info(session_player_states)"))}
-    if sps_cols and "queue_json" not in sps_cols:
-        # The session's queue, so playback can be moved between any two online sessions without
-        # waking the source. See SessionPlayerState for why the hash matters.
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_json TEXT NULL"))
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_hash VARCHAR(64) NULL"))
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_updated_at DATETIME NULL"))
-        session.commit()
-    if sps_cols and "playback_started_at" not in sps_cols:
-        # When this session last STARTED playing, which is what decides who wins when two sessions
-        # both believe they are playing — an offline device cannot be told to stop, so the tie is
-        # broken by who started most recently rather than by who reported most recently.
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN playback_started_at DATETIME NULL"))
-        session.commit()
+    # The per-device queue copy and start-time tiebreak were replaced by the account playback session
+    # (`account_playback_sessions`); the handoff autoplay flag went with the old transfer route.
+    _drop_columns(session, "session_player_states", ["queue_json", "queue_hash", "queue_updated_at", "playback_started_at"])
+    _drop_columns(session, "playback_handoffs", ["autoplay"])
     cmd_cols = {row[1] for row in session.execute(text("PRAGMA table_info(playback_commands)"))}
     if cmd_cols:
         if "position_seconds" not in cmd_cols:
@@ -308,6 +298,15 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _drop_canceled_leftovers(session)
     _fail_completed_batches_with_failed_items(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _drop_columns(session: Session, table: str, columns: list[str]) -> None:
+    """Drop columns an older install still has. SQLite >= 3.35 supports DROP COLUMN."""
+    existing = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
+    for column in columns:
+        if column in existing:
+            session.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
+    session.commit()
 
 
 def _drop_empty_rejected_batches(session: Session) -> None:

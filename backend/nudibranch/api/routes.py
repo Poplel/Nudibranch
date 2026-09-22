@@ -67,12 +67,11 @@ from nudibranch.api.schemas import (
     PlayerCommandOut,
     PlaybackHandoffOut,
     PlaybackHandoffRejection,
-    PlaybackQueueUpload,
     PlaybackSnapshot,
     PlaybackSnapshotItem,
     PlaybackTransferOut,
     PlaybackEnqueueRequest,
-    PlaybackTransferRequest,
+    SessionTransferRequest,
     PlayerSessionOut,
     AccountSessionOut,
     AccountSessionOwner,
@@ -234,7 +233,7 @@ HANDOFF_REACHABLE_WINDOW = timedelta(seconds=150)
 
 
 # How long a handed-off queue stays adoptable. Not indefinite: a queue is a *now* object, and
-# adopting a six-hour-old snapshot with autoplay is a resurrection rather than a handoff — audio
+# adopting a six-hour-old snapshot is a resurrection rather than a handoff — audio
 # starting on a device out of nowhere long after the user forgot pressing the button is the worst
 # thing this feature could do. Not 30 seconds either: the whole point of the APNS nudge is reaching
 # a BACKGROUNDED app, and those pushes are best-effort and can be deferred by minutes under Low
@@ -244,10 +243,6 @@ HANDOFF_TTL = timedelta(minutes=5)
 #: network blip, short enough that a device returning from a real absence is not driven by
 #: instructions given while it was away.
 COMMAND_TTL = timedelta(seconds=45)
-
-# Past this, a target adopts the queue and position but starts PAUSED whatever autoplay said. Cheap
-# safety valve against unattended audio; the server decides it so two clients cannot disagree.
-HANDOFF_AUTOPLAY_DECAY = timedelta(seconds=60)
 
 # A queue can be enormous — the web's "play library" really does page an entire library into its
 # queue — so the snapshot is capped rather than trusted. Clients window their queue before sending;
@@ -981,8 +976,6 @@ def update_player_status(
     if payload.client:
         state.client = payload.client
     now = datetime.now(timezone.utc)
-    if state.status == "playing" and previous_status != "playing":
-        state.playback_started_at = now
     state.reported_at = now
     state.updated_at = now
     # The shared session (§A1b). A report carrying a claim updates it — and re-validates a lapsed
@@ -998,85 +991,7 @@ def update_player_status(
             _apply_claimed_report(account, state, payload, now)
             queue_version = account.queue_version or 0
     session.commit()
-    # Ownership is the claim for a client that has one; the start-time tiebreak is for older ones.
-    if state.status == "playing" and not payload.claim_id:
-        _resolve_playback_ownership(session, user)
-    # The hash handshake: the client is the authority on its own queue and never reads this copy back
-    # to play from. It sends what its queue currently hashes to, and only uploads the queue itself
-    # when the server says the stored copy disagrees — so a queue that plays for an hour unchanged is
-    # never re-sent, while a reordered one is picked up on the next heartbeat.
-    queue_stale = bool(payload.queue_hash) and payload.queue_hash != state.queue_hash
-    return {"ok": True, "queue_stale": queue_stale, "claim_lost": claim_lost, "queue_version": queue_version}
-
-
-def _resolve_playback_ownership(session: Session, user: User) -> None:
-    """One account plays in one place: whoever STARTED most recently owns it, and the rest are stopped.
-
-    ⚠ The tie is broken by `playback_started_at`, never by who reported most recently. A device that
-    loses its network keeps playing and stops reporting, so "most recent report" would hand the
-    session to whichever device merely stayed reachable — and then, the moment the real one came
-    back, it would be stopped by a decision made while it was away. Ownership follows the audio.
-
-    The consequences that follow, and that this is written to produce:
-      • playing, goes offline, another starts → the other started later, so it takes over;
-      • playing, goes offline, comes back with nothing else started → still the latest start, so it
-        keeps the session and nothing interrupts it;
-      • two sessions both playing → the later start wins, whichever of them is reporting right now.
-
-    ⚠ Rows are not rewritten on a device's behalf; only a stop command is sent. A row records what a
-    device said about itself, and an offline device is still playing whatever its row last claimed.
-    """
-    playing = session.scalars(
-        select(SessionPlayerState).where(
-            SessionPlayerState.user_id == user.id,
-            SessionPlayerState.status == "playing",
-        )
-    ).all()
-    if len(playing) < 2:
-        return
-    # A row with no recorded start predates this column; treat it as the oldest possible claim.
-    def started(row: SessionPlayerState) -> datetime:
-        return as_utc(row.playback_started_at) or datetime.min.replace(tzinfo=timezone.utc)
-
-    owner = max(playing, key=started)
-    losers = [row for row in playing if row.session_id != owner.session_id]
-    # ⚠ Only tell a device once. This runs on every report from the owner — several times a minute
-    # while it plays — and a loser that is OFFLINE never acts on the stop or updates its row, so
-    # without this it would collect one stop command and one push every few seconds for as long as
-    # it stayed away.
-    already_told = set(session.scalars(
-        select(PlaybackCommand.device_id).where(
-            PlaybackCommand.user_id == user.id,
-            PlaybackCommand.status == "pending",
-            PlaybackCommand.action == "stop",
-        )
-    ).all())
-    losers = [row for row in losers if row.session_id not in already_told]
-    if not losers:
-        return
-    for other in losers:
-        session.add(PlaybackCommand(
-            user_id=user.id,
-            device_id=other.session_id,
-            action="stop",
-            status="pending",
-        ))
-    session.commit()
-    for other in losers:
-        try:
-            create_notification(
-                session,
-                title="Playback moved",
-                body="Continuing on another device",
-                event_type="remote_playback_command",
-                target_url="/player",
-                user_id=user.id,
-                deliver_apns=True,
-                deliver_web=False,
-                device_id=apns_device_for_session(session, user.id, other.session_id),
-            )
-        except Exception:  # noqa: BLE001 - the stop stands even if the wake cannot be sent.
-            pass
+    return {"ok": True, "claim_lost": claim_lost, "queue_version": queue_version}
 
 
 def apns_device_for_session(session: Session, user_id: str, session_id: str | None) -> str | None:
@@ -1209,11 +1124,6 @@ def create_player_command(
     user: User = Depends(get_current_user),
 ) -> PlayerCommandOut:
     action = (payload.action or "play").strip().lower()
-    # adopt_handoff carries a queue and is only ever minted inside /player/transfer, which validates
-    # the snapshot and the target's reachability. Accepting it here would let a caller point a device
-    # at an arbitrary handoff id.
-    if action == "adopt_handoff":
-        raise HTTPException(status_code=400, detail="Use POST /player/transfer to move playback")
     # Same reasoning: these name a handoff row holding a queue, and only /player/enqueue mints one
     # after validating the items and the target.
     if action == "adopt_session":
@@ -1306,43 +1216,6 @@ def _handoff_or_404(session: Session, handoff_id: str, user_id: str) -> Playback
 
 
 @router.post(
-    "/player/queue",
-    tags=["users"],
-    summary="Publish this session's queue so another device can move it",
-)
-def publish_player_queue(
-    payload: PlaybackQueueUpload,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-    auth_session: AuthSession | None = Depends(get_current_auth_session),
-) -> dict:
-    """Store the caller's queue so a THIRD device can move it somewhere.
-
-    ⚠ This is a copy for other devices to act on, never a source of truth the owner reads back. The
-    owning client stays local-first: it plays from its own queue and re-publishes when that queue
-    changes, which the hash on `POST /player/status` is what detects.
-    """
-    origin = _require_session(auth_session)
-    snapshot = payload.snapshot
-    if len(snapshot.items) > HANDOFF_MAX_ITEMS:
-        raise HTTPException(status_code=413, detail=f"Queue exceeds {HANDOFF_MAX_ITEMS} items")
-    encoded = snapshot.model_dump_json()
-    if len(encoded.encode("utf-8")) > HANDOFF_MAX_PAYLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Queue is too large")
-    state = session.get(SessionPlayerState, origin.id)
-    if not state:
-        state = SessionPlayerState(session_id=origin.id, user_id=user.id)
-        session.add(state)
-    now = datetime.now(timezone.utc)
-    state.user_id = user.id
-    state.queue_json = encoded
-    state.queue_hash = payload.hash[:64]
-    state.queue_updated_at = now
-    session.commit()
-    return {"ok": True}
-
-
-@router.post(
     "/player/enqueue",
     response_model=PlaybackTransferOut,
     tags=["users"],
@@ -1410,7 +1283,6 @@ def enqueue_on_session(
         to_session_id=target.id,
         payload_json=encoded,
         item_count=len(snapshot.items),
-        autoplay=False,
         status="pending",
         created_at=now,
         expires_at=now + HANDOFF_TTL,
@@ -1451,251 +1323,6 @@ def enqueue_on_session(
         )
     except Exception:  # noqa: BLE001
         pass
-    return PlaybackTransferOut(
-        id=handoff.id,
-        status=handoff.status,
-        expires_at=as_utc(handoff.expires_at),
-        item_count=handoff.item_count,
-        to_device_label=target.device_label,
-    )
-
-
-@router.get(
-    "/player/sessions/{session_id}/queue",
-    response_model=PlaybackSnapshot,
-    tags=["users"],
-    summary="Read what another of my sessions has queued",
-)
-def read_player_session_queue(
-    session_id: str,
-    resolve: bool = False,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> PlaybackSnapshot:
-    """The queue a sibling session published, so a remote player can list it like a local one.
-
-    ⚠ Scoped to the caller's OWN sessions by `user_id`, not just by session id: session ids are
-    opaque but guessable in principle, and a queue is a description of what someone is listening to.
-
-    This is deliberately a read of the same copy `/player/transfer` moves, rather than a second
-    store.
-
-    `resolve=true` fills in the titles. It exists for the WEB client, which has no local library
-    mirror and so cannot turn ids into a list anyone can read; the apps leave it off and resolve
-    against their own mirror, which is both faster and works offline. One indexed query for the
-    whole queue either way — never one per item.
-    """
-    state = session.get(SessionPlayerState, session_id)
-    if not state or state.user_id != user.id or not state.queue_json:
-        raise HTTPException(status_code=404, detail="No queue published for that session")
-    snapshot = PlaybackSnapshot.model_validate_json(state.queue_json)
-    if not resolve:
-        return snapshot
-
-    track_ids = [item.id for item in snapshot.items if item.type != "episode"]
-    episode_ids = [item.id for item in snapshot.items if item.type == "episode"]
-    tracks = {
-        row.id: row
-        for row in session.scalars(select(Track).where(Track.id.in_(track_ids)))
-    } if track_ids else {}
-    episodes = {
-        row.id: row
-        for row in session.scalars(select(Episode).where(Episode.id.in_(episode_ids)))
-    } if episode_ids else {}
-    for item in snapshot.items:
-        if item.type == "episode":
-            episode = episodes.get(item.id)
-            if episode:
-                item.title = episode.title
-                item.artist = episode.podcast.title if episode.podcast else None
-            continue
-        track = tracks.get(item.id)
-        if track:
-            item.title = track.title
-            # A track's artist hangs off its album, not off the track itself.
-            item.artist = track.album.artist.name if track.album and track.album.artist else None
-            item.album_id = track.album_id
-    return snapshot
-
-
-@router.post(
-    "/player/transfer",
-    response_model=PlaybackTransferOut,
-    tags=["users"],
-    summary="Hand this session's queue to another of my sessions",
-    responses={
-        400: {"description": "No device session, or the target is not a different session of yours"},
-        409: {"description": "The target session cannot be reached"},
-        413: {"description": "The queue snapshot is too large"},
-    },
-)
-def transfer_playback(
-    payload: PlaybackTransferRequest,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-    auth_session: AuthSession | None = Depends(get_current_auth_session),
-) -> PlaybackTransferOut:
-    """Push the caller's queue to one of their other sessions.
-
-    Push only, always from the session that is playing. The pull direction — an idle device asking
-    for someone else's queue — would need a round trip to wake the source and could never work
-    against a force-quit app, so it does not exist.
-
-    ⚠ **The invariant this route exists to protect: the source's playback is never disturbed until
-    the server has accepted the handoff.** Every rejection below happens in the same request that
-    would otherwise have carried the queue away, so a refused transfer leaves the source playing and
-    nothing is lost. Do not move any of these checks after the commit, and do not have the server
-    tell the source to stop — the source stops itself once it sees a 200.
-    """
-    if not bool(getattr(user, "remote_playback_enabled", True)):
-        # "Local only" has to be refused server-side, or one client with the toggle off is still
-        # reachable from every other one.
-        raise HTTPException(status_code=409, detail="Cross-device playback is turned off")
-    origin = _require_session(auth_session)
-    target = session.scalar(
-        select(AuthSession).where(
-            AuthSession.id == payload.to_session_id, AuthSession.user_id == user.id
-        )
-    )
-    if not target:
-        raise HTTPException(status_code=404, detail="No such device session")
-
-    # The queue being moved belongs to `from_session_id`, defaulting to the caller. Naming a third
-    # session is what lets a Mac move playback from a phone to itself, or between two other devices,
-    # without any of them being the one asking.
-    source_id = payload.from_session_id or origin.id
-    if source_id == payload.to_session_id:
-        raise HTTPException(status_code=400, detail="Playback is already on that device")
-    source = session.scalar(
-        select(AuthSession).where(AuthSession.id == source_id, AuthSession.user_id == user.id)
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="No such device session")
-
-    snapshot = payload.snapshot
-    if snapshot is None or source_id != origin.id:
-        # Moving someone else's queue: use the copy that session published. This is why sessions
-        # publish at all — the source never has to be woken to take part in its own handoff.
-        source_state = session.get(SessionPlayerState, source_id)
-        if not source_state or not source_state.queue_json:
-            raise HTTPException(status_code=409, detail={
-                "detail": "queue_unavailable",
-                "device_label": source.device_label,
-            })
-        snapshot = PlaybackSnapshot.model_validate_json(source_state.queue_json)
-        # Take the live position from that session's own last report rather than from the queue copy,
-        # which only changes when the queue itself does.
-        if source_state.position_seconds is not None:
-            snapshot.position_seconds = float(source_state.position_seconds)
-        if source_state.current_index is not None and source_state.current_index < len(snapshot.items):
-            snapshot.current_index = source_state.current_index
-    if not snapshot.items:
-        raise HTTPException(status_code=400, detail="Nothing to transfer")
-    if len(snapshot.items) > HANDOFF_MAX_ITEMS:
-        raise HTTPException(status_code=413, detail=f"Queue snapshot exceeds {HANDOFF_MAX_ITEMS} items")
-    for item in snapshot.items:
-        if item.type not in {"track", "episode"}:
-            raise HTTPException(status_code=400, detail="Queue items must be tracks or episodes")
-        if not item.id or len(item.id) > 64:
-            raise HTTPException(status_code=400, detail="Queue item ids are missing or too long")
-    if not 0 <= snapshot.current_index < len(snapshot.items):
-        raise HTTPException(status_code=400, detail="current_index is outside the queue")
-    # Ids only, never titles — the target resolves display metadata from its own mirror, so the
-    # server is not asked to be a second source of truth for what a track is called.
-    encoded = snapshot.model_dump_json()
-    if len(encoded.encode("utf-8")) > HANDOFF_MAX_PAYLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Queue snapshot is too large")
-
-    target_state = session.get(SessionPlayerState, target.id)
-    presence = _session_presence(target_state, target.last_used_at)
-    if presence == "unreachable":
-        # Refuse rather than queue for a device that may be gone. A pending handoff nobody collects
-        # is indistinguishable from a lost one, and the user would have stopped their music for it.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "detail": "device_unreachable",
-                "presence": presence,
-                "device_label": target.device_label,
-                "last_seen_at": as_utc(target.last_used_at).isoformat() if target.last_used_at else None,
-                "last_seen_status": target_state.status if target_state else None,
-            },
-        )
-
-    now = datetime.now(timezone.utc)
-    handoff = PlaybackHandoff(
-        user_id=user.id,
-        from_session_id=source_id,
-        to_session_id=target.id,
-        payload_json=encoded,
-        item_count=len(snapshot.items),
-        autoplay=bool(payload.autoplay),
-        status="pending",
-        created_at=now,
-        expires_at=now + HANDOFF_TTL,
-    )
-    session.add(handoff)
-    session.flush()
-    # loop/shuffle are set from the snapshot deliberately: a client too old to know adopt_handoff
-    # still applies those two unconditionally before falling through, so this makes that harmless
-    # rather than a surprise change of playback mode on the target.
-    command = PlaybackCommand(
-        user_id=user.id,
-        device_id=target.id,
-        action="adopt_handoff",
-        target_type="handoff",
-        target_id=handoff.id,
-        loop=snapshot.repeat if snapshot.repeat in {"off", "one", "all"} else "off",
-        shuffle=bool(snapshot.shuffle),
-        status="pending",
-    )
-    session.add(command)
-    session.flush()
-    handoff.command_id = command.id
-    session.commit()
-    session.refresh(handoff)
-
-    try:
-        create_notification(
-            session,
-            title="Playback moved",
-            body=f"Continue on {target.device_label or 'this device'}",
-            event_type="remote_playback_command",
-            target_url="/player",
-            user_id=user.id,
-            deliver_apns=True,
-            deliver_web=False,
-            device_id=apns_device_for_session(session, user.id, target.id),
-        )
-    except Exception:  # noqa: BLE001 - the handoff stands even if the wake nudge cannot be sent.
-        pass
-
-    # A third-party move has to stop the source, because that session is not the one calling and will
-    # not stop itself. When the caller IS the source it stops locally on the 200 instead — no command
-    # needed, and no window where the server has told it to stop before it knows the move succeeded.
-    if source_id != origin.id:
-        session.add(PlaybackCommand(
-            user_id=user.id,
-            device_id=source_id,
-            action="stop",
-            status="pending",
-        ))
-        session.commit()
-        try:
-            create_notification(
-                session,
-                title="Playback moved",
-                body=f"Now on {target.device_label or 'another device'}",
-                event_type="remote_playback_command",
-                target_url="/player",
-                user_id=user.id,
-                deliver_apns=True,
-                deliver_web=False,
-                device_id=apns_device_for_session(session, user.id, source_id),
-            )
-        except Exception:  # noqa: BLE001 - the move stands even if the source cannot be nudged.
-            pass
-
     return PlaybackTransferOut(
         id=handoff.id,
         status=handoff.status,
@@ -1755,10 +1382,6 @@ def get_playback_handoff(
     # to learn the outcome; handing its own queue back would just be a way to get it wrong twice.
     if origin.id == handoff.to_session_id and handoff.status == "pending" and handoff.payload_json:
         out.snapshot = PlaybackSnapshot.model_validate_json(handoff.payload_json)
-        # Decided here, not by each client, so the two cannot derive it differently.
-        out.autoplay_effective = bool(
-            handoff.autoplay and as_utc(handoff.created_at) >= now - HANDOFF_AUTOPLAY_DECAY
-        )
     return out
 
 
@@ -1832,7 +1455,7 @@ def list_player_commands(
     # Commands that CARRY something are exempt: a handoff and a queue addition are not "now" verbs,
     # they are payloads, and the server's own handoff expiry (§31) is what bounds those instead.
     now = datetime.now(timezone.utc)
-    carries_payload = {"adopt_handoff", "enqueue_next", "enqueue_end"}
+    carries_payload = {"enqueue_next", "enqueue_end"}
     fresh: list[PlaybackCommand] = []
     expired = False
     for command in rows:
@@ -2359,14 +1982,18 @@ def edit_account_session(
     responses={404: {"description": "Not a session of yours"}, 409: {"description": "Unreachable"}},
 )
 def transfer_account_session(
-    payload: PlaybackTransferRequest,
+    payload: SessionTransferRequest,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
     auth_session: AuthSession | None = Depends(get_current_auth_session),
 ) -> dict:
-    """Push the session to a named device. The target CLAIMS it on receipt, and that claim stops the
+    """Send the session to a named device. The target CLAIMS it on receipt, and that claim stops the
     current owner — so nothing here stops anybody, and a target that never wakes costs nothing.
-    Only `to_session_id` is read; the session is the payload.
+
+    Without a snapshot the stored session is what moves ("send to device"). With one, the target is
+    told to play THAT — how a device watching another plays an album there instead of locally. The
+    snapshot rides on `playback_handoffs` (the hot command table stays row-narrow) and the target
+    claims with it, so the queue is replaced in the same write that makes it the owner.
     """
     _require_session(auth_session)
     target = session.scalar(
@@ -2377,10 +2004,42 @@ def transfer_account_session(
     presence = _session_presence(session.get(SessionPlayerState, target.id), target.last_used_at)
     if presence == "unreachable":
         raise HTTPException(status_code=409, detail={"detail": "device_unreachable", "device_label": target.device_label})
+    now = datetime.now(timezone.utc)
+    handoff = None
+    if payload.snapshot is not None:
+        snapshot = payload.snapshot
+        if not snapshot.items:
+            raise HTTPException(status_code=400, detail="Nothing to play")
+        _validate_session_items(snapshot.items)
+        if not 0 <= snapshot.current_index < len(snapshot.items):
+            raise HTTPException(status_code=400, detail="current_index is outside the queue")
+        encoded = snapshot.model_dump_json()
+        if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Queue is too large")
+        handoff = PlaybackHandoff(
+            user_id=user.id,
+            from_session_id=auth_session.id,
+            to_session_id=target.id,
+            payload_json=encoded,
+            item_count=len(snapshot.items),
+            status="pending",
+            created_at=now,
+            expires_at=now + ADOPT_SESSION_TTL,
+        )
+        session.add(handoff)
+        session.flush()
     command = PlaybackCommand(
-        user_id=user.id, device_id=target.id, action="adopt_session", target_type="session", status="pending",
+        user_id=user.id,
+        device_id=target.id,
+        action="adopt_session",
+        target_type="handoff" if handoff else "session",
+        target_id=handoff.id if handoff else None,
+        status="pending",
     )
     session.add(command)
+    session.flush()
+    if handoff:
+        handoff.command_id = command.id
     session.commit()
     try:
         create_notification(
@@ -7432,7 +7091,7 @@ def _resolve_target_label(session: Session, target_type: str | None, target_id: 
 _MODE_BEARING_ACTIONS = {"play", "state"}
 
 #: Actions that address a position in the target's published queue rather than the transport.
-#: They carry a payload about the QUEUE, so like `adopt_handoff` they are exempt from COMMAND_TTL's
+#: They carry a payload about the QUEUE, so like the enqueue actions they are exempt from COMMAND_TTL's
 #: "an instruction about now" reasoning — but they are still small and idempotent enough to expire.
 _QUEUE_ACTIONS = {"jump", "remove", "move"}
 
