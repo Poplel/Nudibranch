@@ -9766,6 +9766,25 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
         wishlist_item = session.get(WishlistItem, wishlist_item_id)
         if not wishlist_item or wishlist_item.status in {"rejected", "removed", "completed"}:
             continue
+        # The request starts over, so everything left from the attempt that was cancelled goes too
+        # (all settled by now -- `still_live` above). ⚠️ Not just tidiness: the attempt's
+        # `completed` download items keep this wishlist id, and the wishlist reconcile treats "a
+        # completed download exists" as "request completed", so the fresh request was flipped to
+        # completed the moment its new search finished and then never showed as staged.
+        leftovers = list(session.scalars(select(ProposalItem).where(ProposalItem.wishlist_item_id == wishlist_item_id)))
+        leftover_batch_ids = {item.batch_id for item in leftovers}
+        for leftover in leftovers:
+            session.delete(leftover)
+        session.flush()
+        for batch_id in leftover_batch_ids:
+            batch = session.get(ProposalBatch, batch_id)
+            if batch:
+                session.expire(batch, ["items"])
+                cleanup_empty_container_items(session, batch)
+                session.expire(batch, ["items"])
+                if not batch.items:
+                    session.delete(batch)
+        session.flush()
         wishlist_item.batch_id = None
         wishlist_item.item_id = None
         wishlist_item.status_changed_at = now
