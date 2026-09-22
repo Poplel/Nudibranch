@@ -4587,42 +4587,6 @@ def remove_wishlist_item(
     return serialize_wishlist_item(item)
 
 
-@router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="Get wishlist items pending approval")
-def list_wishlist_approvals(
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.discover)),
-) -> list[ProposalBatchOut]:
-    query = (
-        select(ProposalBatch)
-        .options(selectinload(ProposalBatch.items))
-        .where(ProposalBatch.kind == ProposalKind.download)
-        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
-        .order_by(ProposalBatch.created_at.desc())
-    )
-    batches = prune_settled_batches(session, list(session.scalars(query)))
-    if user_has_permission(user, Permission.wishlist_approve_all):
-        return [serialize_batch(batch) for batch in batches]
-    visible_batches = []
-    for batch in batches:
-        if any((json.loads(item.payload_json or "{}").get("user_id") == user.id) for item in batch.items):
-            visible_batches.append(batch)
-    return [serialize_batch(batch) for batch in visible_batches]
-
-
-@router.post("/wishlist/approvals", tags=["wishlist"], summary="Approve or deny wishlist batch (removed)")
-def propose_wishlist_items(
-    _: User = Depends(require_permission(Permission.wishlist_approve_all)),
-) -> None:
-    # Superseded: candidate search now starts automatically the moment something is wishlisted --
-    # unconditionally, since the manual "wanted"/submit flow this route served was removed -- and
-    # the approval gate moved to the Task Queue's Review bucket. 410 rather than 404 so an older
-    # client shows a legible message instead of "not found".
-    raise HTTPException(
-        status_code=410,
-        detail="Wishlist requests now search automatically; approve downloads in the Task Queue.",
-    )
-
-
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
 
 def _jf_client(session: Session, user: User) -> "tuple[httpx.Client | None, str | None]":
@@ -5694,11 +5658,6 @@ def decline_playlist_share(
     return {"declined": True}
 
 
-@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Remap Nudibranch tracks to Jellyfin item IDs", description="Queues the track-mapping job, which is also triggered automatically after a Jellyfin library scan or track import. Only tracks not yet mapped are processed.")
-def sync_playlists(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
-
-
 @router.get("/playlists/sync/stats", response_model=PlaylistSyncStatsOut, tags=["playlists"], summary="Track remap job stats")
 def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     last_run_at = session.get(AppSetting, "mapping_last_run_at")
@@ -6304,8 +6263,8 @@ def list_requests(
             .where(ProposalBatch.status.in_(statuses))
             .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
             # `/wishlist` is the throwaway "Request: X" intent batch `run_search_wishlist_item`
-            # retires as `completed` once it has spawned the real candidate batch (and the legacy
-            # `propose_wishlist_items` equivalent) -- never a batch a requester actually acts on.
+            # retires as `completed` once it has spawned the real candidate batch -- never a batch a
+            # requester actually acts on.
             # With `include_settled=true` it would otherwise surface as a second, "completed" row
             # for a request whose real batch may still be failing or in progress. Only the SETTLED
             # one is hidden -- while it is still searching it is the requester's "Finding
