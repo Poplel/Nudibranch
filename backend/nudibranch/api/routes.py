@@ -6328,8 +6328,19 @@ def reject(
     batch_id: str,
     payload: ProposalRejectRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.approvals_manage)),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
 ) -> ProposalBatchOut:
+    # `wishlist:approve_all` approves music requests from Review (`/requests/{id}/approve`), so it
+    # must be able to decline them too -- otherwise the Review reject button 403s for exactly the
+    # people whose job it is. Scoped like that route: download requests (gate a) only, never a
+    # metadata, import or delete proposal.
+    if not user_has_permission(user, Permission.approvals_manage):
+        target = session.get(ProposalBatch, batch_id)
+        if not target:
+            raise HTTPException(status_code=404, detail="Batch not found")
+        flow = target.flow if isinstance(target.flow, ProposalFlow) else ProposalFlow.library_change
+        if flow is not ProposalFlow.download_review:
+            raise HTTPException(status_code=403, detail="Only download requests can be declined with this permission")
     reject_items(session, batch_id, payload.item_ids)
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
