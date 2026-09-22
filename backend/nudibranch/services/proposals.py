@@ -473,8 +473,11 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         # Stop the search still feeding this batch BEFORE rolling up, or it re-populates behind us.
         wishlist_ids = {item.wishlist_item_id for item in batch.items if item.wishlist_item_id}
         _stop_feeding_tasks(session, batch, wishlist_ids)
-        # Anything the search added while we were cancelling is still live; sweep it too.
-        for item in _leaf_download_items(batch, None, include_staged=True):
+        # Anything the search added while we were cancelling is still live; sweep it too -- but
+        # ONLY for a whole-batch cancel. ⚠️ A partial cancel must never widen: a batch can hold
+        # other tracks of the same album, or (in "Add to library") other people's requests, and
+        # sweeping here cancelled all of them and deleted their staged files.
+        for item in ([] if item_ids else _leaf_download_items(batch, None)):
             if item.status not in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}:
                 item.status = ProposalStatus.canceled
                 item.stage = "canceled"
