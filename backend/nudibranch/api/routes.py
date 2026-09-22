@@ -107,7 +107,6 @@ from nudibranch.api.schemas import (
     UserPinUpdate,
     UserSearchSettingsUpdate,
     UserUpdate,
-    WishlistApprovalRequest,
     WishlistCreate,
     WishlistOut,
     PodcastSubscribeIn,
@@ -4326,22 +4325,19 @@ def create_wishlist_item(
         session.delete(declined)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
-    auto_search = wishlist_auto_search_enabled(session)
-    if auto_search:
-        # Searching starts immediately, with no human step in between -- that is the whole point of
-        # the rework.  The APPROVAL gate has not moved to the client: the candidate batch this
-        # produces is created `pending` and still needs approvals:manage (or wishlist:approve_all)
-        # to become an actual download, so a discover-only user still cannot self-approve.
-        item.status = "searching"
-        item.stage = ItemStage.searching.value
+    # Searching starts immediately, with no human step in between -- that is the whole point of
+    # the rework.  The APPROVAL gate has not moved to the client: the candidate batch this
+    # produces is created `pending` and still needs approvals:manage (or wishlist:approve_all)
+    # to become an actual download, so a discover-only user still cannot self-approve.
+    item.status = "searching"
+    item.stage = ItemStage.searching.value
     session.add(item)
     session.commit()
     session.refresh(item)
-    if auto_search:
-        # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
-        # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
-        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
-        session.commit()
+    # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
+    # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
+    enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+    session.commit()
     write_app_log(
         "Wishlist item created",
         feature=payload.source or "wishlist",
@@ -4393,126 +4389,18 @@ def list_wishlist_approvals(
     return [serialize_batch(batch) for batch in visible_batches]
 
 
-@router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"], summary="Approve or deny wishlist batch")
+@router.post("/wishlist/approvals", tags=["wishlist"], summary="Approve or deny wishlist batch (removed)")
 def propose_wishlist_items(
-    payload: WishlistApprovalRequest | None = None,
-    session: Session = Depends(get_session),
-    # Moving a "wanted" item into a real download batch (Task Queue) is a review action, not a
-    # normal "discover" capability — a plain discover-only user must NOT be able to self-approve
-    # their own wishlist request. Only wishlist_approve_all holders (or admins) may submit here,
-    # for anyone's items. (The web UI already only shows the submit button to canApproveAll users;
-    # this closes the matching server-side gap that let other clients call this directly.)
-    user: User = Depends(require_permission(Permission.wishlist_approve_all)),
-) -> ProposalBatchOut:
-    if wishlist_auto_search_enabled(session):
-        # Superseded: candidate search now starts automatically the moment something is wishlisted,
-        # and the approval gate moved to the Task Queue's Review bucket.  410 rather than 404 so an
-        # older client shows a legible message instead of "not found".
-        raise HTTPException(
-            status_code=410,
-            detail="Wishlist requests now search automatically; approve downloads in the Task Queue.",
-        )
-    reconcile_stale_approved_wishlist_items(session, user)
-    query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
-    all_wanted_items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
-    denied_items: list[WishlistItem] = []
-    if payload and payload.item_ids:
-        selected_ids = set(payload.item_ids)
-        items = [item for item in all_wanted_items if item.id in selected_ids]
-        if payload.deny_unselected and user_has_permission(user, Permission.wishlist_approve_all):
-            denied_items = [item for item in all_wanted_items if item.id not in selected_ids]
-    else:
-        items = all_wanted_items
-    if not items:
-        raise HTTPException(status_code=400, detail="No wishlist items are ready")
-
-    batch = ProposalBatch(title="Wishlist download review", kind=ProposalKind.download, tree_path="/wishlist")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
-    album_lookup_cache: dict[tuple[str, str], dict | None] = {}
-    for wishlist_item in items:
-        artist_name = wishlist_item.artist
-        album_name = wishlist_item.album or "Singles"
-        if artist_name not in artist_items:
-            artist_item = ProposalItem(
-                batch_id=batch.id,
-                title=artist_name,
-                kind=ProposalKind.download,
-                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "artist", "artist": artist_name}),
-            )
-            session.add(artist_item)
-            session.flush()
-            artist_items[artist_name] = artist_item
-        album_key = (artist_name, album_name)
-        if album_key not in album_items:
-            album_item = ProposalItem(
-                batch_id=batch.id,
-                parent_id=artist_items[artist_name].id,
-                title=album_name,
-                kind=ProposalKind.download,
-                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "album", "artist": artist_name, "album": album_name}),
-            )
-            session.add(album_item)
-            session.flush()
-            album_items[album_key] = album_item
-        # Expand an album-level wishlist entry into one download request per track so the
-        # Soulseek per-track folder matcher can match each track against the found album
-        # folder. Fall back to the single album-level request if MusicBrainz has no tracklist.
-        track_payloads: list[dict] = []
-        if wishlist_item.kind == "album" and not wishlist_item.track and wishlist_item.album:
-            cache_key = (wishlist_item.artist, wishlist_item.album)
-            if cache_key not in album_lookup_cache:
-                try:
-                    album_lookup_cache[cache_key] = lookup_album_tracks(wishlist_item.artist, wishlist_item.album)
-                except Exception:
-                    album_lookup_cache[cache_key] = None
-            record = album_lookup_cache.get(cache_key)
-            for track in (record or {}).get("tracks", []) or []:
-                title = track.get("title")
-                if not title:
-                    continue
-                track_payloads.append(
-                    {
-                        "action": "wishlist_request",
-                        "kind": "track",
-                        "artist": wishlist_item.artist,
-                        "album": wishlist_item.album,
-                        "track": title,
-                        "track_number": track.get("track_number"),
-                        "disc_number": track.get("disc_number"),
-                        "duration_ms": track.get("length"),
-                        "musicbrainz_album_id": track.get("musicbrainz_album_id") or (record or {}).get("musicbrainz_album_id"),
-                        "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
-                    }
-                )
-        if not track_payloads:
-            track_payloads = [wishlist_download_payload(wishlist_item, album_lookup_cache)]
-        for track_payload in track_payloads:
-            session.add(
-                ProposalItem(
-                    batch_id=batch.id,
-                    parent_id=album_items[album_key].id,
-                    title=track_payload.get("track") or wishlist_item.album or wishlist_item.artist,
-                    kind=ProposalKind.download,
-                    payload_json=json.dumps(
-                        track_payload | {"user_id": wishlist_item.user_id, "wishlist_item_id": wishlist_item.id}
-                    ),
-                )
-            )
-        wishlist_item.status = "review"
-        wishlist_item.status_changed_at = datetime.now(timezone.utc)
-    notify_wishlist_decisions(session, items, "Download started", "is downloading", "wishlist_approved", "/requests")
-    for denied_item in denied_items:
-        denied_item.status = "rejected"
-        denied_item.status_changed_at = datetime.now(timezone.utc)
-    if denied_items:
-        notify_wishlist_decisions(session, denied_items, "Request declined", "was not approved for download", "wishlist_denied", "/wishlist")
-    session.commit()
-    session.refresh(batch)
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return serialize_batch(batch)
+    _: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> None:
+    # Superseded: candidate search now starts automatically the moment something is wishlisted --
+    # unconditionally, since the manual "wanted"/submit flow this route served was removed -- and
+    # the approval gate moved to the Task Queue's Review bucket. 410 rather than 404 so an older
+    # client shows a legible message instead of "not found".
+    raise HTTPException(
+        status_code=410,
+        detail="Wishlist requests now search automatically; approve downloads in the Task Queue.",
+    )
 
 
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
@@ -6760,42 +6648,6 @@ def normalized_music_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
 
-def wishlist_download_payload(item: WishlistItem, album_lookup_cache: dict[tuple[str, str], dict | None]) -> dict:
-    payload = {
-        "action": "wishlist_request",
-        "kind": item.kind,
-        "artist": item.artist,
-        "album": item.album,
-        "track": item.track,
-    }
-    if not item.track or not item.album:
-        return payload
-    cache_key = (item.artist, item.album)
-    if cache_key not in album_lookup_cache:
-        try:
-            album_lookup_cache[cache_key] = lookup_album_tracks(item.artist, item.album)
-        except Exception:
-            album_lookup_cache[cache_key] = None
-    record = album_lookup_cache.get(cache_key)
-    if not record:
-        return payload
-    expected_title = normalized_music_name(item.track)
-    for track in record.get("tracks", []):
-        if normalized_music_name(track.get("title")) != expected_title:
-            continue
-        payload.update(
-            {
-                "track_number": track.get("track_number"),
-                "disc_number": track.get("disc_number"),
-                "duration_ms": track.get("length"),
-                "musicbrainz_album_id": track.get("musicbrainz_album_id") or record.get("musicbrainz_album_id"),
-                "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
-            }
-        )
-        break
-    return payload
-
-
 def library_target_tracks(target) -> list[Track]:
     if isinstance(target, Artist):
         return [track for album in target.albums for track in album.tracks]
@@ -6822,19 +6674,6 @@ def get_or_create_favorites(session: Session, user_id: str) -> Playlist:
         playlist.protected = True
         session.flush()
     return playlist
-
-
-# Rollback switch for auto-search-on-wishlist (phase 3).  Default ON once both clients ship; set
-# the AppSetting to "0"/"false" to fall back to the old manual /wishlist/approvals flow without a
-# deploy, e.g. if auto-search turns out to hammer slskd.
-WISHLIST_AUTO_SEARCH_KEY = "wishlist_auto_search"
-
-
-def wishlist_auto_search_enabled(session: Session) -> bool:
-    setting = session.get(AppSetting, WISHLIST_AUTO_SEARCH_KEY)
-    if setting is None:
-        return True
-    return str(setting.value).strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def set_app_setting(session: Session, key: str, value: str) -> None:
@@ -7326,34 +7165,6 @@ def downloading_wishlist_ids(session: Session) -> set[str]:
             if wishlist_item_id:
                 ids.add(wishlist_item_id)
     return ids
-
-
-def notify_wishlist_decisions(
-    session: Session,
-    items: list[WishlistItem],
-    title: str,
-    action_text: str,
-    event_type: str,
-    target_url: str,
-) -> None:
-    items_by_user: dict[str, list[WishlistItem]] = {}
-    for item in items:
-        items_by_user.setdefault(item.user_id, []).append(item)
-    for user_id, user_items in items_by_user.items():
-        names = [item.track or item.album or item.artist for item in user_items]
-        shown = ", ".join(names[:5])
-        extra = "" if len(names) <= 5 else f" and {len(names) - 5} more"
-        create_notification(
-            session,
-            title=title,
-            body=f"{shown}{extra} {action_text}.",
-            event_type=event_type,
-            target_url=target_url,
-            user_id=user_id,
-            # Collapse repeat decisions for one person into a single row.  Keyed per user because
-            # these are addressed rows, not a broadcast, and there is no batch to key on here.
-            group_key=f"wishlist-decision:{event_type}:{user_id}",
-        )
 
 
 def load_user(session: Session, user_id: str) -> User:

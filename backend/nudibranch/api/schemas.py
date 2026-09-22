@@ -253,11 +253,6 @@ class WishlistOut(WishlistCreate):
     status_changed_at: datetime
 
 
-class WishlistApprovalRequest(BaseModel):
-    item_ids: list[str] | None = None
-    deny_unselected: bool = False
-
-
 class CandidateOut(BaseModel):
     """One download candidate, typed.
 

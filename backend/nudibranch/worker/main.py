@@ -35,7 +35,7 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services import content_verify
 from nudibranch.services.content_verify import verify_audio_content
-from nudibranch.services.slskd import cancel_slskd_download, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
+from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, search_slskd_detailed, transfer_state_category
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
@@ -47,6 +47,13 @@ RECENT_TRANSFER_DISAPPEARED_RETRY_SECONDS = 10
 COMPLETED_MISSING_FILE_RETRY_SECONDS = 30
 QUEUED_TRANSFER_RETRY_SECONDS = 45
 REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
+# "Queued, Remotely" = the peer accepted the request and is holding it in their upload queue. That
+# routinely lasts minutes on Soulseek, and the 45s/30s limits above were cancelling healthy transfers
+# (confirmed in slskd's own logs) and burning the whole candidate budget in ~3 minutes. Owner's call,
+# 2026-09-22: 5 minutes for the first candidate, 3 for replacements. Local/initializing waits keep
+# the short limits.
+REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS = 300
+REPLACEMENT_REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS = 180
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 MAX_TASK_ATTEMPTS = 4
 AUTOMATION_TICK_SECONDS = 30
@@ -2562,7 +2569,7 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
             where = f"; slskd wrote it to {slskd_path}" if slskd_path else ""
             return f"slskd reported complete but the file was not found under {downloads_root}{where} (check that slskd's downloads dir is the same shared folder)"
         return None
-    if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry):
+    if transfer_is_queued_or_waiting(transfer) and age >= queued_transfer_retry_seconds(entry, transfer):
         return "transfer stayed queued"
     if not transfer:
         last_error = entry.get("last_transfer_error")
@@ -2581,7 +2588,7 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     last_percent = manifest_float(entry.get("last_transfer_percent"))
     last_progress_age = manifest_seconds_since(entry.get("last_transfer_progress_at"))
     if percent <= 0 and age >= ZERO_PROGRESS_RETRY_SECONDS:
-        queued_retry_seconds = queued_transfer_retry_seconds(entry)
+        queued_retry_seconds = queued_transfer_retry_seconds(entry, transfer)
         if transfer_is_queued_or_waiting(transfer) and age < queued_retry_seconds:
             return None
         if transfer_is_queued_or_waiting(transfer):
@@ -2596,12 +2603,21 @@ def download_retry_reason(entry: dict, transfer: dict | None) -> str | None:
     return None
 
 
-def queued_transfer_retry_seconds(entry: dict) -> int:
+def queued_transfer_retry_seconds(entry: dict, transfer: dict | None = None) -> int:
     retry_count = int(entry.get("retry_count") or 0)
     request = entry.get("request") or {}
-    if retry_count > 0 or request.get("replace_track_id") or request.get("require_lossless"):
-        return REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS
-    return QUEUED_TRANSFER_RETRY_SECONDS
+    replacement = retry_count > 0 or request.get("replace_track_id") or request.get("require_lossless")
+    if transfer_is_remotely_queued(transfer):
+        return REPLACEMENT_REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS if replacement else REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS
+    return REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS if replacement else QUEUED_TRANSFER_RETRY_SECONDS
+
+
+def transfer_is_remotely_queued(transfer: dict | None) -> bool:
+    if not isinstance(transfer, dict):
+        return False
+    status = transfer.get("status") or transfer.get("state") or transfer.get("State") or transfer.get("Status")
+    flags = state_flags(status)
+    return "queued" in flags and "remotely" in flags
 
 
 def slskd_concurrent_download_limit(session: Session) -> int:
@@ -9823,12 +9839,6 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
     """
     if not wishlist_item_ids:
         return
-    # Lazy: `api.routes` imports from `worker.main` elsewhere in the app, so importing it at module
-    # level here would be circular (see the `_jf_client`/`_mirror_pull` import a few thousand lines
-    # down for the same pattern).
-    from nudibranch.api.routes import wishlist_auto_search_enabled
-
-    auto_search = wishlist_auto_search_enabled(session)
     now = datetime.now(timezone.utc)
     for wishlist_item_id in wishlist_item_ids:
         # NOT a plain existence check: `run_search_wishlist_item` marks its spent intent-batch
@@ -9868,19 +9878,14 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
         wishlist_item.batch_id = None
         wishlist_item.item_id = None
         wishlist_item.status_changed_at = now
-        if auto_search:
-            # The exact state a brand-new item gets in `create_wishlist_item` -- searching starts
-            # again immediately, with a fresh candidate batch. The old candidates are not reused.
-            wishlist_item.status = "searching"
-            wishlist_item.stage = ItemStage.searching.value
-        else:
-            wishlist_item.status = "wanted"
-            wishlist_item.stage = None
+        # The exact state a brand-new item gets in `create_wishlist_item` -- searching starts
+        # again immediately, with a fresh candidate batch. The old candidates are not reused.
+        wishlist_item.status = "searching"
+        wishlist_item.stage = ItemStage.searching.value
         session.flush()
-        if auto_search:
-            # Enqueued after the flush, same reasoning as `create_wishlist_item`: the worker must
-            # not be able to claim `search_wishlist_item` before the row it reads exists as searching.
-            enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": wishlist_item.id})
+        # Enqueued after the flush, same reasoning as `create_wishlist_item`: the worker must
+        # not be able to claim `search_wishlist_item` before the row it reads exists as searching.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": wishlist_item.id})
 
 
 def run_retry_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
