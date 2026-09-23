@@ -507,6 +507,14 @@ nav button:hover {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* Remove's in-place two-tap confirm: "Remove" -> "Confirm" must not change the button's width
+   or move anything beside it (the user, 2026-09-23). 108px comfortably fits the icon plus the
+   wider of the two labels. */
+.queue-remove-confirm {
+  min-width: 108px;
+  justify-content: center;
+}
+
 .secondary.action-ready:hover {
   background: color-mix(in srgb, var(--accent) 22%, var(--panel-strong));
 }
@@ -2450,9 +2458,38 @@ nav button:hover {
   min-width: 0;
 }
 
-.proposal-title-cell > .inline-progress {
+.proposal-title-cell > .inline-progress,
+.proposal-title-cell > .queue-download-progress {
   min-width: 140px;
   max-width: 420px;
+}
+
+/* A download row that's actually doing something: the pill names the stage (the server's own
+   status_label — "downloading" / "waiting to download"), the count sits under it with no
+   background of its own, and the bar below both is the podcast episode progress bar reused
+   as-is (.podcast-progress, further down). */
+.queue-download-progress {
+  display: grid;
+  gap: 3px;
+  align-content: center;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-self: start;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.status-pill-waiting {
+  color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warn) 40%, transparent);
 }
 
 .tree-row small,

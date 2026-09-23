@@ -126,7 +126,10 @@ function getDeviceLabel() {
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
 // Minutes a playback claim survives with nothing playing before the session is up for grabs.
 // 0 means it never expires. Matches the server's own default for a new account.
-const DEFAULT_CLAIM_TIMEOUT_MINUTES = 5;
+// "Never" is the default (the user, 2026-09-23) — matches the server's own default for new/migrated
+// accounts. Only the pre-hydration fallback before `GET /me` answers; real accounts get their own
+// `playback_claim_timeout_minutes` from the server.
+const DEFAULT_CLAIM_TIMEOUT_MINUTES = 0;
 
 // Nav order mirrors the iOS app's: the four things you reach for constantly first, then the
 // management pages. "Discover" is not its own page any more — searching for music and tracking
@@ -311,6 +314,10 @@ function App() {
     }
   };
   const [page, setPage] = useState("Library");
+  // Read inside the polling interval below without forcing it to be torn down and recreated on
+  // every nav click / wishlist tab flip — see where they're assigned, beside that effect.
+  const pageRef = useRef(page);
+  const wishlistTabRef = useRef("discover");
   const [albumDetail, setAlbumDetail] = useState(null);
   const [artistDetail, setArtistDetail] = useState(null);
   const [homeVersion, setHomeVersion] = useState(0);
@@ -377,6 +384,12 @@ function App() {
   const [appLogs, setAppLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
+  // Gate 1 (`GET /wishlist/queue`, requested rows awaiting a human before anything searches) —
+  // only ever populated for a wishlist:approve_all holder or admin; see the Wishlist page's Queue
+  // tab. Which sub-tab is showing lives here too, so the poll below can tell whether it needs
+  // /wishlist/queue at all.
+  const [wishlistQueue, setWishlistQueue] = useState([]);
+  const [wishlistTab, setWishlistTab] = useState("discover");
   // The requester's own batches (GET /requests) -- also doubles as the Task Queue's data
   // source for a wishlist:approve_all holder who lacks approvals:manage (GET /approvals is
   // admin-only; /requests admits wishlist:approve_all and returns the same bucketed shape).
@@ -606,6 +619,11 @@ function App() {
     refreshAll();
   }, [token]);
 
+  // Latest-value refs for the interval below, which is intentionally NOT recreated on every
+  // `page`/`wishlistTab` change (that would reset the 2.5–10s cadence on every nav click).
+  pageRef.current = page;
+  wishlistTabRef.current = wishlistTab;
+
   // Polling interval — dep changes here only re-create the interval (no immediate fetch).
   useEffect(() => {
     if (!token) return;
@@ -623,7 +641,19 @@ function App() {
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
       refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
-      if (hasPermission(user, "discover")) refreshWishlist();
+      // The Wishlist page refreshes itself only while it's the page actually on screen AND the
+      // tab/document is visible — never against a page nobody can see (the user, 2026-09-23).
+      // /wishlist/queue only matters on top of that when the Queue tab itself is showing.
+      if (
+        (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all"))
+        && pageRef.current === "Wishlist"
+        && document.visibilityState === "visible"
+      ) {
+        refreshWishlist();
+        if (wishlistTabRef.current === "queue" && hasPermission(user, "wishlist:approve_all")) {
+          refreshWishlistQueue();
+        }
+      }
       // /requests is the requester's own progress feed AND the Task Queue's data source for a
       // wishlist:approve_all holder who lacks approvals:manage (GET /approvals 403s for them).
       if (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all")) refreshRequests();
@@ -631,6 +661,14 @@ function App() {
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
   }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || []), activeWork]);
+
+  // Returning to the Wishlist page (or switching into its Queue tab) shouldn't wait out the
+  // throttled interval above before showing current data.
+  useEffect(() => {
+    if (!token || page !== "Wishlist") return;
+    if (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all")) refreshWishlist();
+    if (wishlistTab === "queue" && hasPermission(user, "wishlist:approve_all")) refreshWishlistQueue();
+  }, [token, page, wishlistTab]);
 
   useEffect(() => {
     if (!user || visibleNavItems.length === 0) return;
@@ -1234,6 +1272,51 @@ function App() {
     }
   }
 
+  // Gate 1 (`GET /wishlist/queue`) — 403s for anyone without wishlist:approve_all/admin, so this
+  // is only ever called from behind that same check.
+  async function refreshWishlistQueue() {
+    try {
+      setWishlistQueue(await api("/wishlist/queue"));
+    } catch {
+      // Queue polling is best-effort, same as every other poll here.
+    }
+  }
+
+  // Approve moves a `requested` row straight to searching — the candidate search itself is
+  // gate 2's job (Download approval, back in the Task Queue), not this one.
+  async function approveWishlistQueueItems(itemIds) {
+    if (itemIds.length === 0) return;
+    setLoading(true);
+    try {
+      await api("/wishlist/queue/approve", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds }),
+      });
+      await Promise.all([refreshWishlistQueue(), refreshWishlist(), refreshRequests()]);
+    } catch (approveError) {
+      notify("Approve failed", approveError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Reject = Declined, and it stays visible on the requester's own wishlist for them to remove.
+  async function rejectWishlistQueueItems(itemIds) {
+    if (itemIds.length === 0) return;
+    setLoading(true);
+    try {
+      await api("/wishlist/queue/reject", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds }),
+      });
+      await Promise.all([refreshWishlistQueue(), refreshWishlist()]);
+    } catch (rejectError) {
+      notify("Reject failed", rejectError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function createWishlistItem(item) {
     setLoading(true);
     try {
@@ -1291,13 +1374,12 @@ function App() {
     if (items.length === 0) return;
     setLoading(true);
     try {
-      const result = await api("/approvals/cancel", {
+      // No success pop-up (the user, 2026-09-23) — the row's own state (back to Download
+      // approval, progress bar gone) is the feedback. A cancel touching nothing cancelable
+      // is a silent no-op: the server answers 0 cancelled and there is nothing to say.
+      await api("/approvals/cancel", {
         method: "POST",
         body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
-      });
-      setToast({
-        title: "Canceled",
-        body: `${result.canceled} item${result.canceled === 1 ? "" : "s"} stopped. The requests stay and search again.`,
       });
       await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
     } catch (cancelError) {
@@ -3816,10 +3898,8 @@ function App() {
         );
       }
       setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
-      setToast({
-        title: "Approved",
-        body: `${items.length} item${items.length === 1 ? "" : "s"} were sent to the task queue.`,
-      });
+      // No success pop-up (the user, 2026-09-23) — approval acts immediately and the row
+      // moving out of Review is the feedback.
       await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
@@ -3836,13 +3916,11 @@ function App() {
     if (items.length === 0) return;
     setLoading(true);
     try {
-      const result = await api("/approvals/remove", {
+      // No success pop-up (the user, 2026-09-23) — the two-tap arm on the button itself is the
+      // confirmation; the row leaving the tree is the result.
+      await api("/approvals/remove", {
         method: "POST",
         body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
-      });
-      setToast({
-        title: "Removed",
-        body: `${result.removed} item${result.removed === 1 ? "" : "s"} taken off the queue.`,
       });
       await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
     } catch (removeError) {
@@ -4172,6 +4250,9 @@ function App() {
               <WishlistWorkspace
                 user={user}
                 wishlist={wishlist}
+                wishlistQueue={wishlistQueue}
+                tab={wishlistTab}
+                onTabChange={setWishlistTab}
                 onSearch={searchDiscover}
                 onFetchTracks={fetchDiscoverAlbumTracks}
                 onQueue={queueDiscoverDownloads}
@@ -4184,6 +4265,8 @@ function App() {
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
                 onInspectorActionsChange={setWishlistInspectorActions}
+                onApproveQueue={approveWishlistQueueItems}
+                onRejectQueue={rejectWishlistQueueItems}
               />
             )}
             {page === "Playlists" && (
@@ -5891,6 +5974,12 @@ const QUEUE_BUCKETS = [
   { id: "changes", label: "Changes", empty: ["No pending changes", "Metadata, artwork, imports and staged downloads land here."] },
 ];
 
+// Stages a download row is actually DOING something in, as opposed to sitting at a gate
+// (awaiting_approval/requested) or already finished (completed/failed/rejected/canceled) — this
+// is what earns the row the orange status pill + the real progress bar. `requested` (gate 1) is
+// deliberately absent: it never reaches the Task Queue and it is not "working" either way.
+const QUEUE_WORKING_STAGES = new Set(["approved", "queued", "downloading", "retrying"]);
+
 function emptyQueueSelection() {
   return { review: new Set(), issues: new Set(), changes: new Set() };
 }
@@ -5899,7 +5988,7 @@ function emptyQueueSelection() {
 // seconds. Cheaper than a confirmation dialog for something done often, but still refuses to
 // fire on one stray click. Matches the iOS ConfirmButton (Components/ConfirmButton.swift) — it
 // disarms on a timeout and whenever `resetKey` changes (selection, bucket, lock state).
-function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, onConfirm, icon: Icon }) {
+function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, onConfirm, icon: Icon, variant = "primary", className = "", title }) {
   const [armed, setArmed] = useState(false);
   const timeoutRef = useRef(null);
 
@@ -5921,7 +6010,12 @@ function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, on
   }
 
   return (
-    <button className={`primary${armed ? " action-ready" : ""}`} onClick={handleClick} disabled={disabled}>
+    <button
+      className={`${variant}${armed ? " action-ready" : ""}${className ? ` ${className}` : ""}`}
+      onClick={handleClick}
+      disabled={disabled}
+      title={title}
+    >
       {Icon && <Icon size={16} />}
       {armed ? confirmLabel : label}
     </button>
@@ -5958,7 +6052,9 @@ function Approvals({ approvals, requests, user, bucket, onBucketChange, selected
   );
   const cancelableItems = useMemo(() => selectedItems.filter((item) => item.can_cancel), [selectedItems]);
   const allSelected = visibleItems.length > 0 && visibleItems.every((item) => selectedIds.has(item.id));
-  const approveResetKey = `${bucket}:${approvableItems.map((item) => item.id).sort().join(",")}`;
+  // Remove's own two-tap arm resets whenever the selection it would act on changes — the same
+  // rule ConfirmButton already applies everywhere else it's used.
+  const removeResetKey = `${bucket}:${selectedItems.map((item) => item.id).sort().join(",")}`;
 
   function toggleSelectAll() {
     if (allSelected) onToggle(allItems.map((item) => item.id), false);
@@ -6003,24 +6099,29 @@ function Approvals({ approvals, requests, user, bucket, onBucketChange, selected
               Cancel
             </button>
             {/* Remove implies cancel — the server stops live transfers, deletes the partial
-                files, then drops the rows and any batch they emptied. */}
-            <button
-              className="secondary"
-              onClick={() => onRemove(selectedItems)}
+                files, then drops the rows and any batch they emptied. No pop-up: an in-place
+                two-tap arm instead, with a fixed width so "Remove" -> "Confirm" never reflows
+                the row (the user, 2026-09-23). */}
+            <ConfirmButton
+              variant="secondary"
+              className="queue-remove-confirm"
+              icon={X}
+              label="Remove"
+              confirmLabel="Confirm"
+              resetKey={removeResetKey}
               disabled={selectedItems.length === 0}
               title="Cancel if running, then remove from the queue"
-            >
-              <X size={16} />
-              Remove
-            </button>
-            <ConfirmButton
-              icon={Check}
-              label="Approve selected"
-              confirmLabel="Confirm approve"
-              resetKey={approveResetKey}
-              disabled={approvableItems.length === 0}
-              onConfirm={() => onApprove(approvableItems, { viaRequests: !isFullApprover })}
+              onConfirm={() => onRemove(selectedItems)}
             />
+            {/* Approve acts immediately — no pop-up, no arm/confirm step (the user, 2026-09-23). */}
+            <button
+              className="primary"
+              onClick={() => onApprove(approvableItems, { viaRequests: !isFullApprover })}
+              disabled={approvableItems.length === 0}
+            >
+              <Check size={16} />
+              Approve selected
+            </button>
           </div>
         </div>
       )}
@@ -6176,7 +6277,11 @@ function ApprovalNode({
     const grandchildren = childrenById.get(child.id) || [];
     return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
   });
-  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? item.progress : null;
+  // A real bar for anything actually moving, at whatever the server says it has done. ⚠️ Reuse the
+  // podcast episode bar (`.podcast-progress`) — the standing rule is to reuse an existing style
+  // rather than invent one, and the old indeterminate `InlineProgress` was a spinner in disguise:
+  // it animated without ever saying how far along the work was.
+  const downloadProgress = QUEUE_WORKING_STAGES.has(item.stage) ? item.progress : null;
   if (hiddenAlternateCandidate) return null;
 
   function updateChecked(nextChecked) {
@@ -6211,7 +6316,13 @@ function ApprovalNode({
         <span className="proposal-title-cell">
           <span className="proposal-title">{item.title}</span>
           {downloadProgress && (
-            <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} compact />
+            <span className="queue-download-progress">
+              <span className="status-pill status-pill-waiting">{item.status_label}</span>
+              {downloadProgress.label && downloadProgress.label !== item.status_label && (
+                <small>{downloadProgress.label}</small>
+              )}
+              <div className="podcast-progress"><div className="podcast-progress-fill" style={{ width: `${Math.max(0, Math.min(100, downloadProgress.value || 0))}%` }} /></div>
+            </span>
           )}
         </span>
         <small title={isFileMoveLeaf ? `${item.old_value || "?"} → ${item.new_value || "?"}` : undefined}>
@@ -6728,14 +6839,17 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, onSearch, onFetchTracks, onQueue, apiKey,
+  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onQueue, apiKey,
   onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
+  onApproveQueue, onRejectQueue,
 }) {
-  const [tab, setTab] = useState("discover");
   const ownCount = useMemo(
     () => wishlist.filter((item) => item.user_id === user.id).length,
     [wishlist, user.id],
   );
+  // Gate 1 review is for a wishlist:approve_all holder or an admin only — everyone else never
+  // sees the tab exists (the user, 2026-09-23).
+  const canReviewQueue = hasPermission(user, "wishlist:approve_all");
 
   return (
     <div className="workspace-split">
@@ -6745,7 +6859,7 @@ function WishlistWorkspace({
           role="tab"
           aria-selected={tab === "discover"}
           className={tab === "discover" ? "active" : ""}
-          onClick={() => setTab("discover")}
+          onClick={() => onTabChange("discover")}
         >
           <Compass size={15} /> Discover
         </button>
@@ -6754,10 +6868,21 @@ function WishlistWorkspace({
           role="tab"
           aria-selected={tab === "requests"}
           className={tab === "requests" ? "active" : ""}
-          onClick={() => setTab("requests")}
+          onClick={() => onTabChange("requests")}
         >
           <Sparkles size={15} /> My requests{ownCount ? ` (${ownCount})` : ""}
         </button>
+        {canReviewQueue && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "queue"}
+            className={tab === "queue" ? "active" : ""}
+            onClick={() => onTabChange("queue")}
+          >
+            <ListChecks size={15} /> Queue{wishlistQueue.length ? ` (${wishlistQueue.length})` : ""}
+          </button>
+        )}
       </div>
       <div className="workspace-tabpanel" hidden={tab !== "discover"}>
         <DiscoverView
@@ -6783,6 +6908,11 @@ function WishlistWorkspace({
           onInspectorActionsChange={onInspectorActionsChange}
         />
       </div>
+      {canReviewQueue && (
+        <div className="workspace-tabpanel" hidden={tab !== "queue"}>
+          <WishlistQueueView items={wishlistQueue} onApprove={onApproveQueue} onReject={onRejectQueue} />
+        </div>
+      )}
     </div>
   );
 }
@@ -6894,7 +7024,7 @@ function renderWishlistArtist(artist, depth, openArtists, setOpenArtists, openAl
                   ))
                 ) : (
                   <div className="tree-action-row library-row-actions wishlist-row">
-                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request ? wishlistItemStatusLabel(album.request) : "Awaiting Approval"} />
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request ? wishlistItemStatusLabel(album.request) : ""} />
                     {album.request && <WishlistRowActions item={album.request} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />}
                   </div>
                 ))}
@@ -6926,6 +7056,160 @@ function WishlistRowActions({ item, onRemove, onCancel, onRequestAgain }) {
         <X size={15} />
       </button>
     </>
+  );
+}
+
+// Gate 1: every user's `requested` rows, grouped by who asked. One `wishlist:approve_all`
+// holder or admin reviews everyone's requests here before anything searches. Deliberately built
+// from the SAME tree pieces the Task Queue draws with (buildItemTree/ApprovalNode/TreeToolbar) —
+// reusing an existing visual style rather than inventing a second tree (the user, 2026-09-23) —
+// by shaping each `WishlistOut` row into the item shape ApprovalNode already knows how to draw:
+// a synthetic artist node, a synthetic album node under it, and the real row (kind
+// "wishlist_queue_item", so none of ApprovalNode's download-candidate/file-move branches fire)
+// as the leaf, carrying its own real id straight through for Approve/Reject.
+function groupWishlistQueueByUser(items) {
+  const byUser = new Map();
+  for (const item of items) {
+    if (!byUser.has(item.user_id)) {
+      byUser.set(item.user_id, { userId: item.user_id, ownerName: item.owner_name || "Unknown user", items: [] });
+    }
+    byUser.get(item.user_id).items.push(item);
+  }
+  return [...byUser.values()].sort((a, b) => a.ownerName.localeCompare(b.ownerName));
+}
+
+function buildWishlistQueueTree(items) {
+  const artists = new Map();
+  for (const item of items) {
+    const artistName = item.artist || "Unknown Artist";
+    const albumName = item.album || "Singles";
+    const artistId = `wq-artist:${artistName}`;
+    const albumId = `wq-album:${artistName}:${albumName}`;
+    if (!artists.has(artistId)) artists.set(artistId, { title: artistName, albums: new Map() });
+    const artist = artists.get(artistId);
+    if (!artist.albums.has(albumId)) artist.albums.set(albumId, { title: albumName, items: [] });
+    artist.albums.get(albumId).items.push(item);
+  }
+  const nodes = [];
+  for (const [artistId, artist] of artists) {
+    const albums = [...artist.albums.values()];
+    const artistCount = albums.reduce((total, album) => total + album.items.length, 0);
+    nodes.push({
+      id: artistId, parent_id: null, kind: "wishlist_group", status: "pending",
+      title: artist.title, status_label: `${artistCount} request${artistCount === 1 ? "" : "s"}`,
+    });
+    for (const [albumId, album] of artist.albums) {
+      nodes.push({
+        id: albumId, parent_id: artistId, kind: "wishlist_group", status: "pending",
+        title: album.title, status_label: `${album.items.length} request${album.items.length === 1 ? "" : "s"}`,
+      });
+      for (const item of album.items) {
+        nodes.push({ ...item, parent_id: albumId, kind: "wishlist_queue_item", status: "pending", title: item.track || "Full album" });
+      }
+    }
+  }
+  return nodes;
+}
+
+function WishlistQueueView({ items, onApprove, onReject }) {
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [openItems, setOpenItems] = useState(() => new Set());
+  const groups = useMemo(() => groupWishlistQueueByUser(items), [items]);
+  const trees = useMemo(
+    () => groups.map((group) => ({ ...group, tree: buildItemTree(buildWishlistQueueTree(group.items)) })),
+    [groups],
+  );
+  const allNodeIds = useMemo(() => trees.flatMap((group) => [...group.tree.childrenById.keys()]), [trees]);
+  const treeKey = useMemo(() => allNodeIds.slice().sort().join(","), [allNodeIds]);
+  // Default expanded, same as a fresh Task Queue batch.
+  useEffect(() => { setOpenItems(new Set(allNodeIds)); }, [treeKey]);
+
+  const realIds = useMemo(() => new Set(items.map((item) => item.id)), [items]);
+  const selectedRealIds = useMemo(() => [...selectedIds].filter((id) => realIds.has(id)), [selectedIds, realIds]);
+
+  function onToggle(ids, checked) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => (checked ? next.add(id) : next.delete(id)));
+      return next;
+    });
+  }
+
+  async function handleApprove() {
+    if (selectedRealIds.length === 0) return;
+    await onApprove(selectedRealIds);
+    setSelectedIds(new Set());
+  }
+
+  async function handleReject() {
+    if (selectedRealIds.length === 0) return;
+    await onReject(selectedRealIds);
+    setSelectedIds(new Set());
+  }
+
+  if (items.length === 0) {
+    return <EmptyState title="Nothing waiting" body="Requests from everyone but you land here first, before anything searches." />;
+  }
+
+  return (
+    <div className="approval-tree">
+      {/* Same bulk bar the Task Queue uses (.batch-header.queue-actions) — Approve/Reject act
+          immediately here too, no pop-up. */}
+      <div className="batch-header queue-actions">
+        <div className="approval-actions">
+          <p>{selectedRealIds.length} selected</p>
+        </div>
+        <div className="approval-actions">
+          <button className="secondary" onClick={handleReject} disabled={selectedRealIds.length === 0}>
+            <X size={16} /> Reject
+          </button>
+          <button className="primary" onClick={handleApprove} disabled={selectedRealIds.length === 0}>
+            <Check size={16} /> Approve
+          </button>
+        </div>
+      </div>
+      {trees.map((group) => {
+        const groupIds = group.items.map((item) => item.id);
+        const groupSelectedCount = groupIds.filter((id) => selectedIds.has(id)).length;
+        const allSelected = groupIds.length > 0 && groupSelectedCount === groupIds.length;
+        const groupNodeIds = [...group.tree.childrenById.keys()];
+        const groupExpanded = groupNodeIds.some((id) => openItems.has(id));
+        return (
+          <section className="batch" key={group.userId}>
+            <div className="batch-header">
+              <h2>{group.ownerName}</h2>
+            </div>
+            <div className="bulk-row">
+              <label>
+                <input type="checkbox" checked={allSelected} onChange={(event) => onToggle(groupIds, event.target.checked)} />
+                Select all
+              </label>
+              <span>{groupSelectedCount} selected</span>
+              <TreeToolbar
+                expanded={groupExpanded}
+                onExpand={() => setOpenItems((prev) => new Set([...prev, ...groupNodeIds]))}
+                onCollapse={() => setOpenItems((prev) => {
+                  const next = new Set(prev);
+                  groupNodeIds.forEach((id) => next.delete(id));
+                  return next;
+                })}
+              />
+            </div>
+            {group.tree.roots.map((root) => (
+              <ApprovalNode
+                item={root}
+                childrenById={group.tree.childrenById}
+                openItems={openItems}
+                setOpenItems={setOpenItems}
+                selectedIds={selectedIds}
+                onToggle={onToggle}
+                key={root.id}
+              />
+            ))}
+          </section>
+        );
+      })}
+    </div>
   );
 }
 
@@ -14646,11 +14930,12 @@ function wishlistItemStatusLabel(item) {
   return item.status_label;
 }
 
-// Stages where the linked download batch is doing something a Cancel would actually stop.
-// Declined ("rejected"), failed, completed and removed rows have nothing left to cancel.
+// Stages where the linked download batch is doing something a Cancel would actually stop —
+// exactly the server's cancelable set (2026-09-23 contract). Gate 1 ("requested"), a gate
+// waiting on a human ("awaiting_approval"/"staged"), staging/verifying, declined, failed,
+// completed and removed rows all have nothing a Cancel would do, so they're deliberately absent.
 const ACTIVE_WISHLIST_STAGES = new Set([
-  "searching", "awaiting_approval", "approved", "queued", "downloading", "retrying",
-  "staging", "verifying", "staged",
+  "searching", "approved", "queued", "downloading", "retrying",
 ]);
 
 function isWishlistItemActive(item) {
