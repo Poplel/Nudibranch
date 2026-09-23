@@ -93,6 +93,8 @@ from nudibranch.api.schemas import (
     ProposalApproveRequest,
     ProposalItemOut,
     ProposalRejectRequest,
+    QueueBulkResult,
+    QueueItemsRequest,
     ProposalSelectionUpdate,
     SearchResponse,
     SearchResultItem,
@@ -184,7 +186,16 @@ from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification, push_identity
-from nudibranch.services.proposals import ApprovalNotPermitted, approve_batch, cancel_items, reject_items, retry_items, set_selection
+from nudibranch.services.proposals import (
+    ApprovalNotPermitted,
+    NothingToApprove,
+    approve_batch,
+    cancel_items,
+    purge_wishlist_work,
+    remove_items,
+    retry_items,
+    set_selection,
+)
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
@@ -728,6 +739,8 @@ def update_user(
         if user.is_admin and not payload.is_admin and count_admins(session) <= 1:
             raise HTTPException(status_code=400, detail="At least one admin user is required")
         user.is_admin = payload.is_admin
+    if payload.playback_claim_timeout_minutes is not None:
+        user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     if payload.permissions is not None:
         set_user_permissions(session, user, payload.permissions)
     session.commit()
@@ -909,8 +922,8 @@ def update_own_appearance(
     user.accent_color = payload.accent_color
     user.background_tint = payload.background_tint
     user.crossfade_duration = payload.crossfade_duration
-    if payload.remote_playback_enabled is not None:
-        user.remote_playback_enabled = payload.remote_playback_enabled
+    user.remote_playback_enabled = payload.remote_playback_enabled
+    user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -1496,9 +1509,10 @@ def ack_player_command(
 
 #: A claim whose owner has said nothing for this long is lapsed — force-quit, crashed, offline.
 CLAIM_SILENCE_TIMEOUT = timedelta(minutes=5)
-#: ...and so is one that has not been PLAYING for this long. A paused session left alone is up for
-#: grabs, so the next device to press Play takes it rather than remote-controlling a sleeping one.
-CLAIM_IDLE_TIMEOUT = timedelta(minutes=5)
+#: Default for `User.playback_claim_timeout_minutes`: how long a claim survives without PLAYING. A
+#: paused session left alone is up for grabs, so the next device to press Play takes it rather than
+#: remote-controlling a sleeping one. Per user since 2026-09-22; 0 means it never lapses this way.
+DEFAULT_CLAIM_IDLE_MINUTES = 5
 # A shared session is meant to be resumed in full, so it is capped far above a transfer (500).
 SESSION_MAX_ITEMS = 5000
 SESSION_MAX_PAYLOAD_BYTES = 512 * 1024
@@ -1506,23 +1520,46 @@ SESSION_MAX_PAYLOAD_BYTES = 512 * 1024
 ADOPT_SESSION_TTL = timedelta(minutes=2)
 
 
-def _claim_valid(row: "AccountPlaybackSession | None", now: datetime | None = None) -> bool:
+def _claim_idle_timeout(session: Session, user_id: str | None) -> timedelta | None:
+    """This account's idle-lapse window, or None for "never lapses from idleness"."""
+    user = session.get(User, user_id) if user_id else None
+    minutes = DEFAULT_CLAIM_IDLE_MINUTES if user is None else int(user.playback_claim_timeout_minutes)
+    return None if minutes <= 0 else timedelta(minutes=minutes)
+
+
+def _claim_valid(
+    row: "AccountPlaybackSession | None",
+    now: datetime | None = None,
+    idle_timeout: timedelta | None = timedelta(minutes=DEFAULT_CLAIM_IDLE_MINUTES),
+) -> bool:
     """Whether the stored claim still entitles its owner to play the session.
 
     ⚠ Derived, never written. A lapsed claim keeps its `claim_id` on purpose: the holder, returning
     from a stretch offline, re-validates it simply by reporting again — unless another device claimed
     in the meantime, which replaced the id. Nothing may clear a claim for having lapsed.
+
+    ⚠ TWO CLOCKS, and they are not interchangeable (§31). A claim that says it is **playing** is a
+    MOVING claim: its position is wrong within seconds of the reports stopping, and the claim itself
+    is wrong if the app died — so it is believed only while the owner reported inside `LIVE_WINDOW`
+    (45s). That is what makes closing the playing app hand the session back almost at once, instead
+    of leaving every other device showing "playing remotely" on a claim nobody is honouring.
+    A **paused** claim drifts nowhere, so it keeps the per-user idle window; `idle_timeout=None`
+    means the user asked for it never to lapse, and then only an explicit "Play here" takes it.
     """
     if row is None or not row.owner_session_id or not row.claim_id:
         return False
     now = now or datetime.now(timezone.utc)
     heard = row.owner_reported_at or row.claimed_at
-    if heard is None or as_utc(heard) < now - CLAIM_SILENCE_TIMEOUT:
+    if heard is None:
         return False
     if row.status == "playing":
+        return as_utc(heard) >= now - LIVE_WINDOW
+    if idle_timeout is None:
         return True
+    if as_utc(heard) < now - CLAIM_SILENCE_TIMEOUT:
+        return False
     idle_since = row.paused_since or heard
-    return as_utc(idle_since) >= now - CLAIM_IDLE_TIMEOUT
+    return as_utc(idle_since) >= now - idle_timeout
 
 
 def _account_session(session: Session, user_id: str) -> AccountPlaybackSession:
@@ -1637,7 +1674,7 @@ def _serialize_account_session(
     claim_id: str | None = None,
 ) -> AccountSessionOut:
     now = datetime.now(timezone.utc)
-    valid = _claim_valid(row, now)
+    valid = _claim_valid(row, now, _claim_idle_timeout(session, row.user_id))
     owner = None
     if valid:
         owner_row = session.get(AuthSession, row.owner_session_id)
@@ -1768,6 +1805,21 @@ def get_account_session(
     return _serialize_account_session(session, row, auth_session, include_items=queue, resolve=resolve)
 
 
+def _require_remote_playback(user: User) -> None:
+    """Refuse the shared-session verbs while the account has cross-device playback switched off.
+
+    ⚠ Deliberately only these two. Turning the setting off means "my devices stop seeing and driving
+    each other" (§31), and claiming or transferring the SHARED session is exactly that — but the
+    command channel stays open, because automations and IFTTT drive a device through it and
+    silently stopping those would be a second, unasked-for change (§3/§24).
+    """
+    if not bool(getattr(user, "remote_playback_enabled", True)):
+        raise HTTPException(
+            status_code=409,
+            detail={"detail": "remote_playback_disabled"},
+        )
+
+
 @router.post(
     "/player/session/claim",
     response_model=AccountSessionOut,
@@ -1787,9 +1839,14 @@ def claim_account_session(
     `claim_id`, which the caller must send on every report after, and the whole queue.
     """
     origin = _require_session(auth_session)
+    _require_remote_playback(user)
     now = datetime.now(timezone.utc)
     row = _account_session(session, user.id)
-    previous_owner = row.owner_session_id if _claim_valid(row, now) else None
+    previous_owner = (
+        row.owner_session_id
+        if _claim_valid(row, now, _claim_idle_timeout(session, user.id))
+        else None
+    )
     if payload.snapshot is not None:
         snap = payload.snapshot
         if snap.items and not 0 <= snap.current_index < len(snap.items):
@@ -1913,7 +1970,7 @@ def edit_account_session(
     """
     now = datetime.now(timezone.utc)
     row = _account_session(session, user.id)
-    if _claim_valid(row, now):
+    if _claim_valid(row, now, _claim_idle_timeout(session, user.id)):
         raise HTTPException(status_code=409, detail={"detail": "owned", "owner_session_id": row.owner_session_id})
     if payload.base_version is not None and payload.base_version != (row.queue_version or 0):
         raise HTTPException(status_code=409, detail={"detail": "queue_changed", "queue_version": row.queue_version or 0})
@@ -1998,6 +2055,7 @@ def transfer_account_session(
     claims with it, so the queue is replaced in the same write that makes it the owner.
     """
     _require_session(auth_session)
+    _require_remote_playback(user)
     target = session.scalar(
         select(AuthSession).where(AuthSession.id == payload.to_session_id, AuthSession.user_id == user.id)
     )
@@ -3052,7 +3110,6 @@ def propose_library_metadata(
     batch = ProposalBatch(
         title=f"Update {payload.target_type} metadata",
         kind=ProposalKind.metadata,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -3135,7 +3192,7 @@ def propose_library_remove(
         # with the real album).
         if payload.target_type == "album" and not library_target_tracks(target):
             artist_name = target.artist.name if target.artist else "Unknown Artist"
-            batch = ProposalBatch(title="Remove empty album", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title="Remove empty album", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.delete)
@@ -3160,7 +3217,6 @@ def propose_library_remove(
     batch = ProposalBatch(
         title=f"{remove_action_title(payload.action)} {payload.target_type}",
         kind=batch_kind,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -3524,7 +3580,6 @@ def queue_musicbrainz_metadata_fixes(session: Session, results: list[dict]) -> P
     batch = ProposalBatch(
         title="MusicBrainz metadata fixes",
         kind=ProposalKind.metadata,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -3560,7 +3615,7 @@ def queue_musicbrainz_replacement_downloads(session: Session, results: list[dict
     replacement_results = [result for result in results if result.get("replacement_request")]
     if not replacement_results:
         return None
-    batch = ProposalBatch(title="MusicBrainz replacement downloads", kind=ProposalKind.download, tree_path="/library")
+    batch = ProposalBatch(title="MusicBrainz replacement downloads", kind=ProposalKind.download)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -4583,8 +4638,14 @@ def remove_wishlist_item(
     if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     item.status = "removed"
+    item.stage = ItemStage.rejected.value
     item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
+    # ⚠️ A removed request takes its work with it: the candidate search is cancelled, any live
+    # transfer stopped and its file deleted, and its rows and emptied batches removed. Leaving them
+    # is how sandalphon ended up holding two batches of "finding candidates" rows for a request
+    # whose own row already read Declined, with nothing in any UI able to clear them.
+    purge_wishlist_work(session, item, actor_id=user.id)
     session.refresh(item)
     return serialize_wishlist_item(item)
 
@@ -5674,59 +5735,19 @@ def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depen
 
 # ── (removed) proposal-based position reorder — position is order from Jellyfin ──
 
-@router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")
-def propose_favorite_position(
-    entry_id: str,
-    payload: PlaylistPositionProposalRequest,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> ProposalBatchOut:
-    playlist = get_or_create_favorites(session, user.id)
-    entry = session.scalar(
-        select(PlaylistTrack)
-        .where(PlaylistTrack.id == entry_id, PlaylistTrack.playlist_id == playlist.id)
-        .options(selectinload(PlaylistTrack.track))
-    )
-    if not entry:
-        raise HTTPException(status_code=404, detail="Playlist entry not found")
-    if entry.position == payload.position:
-        raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
-
-    batch = ProposalBatch(
-        title=f"Update {playlist.name} order",
-        kind=ProposalKind.playlist,
-        tree_path=f"/playlists/{playlist.name}",
-    )
-    session.add(batch)
-    session.flush()
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            title=entry.track.title,
-            kind=ProposalKind.playlist,
-            old_value=str(entry.position),
-            new_value=str(payload.position),
-            payload_json=json.dumps(
-                {
-                    "action": "set_position",
-                    "playlist_track_id": entry.id,
-                    "position": payload.position,
-                }
-            ),
-        )
-    )
-    session.commit()
-    session.refresh(batch)
-    return serialize_batch(batch)
-
-
 @router.post("/playlists/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder playlist entry")
 def propose_playlist_position(
     entry_id: str,
     payload: PlaylistPositionProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> ProposalBatchOut:
+    """Reorder one entry of any playlist, Favorites included.
+
+    The separate `/playlists/favorites/entries/{id}/position` route this replaced existed only to
+    scope the lookup to the caller's own Favorites; that check is the `user_id` guard below, so
+    one route now covers both and there is no second copy of the proposal-building to drift.
+    """
     entry = session.scalar(
         select(PlaylistTrack)
         .where(PlaylistTrack.id == entry_id)
@@ -5734,13 +5755,16 @@ def propose_playlist_position(
     )
     if not entry:
         raise HTTPException(status_code=404, detail="Playlist entry not found")
+    if entry.playlist and entry.playlist.user_id and entry.playlist.user_id != user.id and not user.is_admin:
+        # Someone else's playlist is not yours to reorder -- and Favorites is per user, so this is
+        # exactly the check the Favorites-only route was carrying.
+        raise HTTPException(status_code=404, detail="Playlist entry not found")
     if entry.position == payload.position:
         raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
 
     batch = ProposalBatch(
         title=f"Update {entry.playlist.name} order",
         kind=ProposalKind.playlist,
-        tree_path=f"/playlists/{entry.playlist.name}",
     )
     session.add(batch)
     session.flush()
@@ -5864,7 +5888,7 @@ def propose_check_file_fix(
         if not track:
             raise HTTPException(status_code=404, detail="Track record not found")
         if payload.action == "download_record":
-            batch = ProposalBatch(title=f"Download missing file for {track.title}", kind=ProposalKind.download, tree_path="/library")
+            batch = ProposalBatch(title=f"Download missing file for {track.title}", kind=ProposalKind.download)
             session.add(batch)
             session.flush()
             session.add(
@@ -5884,7 +5908,7 @@ def propose_check_file_fix(
                 )
             )
         else:
-            batch = ProposalBatch(title=f"Remove missing record for {track.title}", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title=f"Remove missing record for {track.title}", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             session.add(
@@ -5905,7 +5929,7 @@ def propose_check_file_fix(
         if library_root not in [file_path, *file_path.parents] or not file_path.exists() or not file_path.is_file():
             raise HTTPException(status_code=400, detail="File must be inside the library folder")
         if payload.action == "delete_file":
-            batch = ProposalBatch(title=f"Delete untracked file {file_path.name}", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title=f"Delete untracked file {file_path.name}", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             session.add(
@@ -5921,7 +5945,7 @@ def propose_check_file_fix(
             session.refresh(batch)
             return serialize_batch(batch)
         metadata = read_audio_metadata(file_path)
-        batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files, tree_path="/library")
+        batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files)
         session.add(batch)
         session.flush()
         session.add(
@@ -6091,16 +6115,18 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
                     batch.status = ProposalStatus.completed
                     settled.add(batch.id)
         elif batch.kind != ProposalKind.download:
-            # An empty non-download batch is an abandoned/failed tool run — safe to retire.
-            batch.status = ProposalStatus.completed
+            # An empty non-download batch is an abandoned/failed tool run. DELETED, not marked
+            # completed: an empty batch is a husk no UI can act on, and removing rows one at a
+            # time used to leave one behind every single time.
+            session.delete(batch)
             settled.add(batch.id)
         elif batch.created_at and as_utc(batch.created_at) < datetime.now(timezone.utc) - timedelta(minutes=10):
             # An empty DOWNLOAD batch is left alone while fresh — a candidate search commits its
             # batch before attaching items and must not be finalized mid-search — but one older
-            # than any plausible in-flight search is a dead leftover and can be retired too.
-            batch.status = ProposalStatus.completed
+            # than any plausible in-flight search is dead leftover and goes the same way.
+            session.delete(batch)
             settled.add(batch.id)
-    if session.dirty:
+    if session.dirty or session.deleted:
         session.commit()
     return [batch for batch in batches if batch.id not in settled]
 
@@ -6201,6 +6227,26 @@ def update_selection(
     return serialize_batch(batch)
 
 
+def _approve_or_explain(
+    session: Session, batch_id: str, item_ids: list[str] | None, user: User
+) -> TaskOut:
+    """Approve, and make every refusal a status code rather than a silent no-op.
+
+    ⚠️ 409 is the whole point of this helper. Approving a set that resolves to nothing approvable
+    used to return 200 with a task that did nothing, which is what "I pressed Approve and nothing
+    happened" was: the client had no way to tell success from a no-op.
+    """
+    try:
+        task = approve_batch(session, batch_id, item_ids, actor=user)
+    except ApprovalNotPermitted as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except NothingToApprove as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return serialize_task(task)
+
+
 @router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"], summary="Approve proposal batch")
 def approve(
     batch_id: str,
@@ -6208,13 +6254,7 @@ def approve(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> TaskOut:
-    try:
-        task = approve_batch(session, batch_id, payload.item_ids if payload else None, actor=user)
-    except ApprovalNotPermitted as error:
-        raise HTTPException(status_code=403, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    return serialize_task(task)
+    return _approve_or_explain(session, batch_id, payload.item_ids if payload else None, user)
 
 
 def prune_batch_to_requester(batch: ProposalBatch, requester_id: str) -> list[ProposalItem]:
@@ -6264,21 +6304,8 @@ def list_requests(
             .options(selectinload(ProposalBatch.items))
             .where(ProposalBatch.status.in_(statuses))
             .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
-            # `/wishlist` is the throwaway "Request: X" intent batch `run_search_wishlist_item`
-            # retires as `completed` once it has spawned the real candidate batch -- never a batch a
-            # requester actually acts on.
-            # With `include_settled=true` it would otherwise surface as a second, "completed" row
-            # for a request whose real batch may still be failing or in progress. Only the SETTLED
-            # one is hidden -- while it is still searching it is the requester's "Finding
-            # candidates" row. ⚠️ Written NULL-safe: a bare `tree_path != "/wishlist"` is NULL (so
-            # false) for batches with no tree_path, and would silently drop them.
-            .where(
-                or_(
-                    ProposalBatch.tree_path.is_(None),
-                    ProposalBatch.tree_path != "/wishlist",
-                    ProposalBatch.status != ProposalStatus.completed,
-                )
-            )
+            # (The "/wishlist" exclusion that used to sit here went with the intent batch it hid: a
+            # searching request has no batch at all now, so there is nothing left to filter out.)
             .order_by(ProposalBatch.created_at.desc())
         )
     )
@@ -6343,13 +6370,7 @@ def approve_request(
     flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
     if flow is not ProposalFlow.download_review:
         raise HTTPException(status_code=403, detail="This endpoint only approves download requests")
-    try:
-        task = approve_batch(session, batch_id, payload.item_ids if payload else None, actor=user)
-    except ApprovalNotPermitted as error:
-        raise HTTPException(status_code=403, detail=str(error)) from error
-    except ValueError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    return serialize_task(task)
+    return _approve_or_explain(session, batch_id, payload.item_ids if payload else None, user)
 
 
 def _may_act_on_request_batch(batch: ProposalBatch, user: User, *, require_approver: bool) -> None:
@@ -6450,26 +6471,114 @@ def reject(
     # must be able to decline them too -- otherwise the Review reject button 403s for exactly the
     # people whose job it is. Scoped like that route: download requests (gate a) only, never a
     # metadata, import or delete proposal.
-    if not user_has_permission(user, Permission.approvals_manage):
-        target = session.get(ProposalBatch, batch_id)
-        if not target:
-            raise HTTPException(status_code=404, detail="Batch not found")
-        flow = target.flow if isinstance(target.flow, ProposalFlow) else ProposalFlow.library_change
-        if flow is not ProposalFlow.download_review:
-            raise HTTPException(status_code=403, detail="Only download requests can be declined with this permission")
-    reject_items(session, batch_id, payload.item_ids)
+    target = session.get(ProposalBatch, batch_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _assert_may_remove(target, user)
+    item_ids = payload.item_ids or [item.id for item in target.items]
+    # ⚠️ Removal CANCELS first (the user's rule, 2026-09-22). `remove_items` stops any live
+    # transfer and deletes its partial file before the row goes, so nothing can be removed from the
+    # Task Queue while it is still running.
+    remove_items(session, item_ids, actor_id=user.id)
+    session.commit()
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    out = serialize_batch(batch)
-    # A fully rejected batch is gone for good: reject_items already removed its items and files, and
-    # the requester's wishlist row (status "rejected") is the only record of the decision. Keeping
-    # the empty batch would leave a husk in the Task Queue history with nothing on it to act on.
-    # Serialized first so the response keeps its shape (iOS decodes ProposalBatchDTO from it).
-    if batch.status == ProposalStatus.rejected and not batch.items:
-        session.delete(batch)
-        session.commit()
-    return out
+        # The batch was emptied and deleted with its last row. Answer with the shape the clients
+        # decode rather than a 404: the removal succeeded, there is simply nothing left of it.
+        return ProposalBatchOut(
+            id=batch_id,
+            title="",
+            kind=ProposalKind.download,
+            status=ProposalStatus.rejected,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            items=[],
+        )
+    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+
+
+def _assert_may_remove(batch: ProposalBatch, user: User) -> None:
+    """`wishlist:approve_all` approves music requests from Review, so it must be able to decline
+    them too -- otherwise the Review remove button 403s for exactly the people whose job it is.
+    Scoped like that route: download requests (gate a) only, never a metadata, import or delete
+    proposal."""
+    if user_has_permission(user, Permission.approvals_manage):
+        return
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    if flow is not ProposalFlow.download_review:
+        raise HTTPException(status_code=403, detail="Only download requests can be removed with this permission")
+
+
+@router.post("/approvals/cancel", response_model=QueueBulkResult, tags=["approvals"], summary="Cancel an arbitrary set of items")
+def cancel_selected_items(
+    payload: QueueItemsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> QueueBulkResult:
+    """Stop work on any set of ids, across any batches -- the clients' "Cancel selected".
+
+    Deliberately idempotent: an id that is already settled, or that no longer exists, is skipped
+    rather than refused, because a bulk selection is always slightly stale by the time it arrives.
+    """
+    canceled = 0
+    batch_ids: set[str] = set()
+    for batch_id, ids in _group_item_ids_by_batch(session, payload.item_ids).items():
+        batch = session.get(ProposalBatch, batch_id)
+        if not batch:
+            continue
+        _may_act_on_request_batch(batch, user, require_approver=False)
+        canceled += len(cancel_items(session, batch_id, sorted(ids), actor_id=user.id))
+        batch_ids.add(batch_id)
+    return QueueBulkResult(canceled=canceled, batches=_serialize_surviving_batches(session, batch_ids))
+
+
+@router.post("/approvals/remove", response_model=QueueBulkResult, tags=["approvals"], summary="Remove an arbitrary set of items")
+def remove_selected_items(
+    payload: QueueItemsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
+) -> QueueBulkResult:
+    """Remove any set of ids, across any batches -- the clients' "Remove selected".
+
+    Cancels before removing, exactly like the per-batch route, and takes any emptied container and
+    any emptied batch with it.
+    """
+    grouped = _group_item_ids_by_batch(session, payload.item_ids)
+    for batch_id in grouped:
+        batch = session.get(ProposalBatch, batch_id)
+        if batch:
+            _assert_may_remove(batch, user)
+    canceled, removed, batch_ids = remove_items(
+        session, [item_id for ids in grouped.values() for item_id in sorted(ids)], actor_id=user.id
+    )
+    session.commit()
+    return QueueBulkResult(
+        canceled=canceled, removed=removed, batches=_serialize_surviving_batches(session, batch_ids)
+    )
+
+
+def _group_item_ids_by_batch(session: Session, item_ids: list[str]) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for item_id in dict.fromkeys(item_ids):
+        item = session.get(ProposalItem, item_id)
+        if item:
+            grouped.setdefault(item.batch_id, set()).add(item.id)
+    return grouped
+
+
+def _serialize_surviving_batches(session: Session, batch_ids: set[str]) -> list[ProposalBatchOut]:
+    """The touched batches that still exist. One that the action emptied is simply absent."""
+    if not batch_ids:
+        return []
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.id.in_(batch_ids))
+        )
+    )
+    names = resolve_requester_names(session, batches)
+    return [serialize_batch(batch, names) for batch in batches]
 
 
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"], summary="List background tasks")
@@ -6949,6 +7058,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         remote_playback_enabled=bool(getattr(user, "remote_playback_enabled", True)),
+        playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 5) or 0),
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,
         jellyfin_user_id=user.jellyfin_user_id or None,
@@ -7113,27 +7223,6 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
     return sessions
 
 
-# The typed `stage` is authoritative, but `status` keeps its legacy vocabulary for one release so
-# clients whose label maps predate this change do not fall through to rendering a raw wire string.
-# Drop this mapping once both clients read `status_code`.
-_STAGE_TO_LEGACY_WISHLIST_STATUS: dict[ItemStage, str] = {
-    ItemStage.waiting: "wanted",
-    ItemStage.searching: "review",
-    ItemStage.awaiting_approval: "review",
-    ItemStage.approved: "approved",
-    ItemStage.queued: "downloading",
-    ItemStage.downloading: "downloading",
-    ItemStage.retrying: "downloading",
-    ItemStage.staging: "downloading",
-    ItemStage.verifying: "downloading",
-    ItemStage.staged: "approved",
-    ItemStage.importing: "approved",
-    ItemStage.completed: "completed",
-    ItemStage.failed: "review",
-    ItemStage.canceled: "rejected",
-    ItemStage.rejected: "rejected",
-}
-
 _WISHLIST_STAGE_LABELS: dict[ItemStage, str] = {
     ItemStage.waiting: "Waiting",
     ItemStage.searching: "Finding candidates",
@@ -7208,7 +7297,6 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
         artist=item.artist,
         album=item.album,
         track=item.track,
-        status=_STAGE_TO_LEGACY_WISHLIST_STATUS.get(stage, item.status),
         stage=stage,
         status_code=stage.value,
         status_label=label,
@@ -7323,7 +7411,7 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
             select(ProposalBatch)
             .options(selectinload(ProposalBatch.items))
             .where(ProposalBatch.kind == ProposalKind.download)
-            .where(ProposalBatch.tree_path.in_(["/task-queue", "/downloads"]))
+            .where(ProposalBatch.flow == ProposalFlow.download_review)
             .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
         )
     )
@@ -7441,12 +7529,17 @@ def serialize_proposal_item(
     item: ProposalItem,
     flow: ProposalFlow,
     requester_names: dict[str, str] | None = None,
+    approvable_ids: set[str] | None = None,
 ) -> ProposalItemOut:
     """One item, with its stage/bucket/progress/candidate resolved server-side.
 
     Every derived value is computed once, here, from a single payload parse -- the clients used to
     each re-derive them by pattern-matching the payload's free text, which is how four different
-    status vocabularies grew.
+    status vocabularies grew, and `payload_json` is no longer sent at all.
+
+    `approvable_ids` comes from `queue_state.approvable_item_ids` over the WHOLE batch, because a
+    container's answer depends on its descendants; passing None falls back to this row alone, which
+    is right only for a leaf.
     """
     payload = queue_state.payload_of(item)
     stage = queue_state.resolve_stage(item, payload)
@@ -7458,6 +7551,7 @@ def serialize_proposal_item(
     candidate = queue_state.candidate_out(payload)
     failure = queue_state.failure_out(payload, stage)
     request_ref = queue_state.request_out(item, payload, requester_name)
+    actionable = queue_state.is_actionable(item, payload)
     return ProposalItemOut(
         id=item.id,
         batch_id=item.batch_id,
@@ -7473,14 +7567,18 @@ def serialize_proposal_item(
         status_label=queue_state.status_label(item, stage, payload),
         bucket=queue_state.bucket_for(flow, stage),
         action=payload.get("action") or None,
+        actionable=actionable,
         progress=ProgressOut(**queue_state.item_progress(item, stage, payload)),
         candidate=CandidateOut(**candidate) if candidate else None,
         failure=FailureOut(**failure) if failure else None,
         request=RequestRefOut(**request_ref) if request_ref else None,
-        can_approve=queue_state.can_approve(stage),
+        can_approve=(
+            item.id in approvable_ids
+            if approvable_ids is not None
+            else (actionable and queue_state.can_approve(stage, flow))
+        ),
         can_retry=queue_state.can_retry(stage, flow),
         can_cancel=queue_state.can_cancel(stage),
-        payload_json=item.payload_json,
     )
 
 
@@ -7501,6 +7599,9 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         seen.add(key)
         requesters.append(RequestRefOut(**ref))
     title = queue_state.library_review_title(items) if flow is ProposalFlow.library_review else batch.title
+    # Computed once over the whole batch: a container is approvable only because of what is under
+    # it, so this cannot be decided row by row.
+    approvable = queue_state.approvable_item_ids(items, flow)
     return ProposalBatchOut(
         id=batch.id,
         title=title,
@@ -7512,10 +7613,12 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         progress=ProgressOut(**queue_state.batch_progress(items, batch.status)),
         requesters=requesters,
         counts=queue_state.batch_counts(items),
-        tree_path=batch.tree_path,
         created_at=batch.created_at,
         updated_at=batch.updated_at,
-        items=[serialize_proposal_item(item, flow, requester_names) for item in items],
+        items=[
+            serialize_proposal_item(item, flow, requester_names, approvable)
+            for item in items
+        ],
     )
 
 

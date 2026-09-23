@@ -19,8 +19,9 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=4, max_length=128)
     device_label: str | None = None
     # "ios" | "mac" | "web". Recorded on the session so a device that has never played still shows
-    # with the right identity in a device picker.
-    client: str | None = None
+    # with the right identity in a device picker. Required: every client sends it, and a session
+    # with no client shape is one the device picker cannot draw.
+    client: Literal["ios", "mac", "web"]
 
 
 class LoginResponse(BaseModel):
@@ -43,6 +44,8 @@ class UserOut(BaseModel):
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
     remote_playback_enabled: bool = True
+    #: Minutes a playback claim survives without playing; 0 = never expires (§31).
+    playback_claim_timeout_minutes: int = 5
     search_min_confidence: float = 0.4
     library_page_size: int = 100
     jellyfin_user_id: str | None = None
@@ -70,6 +73,9 @@ class UserUpdate(BaseModel):
     username: str | None = None
     is_admin: bool | None = None
     permissions: list[str] | None = None
+    #: Minutes a playback claim survives without playing; 0 = never. None means leave alone, the
+    #: rule every field on this admin-side patch follows.
+    playback_claim_timeout_minutes: int | None = Field(default=None, ge=0, le=1440)
 
 
 class UserPinUpdate(BaseModel):
@@ -137,11 +143,14 @@ class UserAppearanceUpdate(BaseModel):
     accent_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     background_tint: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     crossfade_duration: float = Field(default=0.5, ge=0.0, le=15.0)
-    #: ⚠ Optional, and None means LEAVE ALONE — not "restore the default". The web app sends this
-    #: body without the field (it predates the setting), so a non-optional default of True would
-    #: silently switch cross-device playback back on for anyone who turned it off on another client
-    #: and then changed their theme in a browser. Same rule `UserUpdate` follows for its fields.
-    remote_playback_enabled: bool | None = None
+    #: Required. Every client now sends the whole appearance record, so there is no "leave alone"
+    #: case left to model — and an optional field here was a trap: a client that omitted it wrote
+    #: nothing, while a future default would have switched cross-device playback back on for
+    #: someone who turned it off elsewhere.
+    remote_playback_enabled: bool
+    #: How long this account's playback claim survives without playing, in MINUTES. 0 = never
+    #: expires. Replaces the fixed 5-minute CLAIM_IDLE_TIMEOUT per user (§31).
+    playback_claim_timeout_minutes: int = Field(default=5, ge=0, le=1440)
 
 
 class JellyfinUserLinkUpdate(BaseModel):
@@ -239,10 +248,9 @@ class WishlistOut(WishlistCreate):
     id: str
     user_id: str
     owner_name: str | None = None
-    status: str
-    # Typed counterparts to the free-string `status` above, plus the first-class link to the work
-    # serving this request. `status` keeps its legacy vocabulary for one release so existing
-    # clients' label maps do not fall through to raw strings.
+    # The typed state, and the first-class link to the work serving this request. The free-string
+    # `status` this replaces (a second vocabulary: "wanted"/"review"/"approved") is gone from the
+    # wire; the stored column keeps it, and `wishlist_stage()` is the one place it is read.
     stage: ItemStage = ItemStage.waiting
     status_code: str = ItemStage.waiting.value
     status_label: str = ""
@@ -261,6 +269,9 @@ class CandidateOut(BaseModel):
     which is exactly what a human needs to sanity-check a match the ranker got wrong.
     """
 
+    #: Stable dedupe key: "<filename>::<username>", or "youtube::<artist>::<album>::<track>" for a
+    #: yt-dlp fallback. Both clients hand-rolled this off the raw payload; computed once here now.
+    identity: str | None = None
     username: str | None = None
     filename: str | None = None
     folder: str | None = None
@@ -315,6 +326,9 @@ class ProposalItemOut(BaseModel):
     status_label: str = ""
     bucket: QueueBucket = QueueBucket.changes
     action: str | None = None
+    # Whether this row is a real change the batch would apply, as opposed to an artist/album/track
+    # grouping container. Both clients used to re-derive this by parsing `payload_json`.
+    actionable: bool = False
     progress: ProgressOut = Field(default_factory=ProgressOut)
     candidate: CandidateOut | None = None
     failure: FailureOut | None = None
@@ -322,10 +336,6 @@ class ProposalItemOut(BaseModel):
     can_approve: bool = False
     can_retry: bool = False
     can_cancel: bool = False
-    # DEPRECATED, still sent: `ProposalItemDTO.payloadJson` is non-optional in shipped iOS builds,
-    # so removing this breaks decoding of the whole approvals response for every installed app.
-    # Drop only once both clients have shipped against the typed fields above.
-    payload_json: str = "{}"
 
 
 class ProposalBatchOut(BaseModel):
@@ -342,8 +352,6 @@ class ProposalBatchOut(BaseModel):
     # without parsing anything -- and so a client can refuse to merge rows spanning two people.
     requesters: list[RequestRefOut] = Field(default_factory=list)
     counts: dict[str, int] = Field(default_factory=dict)
-    # DEPRECATED alongside payload_json above: `ProposalBatchDTO.treePath` is non-optional on iOS.
-    tree_path: str
     created_at: datetime
     updated_at: datetime
     items: list[ProposalItemOut]
@@ -372,6 +380,27 @@ class ProposalApproveRequest(BaseModel):
 
 class ProposalRejectRequest(BaseModel):
     item_ids: list[str] | None = None
+
+
+class QueueItemsRequest(BaseModel):
+    """An arbitrary set of item ids, from any batches, for the bulk Cancel/Remove actions."""
+
+    item_ids: list[str] = Field(min_length=1, max_length=2000)
+
+
+class QueueBulkResult(BaseModel):
+    """What a bulk action actually did.
+
+    Counts rather than a bare 200 because these are deliberately idempotent: ids that were already
+    settled, or that no longer exist, are skipped rather than refused, and the client needs to be
+    able to say "nothing happened" without guessing.
+    """
+
+    canceled: int = 0
+    removed: int = 0
+    #: The affected batches, re-serialized, so a client can refresh without a second round trip.
+    #: A batch emptied by the action is absent -- it has been deleted.
+    batches: list["ProposalBatchOut"] = Field(default_factory=list)
 
 
 class TaskCreate(BaseModel):

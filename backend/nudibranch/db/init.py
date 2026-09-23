@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -125,7 +125,6 @@ def _init_schema(session: Session) -> None:
         display_name="Admin",
         username="admin",
         pin_hash=hash_password(settings.first_admin_pin),
-        api_key_hash=hash_secret(settings.full_access_api_key),
         is_admin=True,
     )
     session.add(admin)
@@ -134,7 +133,36 @@ def _init_schema(session: Session) -> None:
     for permission in Permission:
         session.add(UserPermission(user_id=admin.id, permission=permission))
 
+    # The env full-access key is an ordinary static API key now, so it can be listed and revoked
+    # like any other instead of living in a per-user column nothing could manage.
+    _ensure_env_full_access_key(session, admin)
     session.commit()
+
+
+def _ensure_env_full_access_key(session: Session, admin: User) -> None:
+    """Make `NUDIBRANCH_FULL_ACCESS_API_KEY` a `StaticApiKey` row owned by the admin.
+
+    Idempotent, and hashed exactly the way `deps.get_current_user` hashes a bearer token
+    (`hash_token` == this module's old `hash_secret`: both are sha256 hex), so a key already in a
+    deploy's `.env` keeps working now that the `users.api_key_hash` lookup is gone.
+    """
+    from nudibranch.db.models import StaticApiKey
+
+    raw = (get_settings().full_access_api_key or "").strip()
+    if not raw:
+        return
+    key_hash = hash_secret(raw)
+    if session.scalar(select(StaticApiKey).where(StaticApiKey.key_hash == key_hash)):
+        return
+    session.add(
+        StaticApiKey(
+            user_id=admin.id,
+            name="Full-access key (from the environment)",
+            key_hash=key_hash,
+            prefix=raw[:8],
+        )
+    )
+    session.flush()
 
 
 def ensure_lightweight_migrations(session: Session) -> None:
@@ -287,7 +315,23 @@ def ensure_lightweight_migrations(session: Session) -> None:
         # Per-pairing APNS proxy grant token (App Attest model); NULL = direct/legacy device.
         session.execute(text("ALTER TABLE mobile_devices ADD COLUMN proxy_grant TEXT"))
         session.commit()
+    if "playback_claim_timeout_minutes" not in user_cols:
+        # Minutes a playback claim survives without playing; 0 = never. 5 is what the hardcoded
+        # CLAIM_IDLE_TIMEOUT was, so an existing account behaves exactly as it did before.
+        session.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN playback_claim_timeout_minutes "
+                "INTEGER NOT NULL DEFAULT 5"
+            )
+        )
+        session.commit()
     _migrate_queue_state_columns(session)
+    # ⚠️ ORDER: everything that still reads `tree_path` must run BEFORE it is dropped.
+    # `_migrate_queue_state_columns` backfills `flow` from it, and `_retire_intent_batches`
+    # identifies the old "/wishlist" batches by it.
+    _retire_intent_batches(session)
+    _drop_columns(session, "proposal_batches", ["tree_path"])
+    _migrate_static_api_keys(session)
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
@@ -297,6 +341,8 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _drop_empty_rejected_batches(session)
     _drop_canceled_leftovers(session)
     _fail_completed_batches_with_failed_items(session)
+    _delete_empty_proposal_batches(session)
+    _heal_searching_parent_items(session)
     move_task_result_logs_to_app_log(session)
 
 
@@ -307,6 +353,185 @@ def _drop_columns(session: Session, table: str, columns: list[str]) -> None:
         if column in existing:
             session.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
     session.commit()
+
+
+def _retire_intent_batches(session: Session) -> None:
+    """Delete the "Request: X" intent batches, and heal the wishlist rows they stranded.
+
+    Until 2026-09-22 a wishlist search committed a *visible* pending batch of `wishlist_request`
+    rows into Review before the search ran, and retired it only on the happy path. A worker killed
+    mid-search (sandalphon recreates its containers on every nightly push) therefore left a batch of
+    rows reading "finding candidates" in Review forever, with nothing able to finish or clear them —
+    and removing them one at a time emptied the batch without ever retiring it. Searching no longer
+    creates a batch at all, so these are pure debris.
+
+    Idempotent and self-limiting: after `tree_path` is dropped there is nothing left to match, and
+    the rows this deletes never existed on a database created after the change.
+    """
+    batch_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_batches)"))}
+    if "tree_path" not in batch_cols:
+        return
+    stale_ids = [
+        row[0]
+        for row in session.execute(
+            text("SELECT id FROM proposal_batches WHERE tree_path = '/wishlist'")
+        )
+    ]
+    if not stale_ids:
+        return
+    # The wishlist rows these batches were serving: re-point them at reality. One that already has
+    # real candidates elsewhere is awaiting approval; one with nothing is searching again, and the
+    # worker's recovery sweep re-queues it on its next tick.
+    wishlist_ids = [
+        row[0]
+        for row in session.execute(
+            text(
+                "SELECT DISTINCT wishlist_item_id FROM proposal_items "
+                "WHERE wishlist_item_id IS NOT NULL AND batch_id IN :ids"
+            ).bindparams(bindparam("ids", value=stale_ids, expanding=True))
+        )
+    ]
+    session.execute(
+        text("DELETE FROM proposal_items WHERE batch_id IN :ids").bindparams(
+            bindparam("ids", value=stale_ids, expanding=True)
+        )
+    )
+    session.execute(
+        text("DELETE FROM proposal_batches WHERE id IN :ids").bindparams(
+            bindparam("ids", value=stale_ids, expanding=True)
+        )
+    )
+    for wishlist_id in wishlist_ids:
+        has_live_work = session.execute(
+            text(
+                "SELECT 1 FROM proposal_items WHERE wishlist_item_id = :id "
+                "AND status IN ('pending', 'approved', 'executing') LIMIT 1"
+            ),
+            {"id": wishlist_id},
+        ).first()
+        session.execute(
+            text(
+                "UPDATE wishlist_items SET status = :status, stage = :stage "
+                "WHERE id = :id AND status NOT IN "
+                "('completed', 'rejected', 'removed', 'canceled', 'failed')"
+            ),
+            {
+                "id": wishlist_id,
+                "status": "review" if has_live_work else "searching",
+                "stage": "awaiting_approval" if has_live_work else "searching",
+            },
+        )
+    # A wishlist row that is settled (the user declined or removed it) must not keep work of its
+    # own: it was the "removing a request left its rows behind" bug, and this clears what it left.
+    session.execute(
+        text(
+            "DELETE FROM proposal_items WHERE wishlist_item_id IN "
+            "(SELECT id FROM wishlist_items WHERE status IN ('rejected', 'removed')) "
+            "AND status IN ('pending', 'approved')"
+        )
+    )
+    session.commit()
+    write_app_log(
+        f"Retired {len(stale_ids)} stale wishlist intent batch(es) and healed "
+        f"{len(wishlist_ids)} request row(s)",
+        "warning",
+    )
+
+
+def _delete_empty_proposal_batches(session: Session) -> None:
+    """Delete batches with no items left.
+
+    A batch is only ever a container for its rows, and an empty one is unactionable debris — but
+    nothing deleted them unless a *rejection* emptied them, so removing rows one by one left a husk
+    in the Task Queue that no UI could clear. Download batches younger than 10 minutes are spared:
+    a candidate search commits its batch before attaching the first candidate.
+
+    Childless artist/album/track containers go first, for the same reason and in the same shape as
+    `proposals.cleanup_empty_container_items`: a batch holding nothing but grouping rows renders as
+    an empty tree rather than as nothing at all. Three passes covers artist > album > track.
+    """
+    for _ in range(3):
+        session.execute(
+            text(
+                "DELETE FROM proposal_items WHERE instr(coalesce(payload_json, ''), '\"action\"') = 0 "
+                "AND NOT EXISTS (SELECT 1 FROM proposal_items child WHERE child.parent_id = proposal_items.id) "
+                "AND (old_value IS NULL OR new_value IS NULL)"
+            )
+        )
+    session.commit()
+    session.execute(
+        text(
+            "DELETE FROM proposal_batches WHERE NOT EXISTS "
+            "(SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id) "
+            "AND (kind != 'download' OR created_at < datetime('now', '-10 minutes'))"
+        )
+    )
+    session.commit()
+
+
+def _heal_searching_parent_items(session: Session) -> None:
+    """Un-stick track rows cached as `searching` that already have candidates under them.
+
+    The stage cache was written when the row was created and not re-stamped when its search ended,
+    so a track with five ready candidates still reported "finding candidates" -- `can_approve=false`
+    on a row a client then (rightly) refuses to approve around. The write-time fix is in the worker;
+    this repairs the rows that already exist. Idempotent.
+    """
+    session.execute(text(
+        "UPDATE proposal_items SET stage = 'awaiting_approval' "
+        "WHERE stage = 'searching' AND status = 'pending' AND EXISTS ("
+        "SELECT 1 FROM proposal_items child WHERE child.parent_id = proposal_items.id "
+        "AND child.status IN ('pending', 'approved', 'executing'))"
+    ))
+    session.commit()
+
+
+def _migrate_static_api_keys(session: Session) -> None:
+    """Move `users.api_key_hash` into `static_api_keys`, then drop the column.
+
+    Same stored form on both sides (sha256 of the token), so every key that worked before still
+    works — as a row that can be listed and revoked, which the column never could be.
+    """
+    user_cols = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
+    if "api_key_hash" in user_cols:
+        rows = list(
+            session.execute(
+                text(
+                    "SELECT id, api_key_hash FROM users "
+                    "WHERE api_key_hash IS NOT NULL AND api_key_hash != ''"
+                )
+            )
+        )
+        for user_id, key_hash in rows:
+            existing = session.execute(
+                text("SELECT 1 FROM static_api_keys WHERE key_hash = :hash"), {"hash": key_hash}
+            ).first()
+            if existing:
+                continue
+            session.execute(
+                text(
+                    "INSERT INTO static_api_keys (id, user_id, name, key_hash, prefix, created_at, revoked) "
+                    "VALUES (:id, :user_id, :name, :hash, :prefix, :created_at, 0)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "name": "Full-access key (migrated)",
+                    "hash": key_hash,
+                    "prefix": str(key_hash)[:8],
+                    "created_at": datetime.now(timezone.utc).isoformat(sep=" "),
+                },
+            )
+        session.commit()
+        _drop_columns(session, "users", ["api_key_hash"])
+        if rows:
+            write_app_log(f"Migrated {len(rows)} legacy API key(s) to static_api_keys", "warning")
+    # A deploy whose `.env` key was only ever in that column (or in no column at all) still needs a
+    # row to authenticate against.
+    admin = session.scalar(select(User).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
+    if admin is not None:
+        _ensure_env_full_access_key(session, admin)
+        session.commit()
 
 
 def _drop_empty_rejected_batches(session: Session) -> None:

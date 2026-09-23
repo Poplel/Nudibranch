@@ -5,7 +5,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nudibranch.db.init import hash_secret
 from nudibranch.db.models import AuthSession, Permission, StaticApiKey, User
 from nudibranch.db.session import get_session
 from nudibranch.services.auth import hash_token
@@ -87,12 +86,6 @@ def get_current_user(
         request.state.auth_session = None
         return static_key.user
 
-    # Legacy fallback: env full-access key + web clients still holding a pre-refactor api_key.
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
-    if user:
-        request.state.auth_session = None
-        return user
-
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
@@ -116,10 +109,10 @@ def resolve_media_user(session: Session, token: str) -> User | None:
 
     Audio/cover/lyrics are loaded by ``<audio>``/``<img>`` elements that cannot
     send an Authorization header, so they pass the token in the query string.
-    This mirrors ``get_current_user``'s precedence — session token, static API
-    key, then the legacy ``api_key_hash`` — so a logged-in session token works
-    for media the same way it does for header-authed routes. Returns ``None`` if
-    the token matches nothing (callers raise their own 401/permission error).
+    This mirrors ``get_current_user``'s precedence — session token, then static
+    API key — so a logged-in session token works for media the same way it does
+    for header-authed routes. Returns ``None`` if the token matches nothing
+    (callers raise their own 401/permission error).
     """
     if not token:
         return None
@@ -145,7 +138,7 @@ def resolve_media_user(session: Session, token: str) -> User | None:
             session.commit()
         return static_key.user
 
-    return session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
+    return None
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:

@@ -70,6 +70,10 @@ PODCAST_SCAN_TICK_SECONDS = 86400
 # deletions to offline clients; past LIBRARY_DELETION_RETENTION a client is told to full-resync
 # instead, so keeping them longer just grows the table.
 DELETION_PRUNE_TICK_SECONDS = 86400
+# How often the worker checks for requests stuck on "finding candidates" with no search behind
+# them. Cheap (one indexed read of wishlist rows in that stage, usually zero) and deliberately
+# frequent: this is the sweep that makes "a request stuck in Review" unable to persist.
+WISHLIST_RECOVERY_TICK_SECONDS = 120
 AUTOMATION_EVENT_SESSION_KEY = "nudibranch:automation-events"
 # Debounce for the post-import Soulseek share rescan (see maybe_queue_slskd_rescan): a batch
 # approval can import dozens of tracks through import_file_to_library in one task, and each one
@@ -283,8 +287,14 @@ def run_propose_import(session: Session, payload: dict, task: Task | None = None
     elif files and all(str(file_info.get("path") or "").startswith(str(get_settings().downloads_path)) for file_info in files):
         batch_title = "Downloaded files review"
     batch_kind = ProposalKind.download if download_requests and not files else ProposalKind.import_files
-    tree_path = "/task-queue" if batch_kind == ProposalKind.download else "/app/import"
-    batch = ProposalBatch(title=batch_title, kind=batch_kind, tree_path=tree_path)
+    # A pure download proposal is gate (a) and belongs in Review; anything with files to import is
+    # an ordinary library change. (This used to be decided by a `tree_path` string that nothing
+    # typed, which is how a Discover download review could land in the wrong bucket.)
+    batch = ProposalBatch(
+        title=batch_title,
+        kind=batch_kind,
+        flow=ProposalFlow.download_review if batch_kind == ProposalKind.download else ProposalFlow.library_change,
+    )
     session.add(batch)
     session.flush()
 
@@ -472,7 +482,7 @@ def add_download_candidate_review_items(
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates)
                 candidates_added += len(candidates)
-                set_item_payload_status(track_item, f"{len(candidates)} candidates ready")
+                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(candidates)} candidates ready")
                 append_task_log(session, task, f"{track_title}: {len(candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s)")
             elif any(r.get("workflow") == "lossless_replacement" for r in requests):
                 # Lossless replacement exists to UPGRADE to lossless — never pull a lossy per-track
@@ -480,10 +490,11 @@ def add_download_candidate_review_items(
                 # (unless yt-dlp fallback is disabled, in which case this just needs attention).
                 set_item_payload_status(track_item, "no album-folder track match" if pools else "no album folder candidates found")
                 if ytdlp_fallback_allowed():
+                    set_candidate_parent_stage(track_item, ItemStage.awaiting_approval)
                     add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
                     append_task_log(session, task, f"{track_title}: no lossless match in the album folder(s) — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
                 else:
-                    set_item_payload_status(track_item, "no candidates found")
+                    set_candidate_parent_stage(track_item, ItemStage.failed, "no candidates found")
                     # A dead end: no candidate to approve and no fallback queued. `payload_json`'s
                     # "status" string is display-only — the client's Task Queue keeps a row by its
                     # real `status` column (`failed`/`executing`, or an `action` in the payload), so
@@ -572,21 +583,24 @@ def add_track_search_candidate_items(
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
                 added += len(candidates[:5])
-                set_item_payload_status(track_item, f"{len(candidates[:5])} candidates ready")
+                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(candidates[:5])} candidates ready")
                 append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
             else:
                 rate_limited = bool(result.get("diagnostics", {}).get("rate_limited"))
                 status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidates found"
-                set_item_payload_status(track_item, status)
                 if rate_limited:
+                    track_item.status = ProposalStatus.failed
+                    set_candidate_parent_stage(track_item, ItemStage.failed, status)
                     append_task_log(session, task, f"{track_title}: {status}", "warning")
                 elif ytdlp_fallback_allowed():
+                    set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, status)
                     add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=True)
                     append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued and pre-selected (approve the batch to download it; deselect to skip)", "warning")
                 else:
                     # See the identical comment in create_album_download_candidate_batch's
                     # sibling dead-end: without this the row is invisible in the app.
                     track_item.status = ProposalStatus.failed
+                    set_candidate_parent_stage(track_item, ItemStage.failed, status)
                     append_task_log(session, task, f"{track_title}: Soulseek found no candidates and YouTube fallback is disabled — needs attention", "warning")
             session.commit()
     return added
@@ -599,6 +613,24 @@ def is_singles_pseudo_album(album: str) -> bool:
     return fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
 
 
+def has_live_descendants(item: ProposalItem) -> bool:
+    """Is there still unfinished, actionable work anywhere under this container?"""
+    for child in item.children:
+        if child.children:
+            if has_live_descendants(child):
+                return True
+            continue
+        payload = json.loads(child.payload_json or "{}")
+        actionable = bool(payload.get("action")) or (
+            child.kind == ProposalKind.import_files and bool(child.old_value and child.new_value)
+        )
+        if not actionable:
+            continue
+        if child.selected and child.status in {ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing}:
+            return True
+    return False
+
+
 def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
     batch_id = payload["batch_id"]
     batch = session.get(ProposalBatch, batch_id)
@@ -606,13 +638,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.executing
     append_task_log(session, task, f"Executing proposal batch {batch.title} ({batch.id})")
-    approved_roots = {item.id for item in batch.items if item.selected and item.status == ProposalStatus.approved}
-    if approved_roots:
-        approved_ids = item_ids_with_descendants(batch.items, approved_roots)
-        for item in batch.items:
-            if item.id in approved_ids and item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
-                item.status = ProposalStatus.approved
-        append_task_log(session, task, f"Expanded {len(approved_roots)} approved selections to {len(approved_ids)} selected descendants")
+    # ⚠️ Nothing is re-expanded here any more. `approve_batch` decided exactly which rows were
+    # approved; expanding an approved container to its still-pending descendants at execution time
+    # undid a PARTIAL approval — approving three tracks of an album approved all ten, because the
+    # album container above them was approved too.
     selected_items = [
         item
         for item in batch.items
@@ -654,7 +683,8 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     ]
     if direct_download_items:
         batch.kind = ProposalKind.download
-        batch.tree_path = "/downloads"
+        # Gate (a): this batch now owns real transfers, which is what the manifest scan looks for.
+        batch.flow = ProposalFlow.download_review
         append_task_log(session, task, f"{batch.title}: selected candidates moved to Downloads for transfer and verification")
     lyrics_items = [
         item
@@ -784,7 +814,11 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     if wishlist_download_items:
         try:
             note_progress("Preparing download candidates", wishlist_download_items[0])
-            process_wishlist_request_items(session, wishlist_download_items, task)
+            process_wishlist_request_items(
+                session,
+                [json.loads(item.payload_json or "{}") for item in wishlist_download_items],
+                task,
+            )
             for wishlist_item in wishlist_download_items:
                 wishlist_item.status = ProposalStatus.completed
             download_changes += len(wishlist_download_items)
@@ -871,7 +905,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         # not execute a step of their own. Retire those containers even when one of the real
         # actions failed, otherwise a mixed-result batch can never become terminal.
         if item.status == ProposalStatus.approved and item.id not in progress_item_ids:
-            item.status = ProposalStatus.completed
+            # ...but only when its content really is finished. Blanket-completing a container
+            # closed artist/album rows that still had unapproved tracks under them, and `completed`
+            # is terminal, so the rest of that batch could never be approved afterwards.
+            item.status = ProposalStatus.pending if has_live_descendants(item) else ProposalStatus.completed
         elif not item.selected and item.status == ProposalStatus.pending and should_count_skipped_item(item):
             skipped += 1
 
@@ -912,6 +949,9 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
 
         for item in batch.items:
             if item.status in {ProposalStatus.pending, ProposalStatus.executing} and not json.loads(item.payload_json or "{}").get("action"):
+                if has_live_descendants(item):
+                    # Rows under it were never approved (a partial approve) — it is not spent yet.
+                    continue
                 failed_under = any(leaf.status is ProposalStatus.failed for leaf in selected_leaves(item))
                 item.status = ProposalStatus.failed if failed_under else ProposalStatus.completed
 
@@ -1861,7 +1901,7 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
     for batch in session.scalars(
         select(ProposalBatch)
         .where(ProposalBatch.status == ProposalStatus.executing)
-        .where(ProposalBatch.tree_path == "/downloads")
+        .where(ProposalBatch.flow == ProposalFlow.download_review)
     ):
         if batch.id not in entries_by_batch and selected_slskd_download_item_ids(batch):
             entries_by_batch[batch.id] = []
@@ -3552,7 +3592,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
         select(ProposalBatch)
         .options(selectinload(ProposalBatch.items))
         .where(ProposalBatch.kind == ProposalKind.import_files)
-        .where(ProposalBatch.tree_path == "/task-queue")
+        .where(ProposalBatch.flow == ProposalFlow.library_review)
         .where(ProposalBatch.status == ProposalStatus.pending)
         .order_by(ProposalBatch.created_at.desc())
         .limit(1)
@@ -3581,7 +3621,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
     def ensure_review_tree(artist: str, album: str) -> str:
         nonlocal review_batch
         if review_batch is None:
-            review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, flow=ProposalFlow.library_review, tree_path="/task-queue")
+            review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, flow=ProposalFlow.library_review)
             session.add(review_batch)
             session.flush()
         if artist not in artist_items:
@@ -4480,18 +4520,26 @@ def existing_library_and_proposal_paths(session: Session) -> set[str]:
     return paths
 
 
-def process_wishlist_request_items(session: Session, items: list[ProposalItem], task: Task | None = None) -> None:
+def process_wishlist_request_items(session: Session, requests: list[dict], task: Task | None = None) -> None:
+    """Turn download REQUEST PAYLOADS into a real candidate batch.
+
+    ⚠️ Takes payloads, not `ProposalItem`s, on purpose (2026-09-22). It used to take rows, so every
+    caller had to persist an "intent" batch of `wishlist_request` items first — a batch that is
+    visible in Review the whole time the search runs, and that survives forever if the worker is
+    killed mid-search or the search raises. A request that is still searching now has no batch at
+    all: it exists only as its `WishlistItem`, and the first thing committed to the Task Queue is
+    the candidate batch itself.
+    """
     grouped: dict[tuple[str, str, str], list[dict]] = {}
     wishlist_item_ids = []
-    for item in items:
-        payload = json.loads(item.payload_json or "{}")
+    for payload in requests:
         artist = payload.get("artist") or "Unknown Artist"
         album = payload.get("album") or "Singles"
         workflow = payload.get("workflow") or "wishlist"
         if payload.get("wishlist_item_id"):
             wishlist_item_ids.append(payload["wishlist_item_id"])
         grouped.setdefault((workflow, artist, album), []).append(payload)
-    append_task_log(session, task, f"Preparing download candidates for {len(items)} tracks across {len(grouped)} album(s)")
+    append_task_log(session, task, f"Preparing download candidates for {len(requests)} tracks across {len(grouped)} album(s)")
     # All albums share one batch so candidates can be reviewed and approved in a single pass.
     workflows = {wf for wf, _, _ in grouped.keys()}
     workflow = next(iter(workflows), "wishlist")
@@ -4502,11 +4550,17 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem], 
     shared_batch: ProposalBatch | None = None
     shared_artist_items: dict[str, ProposalItem] = {}
     shared_album_items: dict[tuple[str, str], ProposalItem] = {}
-    for (album_workflow, artist, album), requests in grouped.items():
+    for (album_workflow, artist, album), album_requests in grouped.items():
         shared_batch = create_album_download_candidate_batch(
-            session, artist, album, requests, task, workflow=album_workflow, existing_batch=shared_batch,
+            session, artist, album, album_requests, task, workflow=album_workflow, existing_batch=shared_batch,
             batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
         )
+        # ⚠️ After EVERY album, not only at the end. This write used to happen once, after the last
+        # album had finished searching, so a worker restarted mid-search left the request reading
+        # "Finding candidates" forever while its candidates sat in Review -- exactly what sandalphon
+        # showed for Radiohead / In Rainbows.
+        advance_wishlist_rows_to_review(session, wishlist_item_ids, shared_batch)
+        session.commit()
     if shared_batch is not None:
         subject = batch_subject(shared_batch)
         track_count = sum(1 for item in shared_batch.items if not item.children)
@@ -4527,17 +4581,30 @@ def process_wishlist_request_items(session: Session, items: list[ProposalItem], 
             body=f"{track_count} track(s) for {subject} have candidates — approve to start downloading.",
             bucket="review",
         )
-    if wishlist_item_ids:
-        for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
-            # Candidates exist and a human must now decide: that is `awaiting_approval`, NOT
-            # "approved".  Approved means someone said yes and bytes are moving.  The stage cache
-            # has to move with it -- it is preferred over `status`, so leaving it at "searching"
-            # pins the row on "Finding candidates" forever.
-            wishlist_item.status = "review"
-            wishlist_item.stage = ItemStage.awaiting_approval.value
-            if shared_batch is not None:
-                wishlist_item.batch_id = shared_batch.id
-            wishlist_item.status_changed_at = datetime.now(timezone.utc)
+    advance_wishlist_rows_to_review(session, wishlist_item_ids, shared_batch)
+
+
+def advance_wishlist_rows_to_review(
+    session: Session, wishlist_item_ids: list[str], batch: ProposalBatch | None
+) -> None:
+    """Move these requests off "Finding candidates" now that candidates exist.
+
+    Candidates exist and a human must now decide: that is `awaiting_approval`, NOT "approved" --
+    approved means someone said yes and bytes are moving. The stage cache has to move with it,
+    because it is preferred over `status`, so leaving it at "searching" pins the row on "Finding
+    candidates" forever. Terminal rows are never revived: a request declined or removed while its
+    search was still running stays declined.
+    """
+    if not wishlist_item_ids:
+        return
+    for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
+        if wishlist_item.status in {"completed", "rejected", "removed", "canceled"}:
+            continue
+        wishlist_item.status = "review"
+        wishlist_item.stage = ItemStage.awaiting_approval.value
+        if batch is not None:
+            wishlist_item.batch_id = batch.id
+        wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
 def apply_lyrics_item(session: Session, item: ProposalItem) -> None:
@@ -4567,7 +4634,6 @@ def create_album_download_candidate_batch(
     album: str,
     requests: list[dict],
     task: Task | None = None,
-    tree_path: str = "/task-queue",
     workflow: str = "wishlist",
     existing_batch: ProposalBatch | None = None,
     batch_title: str | None = None,
@@ -4580,7 +4646,7 @@ def create_album_download_candidate_batch(
             "lossless_replacement": "Lossless replacement candidates",
             "missing_tracks": "Missing track candidates",
         }.get(workflow, "Download candidates")
-        batch = ProposalBatch(title=f"{title_prefix}: {artist} / {album}", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path=tree_path)
+        batch = ProposalBatch(title=f"{title_prefix}: {artist} / {album}", kind=ProposalKind.download, flow=ProposalFlow.download_review)
         session.add(batch)
         session.flush()
     else:
@@ -4711,7 +4777,7 @@ def create_album_download_candidate_batch(
             append_task_log(session, task, f"{track_title}: {len(folder_candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s); best {folder_candidates[0].get('filename')} at {confidence}% confidence")
             add_download_candidate_items(session, batch, track_item, request, query, folder_candidates)
             slskd_tracks += 1
-            set_item_payload_status(track_item, f"{len(folder_candidates)} candidates ready")
+            set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(folder_candidates)} candidates ready")
             completed_tracks += 1
             if task is not None:
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
@@ -4769,22 +4835,27 @@ def create_album_download_candidate_batch(
                 if candidates:
                     add_download_candidate_items(session, batch, track_item, request, query, candidates)
                     slskd_tracks += 1
-                    set_item_payload_status(track_item, "candidate ready")
+                    set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, "candidate ready")
                     append_task_log(session, task, f"{track_title}: {len(candidates)} slskd candidate(s) ready")
                 else:
                     retry_tracks += 1
                     rate_limited = bool(search_result.get("diagnostics", {}).get("rate_limited"))
                     status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidate found"
-                    set_item_payload_status(track_item, status)
                     if rate_limited:
+                        # Nothing will come back for this on its own, so it is a failure a human can
+                        # retry -- not a row left "searching" with no search behind it.
+                        track_item.status = ProposalStatus.failed
+                        set_candidate_parent_stage(track_item, ItemStage.failed, status)
                         append_task_log(session, task, f"{track_title}: {status}", "warning")
                     elif ytdlp_fallback_allowed():
+                        set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, status)
                         add_ytdlp_fallback_item(session, batch, track_item, request, query, selected=False)
                         append_task_log(session, task, f"{track_title}: Soulseek found no candidates — a YouTube fallback is queued (select it and click Run in the task queue to download)", "warning")
                     else:
                         # See `add_download_candidate_review_items`'s identical dead-end: without
                         # this the row is invisible in the app.
                         track_item.status = ProposalStatus.failed
+                        set_candidate_parent_stage(track_item, ItemStage.failed, status)
                         append_task_log(session, task, f"{track_title}: Soulseek found no candidates and YouTube fallback is disabled — needs attention", "warning")
                 completed_tracks += 1
                 session.commit()
@@ -4808,6 +4879,20 @@ def request_owner(request: dict) -> tuple[str | None, str | None]:
     requester_id = request.get("user_id")
     wishlist_item_id = request.get("wishlist_item_id")
     return (str(requester_id) if requester_id else None, str(wishlist_item_id) if wishlist_item_id else None)
+
+
+def set_candidate_parent_stage(item: ProposalItem, stage: ItemStage, status: str | None = None) -> None:
+    """Move a track container off `searching` when its search is over.
+
+    ⚠️ The stage cache is preferred over everything else `resolve_stage` can work out, so a track
+    row created `searching` and never re-stamped reports "finding candidates" for the rest of its
+    life -- with five ready candidates hanging underneath it, `can_approve=false`, and a client
+    that (rightly) refuses to approve a selection containing it. That is the "1 searching child in
+    an otherwise approvable batch" that made Approve look dead.
+    """
+    item.stage = stage.value
+    if status is not None:
+        set_item_payload_status(item, status)
 
 
 def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
@@ -4888,7 +4973,7 @@ def add_ytdlp_fallback_item(session: Session, batch: ProposalBatch, track_item: 
 
 def create_download_candidate_batch(session: Session, request: dict) -> None:
     query = download_query(request)
-    batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/downloads")
+    batch = ProposalBatch(title=f"Download candidates: {query}", kind=ProposalKind.download, flow=ProposalFlow.download_review)
     session.add(batch)
     session.flush()
     track_parent = add_download_tree_parents(session, batch, request, query)
@@ -4953,7 +5038,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
 
 
 def create_ytdlp_fallback_batch(session: Session, request: dict, query: str) -> None:
-    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/downloads", status=ProposalStatus.executing)
+    batch = ProposalBatch(title=f"YouTube fallback: {query}", kind=ProposalKind.download, flow=ProposalFlow.download_review, status=ProposalStatus.executing)
     session.add(batch)
     session.flush()
     track_parent = add_download_tree_parents(session, batch, request, query)
@@ -7901,7 +7986,7 @@ def queue_missing_file_downloads(session: Session, missing_files: list[dict]) ->
         existing.add(key)
     if not rows:
         return 0
-    batch = ProposalBatch(title="Download missing library files", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/library")
+    batch = ProposalBatch(title="Download missing library files", kind=ProposalKind.download, flow=ProposalFlow.download_review)
     session.add(batch)
     session.flush()
     for record in rows:
@@ -7965,7 +8050,7 @@ def run_check_duplicates(session: Session, _payload: dict, task: Task | None = N
         )
         return {"songs_with_duplicates": 0, "files_queued": 0}
 
-    batch = ProposalBatch(title="Remove duplicate library files", kind=ProposalKind.delete, tree_path="/task-queue")
+    batch = ProposalBatch(title="Remove duplicate library files", kind=ProposalKind.delete)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -8050,7 +8135,7 @@ def queue_missing_record_imports(session: Session, missing_records: list[dict]) 
     rows = [record for record in missing_records if record.get("path") and record["path"] not in known_paths]
     if not rows:
         return 0
-    batch = ProposalBatch(title="Create records for library files", kind=ProposalKind.import_files, tree_path="/library")
+    batch = ProposalBatch(title="Create records for library files", kind=ProposalKind.import_files)
     session.add(batch)
     session.flush()
     for record in rows:
@@ -8146,7 +8231,7 @@ def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None)
         )
         return {"checked": len(tracks), "existing": existing, "missing": 0, "batch_id": None}
 
-    batch = ProposalBatch(title="Download missing lyrics", kind=ProposalKind.lyrics, tree_path="/library")
+    batch = ProposalBatch(title="Download missing lyrics", kind=ProposalKind.lyrics)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -8216,7 +8301,7 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
             .order_by(Artist.name.asc())
         )
     )
-    batch = ProposalBatch(title="Fill MusicBrainz info", kind=ProposalKind.metadata, tree_path="/library")
+    batch = ProposalBatch(title="Fill MusicBrainz info", kind=ProposalKind.metadata)
     session.add(batch)
     session.flush()
 
@@ -8527,7 +8612,7 @@ def run_check_album_covers(session: Session, _payload: dict) -> dict:
             .order_by(Album.title.asc())
         )
     )
-    batch = ProposalBatch(title="Download missing album covers", kind=ProposalKind.artwork, tree_path="/library")
+    batch = ProposalBatch(title="Download missing album covers", kind=ProposalKind.artwork)
     session.add(batch)
     session.flush()
     found = 0
@@ -8645,7 +8730,7 @@ def run_check_artist_covers(session: Session, _payload: dict) -> dict:
             .order_by(Artist.name.asc())
         )
     )
-    batch = ProposalBatch(title="Download missing artist covers", kind=ProposalKind.artwork, tree_path="/library")
+    batch = ProposalBatch(title="Download missing artist covers", kind=ProposalKind.artwork)
     session.add(batch)
     session.flush()
     found = 0
@@ -8705,7 +8790,6 @@ def run_check_artist_covers(session: Session, _payload: dict) -> dict:
 
 
 def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None = None) -> dict:
-    discard_pending_batches(session, "Missing album tracks", ProposalKind.download)
     albums = list(
         session.scalars(
             select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
@@ -8713,11 +8797,9 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
     )
     created = 0
     checked = 0
-    batch = ProposalBatch(title="Missing album tracks", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/task-queue")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
+    # No batch: the search is a task, and the only thing that reaches the Task Queue is the
+    # candidate batch it produces (see `run_search_candidates`).
+    requests: list[dict] = []
     for album in albums:
         checked += 1
         if task is not None and checked % 5 == 0:
@@ -8747,11 +8829,7 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
                 continue
             if (disc_number, track_number) in existing_positions or (title_key and title_key in existing_titles):
                 continue
-            add_download_request_item(
-                session,
-                batch,
-                artist_items,
-                album_items,
+            requests.append(download_request_payload(
                 album.artist.name,
                 album.title,
                 track.get("title"),
@@ -8762,11 +8840,10 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
                 musicbrainz_recording_id=track.get("musicbrainz_recording_id"),
                 require_lossless=True,
                 workflow="missing_tracks",
-            )
+            ))
             created += 1
             append_task_log(session, task, f"{album.artist.name} / {album.title}: queued missing track review item for {track.get('title')} with lossless candidate matching")
     if created == 0:
-        session.delete(batch)
         create_notification(
             session,
             title="Missing track check complete",
@@ -8775,18 +8852,13 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
             target_url="/tools",
         )
         return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return {"albums_checked": checked, "download_items_created": created, "batch_id": batch.id}
+    enqueue_task(session, "search_candidates", {"requests": requests})
+    return {"albums_checked": checked, "download_items_created": created}
 
 
 def run_check_non_lossless(session: Session, _payload: dict, task: Task | None = None) -> dict:
-    discard_pending_batches(session, "Lossless replacement downloads", ProposalKind.download)
     tracks = list(session.scalars(select(Track).options(selectinload(Track.album).selectinload(Album.artist)).order_by(Track.title.asc())))
-    batch = ProposalBatch(title="Lossless replacement downloads", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/task-queue")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
+    requests: list[dict] = []
     created = 0
     checked = 0
     for track in tracks:
@@ -8806,11 +8878,7 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
         album = track.album
         artist_name = album.artist.name if album and album.artist else "Unknown Artist"
         album_title = album.title if album else "Unknown Album"
-        add_download_request_item(
-            session,
-            batch,
-            artist_items,
-            album_items,
+        requests.append(download_request_payload(
             artist_name,
             album_title,
             track.title,
@@ -8823,11 +8891,10 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
             replace_path=track.path,
             require_lossless=True,
             workflow="lossless_replacement",
-        )
+        ))
         created += 1
         append_task_log(session, task, f"{artist_name} / {album_title}: queued lossless replacement review item for {track.title}")
     if created == 0:
-        session.delete(batch)
         create_notification(
             session,
             title="Lossless check complete",
@@ -8836,8 +8903,8 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
             target_url="/tools",
         )
         return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return {"tracks_checked": checked, "download_items_created": created, "batch_id": batch.id}
+    enqueue_task(session, "search_candidates", {"requests": requests})
+    return {"tracks_checked": checked, "download_items_created": created}
 
 
 def run_requeue_replacement(session: Session, payload: dict, task: Task | None = None) -> dict:
@@ -8860,21 +8927,13 @@ def run_requeue_replacement(session: Session, payload: dict, task: Task | None =
     if not tracks:
         append_task_log(session, task, "Manual replacement: no matching tracks found", "warning")
         return {"download_items_created": 0, "batch_id": None}
-    batch = ProposalBatch(title="Manual replacement downloads", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/task-queue")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
+    requests: list[dict] = []
     created = 0
     for track in tracks:
         album = track.album
         artist_name = album.artist.name if album and album.artist else "Unknown Artist"
         album_title = album.title if album else "Unknown Album"
-        add_download_request_item(
-            session,
-            batch,
-            artist_items,
-            album_items,
+        requests.append(download_request_payload(
             artist_name,
             album_title,
             track.title,
@@ -8886,13 +8945,12 @@ def run_requeue_replacement(session: Session, payload: dict, task: Task | None =
             replace_track_id=track.id,
             replace_path=track.path,
             workflow="manual_replacement",
-        )
+        ))
         created += 1
         append_task_log(session, task, f"{artist_name} / {album_title}: queued manual replacement for {track.title}")
     if created == 0:
-        session.delete(batch)
         return {"download_items_created": 0, "batch_id": None}
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
+    search_task = enqueue_task(session, "search_candidates", {"requests": requests})
     create_notification(
         session,
         title="Replacement search queued",
@@ -8900,9 +8958,9 @@ def run_requeue_replacement(session: Session, payload: dict, task: Task | None =
         event_type="approval_needed",
         target_url="/task-queue",
         deliver_apns=False,
-        group_key=f"download:{batch.id}",
+        group_key=f"download-search:{search_task.id}",
     )
-    return {"download_items_created": created, "batch_id": batch.id}
+    return {"download_items_created": created}
 
 
 def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
@@ -8923,7 +8981,6 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     imports / "Singles" / untagged albums are verified too (they were skipped entirely before).
     Every track logs a verdict line so a miss can be debugged from the Activity/task log.
     """
-    discard_pending_batches(session, "Replace incorrect audio files", ProposalKind.download)
     from nudibranch.services.metadata_lookup import normalize, text_similarity
 
     albums = list(
@@ -8936,11 +8993,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     api_key = integration_value(session, "acoustid_api_key")
     if not api_key:
         append_task_log(session, task, "Check audio content: no AcoustID key configured — only dead-air (silence) detection will run; wrong-but-audible audio cannot be confirmed. Add a key in Settings → Integrations.", "warning")
-    batch = ProposalBatch(title="Replace incorrect audio files", kind=ProposalKind.download, flow=ProposalFlow.download_review, tree_path="/task-queue")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
+    requests: list[dict] = []
     created = 0
     tracks_checked = 0
     suspicious = 0
@@ -9044,11 +9097,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
             # replacement search — re-derive from the correct title+artist. A dead-air file IS
             # the right song (just silent), so its stored duration/id are kept.
             is_foreign = kind == content_verify.FOREIGN_AUDIO
-            add_download_request_item(
-                session,
-                batch,
-                artist_items,
-                album_items,
+            requests.append(download_request_payload(
                 artist_name,
                 album.title,
                 track.title,
@@ -9061,8 +9110,7 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
                 replace_path=track.path,
                 require_lossless=True if track.is_lossless else None,
                 workflow="content_replacement",
-                display_title=track.title,
-            )
+            ))
             created += 1
             append_task_log(session, task, f"{artist_name} / {album.title}: queued replacement for '{track.title}' ({kind})")
 
@@ -9073,7 +9121,6 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     )
     append_task_log(session, task, f"Check audio content complete — {summary}")
     if created == 0:
-        session.delete(batch)
         create_notification(
             session,
             title="Audio content check complete",
@@ -9082,8 +9129,8 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
             target_url="/tools",
         )
         return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": 0, "batch_id": None}
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": created, "batch_id": batch.id}
+    enqueue_task(session, "search_candidates", {"requests": requests})
+    return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": created}
 
 
 def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = None) -> dict:
@@ -9101,7 +9148,7 @@ def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = N
             .order_by(Track.title.asc())
         )
     )
-    batch = ProposalBatch(title="Apply ReplayGain", kind=ProposalKind.metadata, tree_path="/library")
+    batch = ProposalBatch(title="Apply ReplayGain", kind=ProposalKind.metadata)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -9159,11 +9206,7 @@ def run_apply_replaygain(session: Session, _payload: dict, task: Task | None = N
     return {"tracks_checked": len(tracks), "items_created": created, "batch_id": batch.id}
 
 
-def add_download_request_item(
-    session: Session,
-    batch: ProposalBatch,
-    artist_items: dict[str, ProposalItem],
-    album_items: dict[tuple[str, str], ProposalItem],
+def download_request_payload(
     artist: str,
     album: str,
     track: str | None,
@@ -9176,51 +9219,30 @@ def add_download_request_item(
     replace_path: str | None = None,
     require_lossless: bool | None = None,
     workflow: str | None = None,
-    display_title: str | None = None,
-) -> None:
-    if artist not in artist_items:
-        artist_item = ProposalItem(batch_id=batch.id, title=artist, kind=ProposalKind.download, payload_json=json.dumps({"artist": artist}))
-        session.add(artist_item)
-        session.flush()
-        artist_items[artist] = artist_item
-    album_key = (artist, album)
-    if album_key not in album_items:
-        album_item = ProposalItem(
-            batch_id=batch.id,
-            parent_id=artist_items[artist].id,
-            title=album,
-            kind=ProposalKind.download,
-            payload_json=json.dumps({"artist": artist, "album": album}),
-        )
-        session.add(album_item)
-        session.flush()
-        album_items[album_key] = album_item
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            parent_id=album_items[album_key].id,
-            title=display_title or track or album,
-            kind=ProposalKind.download,
-            payload_json=json.dumps(
-                {
-                    "action": "wishlist_request",
-                    "kind": "track",
-                    "artist": artist,
-                    "album": album,
-                    "track": track,
-                    "track_number": track_number,
-                    "disc_number": disc_number,
-                    "duration_ms": duration_ms,
-                    "musicbrainz_album_id": musicbrainz_album_id,
-                    "musicbrainz_recording_id": musicbrainz_recording_id,
-                    "replace_track_id": replace_track_id,
-                    "replace_path": replace_path,
-                    "require_lossless": require_lossless,
-                    "workflow": workflow,
-                }
-            ),
-        )
-    )
+) -> dict:
+    """One download request, as a plain payload.
+
+    It used to write three `ProposalItem` rows (artist/album/track) into an intent batch that sat
+    in Review until the search consumed it. The tools now collect these payloads and hand them to
+    `search_candidates` in the task, so the first thing a user sees in the Task Queue is the
+    candidate batch — never a row claiming to be "finding candidates" with nothing behind it.
+    """
+    return {
+        "action": "wishlist_request",
+        "kind": "track",
+        "artist": artist,
+        "album": album,
+        "track": track,
+        "track_number": track_number,
+        "disc_number": disc_number,
+        "duration_ms": duration_ms,
+        "musicbrainz_album_id": musicbrainz_album_id,
+        "musicbrainz_recording_id": musicbrainz_recording_id,
+        "replace_track_id": replace_track_id,
+        "replace_path": replace_path,
+        "require_lossless": require_lossless,
+        "workflow": workflow,
+    }
 
 
 def run_backup_now(session: Session, _payload: dict) -> dict:
@@ -9733,21 +9755,72 @@ def jellyfin_audio_match_score(track: Track, item: dict) -> float:
 
 
 def run_search_candidates(session: Session, payload: dict, task: Task | None = None) -> dict:
-    batch_id = payload.get("batch_id")
-    batch = session.get(ProposalBatch, batch_id)
-    if not batch:
-        raise ValueError("Batch not found for candidate search")
-    items = [i for i in batch.items if json.loads(i.payload_json or "{}").get("action") == "wishlist_request"]
-    if items:
-        process_wishlist_request_items(session, items, task)
-    # The intent batch is consumed once its requests have been turned into a candidate batch.
-    for item in batch.items:
-        if item.status in {ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing}:
-            item.status = ProposalStatus.completed
-    batch.status = ProposalStatus.completed
-    session.commit()
-    return {"searched": len(items)}
+    """Search for download candidates for a set of request payloads (the tool workflows).
 
+    The requests ride in the task payload. They used to be persisted first as a batch of
+    `wishlist_request` rows that this handler consumed and then retired -- a batch that sat in
+    Review for the whole search and, if the worker died or the search raised, forever. A search in
+    flight is now a TASK, which is a thing the Activity screen already shows and the worker already
+    knows how to recover.
+
+    `batch_id` is still honoured for one reason: a task queued by the previous build is data on an
+    existing install (§0's migration exception), and dropping it would strand whatever it was
+    searching for. It drains that batch's request rows and deletes it.
+    """
+    requests = [request for request in (payload.get("requests") or []) if isinstance(request, dict)]
+    legacy_batch_id = payload.get("batch_id")
+    if legacy_batch_id:
+        batch = session.get(ProposalBatch, legacy_batch_id)
+        if batch:
+            for item in list(batch.items):
+                item_payload = json.loads(item.payload_json or "{}")
+                if item_payload.get("action") == "wishlist_request":
+                    requests.append(item_payload)
+            append_task_log(
+                session, task, f"Draining {len(requests)} request(s) from a queued pre-2026-09-22 search batch"
+            )
+            session.delete(batch)
+            session.commit()
+    if not requests:
+        return {"searched": 0, "reason": "no requests"}
+    process_wishlist_request_items(session, requests, task)
+    session.commit()
+    return {"searched": len(requests)}
+
+
+def discard_unapproved_search_results(session: Session, wishlist_item_id: str) -> int:
+    """Throw away candidate rows left by an earlier, interrupted search for this request.
+
+    A search that was killed halfway has usually already committed some candidates. The task is
+    then re-queued (`recover_orphaned_tasks`), and without this the second pass would add a second
+    set beside the first -- the duplicate-candidate bug that a retried search used to produce, now
+    that there is no intent batch marking the attempt. Only untouched rows go: anything approved,
+    executing or finished is real work and is left alone.
+    """
+    items = list(
+        session.scalars(
+            select(ProposalItem)
+            .where(ProposalItem.wishlist_item_id == wishlist_item_id)
+            .where(ProposalItem.status == ProposalStatus.pending)
+        )
+    )
+    if not items:
+        return 0
+    batch_ids = {item.batch_id for item in items}
+    for item in items:
+        session.delete(item)
+    session.flush()
+    for batch_id in batch_ids:
+        batch = session.get(ProposalBatch, batch_id)
+        if not batch:
+            continue
+        session.expire(batch, ["items"])
+        cleanup_empty_container_items(session, batch)
+        session.expire(batch, ["items"])
+        if not batch.items:
+            session.delete(batch)
+    session.commit()
+    return len(items)
 
 
 def run_search_wishlist_item(session: Session, payload: dict, task: Task | None = None) -> dict:
@@ -9759,6 +9832,10 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
     `wishlist:approve_all`) to approve it into an actual download.  Nothing here ever writes
     `ProposalStatus.approved`; a `discover`-only user still cannot make their own download run.
 
+    ⚠️ NO batch is created for the search itself (2026-09-22). While this runs, the request is its
+    `WishlistItem` and nothing else, so the Task Queue can never show a row stuck on "finding
+    candidates" -- the state that used to survive a killed worker forever.
+
     Runs on the worker because building the request payloads calls MusicBrainz, which is far too
     slow for the HTTP path of POST /wishlist.
     """
@@ -9766,65 +9843,122 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
     wishlist_item = session.get(WishlistItem, wishlist_item_id) if wishlist_item_id else None
     if not wishlist_item:
         return {"searched": 0, "reason": "wishlist item is gone"}
-    if wishlist_item.status in {"removed", "rejected", "canceled"}:
+    if wishlist_item.status in {"removed", "rejected", "canceled", "completed"}:
         return {"searched": 0, "reason": f"wishlist item is {wishlist_item.status}"}
+
+    discarded = discard_unapproved_search_results(session, wishlist_item.id)
+    if discarded:
+        append_task_log(
+            session, task, f"Discarded {discarded} candidate row(s) from an interrupted earlier search"
+        )
 
     requests = build_request_payloads(wishlist_item)
     if not requests:
+        # Nothing to search for is a dead end, not a search still in progress: say so, or the row
+        # sits on "Finding candidates" with nothing running behind it.
+        fail_wishlist_item(session, wishlist_item, "no requests could be built")
         return {"searched": 0, "reason": "no requests could be built"}
-
-    # An intent batch holding one `wishlist_request` leaf per track, which
-    # `process_wishlist_request_items` then turns into a real candidate batch.  Reusing that path
-    # rather than reimplementing it keeps the album-folder matcher, the ranking and the yt-dlp
-    # fallback identical to every other way a download gets requested.
-    batch = ProposalBatch(
-        title=f"Request: {wishlist_item.album or wishlist_item.track or wishlist_item.artist}",
-        kind=ProposalKind.download,
-        flow=ProposalFlow.download_review,
-        tree_path="/wishlist",
-    )
-    session.add(batch)
-    session.flush()
-
-    items: list[ProposalItem] = []
-    for request in requests:
-        item = ProposalItem(
-            batch_id=batch.id,
-            title=request.get("track") or wishlist_item.album or wishlist_item.artist,
-            kind=ProposalKind.download,
-            requester_id=wishlist_item.user_id,
-            wishlist_item_id=wishlist_item.id,
-            stage=ItemStage.searching.value,
-            payload_json=json.dumps(request | {"status": "finding candidates"}),
-        )
-        session.add(item)
-        items.append(item)
-    session.flush()
 
     wishlist_item.status = "searching"
     wishlist_item.stage = ItemStage.searching.value
-    wishlist_item.batch_id = batch.id
+    wishlist_item.batch_id = None
     wishlist_item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
 
     try:
-        process_wishlist_request_items(session, items, task)
+        process_wishlist_request_items(session, requests, task)
     except Exception:
-        wishlist_item.status = "failed"
-        wishlist_item.stage = ItemStage.failed.value
-        wishlist_item.status_changed_at = datetime.now(timezone.utc)
-        session.commit()
+        fail_wishlist_item(session, wishlist_item, "the candidate search failed")
         raise
-
-    # The intent batch has been consumed into a candidate batch; retire it so it does not linger
-    # as a second, empty-looking row beside the real one.
-    for item in batch.items:
-        if item.status in {ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing}:
-            item.status = ProposalStatus.completed
-    batch.status = ProposalStatus.completed
     session.commit()
-    return {"searched": len(items), "wishlist_item_id": wishlist_item.id}
+    return {"searched": len(requests), "wishlist_item_id": wishlist_item.id}
 
+
+def fail_wishlist_item(session: Session, wishlist_item: WishlistItem, reason: str) -> None:
+    """Land a request in "Needs attention" -- the honest end of a search that produced nothing."""
+    session.rollback()
+    fresh = session.get(WishlistItem, wishlist_item.id)
+    if fresh is None or fresh.status in {"removed", "rejected", "canceled", "completed"}:
+        return
+    fresh.status = "failed"
+    fresh.stage = ItemStage.failed.value
+    fresh.status_changed_at = datetime.now(timezone.utc)
+    session.commit()
+    write_app_log(f"Wishlist search gave up on {fresh.artist} - {fresh.album or fresh.track}: {reason}", "warning")
+
+
+#: How many times the recovery sweep will re-queue one request's search before giving up on it.
+#: Bounded on purpose: an unbounded heal is an infinite loop with a MusicBrainz call in it.
+MAX_WISHLIST_SEARCH_ATTEMPTS = 3
+
+
+def recover_stuck_wishlist_searches(session: Session) -> int:
+    """Heal requests sitting in `searching` with nothing searching for them.
+
+    Three ways a row gets there, all seen live: the worker was killed mid-search (sandalphon
+    recreates its containers on every nightly push), the search raised before it could write the
+    row, or the task was cancelled underneath it. Runs at worker start AND on the idle tick,
+    because a restart is not the only way it happens.
+
+    A row whose candidates already exist is promoted rather than re-searched -- that is the
+    Radiohead case, where the batch was ready in Review while the request still read "Finding
+    candidates". Everything else is re-queued, at most `MAX_WISHLIST_SEARCH_ATTEMPTS` times since
+    the row last changed state, and then marked failed so it lands in "Needs attention" instead of
+    looping.
+    """
+    rows = list(
+        session.scalars(
+            select(WishlistItem).where(WishlistItem.stage == ItemStage.searching.value)
+        )
+    )
+    if not rows:
+        return 0
+    live_tasks = list(
+        session.scalars(
+            select(Task).where(
+                Task.type == "search_wishlist_item",
+                Task.status.in_([TaskStatus.queued, TaskStatus.running]),
+            )
+        )
+    )
+    searching_ids = set()
+    for live in live_tasks:
+        try:
+            searching_ids.add(json.loads(live.payload_json or "{}").get("wishlist_item_id"))
+        except (ValueError, TypeError):
+            continue
+    healed = 0
+    for row in rows:
+        if row.id in searching_ids or row.status in {"removed", "rejected", "canceled", "completed"}:
+            continue
+        has_candidates = session.scalar(
+            select(ProposalItem.id)
+            .where(ProposalItem.wishlist_item_id == row.id)
+            .where(ProposalItem.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing]))
+            .limit(1)
+        )
+        if has_candidates:
+            batch = session.get(ProposalItem, has_candidates)
+            advance_wishlist_rows_to_review(session, [row.id], session.get(ProposalBatch, batch.batch_id) if batch else None)
+            healed += 1
+            write_app_log(f"Request '{row.artist} - {row.album or row.track}' had candidates already; moved to awaiting approval", "warning")
+            continue
+        attempts = session.scalar(
+            select(func.count())
+            .select_from(Task)
+            .where(Task.type == "search_wishlist_item")
+            .where(Task.payload_json.like(f'%{row.id}%'))
+            .where(Task.created_at >= (row.status_changed_at or row.created_at))
+        ) or 0
+        if attempts >= MAX_WISHLIST_SEARCH_ATTEMPTS:
+            fail_wishlist_item(session, row, f"the search was interrupted {attempts} times")
+            healed += 1
+            continue
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": row.id})
+        healed += 1
+        write_app_log(f"Re-queued the interrupted search for '{row.artist} - {row.album or row.track}'", "warning")
+    session.commit()
+    return healed
 
 
 def _manifest_entries_for_items(item_ids: set[str]) -> list[dict]:
@@ -10070,7 +10204,7 @@ def run_consolidate_folders(session: Session, _payload: dict, task: Task | None 
             select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
         )
     )
-    batch = ProposalBatch(title="Consolidate album folders", kind=ProposalKind.file_move, tree_path="/library")
+    batch = ProposalBatch(title="Consolidate album folders", kind=ProposalKind.file_move)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -10368,6 +10502,15 @@ async def worker_loop() -> None:
         _upsert_setting(session, "mapping_run_count", "0")
         _upsert_setting(session, "mapping_started_at", datetime.now(timezone.utc).isoformat())
         session.commit()
+        # A request stuck in `searching` with nothing searching for it is healed before anything
+        # else runs: after a restart that is exactly the state a killed search leaves behind.
+        try:
+            healed = recover_stuck_wishlist_searches(session)
+            if healed:
+                write_app_log(f"Recovered {healed} interrupted music request(s) at startup", "warning")
+        except Exception as error:  # noqa: BLE001 - recovery must never stop the worker booting.
+            session.rollback()
+            write_app_log(f"Wishlist search recovery failed: {error}", "warning")
         recovered = recover_orphaned_tasks(session)
         if recovered:
             create_notification(
@@ -10387,6 +10530,7 @@ async def worker_loop() -> None:
     last_playlist_mirror_tick = 0.0
     last_podcast_scan_tick = 0.0
     last_deletion_prune_tick = 0.0
+    last_wishlist_recovery_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -10466,6 +10610,16 @@ async def worker_loop() -> None:
                     except Exception:  # noqa: BLE001 - never let the podcast tick stop the worker.
                         session.rollback()
                     last_podcast_scan_tick = time.time()
+                if time.time() - last_wishlist_recovery_tick > WISHLIST_RECOVERY_TICK_SECONDS:
+                    # Not only at startup: a search can also be lost to a cancelled task or an
+                    # exception, and a request must never sit on "finding candidates" with nothing
+                    # behind it.
+                    try:
+                        recover_stuck_wishlist_searches(session)
+                    except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
+                        session.rollback()
+                        write_app_log(f"Wishlist search recovery failed: {error}", "warning")
+                    last_wishlist_recovery_tick = time.time()
                 if time.time() - last_deletion_prune_tick > DELETION_PRUNE_TICK_SECONDS:
                     try:
                         cutoff = datetime.now(timezone.utc) - LIBRARY_DELETION_RETENTION

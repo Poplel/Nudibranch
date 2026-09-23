@@ -145,7 +145,9 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
     username: Mapped[str | None] = mapped_column(String(120), unique=True, index=True)
     pin_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    api_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # NOTE: the old `api_key_hash` column is gone. Static keys live in `static_api_keys` only, and
+    # the env full-access key is migrated into one there (db/init.py). A second, per-user secret
+    # that nothing could list or revoke was an authentication path with no management surface.
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     theme: Mapped[str] = mapped_column(String(16), default="light", nullable=False)
     accent_color: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
@@ -157,6 +159,12 @@ class User(Base):
     #: device through the same route (§3/§24), and silently stopping those would be a second,
     #: unasked-for change.
     remote_playback_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: How long this account's playback claim survives without playing, in MINUTES; 0 = never
+    #: expires. Per-user because "how long should my phone keep the session after I pause?" is a
+    #: taste question, not a protocol constant. ⚠ It governs the IDLE clock only: a claim whose
+    #: owner says it is PLAYING is still checked against LIVE_WINDOW (45s), so a force-quit app
+    #: releases the session immediately whatever this says (§31's two clocks).
+    playback_claim_timeout_minutes: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
     search_min_confidence: Mapped[float] = mapped_column(default=0.4, nullable=False)
     library_page_size: Mapped[int] = mapped_column(default=100, nullable=False)
     jellyfin_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -569,13 +577,12 @@ class ProposalBatch(Base):
     kind: Mapped[ProposalKind] = mapped_column(Enum(ProposalKind), nullable=False)
     status: Mapped[ProposalStatus] = mapped_column(Enum(ProposalStatus), default=ProposalStatus.pending, nullable=False)
     # Which approval gate this batch belongs to, and therefore which Task Queue bucket it renders
-    # in.  Supersedes `tree_path`, which was an untyped free string doing double duty as a UI
-    # grouping key AND a de-facto workflow-stage marker ("/wishlist", "/task-queue", "/downloads").
-    # `tree_path` is retained for one release because shipped clients still read it.
+    # in.  Replaced `tree_path`, an untyped free string that did double duty as a UI grouping key
+    # AND a de-facto workflow-stage marker ("/wishlist", "/task-queue", "/downloads"); that column
+    # is dropped (db/init.py) and nothing may reintroduce a string marker beside this.
     flow: Mapped[ProposalFlow] = mapped_column(
         Enum(ProposalFlow), default=ProposalFlow.library_change, nullable=False, index=True
     )
-    tree_path: Mapped[str] = mapped_column(Text, default="/", nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 

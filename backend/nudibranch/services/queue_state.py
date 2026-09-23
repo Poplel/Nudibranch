@@ -153,6 +153,13 @@ SETTLED_ITEM_STATUSES = frozenset(
 # the clients grey it out rather than letting it be re-approved.
 APPROVABLE_STAGES = frozenset({ItemStage.awaiting_approval, ItemStage.waiting, ItemStage.failed})
 
+# ⚠️ Gate (b) adds one. A `library_review` leaf IS a downloaded file waiting in staging, so its
+# honest stage is `staged` -- and `staged` was not approvable, which made "Add to library" report
+# `can_approve=false` on the one row in the batch a human is there to approve, while its own
+# artist/album containers said `true`. It stays out of the download gate, where a staged leaf is
+# already past its approval.
+LIBRARY_REVIEW_APPROVABLE_STAGES = APPROVABLE_STAGES | {ItemStage.staged}
+
 # Stages where stopping the work still means something.
 CANCELABLE_STAGES = frozenset(
     {
@@ -313,6 +320,65 @@ def item_progress(item: ProposalItem, stage: ItemStage, payload: dict | None = N
     }
 
 
+def music_key(payload: dict) -> str:
+    """`artist::album::track`, casefolded -- the identity of the MUSIC a row is about.
+
+    Both clients derived this from the raw payload to dedupe rows; it is computed here now so the
+    two cannot disagree about what counts as the same track.
+    """
+    request = payload.get("request")
+    request = request if isinstance(request, dict) else {}
+    parts = []
+    for keys in (("artist",), ("album",), ("track", "title")):
+        value = ""
+        for key in keys:
+            value = request.get(key) or payload.get(key) or ""
+            if value:
+                break
+        parts.append(" ".join(str(value).casefold().split()))
+    return "::".join(parts)
+
+
+def candidate_identity(payload: dict) -> str | None:
+    """Stable identity for one candidate row, for client-side de-duplication.
+
+    `<filename>::<username>` for an slskd candidate, `youtube::<music key>` for a yt-dlp fallback
+    (which has no file to name yet).  Returns None for anything that is not a candidate.
+    """
+    candidate = payload.get("candidate")
+    action = str(payload.get("action") or "")
+    if not isinstance(candidate, dict) or not candidate:
+        if action == "queue_ytdlp_download":
+            return f"youtube::{music_key(payload)}"
+        return None
+    filename = " ".join(str(candidate.get("filename") or "").casefold().split())
+    username = " ".join(str(candidate.get("username") or "").casefold().split())
+    return f"{filename}::{username}"
+
+
+def is_actionable(item: ProposalItem, payload: dict | None = None) -> bool:
+    """Whether this row is a real change the batch would apply, rather than a grouping container.
+
+    The same rule `run_execute_proposal_batch` selects work by, and the rule both clients used to
+    re-derive from `payload_json` (`isExecutable` on iOS, `isExecutableApprovalItem` on the web).
+    It is on the wire as `actionable` so they no longer have to.
+    """
+    data = payload if payload is not None else payload_of(item)
+    if item.kind is ProposalKind.import_files:
+        return bool(item.old_value and item.new_value)
+    if item.kind is ProposalKind.metadata:
+        return bool(data.get("target_type"))
+    if item.kind in {
+        ProposalKind.delete,
+        ProposalKind.file_move,
+        ProposalKind.playlist,
+        ProposalKind.download,
+        ProposalKind.lyrics,
+    }:
+        return bool(data.get("action"))
+    return False
+
+
 def candidate_out(payload: dict) -> dict | None:
     """Project the stored candidate dict onto the wire shape.
 
@@ -339,6 +405,7 @@ def candidate_out(payload: dict) -> dict | None:
             return None
 
     return {
+        "identity": candidate_identity(payload),
         "username": candidate.get("username"),
         "filename": candidate.get("filename"),
         "folder": candidate.get("folder"),
@@ -506,8 +573,62 @@ def batch_counts(items: Iterable[ProposalItem]) -> dict[str, int]:
     return counts
 
 
-def can_approve(stage: ItemStage) -> bool:
-    return stage in APPROVABLE_STAGES
+def can_approve(stage: ItemStage, flow: ProposalFlow | str | None = None) -> bool:
+    """Whether a human pressing Approve on THIS leaf would do something.
+
+    Flow-dependent by necessity: gate (b) approves `staged` files, gate (a) never does.
+    Containers do not use this -- see `container_can_approve`.
+    """
+    resolved = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+    allowed = (
+        LIBRARY_REVIEW_APPROVABLE_STAGES
+        if resolved is ProposalFlow.library_review
+        else APPROVABLE_STAGES
+    )
+    return stage in allowed
+
+
+def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str | None) -> set[str]:
+    """Every id a human could approve, containers resolved from their descendants.
+
+    ⚠️ A container's own stage says nothing about whether there is work under it to approve. They
+    used to report `can_approve=true` unconditionally (their stage rolls up to `awaiting_approval`),
+    so a batch whose only real row was already downloading still lit up Approve -- and, the other
+    way round, an artist row over a track still searching invited an approve that would do nothing.
+    A container is approvable iff some actionable descendant of it is.
+    """
+    materialized = list(items)
+    children: dict[str, list[ProposalItem]] = {}
+    for item in materialized:
+        if item.parent_id:
+            children.setdefault(item.parent_id, []).append(item)
+    approvable: set[str] = set()
+
+    def visit(item: ProposalItem, seen: frozenset[str]) -> bool:
+        if item.id in seen:
+            return False
+        kids = children.get(item.id, [])
+        # ⚠️ NOT `any(...)`: it short-circuits, and every child has to be visited for its own
+        # answer. With `any`, the first approvable candidate under a track stopped the walk and its
+        # four sibling candidates were reported unapprovable — so picking any alternate was refused.
+        under = False
+        for kid in kids:
+            if visit(kid, seen | {item.id}):
+                under = True
+        payload = payload_of(item)
+        mine = is_actionable(item, payload) and can_approve(resolve_stage(item, payload), flow)
+        if under or mine:
+            approvable.add(item.id)
+        return under or mine
+
+    # Anything whose parent is not in this list is a root here -- including in a requester's pruned
+    # view, where the ancestor chain can be partial.
+    by_id = {item.id: item for item in materialized}
+    for item in materialized:
+        if item.parent_id and item.parent_id in by_id:
+            continue
+        visit(item, frozenset())
+    return approvable
 
 
 def can_cancel(stage: ItemStage) -> bool:
