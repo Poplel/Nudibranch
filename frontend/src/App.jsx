@@ -6039,6 +6039,36 @@ function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, on
   );
 }
 
+// One batch as a single tab should draw it: the rows the server files in THIS bucket, their
+// ancestors for context, and the other candidates of the same track (so a failed track in Issues
+// still offers its alternates to pick from). A batch spans tabs — an album with one failed track
+// has that track in Issues and the rest still downloading in Review — so filtering whole batches
+// by `batch.bucket` put every row of the album in Issues and none of it in Review.
+function batchRowsForBucket(batch, bucket) {
+  const items = batch.items || [];
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const hasChildren = new Set(items.map((item) => item.parent_id).filter(Boolean));
+  const keep = new Set();
+  for (const item of items) {
+    if (item.bucket !== bucket || hasChildren.has(item.id)) continue;
+    keep.add(item.id);
+    if (item.parent_id) {
+      for (const sibling of items) {
+        if (sibling.parent_id === item.parent_id && !hasChildren.has(sibling.id)) keep.add(sibling.id);
+      }
+    }
+  }
+  if (keep.size === 0) return null;
+  for (const id of [...keep]) {
+    let parent = byId.get(id)?.parent_id;
+    while (parent && !keep.has(parent)) {
+      keep.add(parent);
+      parent = byId.get(parent)?.parent_id;
+    }
+  }
+  return { ...batch, items: items.filter((item) => keep.has(item.id)) };
+}
+
 function Approvals({ approvals, requests, user, bucket, onBucketChange, selectedIds, onToggle, onSelectOnly, onApprove, onRemove, onCancel, onRetry }) {
   const isFullApprover = hasPermission(user, "approvals:manage");
   // GET /approvals is admin-only. A wishlist:approve_all holder without approvals:manage reads
@@ -6049,7 +6079,7 @@ function Approvals({ approvals, requests, user, bucket, onBucketChange, selected
   // ⚠️ No counts on the tabs. "Review (12)" counted batches, which read as a number of things to
   // review and was wrong often enough to mislead (the user, 2026-09-22). Do not bring it back.
   const inBucket = useMemo(
-    () => source.filter((batch) => batch.bucket === bucket),
+    () => source.map((batch) => batchRowsForBucket(batch, bucket)).filter(Boolean),
     [source, bucket]
   );
   const groups = useMemo(() => groupApprovalBatches(inBucket), [inBucket]);
@@ -6345,7 +6375,7 @@ function ApprovalNode({
         <small title={isFileMoveLeaf ? `${item.old_value || "?"} → ${item.new_value || "?"}` : undefined}>
           {isFileMoveLeaf
             ? `${shortPath(item.old_value)} → ${shortPath(item.new_value)}`
-            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : item.status_label}
+            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : downloadProgress ? "" : item.status_label}
         </small>
         {leafDownloadCandidate && hasAlternateCandidates && (!pickerOpen || ownsPicker) && (
           <button

@@ -2422,6 +2422,14 @@ nav button:hover {
   grid-template-columns: 18px 18px 18px minmax(70px, 1fr) auto;
 }
 
+/* ⚠️ A queue row can carry any number of trailing icon buttons (pick candidate, cancel, retry,
+   search again, remove). Past the template's columns they used to wrap onto a second grid row,
+   dropping the ✕ under the row. Flow extra children into new auto columns on the SAME row. */
+.proposal-row {
+  grid-auto-flow: column;
+  grid-auto-columns: auto;
+}
+
 .selectable-tree-main,
 .selectable-tree-title {
   display: contents;
@@ -2477,6 +2485,7 @@ nav button:hover {
 .status-pill {
   display: inline-flex;
   align-self: start;
+  justify-self: start; /* hug the word; a grid cell would otherwise stretch it across the row */
   align-items: center;
   padding: 2px 8px;
   border-radius: 999px;
