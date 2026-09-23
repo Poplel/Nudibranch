@@ -8911,7 +8911,16 @@ function TasksView({ tasks, playback, onCancel }) {
 }
 
 function ActiveWorkBar({ tasks }) {
-  const activeTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
+  // One row per kind of work: several "Processing task queue" rows said the same thing over and
+  // over. The one furthest along (running, with progress) speaks for the rest.
+  const byName = new Map();
+  for (const task of tasks.filter((current) => ["queued", "running"].includes(current.status))) {
+    const name = taskDisplayName(task);
+    const rank = (task.status === "running" ? 1 : 0) + (taskProgress(task) ? 2 : 0);
+    const existing = byName.get(name);
+    if (!existing || rank > existing.rank) byName.set(name, { task, rank });
+  }
+  const activeTasks = [...byName.values()].map((entry) => entry.task);
   if (activeTasks.length === 0) return null;
   return (
     <div className="active-work-bar">
