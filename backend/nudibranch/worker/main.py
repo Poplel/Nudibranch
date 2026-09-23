@@ -5060,6 +5060,13 @@ def set_candidate_parent_stage(item: ProposalItem, stage: ItemStage, status: str
     item.stage = stage.value
     if status is not None:
         set_item_payload_status(item, status)
+    else:
+        # ⚠️ Clear the search's own "searching <track>" text: `status_label` prefers free text over
+        # the stage, so leaving it made a row with candidates ready still read "searching …"
+        # instead of "download approval".
+        payload = json.loads(item.payload_json or "{}")
+        if payload.pop("status", None) is not None:
+            item.payload_json = json.dumps(payload)
 
 
 def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
