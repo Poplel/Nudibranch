@@ -55,6 +55,14 @@ REPLACEMENT_QUEUED_TRANSFER_RETRY_SECONDS = 30
 REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS = 300
 REPLACEMENT_REMOTELY_QUEUED_TRANSFER_RETRY_SECONDS = 180
 DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
+# Last-resort watchdog (A, 2026-09-23): every stall found live had a specific fix above (the
+# container rollup, the scan-discovery gap, the orphan-slot cleanup, the silent no-request retry
+# loop). This is only the backstop for whatever shape of stall none of those cover. 30 minutes is
+# deliberately generous -- a healthy scan tick (~3s) re-dispatches a slot-missing item almost
+# immediately, and every real stall timer above (queued/stalled/missing-transfer) fires within
+# minutes -- so 30 minutes of a selected download item sitting non-terminal with NO manifest entry
+# at all (nothing even trying to dispatch it) means every normal recovery path already failed.
+STUCK_DOWNLOAD_ITEM_MINUTES = 30
 MAX_TASK_ATTEMPTS = 4
 AUTOMATION_TICK_SECONDS = 30
 PENDING_PLAYLIST_TICK_SECONDS = 45
@@ -1898,9 +1906,15 @@ def import_manifest_download_batches(session: Session, minimum_age_seconds: int)
         batch_id = entry.get("batch_id")
         if batch_id and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES:
             entries_by_batch.setdefault(batch_id, []).append(entry)
+    # ⚠️ 2026-09-23 (A.3): this used to require `status == executing`, so a batch sitting at
+    # `pending`/`approved`/`failed` whose selected download item has NO manifest entry at all (the
+    # request never got applied, or its only entry was already cleaned up) was invisible here -- the
+    # item stayed `executing`/`approved` forever with nothing left to re-dispatch it. Match the same
+    # status set the loop below already accepts, so every batch that could still have live download
+    # work gets a chance to run the "missing manifest entry" requeue below.
     for batch in session.scalars(
         select(ProposalBatch)
-        .where(ProposalBatch.status == ProposalStatus.executing)
+        .where(ProposalBatch.status.in_([ProposalStatus.executing, ProposalStatus.failed, ProposalStatus.pending, ProposalStatus.approved]))
         .where(ProposalBatch.flow == ProposalFlow.download_review)
     ):
         if batch.id not in entries_by_batch and selected_slskd_download_item_ids(batch):
@@ -2198,6 +2212,15 @@ def reconcile_manifest_entries_to_selected_items(session: Session, batch: Propos
             continue
         manifest_item = session.get(ProposalItem, entry.get("item_id"))
         selected_item = selected_by_parent.get(manifest_item.parent_id) if manifest_item and manifest_item.parent_id else None
+        # ⚠️ 2026-09-23 (Issues re-approve bug): only take over a sibling that has NO download
+        # configuration of its own yet. A currently-selected alternate candidate already carries its
+        # own action/candidate/request from when it was found during the original search -- blindly
+        # overwriting it below with the orphaned entry's payload meant approving a working alternate
+        # for a failed track quietly got its candidate replaced by the exhausted one's, so the retry
+        # just repeated the same failed download under the alternate's item id ("briefly appears,
+        # then goes back to how it was").
+        if selected_item and json.loads(selected_item.payload_json or "{}").get("action") == "queue_download":
+            selected_item = None
         if not selected_item:
             reconciled.append(entry)
             continue
@@ -2344,7 +2367,15 @@ def queue_missing_manifest_download(session: Session, batch: ProposalBatch, item
     except Exception as error:  # noqa: BLE001 - try a different candidate without creating another row.
         request = download_request_from_item(item)
         if not request:
-            set_download_item_status(item, "needs attention")
+            # ⚠️ 2026-09-23 (A.3): this left `item.status` at whatever it was (`executing`), with no
+            # `auto_retry_exhausted` flag set -- `download_item_retry_exhausted` checks `status ==
+            # failed` specifically, so the item never registered as exhausted and this same
+            # unrecoverable path (no request to rebuild from) ran again every ~3s scan tick forever,
+            # spamming the log without ever landing in Issues. Settle it for real.
+            set_download_item_status(item, "needs attention; could not be downloaded automatically", stage="failed")
+            item.status = ProposalStatus.failed
+            payload["auto_retry_exhausted"] = True
+            item.payload_json = json.dumps(payload)
             append_task_log(session, None, f"{item.title}: queue record missing and could not be recreated: {error}", "error")
             return False
         candidate = payload.get("candidate") or {}
@@ -3386,7 +3417,18 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
         ]
         progress_payloads = [json.loads(leaf.payload_json or "{}").get("download_progress") or {} for leaf in leaves]
         downloaded = sum(1 for status in statuses if download_status_is_downloaded(status))
-        verified = sum(1 for status in statuses if download_status_is_verified(status))
+        # ⚠️ 2026-09-23 (Daft Punk / Discovery stall): a leaf that finished is handed off to the
+        # library-review batch by `present_staged_downloads_for_library_review`, which sets its own
+        # status enum to `completed` but its free text to "downloaded; review to add to library" --
+        # that text contains neither "verified" nor "importing", so `download_status_is_verified`
+        # never recognized it and this container was stuck reporting "verifying" forever, even
+        # though the leaf was long done and already sitting in Changes waiting for approval. A
+        # completed leaf is unconditionally verified regardless of what its free text says.
+        verified = sum(
+            1
+            for leaf, status in zip(leaves, statuses)
+            if leaf.status is ProposalStatus.completed or download_status_is_verified(status)
+        )
         failed = sum(
             1
             for leaf, status in zip(leaves, statuses)
@@ -3588,6 +3630,95 @@ def cleanup_orphaned_download_batches(session: Session) -> int:
         finalize_completed_download_batch(session, batch)
         cleaned += 1
     return cleaned
+
+
+def cleanup_orphaned_download_manifest_entries(session: Session) -> int:
+    """Drop and cancel every manifest entry whose batch is gone or already terminal (A.2).
+
+    `import_manifest_download_batches` only reconsiders a batch_id whose manifest entries are
+    individually in `DOWNLOAD_MANIFEST_ACTIVE_STATUSES` -- an entry sitting in some other status
+    (e.g. `rejected`) for a batch that has since been deleted or settled (completed/rejected/
+    canceled) is invisible to that scan and would otherwise sit in the manifest file forever. This
+    sweep checks EVERY entry regardless of its own status, purely against whether its batch is still
+    live, and is the only thing that can catch that shape of orphan. It is also the backstop for the
+    slot deadlock this class of bug caused live (sandalphon, 2026-09-23): a stale `queued`/
+    `downloading` entry for a dead batch holds the single global download slot forever, starving
+    every other batch's transfer with nothing to ever free it.
+    """
+    orphaned = []
+    for entry in load_download_manifest():
+        batch_id = entry.get("batch_id")
+        if not batch_id:
+            continue
+        # ⚠️ Only entries still transferring (or a rejected one's partial). A `completed`/`staged`
+        # entry of a finished download batch points at a file WAITING in "Add to library" --
+        # `cancel_unapproved_download_entries` deletes the file, which would destroy it.
+        if entry.get("status") not in DOWNLOAD_SLOT_STATUSES | {"retrying", "rejected", "rejected_removed"}:
+            continue
+        batch = session.get(ProposalBatch, batch_id)
+        if batch is None or batch.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}:
+            orphaned.append(entry)
+    if orphaned:
+        cancel_unapproved_download_entries(session, orphaned)
+    return len(orphaned)
+
+
+# Process-local, like `_reported_download_import_failures` above: a worker restart resets the
+# clock, which only means a genuinely wedged item is caught up to STUCK_DOWNLOAD_ITEM_MINUTES later
+# than it otherwise would be -- an acceptable trade against a schema migration for one safety net.
+_stuck_download_item_since: dict[str, float] = {}
+
+
+def watchdog_stuck_download_items(session: Session) -> int:
+    """Fail a selected download item into Issues if it has had no manifest entry at all -- nothing
+    even trying to dispatch it -- for STUCK_DOWNLOAD_ITEM_MINUTES. See the constant's comment: every
+    concrete stall found live has its own fix elsewhere; this is only the catch-all for whatever
+    isn't covered by those.
+    """
+    manifest = load_download_manifest()
+    # ⚠️ Downloads run one at a time, so an item waiting its turn has no manifest entry for as long
+    # as the queue ahead of it takes -- an album's last track can wait well past the bound. Only
+    # count time while nothing is transferring or being checked: that holder has its own, much
+    # shorter stall timers, and while it lives the wait is honest.
+    if any(entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES - {"failed"} for entry in manifest):
+        _stuck_download_item_since.clear()
+        return 0
+    manifest_item_ids = {entry.get("item_id") for entry in manifest if entry.get("item_id")}
+    live_ids: set[str] = set()
+    stuck = 0
+    now = time.time()
+    items = session.scalars(
+        select(ProposalItem)
+        .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+        .where(ProposalItem.kind == ProposalKind.download)
+        .where(ProposalItem.selected.is_(True))
+        .where(ProposalItem.status.in_([ProposalStatus.approved, ProposalStatus.executing]))
+        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
+    ).all()
+    for item in items:
+        payload = json.loads(item.payload_json or "{}")
+        if payload.get("action") != "queue_download" or payload.get("auto_retry_exhausted"):
+            continue
+        if item.id in manifest_item_ids:
+            continue  # a live manifest entry means the much shorter stall timers already own this
+        live_ids.add(item.id)
+        first_seen = _stuck_download_item_since.setdefault(item.id, now)
+        if now - first_seen < STUCK_DOWNLOAD_ITEM_MINUTES * 60:
+            continue
+        set_download_item_status(item, "needs attention; could not be downloaded automatically", stage="failed")
+        item.status = ProposalStatus.failed
+        payload["auto_retry_exhausted"] = True
+        item.payload_json = json.dumps(payload)
+        append_task_log(session, None, f"{item.title}: no download was dispatched for over {STUCK_DOWNLOAD_ITEM_MINUTES} min; moved to Issues", "error")
+        stuck += 1
+    # Forget anything that resolved (dispatched, settled, deselected) so a later stall starts its
+    # own fresh clock instead of firing immediately off a stale first-seen time.
+    for tracked_id in list(_stuck_download_item_since):
+        if tracked_id not in live_ids:
+            _stuck_download_item_since.pop(tracked_id, None)
+    if stuck:
+        session.flush()
+    return stuck
 
 
 def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
@@ -10615,6 +10746,11 @@ async def worker_loop() -> None:
                         else:
                             last_download_scan_summary = ""
                         cleanup_orphaned_download_batches(session)
+                        # A.2: never let a manifest entry for a gone/settled batch keep holding the
+                        # single global download slot or just sit there forever.
+                        cleanup_orphaned_download_manifest_entries(session)
+                        # A: last-resort watchdog for a download item stuck with nothing dispatching it.
+                        watchdog_stuck_download_items(session)
                         if scan_result.get("imported"):
                             queue_automation_event(session, "download_complete")
                         session.commit()

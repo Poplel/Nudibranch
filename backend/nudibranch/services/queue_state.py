@@ -124,6 +124,12 @@ _INDETERMINATE_STAGES = frozenset(
     {ItemStage.searching, ItemStage.verifying, ItemStage.importing, ItemStage.staging, ItemStage.retrying}
 )
 
+# Stages that only make sense BEFORE a human has approved something. `resolve_stage` below must
+# not trust a cached value from this set once `status` has moved past `pending` -- see its comment.
+_PRE_APPROVAL_STAGES = frozenset(
+    {ItemStage.waiting, ItemStage.requested, ItemStage.searching, ItemStage.awaiting_approval}
+)
+
 # Worst-wins ordering for rolling child stages up to a container.  "Worst" means "most in need of
 # a human": a batch with one failed track is a failed batch even if ten others finished.
 _STAGE_SEVERITY: list[ItemStage] = [
@@ -235,9 +241,19 @@ def resolve_stage(item: ProposalItem, payload: dict | None = None) -> ItemStage:
 
     if item.stage:
         try:
-            return ItemStage(item.stage)
+            cached = ItemStage(item.stage)
         except ValueError:
-            pass  # unknown cache value: fall through and recompute rather than trust it
+            cached = None  # unknown cache value: fall through and recompute rather than trust it
+        # ⚠️ 2026-09-23: a pre-approval cache (awaiting_approval/waiting/searching/requested) is
+        # stale the instant `status` moves past `pending` -- `approve_batch` flips `status` straight
+        # to `approved` (and the worker on to `executing`/`queued`) without touching `stage`, which
+        # is only refreshed once real download progress is reported. A just-approved item sitting in
+        # that gap kept reporting its creation-time "awaiting approval" cache, which is why queued/
+        # executing rows were showing `can_approve=true` (APPROVABLE_STAGES includes
+        # awaiting_approval). Only trust a pre-approval cache while the row itself still agrees it
+        # is pending.
+        if cached is not None and not (cached in _PRE_APPROVAL_STAGES and item.status is not ProposalStatus.pending):
+            return cached
 
     data = payload if payload is not None else payload_of(item)
     progress = data.get("download_progress")
