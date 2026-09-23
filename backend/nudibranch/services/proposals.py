@@ -36,6 +36,16 @@ def set_selection(session: Session, batch_id: str, item_ids: list[str], selected
     )
     for item in items:
         item.selected = selected
+    if selected and items:
+        # Round 4 #4a: this is the one place in the codebase that flips `.selected` without also
+        # enforcing "at most one selected candidate per track" -- `approve_batch` and `retry_items`
+        # both already keep that invariant themselves. Left unreconciled, picking an alternate
+        # candidate here (without the caller separately deselecting the old one) left a track with
+        # two independently "expected" selected candidates, each running its own download/retry
+        # lifecycle in parallel (confirmed live: batch 83a8df73, track "Only").
+        batch = session.get(ProposalBatch, batch_id)
+        if batch:
+            normalize_download_candidate_selection(batch.items, set(item_ids))
     session.commit()
     return len(items)
 
@@ -826,6 +836,10 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         raise ValueError(f"Unknown retry mode: {mode}")
     targets = _leaf_download_items(batch, item_ids)
     retried: list[str] = []
+    # Round 4 #2: Retry must always do something. `next_candidate` used to silently no-op when
+    # every sibling candidate had already been tried -- tracked per item here so a batch that mixes
+    # "switch candidate" and "search again" items still enqueues the right worker task for each.
+    retried_mode: dict[str, str] = {}
     for item in targets:
         if item.status is not ProposalStatus.failed:
             continue
@@ -835,24 +849,17 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         # candidate, so "next candidate" only advanced if the worker's own in-flight replacement
         # search happened to find something (and exhausted it all over again if not).
         target = item
+        effective_mode = mode
         if mode == "next_candidate":
             alternate = _next_untried_candidate(item)
             if alternate is not None:
                 item.selected = False
                 target = alternate
             else:
-                # Nothing left to switch to, and no live search either -- that is `research`'s
-                # job. Recording this as exhausted right away, instead of quietly re-queuing the
-                # same doomed candidate, is what lets the wishlist row's stage follow it to failure
-                # instead of reading "Retrying" forever (queue_state's rule: a denormalized cache
-                # must never outrank the column it caches).
-                if item.wishlist_item_id:
-                    wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
-                    if wishlist_item and wishlist_item.status not in {"removed", "completed", "rejected", "canceled"}:
-                        wishlist_item.status = "failed"
-                        wishlist_item.stage = "failed"
-                        wishlist_item.status_changed_at = datetime.now(timezone.utc)
-                continue
+                # Nothing left to switch to -- fall back to `research` (a fresh search for this
+                # track) instead of doing nothing. This is the same path the "research" button
+                # takes, re-entering gate (a) / Download approval once new candidates are found.
+                effective_mode = "research"
         payload = json.loads(target.payload_json or "{}")
         # Keep the history -- Issues should be able to say what was already tried -- but clear the
         # flags that make the worker treat this as finished.
@@ -865,15 +872,16 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         target.payload_json = json.dumps(payload)
         # `research` re-enters gate (a): it throws away the candidates and searches again, so a
         # human picks from the new ones. It must NOT auto-approve.
-        target.status = ProposalStatus.pending if mode == "research" else ProposalStatus.approved
-        target.stage = "awaiting_approval" if mode == "research" else "retrying"
+        target.status = ProposalStatus.pending if effective_mode == "research" else ProposalStatus.approved
+        target.stage = "awaiting_approval" if effective_mode == "research" else "retrying"
         target.selected = True
         retried.append(target.id)
+        retried_mode[target.id] = effective_mode
         if target.wishlist_item_id:
             wishlist_item = session.get(WishlistItem, target.wishlist_item_id)
             if wishlist_item:
-                wishlist_item.status = "review" if mode == "research" else "downloading"
-                wishlist_item.stage = "awaiting_approval" if mode == "research" else "retrying"
+                wishlist_item.status = "review" if effective_mode == "research" else "downloading"
+                wishlist_item.stage = "awaiting_approval" if effective_mode == "research" else "retrying"
                 wishlist_item.status_changed_at = datetime.now(timezone.utc)
     if retried:
         # Revive the ancestor chain. `cancel_items` settles containers when everything beneath them
@@ -900,9 +908,16 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         # item (cancel's "nothing live left" check treats unselected as settled too), and reviving
         # that one item here must not leave a terminal batch status sitting on top of it.
         if batch.status in {ProposalStatus.failed, ProposalStatus.rejected, ProposalStatus.canceled, ProposalStatus.completed}:
-            batch.status = ProposalStatus.pending if mode == "research" else ProposalStatus.approved
+            any_research = any(m == "research" for m in retried_mode.values())
+            batch.status = ProposalStatus.pending if any_research else ProposalStatus.approved
         session.commit()
-        enqueue_task(session, "retry_download_item", {"item_ids": retried, "mode": mode})
+        # One task per effective mode -- a `next_candidate` call that fell back to `research` for
+        # some items must not tell the worker to treat those as ordinary candidate switches.
+        by_mode: dict[str, list[str]] = {}
+        for item_id in retried:
+            by_mode.setdefault(retried_mode.get(item_id, mode), []).append(item_id)
+        for effective_mode, ids in by_mode.items():
+            enqueue_task(session, "retry_download_item", {"item_ids": ids, "mode": effective_mode})
     else:
         session.commit()
     return retried

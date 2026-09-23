@@ -357,6 +357,11 @@ class ProposalBatchOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     items: list[ProposalItemOut]
+    # Populated only by the retry routes (Round 4 #2), so a client can tell exactly which item ids
+    # changed -- `next_candidate` can retarget a different sibling id than the one it was asked to
+    # retry, and a `research` fallback replaces the item's candidates entirely, so the caller cannot
+    # assume the id(s) it sent are still the ones to watch.
+    retried_item_ids: list[str] = Field(default_factory=list)
 
 
 class RetryRequest(BaseModel):

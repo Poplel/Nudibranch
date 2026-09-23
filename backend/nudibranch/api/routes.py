@@ -6555,11 +6555,13 @@ def retry_batch_items(
         raise HTTPException(status_code=404, detail="Batch not found")
     _may_act_on_request_batch(batch, user, require_approver=True)
     try:
-        retry_items(session, batch_id, payload.item_ids if payload else None, payload.mode if payload else "next_candidate")
+        retried = retry_items(session, batch_id, payload.item_ids if payload else None, payload.mode if payload else "next_candidate")
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error)) from error
     session.refresh(batch)
-    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+    result = serialize_batch(batch, resolve_requester_names(session, [batch]))
+    result.retried_item_ids = retried  # Round 4 #2: tell the client exactly what changed
+    return result
 
 
 @router.post("/approvals/items/{item_id}/cancel", response_model=ProposalBatchOut, tags=["approvals"], summary="Cancel one item")

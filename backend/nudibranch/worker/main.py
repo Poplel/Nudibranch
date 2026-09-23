@@ -923,8 +923,10 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     # Import-wizard files are imported directly above (not via the download manifest), so trigger
     # a Jellyfin rescan for them here. Download imports queue their own rescan as they complete.
     if imported:
-        append_task_log(session, task, f"Imported {imported} file(s) into the library; queueing Jellyfin scan")
-        enqueue_task(session, "jellyfin_scan", {})
+        # Round 4 #1: only queue a Jellyfin scan when Jellyfin is actually linked.
+        if jellyfin_configured(session):
+            append_task_log(session, task, f"Imported {imported} file(s) into the library; queueing Jellyfin scan")
+            enqueue_task(session, "jellyfin_scan", {})
         flush_import_enrichment(session)
     downloaded_import = import_completed_downloads(session)
     open_downloads = batch_has_open_downloads(batch)
@@ -1492,7 +1494,8 @@ def apply_playlist_item(session: Session, item: ProposalItem) -> None:
                 write_app_log(f"Playlist sync: could not delete Jellyfin playlist '{playlist_name}': {del_error}", level="warning")
     else:
         raise ValueError("Unsupported playlist action")
-    enqueue_task(session, "sync_favorites_jellyfin", {})
+    if jellyfin_configured(session):  # Round 4 #1: no Jellyfin linked -> nothing to sync
+        enqueue_task(session, "sync_favorites_jellyfin", {})
 
 
 def apply_download_item(session: Session, item: ProposalItem, task: Task | None = None) -> None:
@@ -1840,8 +1843,9 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -
             event_type="tool_completed",
             target_url="/library",
         )
-        append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
-        enqueue_task(session, "jellyfin_scan", {})
+        if jellyfin_configured(session):
+            append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
+            enqueue_task(session, "jellyfin_scan", {})
         flush_import_enrichment(session)
         return {"imported": manifest_imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
     if manifest_waiting or manifest_ready or manifest_failed:
@@ -1894,8 +1898,9 @@ def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -
             event_type="tool_completed",
             target_url="/library",
         )
-        append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
-        enqueue_task(session, "jellyfin_scan", {})
+        if jellyfin_configured(session):
+            append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
+            enqueue_task(session, "jellyfin_scan", {})
         flush_import_enrichment(session)
     return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
 
@@ -2130,6 +2135,13 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             staged_entries.append((entry, file_path))
             ready_count += 1
             set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
+            # Round 4 #4b: `item` may currently be embodying a SIBLING candidate that
+            # `queue_existing_retry_candidate`/`retry_download_entry` swapped in (see
+            # `settle_replaced_candidate_item`) -- only the failure path used to resolve that
+            # sibling, so a successful transfer left it stuck at `executing` forever. Credit it as
+            # completed now that its transfer has actually delivered the file.
+            if item:
+                settle_replaced_candidate_item(session, item, entry.get("candidate") or {}, outcome=ProposalStatus.completed)
             continue
 
         # Not downloaded yet — keep waiting on / retrying the transfer.
@@ -2882,7 +2894,12 @@ def queue_existing_retry_candidate(
     return False
 
 
-def settle_replaced_candidate_item(session: Session, item: ProposalItem, candidate: dict) -> None:
+def settle_replaced_candidate_item(
+    session: Session,
+    item: ProposalItem,
+    candidate: dict,
+    outcome: ProposalStatus = ProposalStatus.failed,
+) -> None:
     """Resolve the sibling candidate row a just-abandoned transfer was swapped in from, if any.
 
     `queue_existing_retry_candidate` sets a sibling's status to `executing` the instant it is
@@ -2890,6 +2907,12 @@ def settle_replaced_candidate_item(session: Session, item: ProposalItem, candida
     tracked on `item` itself, which keeps being re-pointed at whichever candidate is live. Nothing
     ever told the sibling row its transfer ended, so it was left reading `executing` forever, long
     after the candidate it stood in for had failed and moved on.
+
+    `outcome` defaults to `failed` for the "abandoned for another candidate" call sites in
+    `retry_download_entry`. Round 4 #4b: this was never called on the SUCCESS path at all, so a
+    sibling whose transfer actually finished (staged) was left at `executing` forever, unselected,
+    with no manifest entry of its own -- reported live as e.g. `aa708d4e`/`67d53708`/`b08ba750`/
+    `c6a5aecd`. The staging-success call site below passes `outcome=ProposalStatus.completed`.
     """
     if not item.parent_id or not candidate or not item.parent:
         return
@@ -2901,7 +2924,7 @@ def settle_replaced_candidate_item(session: Session, item: ProposalItem, candida
         if sibling_payload.get("action") != "queue_download":
             continue
         if candidate_identity(sibling_payload.get("candidate") or {}) == identity:
-            sibling.status = ProposalStatus.failed
+            sibling.status = outcome
             break
 
 
@@ -7119,7 +7142,8 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
                     group_key=f"download:{item.batch_id}",
                 )
                 session.flush()
-                enqueue_task(session, "jellyfin_scan", {})
+                if jellyfin_configured(session):  # Round 4 #1
+                    enqueue_task(session, "jellyfin_scan", {})
                 flush_import_enrichment(session)
                 imported_to_library = True
             else:
@@ -7150,6 +7174,13 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
         "file": str(downloaded_path) if downloaded_path else None,
         "imported": imported_to_library,
     }
+
+
+def jellyfin_configured(session: Session) -> bool:
+    """True only when both a Jellyfin URL and API key are set (Round 4 #1: an unconfigured
+    Jellyfin must never be scanned/synced -- neither enqueued nor executed)."""
+    settings = integration_settings(session)
+    return bool(settings.get("jellyfin_url", "").rstrip("/") and settings.get("jellyfin_api_key", ""))
 
 
 def run_sync_favorites_jellyfin(session: Session, _payload: dict) -> dict:
@@ -7891,7 +7922,11 @@ def run_jellyfin_scan(session: Session, _payload: dict) -> dict:
     jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
     jellyfin_api_key = settings.get("jellyfin_api_key", "")
     if not jellyfin_url or not jellyfin_api_key:
-        raise ValueError("Jellyfin URL and API key are required")
+        # Round 4 #1: no Jellyfin linked -- succeed quietly rather than failing the task.
+        # Every enqueue site now skips this task when unconfigured; this is the backstop for
+        # any caller (manual tool trigger, an automation) that enqueues it anyway.
+        append_task_log(session, None, "Jellyfin not configured — skipping library scan", "warning")
+        return {"requested": False}
     with httpx.Client(base_url=jellyfin_url, headers={"X-Emby-Token": jellyfin_api_key}, timeout=25) as client:
         response = client.post("/Library/Refresh")
         response.raise_for_status()
