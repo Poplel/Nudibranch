@@ -44,8 +44,9 @@ class UserOut(BaseModel):
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
     remote_playback_enabled: bool = True
-    #: Minutes a playback claim survives without playing; 0 = never expires (§31).
-    playback_claim_timeout_minutes: int = 5
+    #: Minutes a playback claim survives without playing; 0 = never expires (§31), and is the
+    #: default (2026-09-23 -- "Never" is the default for Hand Off After).
+    playback_claim_timeout_minutes: int = 0
     search_min_confidence: float = 0.4
     library_page_size: int = 100
     jellyfin_user_id: str | None = None
@@ -149,8 +150,9 @@ class UserAppearanceUpdate(BaseModel):
     #: someone who turned it off elsewhere.
     remote_playback_enabled: bool
     #: How long this account's playback claim survives without playing, in MINUTES. 0 = never
-    #: expires. Replaces the fixed 5-minute CLAIM_IDLE_TIMEOUT per user (§31).
-    playback_claim_timeout_minutes: int = Field(default=5, ge=0, le=1440)
+    #: expires, and is the default (2026-09-23) -- replaces the old fixed 5-minute
+    #: CLAIM_IDLE_TIMEOUT per user (§31).
+    playback_claim_timeout_minutes: int = Field(default=0, ge=0, le=1440)
 
 
 class JellyfinUserLinkUpdate(BaseModel):
@@ -367,6 +369,12 @@ class RetryRequest(BaseModel):
 
 class CancelRequest(BaseModel):
     item_ids: list[str] | None = None
+
+
+class WishlistQueueActionRequest(BaseModel):
+    """Body for `/wishlist/queue/approve` and `/wishlist/queue/reject` -- gate 1."""
+
+    item_ids: list[str]
 
 
 class ProposalSelectionUpdate(BaseModel):

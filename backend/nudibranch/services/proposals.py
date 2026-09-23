@@ -19,6 +19,7 @@ from nudibranch.db.models import (
     User,
     WishlistItem,
 )
+from nudibranch.services import queue_state
 from nudibranch.services.notifications import create_notification
 from nudibranch.services.tasks import enqueue_task
 
@@ -252,9 +253,10 @@ def decline_linked_wishlist_items(session: Session, items: list[ProposalItem]) -
     """Mark the requests behind these items declined, without deleting anything.
 
     ⚠️ Load-bearing for "remove implies cancel": the worker's `reset_canceled_wishlist_items` sends
-    a cancelled request back to `searching`, which is right for a cancel and exactly wrong for a
-    removal. It skips rows that are already `rejected`/`removed`, so declining them BEFORE the
-    cancel is what stops a removed request re-searching itself a second later.
+    an emptied request back to `requested` (gate 1), which is wrong for a removal -- a removed
+    request should stay declined, not reappear waiting for re-approval. It skips rows that are
+    already `rejected`/`removed`, so declining them BEFORE the removal-cancel step is what stops a
+    removed request coming back to life a second later.
     """
     now = datetime.now(timezone.utc)
     declined: set[str] = set()
@@ -317,7 +319,11 @@ def remove_items(
         live_ids |= {item.id for item in targets if item.status is ProposalStatus.canceled}
         if live:
             decline_linked_wishlist_items(session, live)
-            canceled_total += len(cancel_items(session, batch_id, sorted(live_ids), actor_id))
+            # ⚠️ NOT `cancel_items` (2026-09-23): that function now hands a stopped download BACK
+            # to gate (a), keeping the row -- exactly wrong for a Remove, which must delete it for
+            # good. `_mark_items_canceled_for_removal` is the old terminal-`canceled` marking that
+            # `run_cancel_download_item(delete_rows=True)` deletes once the transfer is stopped.
+            canceled_total += len(_mark_items_canceled_for_removal(session, batch_id, sorted(live_ids), actor_id))
         session.expire(batch, ["items"])
         # ⚠️ Everything the cancel is still working on is left alone -- the row itself AND its
         # ancestors. The worker finds a cancelled download by its `ProposalItem` (that is how it
@@ -633,18 +639,17 @@ def _roll_up_container_status(batch: ProposalBatch) -> None:
             item.selected = False
 
 
-def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, actor_id: str | None = None) -> list[str]:
-    """Stop this work. Returns the ids marked cancelled.
+def _mark_items_canceled_for_removal(
+    session: Session, batch_id: str, item_ids: list[str] | None, actor_id: str | None = None
+) -> list[str]:
+    """Stop live work and mark it `canceled`, for `remove_items`'s cancel-then-delete two-step.
 
-    Distinct from `reject_items`, which is an approver's decline and tells the requester their
-    request was denied. A cancel is "not now" -- from whoever's item it is, requester or approver --
-    and per the 2026-09-21 product rule it is never a resting state: a cancelled item is deleted for
-    good, an emptied batch goes with it, and a cancelled wishlist request goes back to searching
-    rather than sitting there looking declined. This function only marks the state; the row/file
-    deletion, the empty-batch cleanup and the wishlist reset all happen in the worker's
-    `run_cancel_download_item`, AFTER it has told slskd/yt-dlp to stop and removed the partial file
-    -- deleting the row here, before the worker has looked up its transfer/manifest entry by it,
-    would hand the worker nothing to clean up with.
+    ⚠️ NOT the Cancel button -- see `cancel_items` below, which never deletes anything any more.
+    `remove_items` needs the OLD terminal behaviour: a row marked `canceled` here is deleted for
+    good by the worker's `run_cancel_download_item(delete_rows=True)`, AFTER it has told
+    slskd/yt-dlp to stop and removed the partial file -- deleting the row here, before the worker
+    has looked up its transfer/manifest entry by it, would hand the worker nothing to clean up
+    with.
 
     ⚠️ Sets `selected = False` as well as the status. `queue_missing_manifest_download` re-queues
     any *selected* download item that has no manifest entry -- which is precisely the state a
@@ -671,10 +676,6 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         item.stage = "canceled"
         item.selected = False
         cancelled.append(item.id)
-        # ⚠️ The wishlist row is deliberately NOT touched here. A cancelled request is never shown
-        # as cancelled: the worker's `reset_canceled_wishlist_items` sends it back to searching once
-        # none of its work is live. Writing "canceled" here stranded the row whenever other work
-        # under the same request was still live, because the reset then (rightly) skipped it.
     if cancelled:
         # Stop the search still feeding this batch BEFORE rolling up, or it re-populates behind us.
         wishlist_ids = {item.wishlist_item_id for item in batch.items if item.wishlist_item_id}
@@ -702,7 +703,74 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
         batch.status = ProposalStatus.canceled
     session.commit()
     if cancelled:
-        enqueue_task(session, "cancel_download_item", {"item_ids": cancelled})
+        enqueue_task(session, "cancel_download_item", {"item_ids": cancelled, "delete_rows": True})
+    return cancelled
+
+
+def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, actor_id: str | None = None) -> list[str]:
+    """Stop an in-flight download and hand it back to gate (a) -- Download approval.
+
+    2026-09-23 rewrite ("today a cancel re-searches, and that is a bug"). This is the Cancel
+    button, and it is no longer a destructive act: it stops the real transfer and deletes the
+    partial file (the worker's `run_cancel_download_item`, enqueued below, with `delete_rows`
+    False), then puts the candidate `ProposalItem` straight back to `pending` + `selected` --
+    WITHOUT deleting it or any sibling candidate, and WITHOUT starting a new search. Distinct from
+    `remove_items`/`reject_items`, which delete for good and go through
+    `_mark_items_canceled_for_removal` instead.
+
+    Only stages genuinely doing something right now (`queue_state.CANCELABLE_STAGES`) are ever
+    touched; anything else (awaiting approval, staged, already terminal) is a silent no-op and is
+    never counted in the returned list -- so a stale bulk selection or a double-tap on a row that
+    already finished costs nothing and reports nothing.
+    """
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise ValueError("Proposal batch not found")
+    # `include_staged=False`: a `staged` (gate-b, Import approval) leaf is no longer cancelable --
+    # there is no transfer left to stop, and "Remove" is the right action there instead.
+    targets = _leaf_download_items(batch, item_ids, include_staged=False)
+    now = datetime.now(timezone.utc)
+    cancelled: list[str] = []
+    wishlist_item_ids: set[str] = set()
+    for item in targets:
+        if queue_state.resolve_stage(item) not in queue_state.CANCELABLE_STAGES:
+            continue
+        payload = json.loads(item.payload_json or "{}")
+        # No free-text status: `status_label` prefers it over the stage, and this row's honest
+        # label is the stage's own -- "download approval".
+        payload.pop("status", None)
+        payload.pop("download_progress", None)
+        payload["canceled_at"] = now.isoformat()
+        if actor_id:
+            payload["canceled_by"] = actor_id
+        item.payload_json = json.dumps(payload)
+        item.status = ProposalStatus.pending
+        item.stage = ItemStage.awaiting_approval.value
+        # `selected` deliberately STAYS True: it is still the chosen candidate for its track, just
+        # back at gate (a) instead of mid-transfer. `selected_slskd_download_item_ids` already
+        # gates re-queueing on `status` being approved/executing/failed, not on `selected` alone,
+        # so a `pending` row here is safely inert against `queue_missing_manifest_download`.
+        cancelled.append(item.id)
+        if item.wishlist_item_id:
+            wishlist_item_ids.add(item.wishlist_item_id)
+    if not cancelled:
+        return []
+    # Stop any search still feeding this batch -- a live search must not repopulate what was just
+    # handed back to gate (a) behind us.
+    wishlist_ids_feeding = {item.wishlist_item_id for item in batch.items if item.wishlist_item_id}
+    _stop_feeding_tasks(session, batch, wishlist_ids_feeding)
+    for wishlist_item_id in wishlist_item_ids:
+        wishlist_item = session.get(WishlistItem, wishlist_item_id)
+        if wishlist_item and wishlist_item.status not in {"rejected", "removed", "completed"}:
+            # Back to Download approval, honestly -- not "searching", and nothing is re-enqueued.
+            wishlist_item.status = "review"
+            wishlist_item.stage = ItemStage.awaiting_approval.value
+            wishlist_item.status_changed_at = now
+    session.commit()
+    # The slow half: stop the real slskd/yt-dlp transfer and delete the partial file. This needs
+    # the row to still exist -- it looks up the manifest/transfer entry by item id -- which is
+    # exactly why this no longer deletes it.
+    enqueue_task(session, "cancel_download_item", {"item_ids": cancelled, "delete_rows": False})
     return cancelled
 
 
@@ -745,10 +813,11 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     may cancel their own request but never retry it. The route enforces that; this function assumes
     the caller already checked.
 
-    ⚠️ `canceled` is deliberately NOT a retry target (it was, before 2026-09-21). A cancelled item
-    is now deleted outright by the worker's `run_cancel_download_item`, so by the time a retry could
-    reach it there is nothing here to put back in flight -- the wishlist row gets a fresh search
-    instead, which is retry's `research` mode in everything but name.
+    ⚠️ `canceled` is deliberately NOT a retry target. A row the Cancel button touches is put back
+    at `pending` (gate a, Download approval) by `cancel_items`, not left `canceled` -- so by the
+    time a retry could reach a `canceled` row, it can only be one `remove_items` is in the middle
+    of deleting, and there is nothing here to put back in flight. Re-entering the download from
+    gate (a) is an ordinary Approve, not a retry.
     """
     batch = session.get(ProposalBatch, batch_id)
     if not batch:

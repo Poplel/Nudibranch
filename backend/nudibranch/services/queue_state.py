@@ -76,16 +76,23 @@ MANIFEST_STATUS_TO_STAGE: dict[str, ItemStage] = {
 
 _STAGE_DEFAULT_LABEL: dict[ItemStage, str] = {
     ItemStage.waiting: "waiting",
-    ItemStage.searching: "finding candidates",
+    # Gate 1: a wishlist request waiting for a human to approve the search. Never appears in the
+    # Task Queue (a ProposalItem is never created before gate 1 passes).
+    ItemStage.requested: "request approval",
+    ItemStage.searching: "searching",
+    # Flow-dependent gate (a)/(b)/(c) label -- resolved properly in `status_label` below, which
+    # needs the batch's `flow` to pick "download approval" / "import approval" / "change
+    # approval". This entry is only the fallback for a caller that has no flow to give it.
     ItemStage.awaiting_approval: "awaiting approval",
-    ItemStage.approved: "approved",
-    ItemStage.queued: "queued",
+    ItemStage.approved: "waiting to download",
+    ItemStage.queued: "waiting to download",
     ItemStage.downloading: "downloading",
     ItemStage.retrying: "retrying",
     ItemStage.staging: "moving into place",
     ItemStage.verifying: "verifying",
-    ItemStage.staged: "ready to add",
-    ItemStage.importing: "adding to library",
+    # A `library_review` leaf sitting in staging, waiting for gate (b).
+    ItemStage.staged: "import approval",
+    ItemStage.importing: "importing",
     ItemStage.completed: "done",
     ItemStage.failed: "needs attention",
     ItemStage.canceled: "canceled",
@@ -96,6 +103,7 @@ _STAGE_DEFAULT_LABEL: dict[ItemStage, str] = {
 # bar while real work is happening.
 _STAGE_DEFAULT_PROGRESS: dict[ItemStage, float] = {
     ItemStage.waiting: 0.0,
+    ItemStage.requested: 0.0,
     ItemStage.searching: 0.0,
     ItemStage.awaiting_approval: 0.0,
     ItemStage.approved: 0.0,
@@ -120,6 +128,7 @@ _INDETERMINATE_STAGES = frozenset(
 # a human": a batch with one failed track is a failed batch even if ten others finished.
 _STAGE_SEVERITY: list[ItemStage] = [
     ItemStage.failed,
+    ItemStage.requested,
     ItemStage.awaiting_approval,
     ItemStage.retrying,
     ItemStage.searching,
@@ -160,17 +169,17 @@ APPROVABLE_STAGES = frozenset({ItemStage.awaiting_approval, ItemStage.waiting, I
 # already past its approval.
 LIBRARY_REVIEW_APPROVABLE_STAGES = APPROVABLE_STAGES | {ItemStage.staged}
 
-# Stages where stopping the work still means something.
+# Stages where stopping the work still means something. ⚠️ 2026-09-23: NARROWED on purpose.
+# `waiting`, `awaiting_approval` and `staged` are gates waiting on a human DECISION, not work in
+# flight -- there is nothing there for Cancel to stop, and the contract's `can_approve`/"Remove"
+# actions are what apply instead. Only these five have a live search or transfer behind them.
 CANCELABLE_STAGES = frozenset(
     {
-        ItemStage.waiting,
         ItemStage.searching,
-        ItemStage.awaiting_approval,
         ItemStage.approved,
         ItemStage.queued,
         ItemStage.downloading,
         ItemStage.retrying,
-        ItemStage.staged,
     }
 )
 
@@ -277,17 +286,39 @@ def _coerce_flow(flow: str | None) -> ProposalFlow:
         return ProposalFlow.library_change
 
 
-def status_label(item: ProposalItem, stage: ItemStage, payload: dict | None = None) -> str:
+# The `awaiting_approval` stage means three different things depending which gate the batch is
+# for -- resolved here, once, so no client has to know `ProposalFlow` exists.
+_AWAITING_APPROVAL_LABEL_BY_FLOW: dict[ProposalFlow, str] = {
+    ProposalFlow.download_review: "download approval",
+    ProposalFlow.library_review: "import approval",
+    ProposalFlow.library_change: "change approval",
+}
+
+
+def status_label(
+    item: ProposalItem, stage: ItemStage, payload: dict | None = None, flow: ProposalFlow | str | None = None
+) -> str:
     """Human-readable status.  The worker's own free text wins when it exists -- it is more
-    specific ("downloading 42% - 2 of 5 downloaded") than any generic stage name."""
+    specific ("87% match - FLAC") than any generic stage name.
+
+    `flow` disambiguates `awaiting_approval` into "download approval" / "import approval" /
+    "change approval" -- the same stage means a different gate depending which batch it is in.
+    Omitting it (the caller has none to give, e.g. a wishlist row) falls back to the flow-neutral
+    `_STAGE_DEFAULT_LABEL` entry ("awaiting approval").
+    """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
     if isinstance(existing, str) and existing.strip():
         return existing.strip()
+    if stage is ItemStage.awaiting_approval and flow is not None:
+        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+        return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
     return _STAGE_DEFAULT_LABEL.get(stage, stage.value)
 
 
-def item_progress(item: ProposalItem, stage: ItemStage, payload: dict | None = None) -> dict:
+def item_progress(
+    item: ProposalItem, stage: ItemStage, payload: dict | None = None, flow: ProposalFlow | str | None = None
+) -> dict:
     """`{value, label, indeterminate, stage}` for any item of any kind.
 
     Non-download proposals had no progress at all before this -- they now get a synthesized floor
@@ -314,7 +345,7 @@ def item_progress(item: ProposalItem, stage: ItemStage, payload: dict | None = N
         indeterminate = stage in _INDETERMINATE_STAGES
     return {
         "value": value,
-        "label": label or status_label(item, stage, data),
+        "label": label or status_label(item, stage, data, flow),
         "indeterminate": bool(indeterminate),
         "stage": stage,
     }

@@ -117,6 +117,7 @@ from nudibranch.api.schemas import (
     UserUpdate,
     WishlistCreate,
     WishlistOut,
+    WishlistQueueActionRequest,
     PodcastSubscribeIn,
     PodcastUpdateIn,
     PodcastOut,
@@ -1511,8 +1512,9 @@ def ack_player_command(
 CLAIM_SILENCE_TIMEOUT = timedelta(minutes=5)
 #: Default for `User.playback_claim_timeout_minutes`: how long a claim survives without PLAYING. A
 #: paused session left alone is up for grabs, so the next device to press Play takes it rather than
-#: remote-controlling a sleeping one. Per user since 2026-09-22; 0 means it never lapses this way.
-DEFAULT_CLAIM_IDLE_MINUTES = 5
+#: remote-controlling a sleeping one. Per user since 2026-09-22; 0 (the default since 2026-09-23,
+#: "Never" is the default for Hand Off After) means it never lapses this way.
+DEFAULT_CLAIM_IDLE_MINUTES = 0
 # A shared session is meant to be resumed in full, so it is capped far above a transfer (500).
 SESSION_MAX_ITEMS = 5000
 SESSION_MAX_PAYLOAD_BYTES = 512 * 1024
@@ -4575,7 +4577,7 @@ def create_wishlist_item(
         .where(WishlistItem.artist == payload.artist)
         .where(WishlistItem.album == payload.album)
         .where(WishlistItem.track == payload.track)
-        .where(WishlistItem.status.in_(["wanted", "searching", "review", "approved", "staged", "downloading"]))
+        .where(WishlistItem.status.in_(["wanted", "requested", "searching", "review", "approved", "staged", "downloading"]))
     )
     if existing:
         write_app_log(
@@ -4602,19 +4604,24 @@ def create_wishlist_item(
         session.delete(declined)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
-    # Searching starts immediately, with no human step in between -- that is the whole point of
-    # the rework.  The APPROVAL gate has not moved to the client: the candidate batch this
-    # produces is created `pending` and still needs approvals:manage (or wishlist:approve_all)
-    # to become an actual download, so a discover-only user still cannot self-approve.
-    item.status = "searching"
-    item.stage = ItemStage.searching.value
+    # Gate 1 (2026-09-23): an approver's own request skips straight to searching, exactly as
+    # before. Everyone else's request waits at `requested` until a `wishlist:approve_all` holder
+    # (or admin) approves it from /wishlist/queue -- nothing searches until a human says so.
+    is_approver = user_has_permission(user, Permission.wishlist_approve_all)
+    if is_approver:
+        item.status = "searching"
+        item.stage = ItemStage.searching.value
+    else:
+        item.status = "requested"
+        item.stage = ItemStage.requested.value
     session.add(item)
     session.commit()
     session.refresh(item)
-    # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
-    # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
-    enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
-    session.commit()
+    if is_approver:
+        # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
+        # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+        session.commit()
     write_app_log(
         "Wishlist item created",
         feature=payload.source or "wishlist",
@@ -4648,6 +4655,105 @@ def remove_wishlist_item(
     purge_wishlist_work(session, item, actor_id=user.id)
     session.refresh(item)
     return serialize_wishlist_item(item)
+
+
+@router.get("/wishlist/queue", response_model=list[WishlistOut], tags=["wishlist"], summary="List requests waiting at gate 1")
+def list_wishlist_queue(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> list[WishlistOut]:
+    """Every user's rows still waiting for gate 1 (Request approval), oldest first.
+
+    Gate 1: nothing searches until a `wishlist:approve_all` holder (or admin) approves the
+    request here. An approver's own requests skip this gate entirely (see create_wishlist_item),
+    so this list is always someone ELSE's requests.
+    """
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.status == "requested")
+            .order_by(WishlistItem.created_at.asc())
+        )
+    )
+    return [serialize_wishlist_item(item) for item in items]
+
+
+@router.post("/wishlist/queue/approve", response_model=list[WishlistOut], tags=["wishlist"], summary="Approve requests at gate 1")
+def approve_wishlist_queue(
+    payload: WishlistQueueActionRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> list[WishlistOut]:
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.id.in_(payload.item_ids))
+        )
+    )
+    now = datetime.now(timezone.utc)
+    approved: list[WishlistItem] = []
+    for item in items:
+        # Anything not still at gate 1 is ignored silently -- a double-tap or a stale client list
+        # must not re-trigger a search for a row already searching/declined/etc.
+        if item.status != "requested":
+            continue
+        item.status = "searching"
+        item.stage = ItemStage.searching.value
+        item.status_changed_at = now
+        approved.append(item)
+    session.commit()
+    for item in approved:
+        session.refresh(item)
+        # Enqueued AFTER the commit, same reasoning as create_wishlist_item: the worker must never
+        # be able to claim the task before the row it needs exists.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+        write_app_log(
+            "Wishlist request approved at gate 1",
+            feature="wishlist",
+            user_id=user.id,
+            item_id=item.id,
+            requester_id=item.user_id,
+        )
+    session.commit()
+    return [serialize_wishlist_item(item) for item in approved]
+
+
+@router.post("/wishlist/queue/reject", response_model=list[WishlistOut], tags=["wishlist"], summary="Decline requests at gate 1")
+def reject_wishlist_queue(
+    payload: WishlistQueueActionRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> list[WishlistOut]:
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.id.in_(payload.item_ids))
+        )
+    )
+    now = datetime.now(timezone.utc)
+    rejected: list[WishlistItem] = []
+    for item in items:
+        if item.status != "requested":
+            continue
+        # Declined, and it STAYS visible on the requester's wishlist -- they remove it themselves.
+        # Nothing has searched yet at gate 1, so there is no candidate work to purge.
+        item.status = "rejected"
+        item.stage = ItemStage.rejected.value
+        item.status_changed_at = now
+        rejected.append(item)
+    session.commit()
+    for item in rejected:
+        write_app_log(
+            "Wishlist request declined at gate 1",
+            feature="wishlist",
+            user_id=user.id,
+            item_id=item.id,
+            requester_id=item.user_id,
+        )
+    return [serialize_wishlist_item(item) for item in rejected]
 
 
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
@@ -7048,7 +7154,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         remote_playback_enabled=bool(getattr(user, "remote_playback_enabled", True)),
-        playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 5) or 0),
+        playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 0) or 0),
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,
         jellyfin_user_id=user.jellyfin_user_id or None,
@@ -7215,18 +7321,22 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
 
 _WISHLIST_STAGE_LABELS: dict[ItemStage, str] = {
     ItemStage.waiting: "Waiting",
-    ItemStage.searching: "Finding candidates",
-    ItemStage.awaiting_approval: "Awaiting approval",
-    ItemStage.approved: "Approved",
-    ItemStage.queued: "Queued",
+    # Gate 1 (2026-09-23): a request that has not yet been approved to search at all.
+    ItemStage.requested: "Request approval",
+    ItemStage.searching: "Searching",
+    # A wishlist row only ever reaches `awaiting_approval` for gate (a) -- candidates ready,
+    # needing approval to download. Gate (b) (import) is the `staged` status below instead.
+    ItemStage.awaiting_approval: "Download approval",
+    ItemStage.approved: "Waiting to download",
+    ItemStage.queued: "Waiting to download",
     ItemStage.downloading: "Downloading",
     ItemStage.retrying: "Retrying",
     ItemStage.staging: "Moving into place",
     ItemStage.verifying: "Verifying",
     # Deliberately not "Completed": the files exist but have NOT been approved into the library
     # yet.  Reporting this as done is the bug where a rejected import still read "completed".
-    ItemStage.staged: "Downloaded - waiting for approval to add",
-    ItemStage.importing: "Adding to library",
+    ItemStage.staged: "Import approval",
+    ItemStage.importing: "Importing",
     ItemStage.completed: "In your library",
     ItemStage.failed: "Needs attention",
     ItemStage.canceled: "Canceled",
@@ -7262,6 +7372,7 @@ def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) 
         return ItemStage.downloading
     return {
         "wanted": ItemStage.waiting,
+        "requested": ItemStage.requested,
         "searching": ItemStage.searching,
         "review": ItemStage.awaiting_approval,
         "awaiting_approval": ItemStage.awaiting_approval,
@@ -7554,11 +7665,11 @@ def serialize_proposal_item(
         new_value=item.new_value,
         stage=stage,
         status_code=stage.value,
-        status_label=queue_state.status_label(item, stage, payload),
+        status_label=queue_state.status_label(item, stage, payload, flow),
         bucket=queue_state.bucket_for(flow, stage),
         action=payload.get("action") or None,
         actionable=actionable,
-        progress=ProgressOut(**queue_state.item_progress(item, stage, payload)),
+        progress=ProgressOut(**queue_state.item_progress(item, stage, payload, flow)),
         candidate=CandidateOut(**candidate) if candidate else None,
         failure=FailureOut(**failure) if failure else None,
         request=RequestRefOut(**request_ref) if request_ref else None,

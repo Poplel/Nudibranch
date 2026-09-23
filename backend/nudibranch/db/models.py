@@ -94,6 +94,7 @@ class ItemStage(str, enum.Enum):
     """
 
     waiting = "waiting"                      # created, nothing started
+    requested = "requested"                  # wishlist request waiting at gate 1 (human must approve the search)
     searching = "searching"                  # slskd candidate search in flight
     awaiting_approval = "awaiting_approval"  # a human must act (gate a or b)
     approved = "approved"                    # approved, worker has not picked it up
@@ -164,7 +165,7 @@ class User(Base):
     #: taste question, not a protocol constant. ⚠ It governs the IDLE clock only: a claim whose
     #: owner says it is PLAYING is still checked against LIVE_WINDOW (45s), so a force-quit app
     #: releases the session immediately whatever this says (§31's two clocks).
-    playback_claim_timeout_minutes: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    playback_claim_timeout_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     search_min_confidence: Mapped[float] = mapped_column(default=0.4, nullable=False)
     library_page_size: Mapped[int] = mapped_column(default=100, nullable=False)
     jellyfin_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)

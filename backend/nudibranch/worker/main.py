@@ -482,7 +482,7 @@ def add_download_candidate_review_items(
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates)
                 candidates_added += len(candidates)
-                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(candidates)} candidates ready")
+                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval)
                 append_task_log(session, task, f"{track_title}: {len(candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s)")
             elif any(r.get("workflow") == "lossless_replacement" for r in requests):
                 # Lossless replacement exists to UPGRADE to lossless — never pull a lossy per-track
@@ -583,7 +583,7 @@ def add_track_search_candidate_items(
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
                 added += len(candidates[:5])
-                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(candidates[:5])} candidates ready")
+                set_candidate_parent_stage(track_item, ItemStage.awaiting_approval)
                 append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
             else:
                 rate_limited = bool(result.get("diagnostics", {}).get("rate_limited"))
@@ -3395,25 +3395,35 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
         total = len(leaves)
         progress_values = [download_status_progress_value(status, payload) for status, payload in zip(statuses, progress_payloads)]
         average_progress = sum(progress_values) / max(1, total)
+        # ⚠️ 2026-09-23: `status` is the pill word ALONE ("downloading" / "waiting to download" /
+        # …) and `progress_label` is the count ALONE ("3 of 8 downloaded") -- the two are never
+        # combined into one string any more (that combined text, e.g. "downloading 42% - 2 of 5
+        # downloaded", was one string doing two jobs and clients could not style the count as the
+        # separate no-background line the design calls for).
         if failed:
-            status = f"{failed} of {total} need attention"
+            status = "needs attention"
+            progress_label = f"{failed} of {total} failed"
         elif verified == total:
-            status = "verified 100% · ready to import"
+            status = "verified"
+            progress_label = f"{verified} of {total} verified"
         elif downloaded == total:
-            verify_percent = (verified / max(1, total)) * 100
-            status = f"verifying {verify_percent:.0f}% · {verified} of {total} verified"
-        elif downloaded:
-            status = f"downloading {average_progress:.0f}% · {downloaded} of {total} downloaded"
-        elif average_progress > 0:
-            status = f"downloading {average_progress:.0f}% · 0 of {total} downloaded"
-        elif any("waiting to download" in status for status in statuses):
-            status = f"waiting to download · {downloaded} of {total} downloaded"
-        elif any("queued in slskd" in status or "download queued in slskd" in status for status in statuses):
-            status = f"queued in slskd · {downloaded} of {total} downloaded"
+            status = "verifying"
+            progress_label = f"{verified} of {total} verified"
+        elif downloaded or average_progress > 0:
+            status = "downloading"
+            progress_label = f"{downloaded} of {total} downloaded"
         else:
-            status = f"waiting for transfer progress · {downloaded} of {total} downloaded"
+            # Covers every pre-transfer wait (queued in slskd, no transfer state yet, …) under one
+            # pill word -- the contract's two download-row pill words are "downloading" and
+            # "waiting to download", not a menu of slskd-internal phrasings.
+            status = "waiting to download"
+            progress_label = f"{downloaded} of {total} downloaded"
         stage = "failed" if failed else "verified" if verified == total else "verifying" if downloaded == total else "downloading" if average_progress > 0 else "queued"
-        set_item_payload_status(item, status, download_progress_payload(status, stage=stage, progress=average_progress, indeterminate=stage in {"verifying"}))
+        set_item_payload_status(
+            item,
+            status,
+            download_progress_payload(status, stage=stage, progress=average_progress, indeterminate=stage in {"verifying"}, label=progress_label),
+        )
         cache_item_stage(item, stage)
 
 
@@ -4777,7 +4787,7 @@ def create_album_download_candidate_batch(
             append_task_log(session, task, f"{track_title}: {len(folder_candidates)} album-folder candidate(s) ready after trying up to {folder_try_limit} folder(s); best {folder_candidates[0].get('filename')} at {confidence}% confidence")
             add_download_candidate_items(session, batch, track_item, request, query, folder_candidates)
             slskd_tracks += 1
-            set_candidate_parent_stage(track_item, ItemStage.awaiting_approval, f"{len(folder_candidates)} candidates ready")
+            set_candidate_parent_stage(track_item, ItemStage.awaiting_approval)
             completed_tracks += 1
             if task is not None:
                 update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
@@ -5146,7 +5156,14 @@ def mirror_download_stage_to_wishlist(item: ProposalItem, stage: ItemStage) -> N
         wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
-def download_progress_payload(status: str, *, stage: str | None = None, progress: float | None = None, indeterminate: bool | None = None) -> dict:
+def download_progress_payload(
+    status: str,
+    *,
+    stage: str | None = None,
+    progress: float | None = None,
+    indeterminate: bool | None = None,
+    label: str | None = None,
+) -> dict:
     lowered = str(status or "").casefold()
     value = max(0.0, min(100.0, float(progress))) if isinstance(progress, (int, float)) else None
     resolved_stage = stage
@@ -5189,7 +5206,9 @@ def download_progress_payload(status: str, *, stage: str | None = None, progress
     return {
         "stage": resolved_stage,
         "value": 0 if value is None else value,
-        "label": status,
+        # Callers with a count to report (e.g. "3 of 8 downloaded") pass it separately via
+        # `label=` -- it is never the same string as `status`, which is the pill word alone.
+        "label": status if label is None else label,
         "indeterminate": resolved_indeterminate,
     }
 
@@ -9966,19 +9985,29 @@ def _manifest_entries_for_items(item_ids: set[str]) -> list[dict]:
 
 
 def run_cancel_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
-    """Stop the real transfer behind a cancelled item, then remove it for good.
+    """Stop the real transfer behind a cancelled item.
 
-    `cancel_items` already flipped these rows to `canceled` and unselected synchronously, so the UI
-    is instant and nothing re-queues them meanwhile; this is the slow half, and per the 2026-09-21
-    product rule ("cancelled means gone") it also does the actual deletion. Deletion happens HERE,
-    AFTER slskd/yt-dlp has been told to drop the transfer and the partial file is gone, not in
-    `cancel_items` -- the transfer/manifest lookups above key off the row (and the manifest entry,
-    keyed by item id), so deleting it first would leave nothing to look them up by. Everything up to
-    the delete is still best-effort: a transfer slskd has already forgotten is not an error.
+    2026-09-23 rewrite ("today a cancel re-searches, and that is a bug"). `delete_rows` tells the
+    two very different callers apart:
+
+    * The Cancel button (`cancel_items`) sends `delete_rows=False` -- it already put the row back
+      at `pending` + `selected` (gate a, Download approval) synchronously, keeping every sibling
+      candidate. This is only the slow half: stop the live transfer and delete the partial file.
+      The row stays; nothing here may delete it, its container, its batch, or touch the wishlist
+      row's status beyond what `cancel_items` already set.
+    * Removal (`_mark_items_canceled_for_removal`, via `remove_items`/`reject`) sends
+      `delete_rows=True` and keeps the OLD terminal behaviour: once the transfer is stopped, the
+      row (and any emptied container/batch) is deleted for good, same as before 2026-09-23.
+
+    Either way, deletion of the manifest entry and partial file happens HERE, AFTER slskd/yt-dlp
+    has been told to drop the transfer, not in the API layer -- the transfer/manifest lookups key
+    off the row, so deleting it first would leave nothing to look them up by. Everything up to
+    that point is still best-effort: a transfer slskd has already forgotten is not an error.
     """
     item_ids = {str(i) for i in (payload.get("item_ids") or [])}
     if not item_ids:
         return {"canceled": 0}
+    delete_rows = bool(payload.get("delete_rows"))
     entries = _manifest_entries_for_items(item_ids)
     transfers, _ = slskd_transfer_lookup(session, entries) if entries else ({}, None)
     removed = 0
@@ -10001,7 +10030,26 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
         remove_download_manifest_entry(entry)
         removed += 1
 
-    # The destructive half. Gather batch/wishlist linkage before delete() expires it off the row.
+    if not delete_rows:
+        # The row stays at gate (a). Re-assert it: the download scan can mirror the manifest's
+        # "downloading" into `stage` in the window before this task removed the entry, and a stale
+        # cache would then outrank the pending status in `resolve_stage` for good.
+        for item_id in item_ids:
+            item = session.get(ProposalItem, item_id)
+            if item and item.status is ProposalStatus.pending:
+                item.stage = ItemStage.awaiting_approval.value
+                item_payload = json.loads(item.payload_json or "{}")
+                item_payload.pop("status", None)
+                item_payload.pop("download_progress", None)
+                item.payload_json = json.dumps(item_payload)
+        session.commit()
+        append_task_log(
+            session, task, f"Canceled {len(item_ids)} download(s); stopped {stopped} slskd transfer(s), cleared {removed} manifest entr(ies) -- kept at Download approval"
+        )
+        return {"canceled": len(item_ids), "cleaned": removed, "stopped": stopped}
+
+    # The destructive half (removal only). Gather batch/wishlist linkage before delete() expires it
+    # off the row.
     items = [item for item_id in item_ids if (item := session.get(ProposalItem, item_id))]
     # A cancelled "Add to library" leaf has no transfer; its file is already staged in downloads.
     # Same removal `reject_items` does; download leaves are skipped by it (wrong kind).
@@ -10020,9 +10068,10 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
 
     # A container (artist/album/track) left with no children by that deletion goes too -- the same
     # cleanup `reject_items` runs -- and a batch left with no items at all follows it. So does a
-    # batch `cancel_items` settled as `canceled`: it can still hold unselected alternate candidates
-    # (or finished rows), which would otherwise keep a "canceled" husk in Issues forever. Deleting
-    # those rows never touches library files; only the cancelled leaves above had files to remove.
+    # batch `_mark_items_canceled_for_removal` settled as `canceled`: it can still hold unselected
+    # alternate candidates (or finished rows), which would otherwise keep a "canceled" husk in
+    # Issues forever. Deleting those rows never touches library files; only the cancelled leaves
+    # above had files to remove.
     for batch in batches.values():
         session.expire(batch, ["items"])
         cleanup_empty_container_items(session, batch)
@@ -10034,19 +10083,27 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
     reset_canceled_wishlist_items(session, wishlist_item_ids)
     session.commit()
     append_task_log(
-        session, task, f"Canceled {len(item_ids)} download(s); stopped {stopped} slskd transfer(s), cleared {removed} manifest entr(ies), removed {len(items)} row(s)"
+        session, task, f"Removed {len(item_ids)} download(s); stopped {stopped} slskd transfer(s), cleared {removed} manifest entr(ies), removed {len(items)} row(s)"
     )
     return {"canceled": len(item_ids), "cleaned": removed, "stopped": stopped}
 
 
 def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str]) -> None:
-    """A cancelled request is not declined -- put its wishlist row back to square one.
+    """A removed request is not declined -- put its wishlist row back to gate 1 (`requested`).
+
+    ⚠️ 2026-09-23: this used to restart the search immediately ("searching" + a fresh
+    `search_wishlist_item` task) -- "today a cancel re-searches, and that is a bug". It now lands
+    on `requested` and enqueues NOTHING, so a human has to approve it again at gate 1 before
+    anything searches. In practice this path is now rare: the Cancel button (`cancel_items`) no
+    longer deletes rows at all, so it never empties a wishlist item's work any more. This only
+    still fires via the removal path (`run_cancel_download_item(delete_rows=True)`), and only for
+    a wishlist item removal hasn't already marked terminal (see the guard below) -- a defensive
+    backstop, not the primary route to `requested`.
 
     Only once EVERY item this wishlist row still owns is gone: an album is many `ProposalItem`
-    download leaves sharing one `wishlist_item_id`, and cancelling a single track must not blow
-    away the wishlist row -- and re-search the whole album -- while its siblings are still
-    downloading under the same request. `rejected`/`removed`/`completed` rows are settled for good and
-    must never be revived by a cancel that happens to share their id.
+    download leaves sharing one `wishlist_item_id`, and removing a single track must not blow away
+    the wishlist row while its siblings are still downloading under the same request.
+    `rejected`/`removed`/`completed` rows are settled for good and must never be revived by this.
     """
     if not wishlist_item_ids:
         return
@@ -10089,24 +10146,20 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
         wishlist_item.batch_id = None
         wishlist_item.item_id = None
         wishlist_item.status_changed_at = now
-        # The exact state a brand-new item gets in `create_wishlist_item` -- searching starts
-        # again immediately, with a fresh candidate batch. The old candidates are not reused.
-        wishlist_item.status = "searching"
-        wishlist_item.stage = ItemStage.searching.value
+        # Gate 1, not a fresh search: nothing here may enqueue `search_wishlist_item` any more.
+        wishlist_item.status = "requested"
+        wishlist_item.stage = ItemStage.requested.value
         session.flush()
-        # Enqueued after the flush, same reasoning as `create_wishlist_item`: the worker must
-        # not be able to claim `search_wishlist_item` before the row it reads exists as searching.
-        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": wishlist_item.id})
 
 
 def run_retry_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Put a failed download back in flight.
 
-    (Only failed, since 2026-09-21 -- a cancelled item is deleted by `run_cancel_download_item`
-    rather than left around, so `retry_items` no longer produces one of these for a cancelled row.)
-    `retry_items` already reset the row; this clears the *physical* leftovers so the retry starts
-    clean. Without removing the old manifest entry the scan loop would see the item as already in
-    progress and never re-queue it.
+    (Only failed -- a `canceled` row is either kept at gate (a) by `cancel_items` (nothing here to
+    retry; re-entering it is an ordinary Approve) or being deleted by removal, so `retry_items`
+    never produces a retry task for a cancelled row either way.) `retry_items` already reset the
+    row; this clears the *physical* leftovers so the retry starts clean. Without removing the old
+    manifest entry the scan loop would see the item as already in progress and never re-queue it.
     """
     item_ids = {str(i) for i in (payload.get("item_ids") or [])}
     mode = str(payload.get("mode") or "next_candidate")
