@@ -4607,8 +4607,11 @@ def advance_wishlist_rows_to_review(
     """
     if not wishlist_item_ids:
         return
-    for wishlist_item in session.scalars(select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids))):
-        if wishlist_item.status in {"completed", "rejected", "removed", "canceled"}:
+    # `populate_existing`: read the row as it is NOW. A request sent back to gate 1 while this
+    # search ran (`POST /wishlist/{id}/cancel`) must not be advanced from a stale identity-map copy.
+    fresh = select(WishlistItem).where(WishlistItem.id.in_(wishlist_item_ids)).execution_options(populate_existing=True)
+    for wishlist_item in session.scalars(fresh):
+        if wishlist_item.status in {"completed", "rejected", "removed", "canceled", "requested"}:
             continue
         wishlist_item.status = "review"
         wishlist_item.stage = ItemStage.awaiting_approval.value
@@ -9862,7 +9865,7 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
     wishlist_item = session.get(WishlistItem, wishlist_item_id) if wishlist_item_id else None
     if not wishlist_item:
         return {"searched": 0, "reason": "wishlist item is gone"}
-    if wishlist_item.status in {"removed", "rejected", "canceled", "completed"}:
+    if wishlist_item.status in {"removed", "rejected", "canceled", "completed", "requested"}:
         return {"searched": 0, "reason": f"wishlist item is {wishlist_item.status}"}
 
     discarded = discard_unapproved_search_results(session, wishlist_item.id)
@@ -9890,6 +9893,13 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
         fail_wishlist_item(session, wishlist_item, "the candidate search failed")
         raise
     session.commit()
+    # ⚠️ Cancelled while it ran (`POST /wishlist/{id}/cancel` sent it back to gate 1, or it was
+    # removed): the search could not see that mid-flight, so throw away what it just produced.
+    session.refresh(wishlist_item)
+    if wishlist_item.status in {"requested", "removed", "rejected"}:
+        discard_unapproved_search_results(session, wishlist_item.id)
+        session.commit()
+        return {"searched": 0, "reason": f"canceled while searching ({wishlist_item.status})"}
     return {"searched": len(requests), "wishlist_item_id": wishlist_item.id}
 
 

@@ -193,6 +193,7 @@ from nudibranch.services.proposals import (
     approve_batch,
     cancel_items,
     purge_wishlist_work,
+    stop_wishlist_search_tasks,
     remove_items,
     retry_items,
     set_selection,
@@ -4653,6 +4654,37 @@ def remove_wishlist_item(
     # is how sandalphon ended up holding two batches of "finding candidates" rows for a request
     # whose own row already read Declined, with nothing in any UI able to clear them.
     purge_wishlist_work(session, item, actor_id=user.id)
+    session.refresh(item)
+    return serialize_wishlist_item(item)
+
+
+@router.post("/wishlist/{item_id}/cancel", response_model=WishlistOut, tags=["wishlist"], summary="Stop a request's candidate search")
+def cancel_wishlist_search(
+    item_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> WishlistOut:
+    """Stop a request that is still searching and send it back to gate 1 (Request approval).
+
+    The one cancel that has no batch to go through: while `search_wishlist_item` runs, the request
+    is its `WishlistItem` and nothing else. Open to the requester and to approvers, like every other
+    cancel. Anything not searching is a silent no-op -- the row comes back unchanged.
+    """
+    item = session.get(WishlistItem, item_id)
+    if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
+        raise HTTPException(status_code=404, detail="Wishlist item not found")
+    if wishlist_stage(item) is not ItemStage.searching:
+        return serialize_wishlist_item(item)
+    stop_wishlist_search_tasks(session, {item.id})
+    # Candidates the search already committed go too. `purge_wishlist_work` declines the row on the
+    # way (it is shared with Remove), so the gate-1 state is written after it, not before.
+    purge_wishlist_work(session, item, actor_id=user.id)
+    item.status = "requested"
+    item.stage = ItemStage.requested.value
+    item.batch_id = None
+    item.item_id = None
+    item.status_changed_at = datetime.now(timezone.utc)
+    session.commit()
     session.refresh(item)
     return serialize_wishlist_item(item)
 

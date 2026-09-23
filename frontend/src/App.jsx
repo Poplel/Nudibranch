@@ -1389,6 +1389,23 @@ function App() {
     }
   }
 
+  // The wishlist's Cancel. A request still searching has no batch rows to cancel through, so it
+  // goes to `/wishlist/{id}/cancel`, which stops the search and sends it back to Request approval;
+  // anything further along is an ordinary download cancel.
+  async function cancelWishlistRequests(items) {
+    const searches = items.filter((item) => item.wishlist_item_id);
+    const downloads = items.filter((item) => !item.wishlist_item_id);
+    if (searches.length > 0) {
+      try {
+        await Promise.all(searches.map((item) => api(`/wishlist/${item.wishlist_item_id}/cancel`, { method: "POST" })));
+        await refreshWishlist();
+      } catch (cancelError) {
+        notify("Cancel failed", cancelError.message, "ui_error");
+      }
+    }
+    if (downloads.length > 0) await cancelApprovalItems(downloads);
+  }
+
   // mode: "next_candidate" (try the next ranked source) | "same_candidate" | "research" (discard
   // candidates and search again -- re-enters the approval gate, never auto-starts a download).
   async function retryApprovalItems(items, mode = "next_candidate") {
@@ -4260,7 +4277,7 @@ function App() {
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onRemoveMany={removeWishlistItems}
-                onCancel={cancelApprovalItems}
+                onCancel={cancelWishlistRequests}
                 onRequestAgain={requestWishlistItemAgain}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
@@ -7042,8 +7059,14 @@ function WishlistRowActions({ item, onRemove, onCancel, onRequestAgain }) {
   const needsRequestAgain = ["rejected", "failed"].includes(item.stage);
   return (
     <>
-      {active && item.batch_id && (
-        <button className="row-icon-button" onClick={() => onCancel([{ id: item.item_id || item.id, batch_id: item.batch_id }])} title="Cancel — the request stays and searches again">
+      {active && (item.batch_id || item.stage === "searching") && (
+        <button
+          className="row-icon-button"
+          onClick={() => onCancel(item.stage === "searching"
+            ? [{ wishlist_item_id: item.id }]
+            : [{ id: item.item_id || item.id, batch_id: item.batch_id }])}
+          title={item.stage === "searching" ? "Cancel — stop searching and wait for approval again" : "Cancel — stop downloading and wait for approval again"}
+        >
           <Ban size={15} />
         </button>
       )}
