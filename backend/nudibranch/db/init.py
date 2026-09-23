@@ -325,7 +325,6 @@ def ensure_lightweight_migrations(session: Session) -> None:
             )
         )
         session.commit()
-    _migrate_playback_claim_timeout_default(session)
     _migrate_queue_state_columns(session)
     # ⚠️ ORDER: everything that still reads `tree_path` must run BEFORE it is dropped.
     # `_migrate_queue_state_columns` backfills `flow` from it, and `_retire_intent_batches`
@@ -353,31 +352,6 @@ def _drop_columns(session: Session, table: str, columns: list[str]) -> None:
     for column in columns:
         if column in existing:
             session.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
-    session.commit()
-
-
-def _migrate_playback_claim_timeout_default(session: Session) -> None:
-    """One-time: reset every user still at the OLD hardcoded default (5) to the new default (0).
-
-    "Never" became the default for Hand Off After on 2026-09-23. Unlike the column's own ADD
-    COLUMN default above, this can't just be a WHERE-matches-nothing-once-fixed idempotent update:
-    a user who explicitly picks 5 minutes *after* this runs must keep it, so re-running this on
-    every boot would wrongly stomp that choice back to 0. Guarded with an `app_settings` flag
-    (the standard KV store, see AppSetting) so it fires exactly once per install.
-    """
-    flag_key = "migrated_playback_claim_timeout_default_2026_09_23"
-    already_ran = session.execute(
-        text("SELECT 1 FROM app_settings WHERE key = :k"), {"k": flag_key}
-    ).first()
-    if already_ran:
-        return
-    session.execute(
-        text("UPDATE users SET playback_claim_timeout_minutes = 0 WHERE playback_claim_timeout_minutes = 5")
-    )
-    session.execute(
-        text("INSERT INTO app_settings (key, value, updated_at) VALUES (:k, '1', :now)"),
-        {"k": flag_key, "now": datetime.now(timezone.utc).isoformat(sep=" ")},
-    )
     session.commit()
 
 
