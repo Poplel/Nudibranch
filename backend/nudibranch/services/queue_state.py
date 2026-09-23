@@ -311,6 +311,11 @@ _AWAITING_APPROVAL_LABEL_BY_FLOW: dict[ProposalFlow, str] = {
 }
 
 
+_FIXED_WORD_STAGES = frozenset(
+    {ItemStage.approved, ItemStage.queued, ItemStage.downloading, ItemStage.retrying, ItemStage.failed}
+)
+
+
 def status_label(
     item: ProposalItem, stage: ItemStage, payload: dict | None = None, flow: ProposalFlow | str | None = None
 ) -> str:
@@ -324,7 +329,10 @@ def status_label(
     """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
-    if isinstance(existing, str) and existing.strip():
+    # ⚠️ In-flight stages always use their own word. The worker's free text for them is transfer
+    # plumbing ("download queued in slskd: Initializing (5s)", "needs attention; could not be
+    # downloaded automatically") -- jargon in a row (§0), and the pill must say one thing.
+    if stage not in _FIXED_WORD_STAGES and isinstance(existing, str) and existing.strip():
         return existing.strip()
     if stage is ItemStage.awaiting_approval and flow is not None:
         resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)

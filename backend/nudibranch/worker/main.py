@@ -2567,20 +2567,22 @@ def transfer_wait_status(entry: dict, transfer: dict | None, fallback: str) -> s
     percent = transfer_percent(transfer)
     if percent is not None:
         if percent <= 0 and not transfer_has_started(transfer):
-            return manifest_wait_status(entry, f"download queued in slskd: {friendly_transfer_status(status)}")
+            return manifest_wait_status(entry, "waiting to download")
         speed = transfer_speed_label(transfer)
         return f"downloading {percent:.0f}%{speed}"
     if status:
         if transfer_is_queued_or_waiting(transfer):
-            return manifest_wait_status(entry, f"download queued in slskd: {status}")
-        return manifest_wait_status(entry, f"download status from slskd: {status}")
+            return manifest_wait_status(entry, "waiting to download")
+        return manifest_wait_status(entry, "waiting to download")
     return manifest_wait_status(entry, fallback)
 
 
 def transfer_progress_state(entry: dict, transfer: dict | None, fallback: str) -> dict:
     status = transfer_wait_status(entry, transfer, fallback)
+    # A queued transfer has nothing to count: an empty label lets the row fall back to its pill
+    # word alone, instead of repeating it underneath as "waiting to download (2m)".
     if not transfer:
-        return {"stage": "queued", "progress": 0, "label": status}
+        return {"stage": "queued", "progress": 0, "label": ""}
     if transfer_is_failed(transfer):
         return {"stage": "failed", "progress": transfer_percent(transfer) or 0, "label": status}
     if transfer_is_complete_or_finishing(transfer):
@@ -2588,9 +2590,9 @@ def transfer_progress_state(entry: dict, transfer: dict | None, fallback: str) -
     percent = transfer_percent(transfer)
     if percent is not None:
         stage = "downloading" if percent > 0 or transfer_has_started(transfer) else "queued"
-        return {"stage": stage, "progress": percent, "label": status}
+        return {"stage": stage, "progress": percent, "label": status if stage == "downloading" else ""}
     if transfer_is_queued_or_waiting(transfer):
-        return {"stage": "queued", "progress": 0, "label": status}
+        return {"stage": "queued", "progress": 0, "label": ""}
     return {"stage": "transferring", "progress": 0, "label": status, "indeterminate": True}
 
 
