@@ -6096,7 +6096,9 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
         if batch.items:
             actionable_items = [
                 item for item in batch.items
-                if item.selected and approval_item_is_actionable(item)
+                # The one definition of "is this a real change, or a grouping row?" -- the same
+                # rule the wire's `actionable` flag and the worker's own work selection use.
+                if item.selected and queue_state.is_actionable(item)
             ]
             # ⚠️ Settled is not the same as completed. A batch whose selected work FAILED is marked
             # failed and kept in the list, because it belongs in Issues. This used to write
@@ -6129,18 +6131,6 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
     if session.dirty or session.deleted:
         session.commit()
     return [batch for batch in batches if batch.id not in settled]
-
-
-def approval_item_is_actionable(item: ProposalItem) -> bool:
-    """Ignore selected tree containers when deciding whether a batch still has work."""
-    payload = json.loads(item.payload_json or "{}")
-    if item.kind == ProposalKind.import_files:
-        return bool(item.old_value and item.new_value)
-    if item.kind == ProposalKind.metadata:
-        return bool(payload.get("target_type"))
-    if item.kind in {ProposalKind.delete, ProposalKind.file_move, ProposalKind.playlist, ProposalKind.download, ProposalKind.lyrics}:
-        return bool(payload.get("action"))
-    return False
 
 
 def resolve_requester_names(session: Session, batches: list[ProposalBatch]) -> dict[str, str]:
