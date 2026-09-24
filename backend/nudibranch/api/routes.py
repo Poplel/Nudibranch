@@ -1512,8 +1512,6 @@ def ack_player_command(
 # owner applies the command and republishes. Only an ORPHANED session, with nobody to command, is
 # edited here directly.
 
-#: A claim whose owner has said nothing for this long is lapsed — force-quit, crashed, offline.
-CLAIM_SILENCE_TIMEOUT = timedelta(minutes=5)
 #: Default for `User.playback_claim_timeout_minutes`: how long a claim survives without PLAYING. A
 #: paused session left alone is up for grabs, so the next device to press Play takes it rather than
 #: remote-controlling a sleeping one. Per user since 2026-09-22; 0 (the default since 2026-09-23,
@@ -1549,8 +1547,12 @@ def _claim_valid(
     is wrong if the app died — so it is believed only while the owner reported inside `LIVE_WINDOW`
     (45s). That is what makes closing the playing app hand the session back almost at once, instead
     of leaving every other device showing "playing remotely" on a claim nobody is honouring.
-    A **paused** claim drifts nowhere, so it keeps the per-user idle window; `idle_timeout=None`
-    means the user asked for it never to lapse, and then only an explicit "Play here" takes it.
+    A **paused** claim drifts nowhere, but its OWNER can still be gone: every client heartbeats its
+    claim every 15s while it is open, playing or paused (user, 2026-09-23), so silence past
+    `LIVE_WINDOW` means the app is closed, suspended or offline, and the session is free for every
+    other device to show idle and claim. On top of that a live, heartbeating owner that has sat
+    paused loses the claim after the per-user idle window; `idle_timeout=None` ("Never") only
+    switches THAT rule off, never the heartbeat.
     """
     if row is None or not row.owner_session_id or not row.claim_id:
         return False
@@ -1558,12 +1560,10 @@ def _claim_valid(
     heard = row.owner_reported_at or row.claimed_at
     if heard is None:
         return False
-    if row.status == "playing":
-        return as_utc(heard) >= now - LIVE_WINDOW
-    if idle_timeout is None:
-        return True
-    if as_utc(heard) < now - CLAIM_SILENCE_TIMEOUT:
+    if as_utc(heard) < now - LIVE_WINDOW:
         return False
+    if row.status == "playing" or idle_timeout is None:
+        return True
     idle_since = row.paused_since or heard
     return as_utc(idle_since) >= now - idle_timeout
 
