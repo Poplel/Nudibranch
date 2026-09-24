@@ -121,6 +121,11 @@ def signing_public_key_pem(session: Session) -> str:
     ).decode()
 
 
+def instance_id(session: Session) -> str:
+    """This server's stable identity, shared by push pairing and the apps' address race."""
+    return _get_or_create_instance_id(session)
+
+
 def push_identity(session: Session) -> dict:
     """Identity the iOS app needs to authorise this server with the proxy."""
     settings = get_settings()

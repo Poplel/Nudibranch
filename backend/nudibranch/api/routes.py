@@ -189,7 +189,7 @@ from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
-from nudibranch.services.notifications import create_notification, push_identity
+from nudibranch.services.notifications import create_notification, instance_id, push_identity
 from nudibranch.services.proposals import (
     ApprovalNotPermitted,
     NothingToApprove,
@@ -6933,6 +6933,15 @@ def list_notifications(
     )
     notifications = list(session.scalars(query.order_by(Notification.created_at.desc()).limit(100)))
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
+
+
+@router.get("/ping", tags=["system"], summary="Reachability and identity probe", response_model=dict)
+def ping(session: Session = Depends(get_session)) -> dict:
+    """Unauthenticated and cheap. The apps race this against a server's primary and secondary
+    addresses and use the fastest one that answers with the same `instance_id`, which is how they
+    tell this server apart from some other machine at the same LAN address. Never touches a user
+    session, so it bumps nothing."""
+    return {"ok": True, "instance_id": instance_id(session)}
 
 
 @router.get("/notifications/push-identity", tags=["notifications"], summary="This server's APNS push identity", response_model=PushIdentityResponse)
