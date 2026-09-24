@@ -1123,6 +1123,10 @@ class AccountSessionOut(BaseModel):
     owner: AccountSessionOwner | None = None
     claim_valid: bool = False
     you_own: bool = False
+    #: The most recent claim, VALID OR LAPSED, is the caller's. A device still holding a claim id
+    #: must let go when this is false: someone else has claimed since, and a lapsed owner is never
+    #: sent the `stop` a valid one gets.
+    claim_is_yours: bool = False
     #: Returned only to the caller that just claimed — it must send it on every report after.
     claim_id: str | None = None
     queue_version: int = 0

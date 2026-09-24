@@ -2443,6 +2443,14 @@ function App() {
   function applyAccountSession(data) {
     if (!data) return;
     const { items, claim_id: _claimId, ...row } = data;
+    // ⚠️ A claim this tab holds is dead once the latest claim is someone else's, valid or not: a
+    // tab whose claim LAPSED (paused past the idle limit) is never sent the `stop` a valid owner
+    // gets, so without this it kept showing its own old track after another device played.
+    // Only a read NEWER than our claim counts: a GET sent just before claiming can land after it.
+    const held = sessionClaimRef.current;
+    if (held && row.claim_is_yours === false && Date.parse(row.updated_at || "") > Date.parse(held.at || "")) {
+      handleSessionClaimLost(held.id);
+    }
     setAccountSession((previous) => {
       const before = Date.parse(previous?.updated_at || "") || 0;
       const after = Date.parse(row.updated_at || "") || 0;
@@ -2501,7 +2509,7 @@ function App() {
     const win = sessionWindow(queue, index);
     const key = sessionQueueKeyOf(queue);
     claimSession(sessionSnapshot(win, 0, true, shuffleOn, sessionLiveRef.current.repeat), (data) => {
-      sessionClaimRef.current = { id: data.claim_id, start: win.start, length: win.length };
+      sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: win.start, length: win.length };
       lastPublishedKeyRef.current = key;
       applyAccountSession(data);
     }).catch(() => { /* the next "playing" report retries — maybeRecoverSessionClaim */ });
@@ -2613,7 +2621,7 @@ function App() {
       await claimSession(
         sessionSnapshot(win, ctl?.position?.(), true, current.shuffle, current.repeat),
         (data) => {
-          sessionClaimRef.current = { id: data.claim_id, start: win.start, length: win.length };
+          sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: win.start, length: win.length };
           lastPublishedKeyRef.current = key;
           applyAccountSession(data);
         },
@@ -2685,7 +2693,7 @@ function App() {
     const resolved = await playablesFromSessionItems(items);
     const tracks = resolved.filter(Boolean);
     if (tracks.length === 0) {
-      sessionClaimRef.current = { id: data.claim_id, start: 0, length: items.length };
+      sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: 0, length: items.length };
       releaseSessionClaim();
       notify("Playback", "Nothing in that queue is available here.", "ui_notice");
       return false;
@@ -2702,7 +2710,7 @@ function App() {
     if (startIndex < 0) startIndex = 0;
     // Everything resolved: what plays here IS the shared queue, so there is nothing to republish.
     // Otherwise this tab's shorter queue is published, since the owner is authoritative.
-    sessionClaimRef.current = { id: data.claim_id, start: 0, length: tracks.length === items.length ? items.length : tracks.length };
+    sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: 0, length: tracks.length === items.length ? items.length : tracks.length };
     lastPublishedKeyRef.current = tracks.length === items.length ? sessionQueueKeyOf(tracks) : null;
     applyAccountSession(data);
     setOrphanDismissedAt(null);

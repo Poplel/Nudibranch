@@ -1705,6 +1705,7 @@ def _serialize_account_session(
         owner=owner,
         claim_valid=valid,
         you_own=bool(valid and auth_session is not None and row.owner_session_id == auth_session.id),
+        claim_is_yours=bool(auth_session is not None and row.owner_session_id == auth_session.id),
         claim_id=claim_id,
         queue_version=row.queue_version or 0,
         queue_length=row.queue_length or 0,
