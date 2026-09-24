@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 import secrets
 import json
@@ -2259,6 +2260,24 @@ def library_top(
 
 
 # ── Offline delta sync ────────────────────────────────────────────────────────
+
+@router.get("/library/checksum", tags=["library"], summary="Library row counts and id digests (mirror integrity check)", response_model=dict)
+def library_checksum(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_view)),
+) -> dict:
+    """What an offline mirror must hold, cheaply: per table, the row count and the SHA-256 of every
+    id sorted and joined with "\\n". A client compares its own after a delta sync and runs a full
+    resync on any mismatch -- the delta path has no way to notice rows it never received (a cursor
+    the server kept rejecting froze a mirror for a day, 2026-09-23). Ids only, so the digest is
+    independent of timestamp formatting; edits stay the delta sync's job.
+    """
+    out: dict[str, dict] = {}
+    for key, model in (("artists", Artist), ("albums", Album), ("tracks", Track)):
+        ids = sorted(session.scalars(select(model.id)))
+        out[key] = {"count": len(ids), "digest": hashlib.sha256("\n".join(ids).encode()).hexdigest()}
+    return out
+
 
 @router.get("/library/changes", tags=["library"], summary="Library rows changed since a timestamp (delta sync)", response_model=dict)
 def library_changes(
