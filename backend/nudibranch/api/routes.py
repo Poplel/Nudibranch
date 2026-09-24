@@ -2261,21 +2261,32 @@ def library_top(
 
 # ── Offline delta sync ────────────────────────────────────────────────────────
 
+def _library_iso(dt: datetime | None) -> str | None:
+    """The one wire form of a library row's `updated_at`: `/library/changes` sends it and
+    `/library/checksum` hashes it, so a mirror that stored what it was sent reproduces the digest."""
+    # SQLite stores these tz-naive; they are UTC, so emit a UTC-aware ISO string consistent with
+    # server_time for client cursor math.
+    if not dt:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+
+
 @router.get("/library/checksum", tags=["library"], summary="Library row counts and id digests (mirror integrity check)", response_model=dict)
 def library_checksum(
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.library_view)),
 ) -> dict:
-    """What an offline mirror must hold, cheaply: per table, the row count and the SHA-256 of every
-    id sorted and joined with "\\n". A client compares its own after a delta sync and runs a full
-    resync on any mismatch -- the delta path has no way to notice rows it never received (a cursor
-    the server kept rejecting froze a mirror for a day, 2026-09-23). Ids only, so the digest is
-    independent of timestamp formatting; edits stay the delta sync's job.
+    """What an offline mirror must hold: per table, the row count and the SHA-256 of every
+    `"<id>|<updated_at>"` line (updated_at exactly as `/library/changes` sends it, "" when null),
+    sorted by id and joined with "\\n". Covers additions, deletions AND edits, so a client that
+    checks after each delta sync needs no periodic full resync -- only one when this disagrees (a
+    cursor the server kept rejecting froze a mirror for a day unnoticed, 2026-09-23).
     """
     out: dict[str, dict] = {}
     for key, model in (("artists", Artist), ("albums", Album), ("tracks", Track)):
-        ids = sorted(session.scalars(select(model.id)))
-        out[key] = {"count": len(ids), "digest": hashlib.sha256("\n".join(ids).encode()).hexdigest()}
+        rows = sorted(session.execute(select(model.id, model.updated_at)).all(), key=lambda row: row[0])
+        lines = [f"{row_id}|{_library_iso(updated) or ''}" for row_id, updated in rows]
+        out[key] = {"count": len(lines), "digest": hashlib.sha256("\n".join(lines).encode()).hexdigest()}
     return out
 
 
@@ -2301,12 +2312,7 @@ def library_changes(
         query = query.where(model.updated_at <= server_time)
         return query.where(model.updated_at > since_dt) if since_dt else query
 
-    def _iso(dt):
-        # SQLite stores these tz-naive; they are UTC, so emit a UTC-aware ISO string
-        # consistent with server_time for client cursor math.
-        if not dt:
-            return None
-        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+    _iso = _library_iso
 
     artists = [
         {"id": a.id, "name": a.name, "sort_name": a.sort_name, "musicbrainz_id": a.musicbrainz_id,
