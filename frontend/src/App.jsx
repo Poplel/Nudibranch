@@ -62,6 +62,8 @@ import {
   Zap,
 } from "lucide-react";
 import "./styles.css";
+// The web app's own version, shown in the Settings footer. package.json is its single source.
+import { version as WEB_VERSION } from "../package.json";
 
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
@@ -10909,7 +10911,7 @@ function SettingsPanel({
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
-        Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
+        Nudibranch {WEB_VERSION} | Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
         {" | "}<button type="button" onClick={() => setShowAttributions(true)}>Attributions</button>
       </footer>
     </div>
