@@ -10897,6 +10897,7 @@ function SettingsPanel({
           onSaveIntegrations={onSaveIntegrations}
         />
       )}
+      {canManageSettings(user) && <SlskdReachabilitySettings api={api} notify={notify} />}
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
@@ -11077,6 +11078,90 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
       </div>
       </>
       )}
+    </section>
+  );
+}
+
+// Soulseek listen-port reachability self-probe (Settings -> Download settings). Backend:
+// GET/POST /settings/slskd/port-check (services/slskd_reachability.py). The check runs on the
+// worker -- its identity step can take up to ~90s -- so "Check now" enqueues it and this polls
+// GET until `checking` goes false, same shape as the podcast "Check for new" button.
+function SlskdReachabilitySettings({ api, notify }) {
+  const [state, setState] = useState(null);
+  const pollRef = useRef(null);
+
+  const load = useCallback(
+    () => api("/settings/slskd/port-check").then((data) => { if (data) setState(data); return data; }).catch(() => null),
+    [api]
+  );
+
+  useEffect(() => {
+    load();
+    return () => clearInterval(pollRef.current);
+  }, [load]);
+
+  useEffect(() => {
+    if (state?.checking && !pollRef.current) {
+      pollRef.current = setInterval(() => {
+        load().then((data) => {
+          if (data && !data.checking) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        });
+      }, 3000);
+    }
+  }, [state?.checking, load]);
+
+  async function checkNow() {
+    try {
+      const data = await api("/settings/slskd/port-check", { method: "POST" });
+      if (data) setState(data);
+    } catch (error) {
+      notify?.("Reachability check failed", error?.message || "Could not start the Soulseek reachability check", "ui_error");
+    }
+  }
+
+  const statusLabel = { ok: "Reachable", warning: "Reachable, unconfirmed", failed: "Not reachable" }[state?.status] || "Not checked yet";
+  const statusColor = state?.status === "ok" ? "#37c871" : state?.status === "failed" ? "#ff5a5a" : "var(--muted)";
+  const checking = !!state?.checking;
+
+  return (
+    <section className="settings-section">
+      <h2>Soulseek reachability</h2>
+      <label className="setting-row">
+        <span>
+          Listen port check
+          <small>
+            {state?.public_address && state?.port ? `${state.public_address}:${state.port} — ` : ""}
+            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Confirms slskd's own port forward is reachable, end to end."}
+          </small>
+        </span>
+        <button className="secondary compact" onClick={checkNow} disabled={checking}>
+          <RefreshCw size={14} className={checking ? "spin-icon" : ""} /> {checking ? "Checking…" : "Check now"}
+        </button>
+      </label>
+      {state?.status && (
+        <label className="setting-row">
+          <span>Status</span>
+          <strong style={{ color: statusColor }}>{statusLabel}</strong>
+        </label>
+      )}
+      {(state?.steps || []).map((step) => (
+        <label className="setting-row" key={step.key}>
+          <span>
+            {step.label}
+            <small>{step.detail}</small>
+          </span>
+          {step.ok === true ? (
+            <Check size={16} style={{ color: "#37c871" }} />
+          ) : step.ok === false ? (
+            <X size={16} style={{ color: "#ff5a5a" }} />
+          ) : (
+            <Info size={16} style={{ color: "var(--muted)" }} />
+          )}
+        </label>
+      ))}
     </section>
   );
 }

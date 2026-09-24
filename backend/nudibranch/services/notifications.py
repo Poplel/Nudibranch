@@ -179,6 +179,7 @@ _NOTIFICATION_AUDIENCE: dict[str, set[Permission]] = {
     # Where a requester watches their own request.  Anyone who can ask for music can read it.
     "requests": {Permission.discover},
     "podcasts": {Permission.podcasts_manage},
+    "settings": {Permission.settings_manage},
 }
 
 

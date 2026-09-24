@@ -494,6 +494,27 @@ class IntegrationSettings(BaseModel):
     allow_ytdlp_fallback: str = "false"
 
 
+class SlskdPortCheckStep(BaseModel):
+    key: str
+    label: str
+    ok: bool | None = None
+    detail: str
+
+
+class SlskdPortCheckOut(BaseModel):
+    """The Soulseek listen-port reachability self-probe. `status`/`checked_at` are None until the
+    check has run at least once. `checking` is true while a triggered run is still in flight
+    (the identity step's browse can take up to ~90s), and the client should keep polling GET."""
+
+    checking: bool = False
+    ok: bool | None = None
+    status: str | None = None
+    checked_at: datetime | None = None
+    public_address: str | None = None
+    port: int | None = None
+    steps: list[SlskdPortCheckStep] = Field(default_factory=list)
+
+
 class PlaylistTrackOut(BaseModel):
     id: str
     track_id: str

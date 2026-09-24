@@ -103,6 +103,7 @@ from nudibranch.api.schemas import (
     StaticKeyCreate,
     StaticKeyOut,
     StaticKeyCreated,
+    SlskdPortCheckOut,
     TaskCreate,
     TaskOut,
     UserCreate,
@@ -167,6 +168,7 @@ from nudibranch.db.models import (
     SessionPlayerState,
     StaticApiKey,
     Task,
+    TaskStatus,
     Track,
     User,
     UserPermission,
@@ -201,6 +203,7 @@ from nudibranch.services.proposals import (
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
+from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
 from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
@@ -6789,6 +6792,48 @@ def get_connection_status(
         "slskd": probe(slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else "disabled",
         "jellyfin": probe(jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else "disabled",
     }
+
+
+def _current_slskd_port_check_task(session: Session) -> Task | None:
+    return session.scalar(
+        select(Task)
+        .where(Task.type == "slskd_port_check")
+        .where(Task.status.in_([TaskStatus.queued, TaskStatus.running]))
+        .order_by(Task.created_at.desc())
+        .limit(1)
+    )
+
+
+def _slskd_port_check_out(session: Session, task: Task | None) -> SlskdPortCheckOut:
+    last = load_last_slskd_check(session) or {}
+    return SlskdPortCheckOut(
+        checking=task is not None,
+        ok=last.get("ok"),
+        status=last.get("status"),
+        checked_at=last.get("checked_at"),
+        public_address=last.get("public_address"),
+        port=last.get("port"),
+        steps=last.get("steps") or [],
+    )
+
+
+@router.post("/settings/slskd/port-check", response_model=SlskdPortCheckOut, tags=["settings"], summary="Run the Soulseek listen-port reachability check")
+def trigger_slskd_port_check(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> SlskdPortCheckOut:
+    """Enqueued on the worker, not run inline here -- the identity step can take up to ~90s
+    (it browses slskd's own share). The client polls GET until `checking` goes false."""
+    enqueue_task(session, "slskd_port_check", {})
+    return _slskd_port_check_out(session, _current_slskd_port_check_task(session))
+
+
+@router.get("/settings/slskd/port-check", response_model=SlskdPortCheckOut, tags=["settings"], summary="Last Soulseek listen-port reachability check result")
+def get_slskd_port_check(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> SlskdPortCheckOut:
+    return _slskd_port_check_out(session, _current_slskd_port_check_task(session))
 
 
 @router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key", response_model=list[JellyfinUserOut])

@@ -36,6 +36,7 @@ from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services import content_verify
 from nudibranch.services.content_verify import verify_audio_content
 from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, rescan_slskd_shares, search_slskd_detailed, transfer_state_category
+from nudibranch.services.slskd_reachability import run_slskd_reachability_check, should_run_download_failure_check, store_slskd_check_result
 from nudibranch.services.tasks import append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
@@ -3177,6 +3178,7 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
             target_url="/task-queue?bucket=issues",
             group_key=queue_group_key(item.batch_id) if item else None,
         )
+    check_slskd_after_download_failure(session)
     return False
 
 
@@ -3588,6 +3590,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
         bucket="issues",
         event_type="task_failed",
     )
+    check_slskd_after_download_failure(session)
     session.commit()
     return False
 
@@ -3607,6 +3610,7 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
         bucket="issues",
         event_type="task_failed",
     )
+    check_slskd_after_download_failure(session)
     session.commit()
 
 
@@ -7964,6 +7968,51 @@ def run_rescan_slskd_shares(session: Session, _payload: dict) -> dict:
     return result
 
 
+def run_slskd_port_check(session: Session, _payload: dict) -> dict:
+    """Manual "Check now" from Settings -> Search. Runs the full 5-step self-probe (see
+    services/slskd_reachability.py) and stores the result for both the settings routes and the
+    next automatic download-failure check to read."""
+    settings = integration_settings(session)
+    result = run_slskd_reachability_check(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""))
+    store_slskd_check_result(session, result)
+    write_app_log(
+        f"Soulseek reachability check: {result['status']}",
+        level="info" if result["ok"] else "warning",
+        event_type="tool_completed",
+    )
+    return result
+
+
+def check_slskd_after_download_failure(session: Session) -> None:
+    """After a download fails into Issues, run the Soulseek reachability self-probe so a broken
+    port forward (which looks exactly like "every download fails") doesn't stay invisible until
+    someone happens to open Settings. Rate-limited to once per 30 min -- see
+    should_run_download_failure_check -- so a bad run of failures doesn't hammer slskd. The
+    manual "Check now" button in Settings is a separate path (run_slskd_port_check) and is never
+    throttled by this."""
+    if not should_run_download_failure_check(session):
+        return
+    settings = integration_settings(session)
+    slskd_url = settings.get("slskd_url", "")
+    api_key = settings.get("slskd_api_key", "")
+    if not slskd_url or not api_key:
+        return
+    result = run_slskd_reachability_check(slskd_url, api_key)
+    store_slskd_check_result(session, result)
+    if result["ok"]:
+        return
+    failing_step = next((step for step in result["steps"] if step["ok"] is False), None)
+    detail = failing_step["detail"] if failing_step else "The Soulseek reachability check did not pass."
+    write_app_log(f"Soulseek reachability check failed after a download error: {detail}", level="warning", event_type="tool_completed")
+    create_notification(
+        session,
+        title="Soulseek may be unreachable",
+        body=detail,
+        event_type="slskd_unreachable",
+        target_url="/settings?section=search",
+    )
+
+
 def run_check_files(session: Session, _payload: dict) -> dict:
     discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
     settings = get_settings()
@@ -10662,6 +10711,7 @@ TASK_HANDLERS = {
     "playlist_mirror": run_playlist_mirror,
     "jellyfin_scan": run_jellyfin_scan,
     "rescan_slskd_shares": run_rescan_slskd_shares,
+    "slskd_port_check": run_slskd_port_check,
     "check_files": run_check_files,
     "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
@@ -10963,6 +11013,7 @@ def task_notification_title(task_type: str) -> str:
         "migrate_native_playlists_to_jellyfin": "Playlist migration",
         "jellyfin_scan": "Jellyfin scan",
         "rescan_slskd_shares": "Soulseek share rescan",
+        "slskd_port_check": "Soulseek reachability check",
         "check_files": "File check",
         "check_duplicates": "Duplicate check",
         "check_lyrics": "Lyrics check",
