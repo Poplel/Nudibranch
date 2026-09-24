@@ -720,6 +720,8 @@ class LibraryArtistRow(BaseModel):
     cover_path: str | None = None
     cover_locked: bool = False
     album_count: int = 0
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class LibraryAlbumRow(BaseModel):
@@ -731,6 +733,8 @@ class LibraryAlbumRow(BaseModel):
     cover_path: str | None = None
     cover_locked: bool = False
     track_count: int = 0
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class LibraryTrackRow(BaseModel):
@@ -746,6 +750,8 @@ class LibraryTrackRow(BaseModel):
     format: str | None = None
     is_lossless: bool = False
     replaygain_track_gain: float | None = None
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class PaginatedArtists(BaseModel):

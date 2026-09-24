@@ -2975,6 +2975,7 @@ def library_artists(
         LibraryArtistRow(
             id=a.id, name=a.name, sort_name=a.sort_name, cover_path=a.cover_path,
             cover_locked=a.cover_locked, album_count=len(a.albums),
+            updated_at=_library_iso(a.updated_at),
         )
         for a in rows
     ]
@@ -3010,6 +3011,7 @@ def library_albums(
             id=al.id, title=al.title, sort_name=al.sort_name, artist_id=al.artist_id,
             artist_name=(al.artist.name if al.artist else ""),
             cover_path=al.cover_path, cover_locked=al.cover_locked, track_count=len(al.tracks),
+            updated_at=_library_iso(al.updated_at),
         )
         for al in rows
     ]
@@ -3052,6 +3054,7 @@ def library_tracks(
             track_number=t.track_number, disc_number=t.disc_number,
             duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
             replaygain_track_gain=t.replaygain_track_gain,
+            updated_at=_library_iso(t.updated_at),
         )
         for t in rows
     ]
