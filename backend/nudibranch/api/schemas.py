@@ -496,6 +496,10 @@ class IntegrationSettings(BaseModel):
     server_secondary_address: str = ""
 
 
+class NotificationReadRequest(BaseModel):
+    ids: list[str] | None = Field(default=None, max_length=500)
+
+
 class ServerAddressesOut(BaseModel):
     """The addresses an admin configured for this server. Either may be null. Clients adopt the
     one they did not sign in with as their fallback address."""

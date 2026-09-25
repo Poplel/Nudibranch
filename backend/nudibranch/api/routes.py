@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, selectinload
 from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_any_permission, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
     CancelRequest,
+    NotificationReadRequest,
     ServerAddressesOut,
     RetryRequest,
     CoverFromURLRequest,
@@ -7099,10 +7100,19 @@ def deregister_device(
 
 @router.post("/notifications/read", tags=["notifications"], summary="Mark notifications as read", response_model=dict)
 def mark_notifications_read(
+    payload: NotificationReadRequest | None = None,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict:
-    notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
+    """Marks the caller's notifications read: all of them, or only `ids` when given. The apps send
+    ids for a banner cleared from the OS notification centre, which acknowledges that one row and
+    nothing else."""
+    query = select(Notification).where(Notification.user_id == user.id)
+    if payload is not None and payload.ids is not None:
+        if not payload.ids:
+            return {"updated": 0}
+        query = query.where(Notification.id.in_(payload.ids))
+    notifications = list(session.scalars(query))
     for notification in notifications:
         if notification.status == NotificationStatus.unread:
             notification.status = NotificationStatus.read
