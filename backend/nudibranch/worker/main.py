@@ -8009,7 +8009,7 @@ def check_slskd_after_download_failure(session: Session) -> None:
         title="Soulseek may be unreachable",
         body=detail,
         event_type="slskd_unreachable",
-        target_url="/settings?section=search",
+        target_url="/settings?section=integrations",
     )
 
 
