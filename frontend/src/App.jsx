@@ -10899,6 +10899,28 @@ function SettingsPanel({
         </section>
       )}
       {canManageSettings(user) && (
+        <section className="settings-section">
+          <h2>Server addresses</h2>
+          {[
+            ["server_primary_address", "Primary address"],
+            ["server_secondary_address", "Secondary address"],
+          ].map(([key, label]) => (
+            <label className="setting-row integration-row" key={key}>
+              <span>{label}</span>
+              <input
+                type="url"
+                placeholder="https://"
+                value={integrationDraft[key] || ""}
+                onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+              />
+            </label>
+          ))}
+          <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
+            Save addresses
+          </button>
+        </section>
+      )}
+      {canManageSettings(user) && (
         <MatchTuningSettings
           api={api}
           notify={notify}

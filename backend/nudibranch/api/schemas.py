@@ -492,6 +492,16 @@ class IntegrationSettings(BaseModel):
     acoustid_api_key: str = ""
     allow_m4a_downloads: str = "true"
     allow_ytdlp_fallback: str = "false"
+    server_primary_address: str = ""
+    server_secondary_address: str = ""
+
+
+class ServerAddressesOut(BaseModel):
+    """The addresses an admin configured for this server. Either may be null. Clients adopt the
+    one they did not sign in with as their fallback address."""
+
+    primary: str | None = None
+    secondary: str | None = None
 
 
 class SlskdPortCheckStep(BaseModel):

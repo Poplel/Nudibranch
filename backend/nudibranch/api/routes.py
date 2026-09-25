@@ -6,6 +6,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from sqlalchemy.orm import Session, selectinload
 from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_any_permission, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
     CancelRequest,
+    ServerAddressesOut,
     RetryRequest,
     CoverFromURLRequest,
     AlbumLookupRequest,
@@ -6891,7 +6893,10 @@ def update_integrations(
 ) -> IntegrationSettings:
     old_url = integration_settings(session).get("jellyfin_url", "")
     new_url = (payload.jellyfin_url or "").rstrip("/")
-    update_integration_settings(session, payload.model_dump())
+    values = payload.model_dump()
+    for key in ("server_primary_address", "server_secondary_address"):
+        values[key] = _normalized_server_address(values.get(key))
+    update_integration_settings(session, values)
     if new_url and new_url != old_url.rstrip("/"):
         # Jellyfin URL changed — item IDs from the old server are invalid, clear them
         # so the next remap job rebuilds the mapping against the new server.
@@ -6933,6 +6938,32 @@ def list_notifications(
     )
     notifications = list(session.scalars(query.order_by(Notification.created_at.desc()).limit(100)))
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
+
+
+def _normalized_server_address(raw: str | None) -> str:
+    """`scheme://host[:port]` with no path or trailing slash, or "" for none. The apps append
+    `/api/v1` themselves, so anything past the origin would break every URL they build."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=422, detail="Server addresses must be a full http:// or https:// address.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+@router.get("/server/addresses", tags=["system"], summary="This server's configured addresses", response_model=ServerAddressesOut)
+def get_server_addresses(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> ServerAddressesOut:
+    """Read by the apps after signing in, to fill in the fallback address automatically. Any
+    signed-in user may read it: it is how their own client reaches this server."""
+    values = integration_settings(session)
+    return ServerAddressesOut(
+        primary=values.get("server_primary_address") or None,
+        secondary=values.get("server_secondary_address") or None,
+    )
 
 
 @router.get("/ping", tags=["system"], summary="Reachability and identity probe", response_model=dict)
