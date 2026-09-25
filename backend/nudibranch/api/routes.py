@@ -6967,6 +6967,26 @@ def get_server_addresses(
     )
 
 
+@router.put("/server/addresses", tags=["settings"], summary="Set this server's configured addresses", response_model=ServerAddressesOut)
+def update_server_addresses(
+    payload: ServerAddressesOut,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> ServerAddressesOut:
+    """Just the two addresses. The apps edit these without ever holding the other integration
+    settings, which `PUT /settings/integrations` would overwrite with whatever they sent."""
+    update_integration_settings(session, {
+        "server_primary_address": _normalized_server_address(payload.primary),
+        "server_secondary_address": _normalized_server_address(payload.secondary),
+    })
+    session.commit()
+    values = integration_settings(session)
+    return ServerAddressesOut(
+        primary=values.get("server_primary_address") or None,
+        secondary=values.get("server_secondary_address") or None,
+    )
+
+
 @router.get("/ping", tags=["system"], summary="Reachability and identity probe", response_model=dict)
 def ping(session: Session = Depends(get_session)) -> dict:
     """Unauthenticated and cheap. The apps race this against a server's primary and secondary
