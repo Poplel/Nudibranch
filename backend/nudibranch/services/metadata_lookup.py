@@ -519,17 +519,30 @@ _DOWNRANK_SECONDARY_TYPES = {"compilation", "live", "dj-mix", "mixtape/street", 
 
 def rank_releases(album: str, releases: list[dict]) -> list[dict]:
     """Order release search hits best-first: exact normalized title, then closest title, then a
-    studio album over a compilation/live set, then MusicBrainz's own relevance score."""
+    studio album over a compilation/live set, then an Album release group over a single/EP, then
+    the fewest discs, then MusicBrainz's own relevance score.
+
+    ⚠️ The disc count is what keeps a request to the canonical edition. Many releases share an
+    album's exact title — box sets and anniversary editions among them — and without it one wishlist
+    add for The Dark Side of the Moon picked a six-disc box set and expanded to 152 track requests.
+    A genuine double album still wins, because every edition of it has two discs. A hit listing no
+    media at all (some printed-matter releases) has no tracklist to expand, so it goes last."""
     normalized_album = normalize(album)
 
     def key(release: dict) -> tuple:
         title = release.get("title") or ""
-        secondary = (release.get("release-group") or {}).get("secondary-types") or []
+        group = release.get("release-group") or {}
+        secondary = group.get("secondary-types") or []
         is_downranked = any(str(s).lower() in _DOWNRANK_SECONDARY_TYPES for s in secondary)
+        primary = str(group.get("primary-type") or "").lower()
+        disc_count = len(release.get("media") or [])
         return (
             normalize(title) != normalized_album,        # exact normalized-title match first
             -text_similarity(album, title),              # then the most similar title
             is_downranked,                               # prefer studio albums over comps/live
+            bool(primary) and primary != "album",        # an album over a single/EP of that name
+            disc_count == 0,                             # something with a tracklist at all
+            disc_count,                                  # the standard edition over a box set
             -(release.get("score") or 0),                # then MusicBrainz relevance
         )
 

@@ -1,10 +1,12 @@
 import base64
+import hashlib
 import os
 import secrets
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -16,8 +18,12 @@ import httpx
 from sqlalchemy import case, delete, func, literal, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
-from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_permission, resolve_media_user
+from nudibranch.api.deps import SESSION_TTL, get_current_auth_session, get_current_user, require_admin, require_any_permission, require_permission, resolve_media_user
 from nudibranch.api.schemas import (
+    CancelRequest,
+    NotificationReadRequest,
+    ServerAddressesOut,
+    RetryRequest,
     CoverFromURLRequest,
     AlbumLookupRequest,
     AutomationCreate,
@@ -65,12 +71,18 @@ from nudibranch.api.schemas import (
     PlayerCommandOut,
     PlaybackHandoffOut,
     PlaybackHandoffRejection,
-    PlaybackQueueUpload,
     PlaybackSnapshot,
+    PlaybackSnapshotItem,
     PlaybackTransferOut,
     PlaybackEnqueueRequest,
-    PlaybackTransferRequest,
+    SessionTransferRequest,
     PlayerSessionOut,
+    AccountSessionOut,
+    AccountSessionOwner,
+    SessionClaimRequest,
+    SessionEditRequest,
+    SessionQueuePublish,
+    SessionReleaseRequest,
     PlayerStateUpdate,
     PlaylistTrackOut,
     PlaylistImportRequest,
@@ -85,6 +97,8 @@ from nudibranch.api.schemas import (
     ProposalApproveRequest,
     ProposalItemOut,
     ProposalRejectRequest,
+    QueueBulkResult,
+    QueueItemsRequest,
     ProposalSelectionUpdate,
     SearchResponse,
     SearchResultItem,
@@ -93,6 +107,7 @@ from nudibranch.api.schemas import (
     StaticKeyCreate,
     StaticKeyOut,
     StaticKeyCreated,
+    SlskdPortCheckOut,
     TaskCreate,
     TaskOut,
     UserCreate,
@@ -105,9 +120,9 @@ from nudibranch.api.schemas import (
     UserPinUpdate,
     UserSearchSettingsUpdate,
     UserUpdate,
-    WishlistApprovalRequest,
     WishlistCreate,
     WishlistOut,
+    WishlistQueueActionRequest,
     PodcastSubscribeIn,
     PodcastUpdateIn,
     PodcastOut,
@@ -118,6 +133,10 @@ from nudibranch.api.schemas import (
     EpisodeProgressIn,
     PaginatedEpisodes,
     PodcastNotificationIn,
+    CandidateOut,
+    FailureOut,
+    ProgressOut,
+    RequestRefOut,
 )
 from nudibranch.db.models import (
     Album,
@@ -144,6 +163,8 @@ from nudibranch.db.models import (
     PlaylistShare,
     PlaylistTrack,
     PlaybackHandoff,
+    AccountPlaybackSession,
+    uuid_str,
     ProposalBatch,
     ProposalItem,
     ProposalKind,
@@ -151,10 +172,14 @@ from nudibranch.db.models import (
     SessionPlayerState,
     StaticApiKey,
     Task,
+    TaskStatus,
     Track,
     User,
     UserPermission,
     WishlistItem,
+    ItemStage,
+    ProposalFlow,
+    QueueBucket,
 )
 from nudibranch.core.config import get_settings
 from nudibranch.db.session import get_session
@@ -162,15 +187,27 @@ from nudibranch.services.cover_images import square_cover_bytes
 from nudibranch.services.auth import generate_token, hash_password, hash_token, token_prefix, verify_password
 from nudibranch.services.imports import discover_import_files, read_audio_metadata, safe_path_part, SUPPORTED_AUDIO_EXTENSIONS
 from nudibranch.services import podcasts as podcast_service
+from nudibranch.services import queue_state
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
-from nudibranch.services.notifications import create_notification, push_identity
-from nudibranch.services.proposals import approve_batch, reject_items, set_selection
+from nudibranch.services.notifications import create_notification, instance_id, push_identity
+from nudibranch.services.proposals import (
+    ApprovalNotPermitted,
+    NothingToApprove,
+    approve_batch,
+    cancel_items,
+    purge_wishlist_work,
+    stop_wishlist_search_tasks,
+    remove_items,
+    retry_items,
+    set_selection,
+)
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
+from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
 from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
@@ -216,7 +253,7 @@ HANDOFF_REACHABLE_WINDOW = timedelta(seconds=150)
 
 
 # How long a handed-off queue stays adoptable. Not indefinite: a queue is a *now* object, and
-# adopting a six-hour-old snapshot with autoplay is a resurrection rather than a handoff — audio
+# adopting a six-hour-old snapshot is a resurrection rather than a handoff — audio
 # starting on a device out of nowhere long after the user forgot pressing the button is the worst
 # thing this feature could do. Not 30 seconds either: the whole point of the APNS nudge is reaching
 # a BACKGROUNDED app, and those pushes are best-effort and can be deferred by minutes under Low
@@ -226,10 +263,6 @@ HANDOFF_TTL = timedelta(minutes=5)
 #: network blip, short enough that a device returning from a real absence is not driven by
 #: instructions given while it was away.
 COMMAND_TTL = timedelta(seconds=45)
-
-# Past this, a target adopts the queue and position but starts PAUSED whatever autoplay said. Cheap
-# safety valve against unattended audio; the server decides it so two clients cannot disagree.
-HANDOFF_AUTOPLAY_DECAY = timedelta(seconds=60)
 
 # A queue can be enormous — the web's "play library" really does page an entire library into its
 # queue — so the snapshot is capped rather than trusted. Clients window their queue before sending;
@@ -715,6 +748,8 @@ def update_user(
         if user.is_admin and not payload.is_admin and count_admins(session) <= 1:
             raise HTTPException(status_code=400, detail="At least one admin user is required")
         user.is_admin = payload.is_admin
+    if payload.playback_claim_timeout_minutes is not None:
+        user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     if payload.permissions is not None:
         set_user_permissions(session, user, payload.permissions)
     session.commit()
@@ -896,8 +931,8 @@ def update_own_appearance(
     user.accent_color = payload.accent_color
     user.background_tint = payload.background_tint
     user.crossfade_duration = payload.crossfade_duration
-    if payload.remote_playback_enabled is not None:
-        user.remote_playback_enabled = payload.remote_playback_enabled
+    user.remote_playback_enabled = payload.remote_playback_enabled
+    user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     session.commit()
     return serialize_user(load_user(session, user.id))
 
@@ -963,89 +998,22 @@ def update_player_status(
     if payload.client:
         state.client = payload.client
     now = datetime.now(timezone.utc)
-    if state.status == "playing" and previous_status != "playing":
-        state.playback_started_at = now
     state.reported_at = now
     state.updated_at = now
+    # The shared session (§A1b). A report carrying a claim updates it — and re-validates a lapsed
+    # claim, which is how a device returning from offline keeps the session when nobody else took it.
+    # A claim that no longer matches means another device took over: the client stops and follows.
+    claim_lost = False
+    queue_version = None
+    if payload.claim_id:
+        account = session.get(AccountPlaybackSession, user.id)
+        if account is None or account.claim_id != payload.claim_id:
+            claim_lost = True
+        else:
+            _apply_claimed_report(account, state, payload, now)
+            queue_version = account.queue_version or 0
     session.commit()
-    if state.status == "playing":
-        _resolve_playback_ownership(session, user)
-    # The hash handshake: the client is the authority on its own queue and never reads this copy back
-    # to play from. It sends what its queue currently hashes to, and only uploads the queue itself
-    # when the server says the stored copy disagrees — so a queue that plays for an hour unchanged is
-    # never re-sent, while a reordered one is picked up on the next heartbeat.
-    queue_stale = bool(payload.queue_hash) and payload.queue_hash != state.queue_hash
-    return {"ok": True, "queue_stale": queue_stale}
-
-
-def _resolve_playback_ownership(session: Session, user: User) -> None:
-    """One account plays in one place: whoever STARTED most recently owns it, and the rest are stopped.
-
-    ⚠ The tie is broken by `playback_started_at`, never by who reported most recently. A device that
-    loses its network keeps playing and stops reporting, so "most recent report" would hand the
-    session to whichever device merely stayed reachable — and then, the moment the real one came
-    back, it would be stopped by a decision made while it was away. Ownership follows the audio.
-
-    The consequences that follow, and that this is written to produce:
-      • playing, goes offline, another starts → the other started later, so it takes over;
-      • playing, goes offline, comes back with nothing else started → still the latest start, so it
-        keeps the session and nothing interrupts it;
-      • two sessions both playing → the later start wins, whichever of them is reporting right now.
-
-    ⚠ Rows are not rewritten on a device's behalf; only a stop command is sent. A row records what a
-    device said about itself, and an offline device is still playing whatever its row last claimed.
-    """
-    playing = session.scalars(
-        select(SessionPlayerState).where(
-            SessionPlayerState.user_id == user.id,
-            SessionPlayerState.status == "playing",
-        )
-    ).all()
-    if len(playing) < 2:
-        return
-    # A row with no recorded start predates this column; treat it as the oldest possible claim.
-    def started(row: SessionPlayerState) -> datetime:
-        return as_utc(row.playback_started_at) or datetime.min.replace(tzinfo=timezone.utc)
-
-    owner = max(playing, key=started)
-    losers = [row for row in playing if row.session_id != owner.session_id]
-    # ⚠ Only tell a device once. This runs on every report from the owner — several times a minute
-    # while it plays — and a loser that is OFFLINE never acts on the stop or updates its row, so
-    # without this it would collect one stop command and one push every few seconds for as long as
-    # it stayed away.
-    already_told = set(session.scalars(
-        select(PlaybackCommand.device_id).where(
-            PlaybackCommand.user_id == user.id,
-            PlaybackCommand.status == "pending",
-            PlaybackCommand.action == "stop",
-        )
-    ).all())
-    losers = [row for row in losers if row.session_id not in already_told]
-    if not losers:
-        return
-    for other in losers:
-        session.add(PlaybackCommand(
-            user_id=user.id,
-            device_id=other.session_id,
-            action="stop",
-            status="pending",
-        ))
-    session.commit()
-    for other in losers:
-        try:
-            create_notification(
-                session,
-                title="Playback moved",
-                body="Continuing on another device",
-                event_type="remote_playback_command",
-                target_url="/player",
-                user_id=user.id,
-                deliver_apns=True,
-                deliver_web=False,
-                device_id=apns_device_for_session(session, user.id, other.session_id),
-            )
-        except Exception:  # noqa: BLE001 - the stop stands even if the wake cannot be sent.
-            pass
+    return {"ok": True, "claim_lost": claim_lost, "queue_version": queue_version}
 
 
 def apns_device_for_session(session: Session, user_id: str, session_id: str | None) -> str | None:
@@ -1178,13 +1146,10 @@ def create_player_command(
     user: User = Depends(get_current_user),
 ) -> PlayerCommandOut:
     action = (payload.action or "play").strip().lower()
-    # adopt_handoff carries a queue and is only ever minted inside /player/transfer, which validates
-    # the snapshot and the target's reachability. Accepting it here would let a caller point a device
-    # at an arbitrary handoff id.
-    if action == "adopt_handoff":
-        raise HTTPException(status_code=400, detail="Use POST /player/transfer to move playback")
     # Same reasoning: these name a handoff row holding a queue, and only /player/enqueue mints one
     # after validating the items and the target.
+    if action == "adopt_session":
+        raise HTTPException(status_code=400, detail="Use POST /player/session/transfer to move playback")
     if action in {"enqueue_next", "enqueue_end"}:
         raise HTTPException(status_code=400, detail="Use POST /player/enqueue to add to a queue")
     target_type = payload.target_type
@@ -1273,43 +1238,6 @@ def _handoff_or_404(session: Session, handoff_id: str, user_id: str) -> Playback
 
 
 @router.post(
-    "/player/queue",
-    tags=["users"],
-    summary="Publish this session's queue so another device can move it",
-)
-def publish_player_queue(
-    payload: PlaybackQueueUpload,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-    auth_session: AuthSession | None = Depends(get_current_auth_session),
-) -> dict:
-    """Store the caller's queue so a THIRD device can move it somewhere.
-
-    ⚠ This is a copy for other devices to act on, never a source of truth the owner reads back. The
-    owning client stays local-first: it plays from its own queue and re-publishes when that queue
-    changes, which the hash on `POST /player/status` is what detects.
-    """
-    origin = _require_session(auth_session)
-    snapshot = payload.snapshot
-    if len(snapshot.items) > HANDOFF_MAX_ITEMS:
-        raise HTTPException(status_code=413, detail=f"Queue exceeds {HANDOFF_MAX_ITEMS} items")
-    encoded = snapshot.model_dump_json()
-    if len(encoded.encode("utf-8")) > HANDOFF_MAX_PAYLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Queue is too large")
-    state = session.get(SessionPlayerState, origin.id)
-    if not state:
-        state = SessionPlayerState(session_id=origin.id, user_id=user.id)
-        session.add(state)
-    now = datetime.now(timezone.utc)
-    state.user_id = user.id
-    state.queue_json = encoded
-    state.queue_hash = payload.hash[:64]
-    state.queue_updated_at = now
-    session.commit()
-    return {"ok": True}
-
-
-@router.post(
     "/player/enqueue",
     response_model=PlaybackTransferOut,
     tags=["users"],
@@ -1377,7 +1305,6 @@ def enqueue_on_session(
         to_session_id=target.id,
         payload_json=encoded,
         item_count=len(snapshot.items),
-        autoplay=False,
         status="pending",
         created_at=now,
         expires_at=now + HANDOFF_TTL,
@@ -1418,251 +1345,6 @@ def enqueue_on_session(
         )
     except Exception:  # noqa: BLE001
         pass
-    return PlaybackTransferOut(
-        id=handoff.id,
-        status=handoff.status,
-        expires_at=as_utc(handoff.expires_at),
-        item_count=handoff.item_count,
-        to_device_label=target.device_label,
-    )
-
-
-@router.get(
-    "/player/sessions/{session_id}/queue",
-    response_model=PlaybackSnapshot,
-    tags=["users"],
-    summary="Read what another of my sessions has queued",
-)
-def read_player_session_queue(
-    session_id: str,
-    resolve: bool = False,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-) -> PlaybackSnapshot:
-    """The queue a sibling session published, so a remote player can list it like a local one.
-
-    ⚠ Scoped to the caller's OWN sessions by `user_id`, not just by session id: session ids are
-    opaque but guessable in principle, and a queue is a description of what someone is listening to.
-
-    This is deliberately a read of the same copy `/player/transfer` moves, rather than a second
-    store.
-
-    `resolve=true` fills in the titles. It exists for the WEB client, which has no local library
-    mirror and so cannot turn ids into a list anyone can read; the apps leave it off and resolve
-    against their own mirror, which is both faster and works offline. One indexed query for the
-    whole queue either way — never one per item.
-    """
-    state = session.get(SessionPlayerState, session_id)
-    if not state or state.user_id != user.id or not state.queue_json:
-        raise HTTPException(status_code=404, detail="No queue published for that session")
-    snapshot = PlaybackSnapshot.model_validate_json(state.queue_json)
-    if not resolve:
-        return snapshot
-
-    track_ids = [item.id for item in snapshot.items if item.type != "episode"]
-    episode_ids = [item.id for item in snapshot.items if item.type == "episode"]
-    tracks = {
-        row.id: row
-        for row in session.scalars(select(Track).where(Track.id.in_(track_ids)))
-    } if track_ids else {}
-    episodes = {
-        row.id: row
-        for row in session.scalars(select(Episode).where(Episode.id.in_(episode_ids)))
-    } if episode_ids else {}
-    for item in snapshot.items:
-        if item.type == "episode":
-            episode = episodes.get(item.id)
-            if episode:
-                item.title = episode.title
-                item.artist = episode.podcast.title if episode.podcast else None
-            continue
-        track = tracks.get(item.id)
-        if track:
-            item.title = track.title
-            # A track's artist hangs off its album, not off the track itself.
-            item.artist = track.album.artist.name if track.album and track.album.artist else None
-            item.album_id = track.album_id
-    return snapshot
-
-
-@router.post(
-    "/player/transfer",
-    response_model=PlaybackTransferOut,
-    tags=["users"],
-    summary="Hand this session's queue to another of my sessions",
-    responses={
-        400: {"description": "No device session, or the target is not a different session of yours"},
-        409: {"description": "The target session cannot be reached"},
-        413: {"description": "The queue snapshot is too large"},
-    },
-)
-def transfer_playback(
-    payload: PlaybackTransferRequest,
-    session: Session = Depends(get_session),
-    user: User = Depends(get_current_user),
-    auth_session: AuthSession | None = Depends(get_current_auth_session),
-) -> PlaybackTransferOut:
-    """Push the caller's queue to one of their other sessions.
-
-    Push only, always from the session that is playing. The pull direction — an idle device asking
-    for someone else's queue — would need a round trip to wake the source and could never work
-    against a force-quit app, so it does not exist.
-
-    ⚠ **The invariant this route exists to protect: the source's playback is never disturbed until
-    the server has accepted the handoff.** Every rejection below happens in the same request that
-    would otherwise have carried the queue away, so a refused transfer leaves the source playing and
-    nothing is lost. Do not move any of these checks after the commit, and do not have the server
-    tell the source to stop — the source stops itself once it sees a 200.
-    """
-    if not bool(getattr(user, "remote_playback_enabled", True)):
-        # "Local only" has to be refused server-side, or one client with the toggle off is still
-        # reachable from every other one.
-        raise HTTPException(status_code=409, detail="Cross-device playback is turned off")
-    origin = _require_session(auth_session)
-    target = session.scalar(
-        select(AuthSession).where(
-            AuthSession.id == payload.to_session_id, AuthSession.user_id == user.id
-        )
-    )
-    if not target:
-        raise HTTPException(status_code=404, detail="No such device session")
-
-    # The queue being moved belongs to `from_session_id`, defaulting to the caller. Naming a third
-    # session is what lets a Mac move playback from a phone to itself, or between two other devices,
-    # without any of them being the one asking.
-    source_id = payload.from_session_id or origin.id
-    if source_id == payload.to_session_id:
-        raise HTTPException(status_code=400, detail="Playback is already on that device")
-    source = session.scalar(
-        select(AuthSession).where(AuthSession.id == source_id, AuthSession.user_id == user.id)
-    )
-    if not source:
-        raise HTTPException(status_code=404, detail="No such device session")
-
-    snapshot = payload.snapshot
-    if snapshot is None or source_id != origin.id:
-        # Moving someone else's queue: use the copy that session published. This is why sessions
-        # publish at all — the source never has to be woken to take part in its own handoff.
-        source_state = session.get(SessionPlayerState, source_id)
-        if not source_state or not source_state.queue_json:
-            raise HTTPException(status_code=409, detail={
-                "detail": "queue_unavailable",
-                "device_label": source.device_label,
-            })
-        snapshot = PlaybackSnapshot.model_validate_json(source_state.queue_json)
-        # Take the live position from that session's own last report rather than from the queue copy,
-        # which only changes when the queue itself does.
-        if source_state.position_seconds is not None:
-            snapshot.position_seconds = float(source_state.position_seconds)
-        if source_state.current_index is not None and source_state.current_index < len(snapshot.items):
-            snapshot.current_index = source_state.current_index
-    if not snapshot.items:
-        raise HTTPException(status_code=400, detail="Nothing to transfer")
-    if len(snapshot.items) > HANDOFF_MAX_ITEMS:
-        raise HTTPException(status_code=413, detail=f"Queue snapshot exceeds {HANDOFF_MAX_ITEMS} items")
-    for item in snapshot.items:
-        if item.type not in {"track", "episode"}:
-            raise HTTPException(status_code=400, detail="Queue items must be tracks or episodes")
-        if not item.id or len(item.id) > 64:
-            raise HTTPException(status_code=400, detail="Queue item ids are missing or too long")
-    if not 0 <= snapshot.current_index < len(snapshot.items):
-        raise HTTPException(status_code=400, detail="current_index is outside the queue")
-    # Ids only, never titles — the target resolves display metadata from its own mirror, so the
-    # server is not asked to be a second source of truth for what a track is called.
-    encoded = snapshot.model_dump_json()
-    if len(encoded.encode("utf-8")) > HANDOFF_MAX_PAYLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="Queue snapshot is too large")
-
-    target_state = session.get(SessionPlayerState, target.id)
-    presence = _session_presence(target_state, target.last_used_at)
-    if presence == "unreachable":
-        # Refuse rather than queue for a device that may be gone. A pending handoff nobody collects
-        # is indistinguishable from a lost one, and the user would have stopped their music for it.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "detail": "device_unreachable",
-                "presence": presence,
-                "device_label": target.device_label,
-                "last_seen_at": as_utc(target.last_used_at).isoformat() if target.last_used_at else None,
-                "last_seen_status": target_state.status if target_state else None,
-            },
-        )
-
-    now = datetime.now(timezone.utc)
-    handoff = PlaybackHandoff(
-        user_id=user.id,
-        from_session_id=source_id,
-        to_session_id=target.id,
-        payload_json=encoded,
-        item_count=len(snapshot.items),
-        autoplay=bool(payload.autoplay),
-        status="pending",
-        created_at=now,
-        expires_at=now + HANDOFF_TTL,
-    )
-    session.add(handoff)
-    session.flush()
-    # loop/shuffle are set from the snapshot deliberately: a client too old to know adopt_handoff
-    # still applies those two unconditionally before falling through, so this makes that harmless
-    # rather than a surprise change of playback mode on the target.
-    command = PlaybackCommand(
-        user_id=user.id,
-        device_id=target.id,
-        action="adopt_handoff",
-        target_type="handoff",
-        target_id=handoff.id,
-        loop=snapshot.repeat if snapshot.repeat in {"off", "one", "all"} else "off",
-        shuffle=bool(snapshot.shuffle),
-        status="pending",
-    )
-    session.add(command)
-    session.flush()
-    handoff.command_id = command.id
-    session.commit()
-    session.refresh(handoff)
-
-    try:
-        create_notification(
-            session,
-            title="Playback moved",
-            body=f"Continue on {target.device_label or 'this device'}",
-            event_type="remote_playback_command",
-            target_url="/player",
-            user_id=user.id,
-            deliver_apns=True,
-            deliver_web=False,
-            device_id=apns_device_for_session(session, user.id, target.id),
-        )
-    except Exception:  # noqa: BLE001 - the handoff stands even if the wake nudge cannot be sent.
-        pass
-
-    # A third-party move has to stop the source, because that session is not the one calling and will
-    # not stop itself. When the caller IS the source it stops locally on the 200 instead — no command
-    # needed, and no window where the server has told it to stop before it knows the move succeeded.
-    if source_id != origin.id:
-        session.add(PlaybackCommand(
-            user_id=user.id,
-            device_id=source_id,
-            action="stop",
-            status="pending",
-        ))
-        session.commit()
-        try:
-            create_notification(
-                session,
-                title="Playback moved",
-                body=f"Now on {target.device_label or 'another device'}",
-                event_type="remote_playback_command",
-                target_url="/player",
-                user_id=user.id,
-                deliver_apns=True,
-                deliver_web=False,
-                device_id=apns_device_for_session(session, user.id, source_id),
-            )
-        except Exception:  # noqa: BLE001 - the move stands even if the source cannot be nudged.
-            pass
-
     return PlaybackTransferOut(
         id=handoff.id,
         status=handoff.status,
@@ -1722,10 +1404,6 @@ def get_playback_handoff(
     # to learn the outcome; handing its own queue back would just be a way to get it wrong twice.
     if origin.id == handoff.to_session_id and handoff.status == "pending" and handoff.payload_json:
         out.snapshot = PlaybackSnapshot.model_validate_json(handoff.payload_json)
-        # Decided here, not by each client, so the two cannot derive it differently.
-        out.autoplay_effective = bool(
-            handoff.autoplay and as_utc(handoff.created_at) >= now - HANDOFF_AUTOPLAY_DECAY
-        )
     return out
 
 
@@ -1799,12 +1477,13 @@ def list_player_commands(
     # Commands that CARRY something are exempt: a handoff and a queue addition are not "now" verbs,
     # they are payloads, and the server's own handoff expiry (§31) is what bounds those instead.
     now = datetime.now(timezone.utc)
-    carries_payload = {"adopt_handoff", "enqueue_next", "enqueue_end"}
+    carries_payload = {"enqueue_next", "enqueue_end"}
     fresh: list[PlaybackCommand] = []
     expired = False
     for command in rows:
         created = as_utc(command.created_at) or now
-        if command.action not in carries_payload and (now - created) > COMMAND_TTL:
+        ttl = ADOPT_SESSION_TTL if command.action == "adopt_session" else COMMAND_TTL
+        if command.action not in carries_payload and (now - created) > ttl:
             command.status = "expired"
             command.consumed_at = now
             expired = True
@@ -1827,6 +1506,627 @@ def ack_player_command(
         command.consumed_at = datetime.now(timezone.utc)
         session.commit()
     return {"ok": True}
+
+
+# ── The account's shared playback session (§A1b) ────────────────────────────────
+#
+# One queue and one position per account, stored here and outliving every device. A device session
+# CLAIMS it to play it; everyone else views it and drives it remotely. Remote control of an owned
+# session is the ordinary command channel above (transport, seek, jump/remove/move, enqueue) — the
+# owner applies the command and republishes. Only an ORPHANED session, with nobody to command, is
+# edited here directly.
+
+#: Default for `User.playback_claim_timeout_minutes`: how long a claim survives without PLAYING. A
+#: paused session left alone is up for grabs, so the next device to press Play takes it rather than
+#: remote-controlling a sleeping one. Per user since 2026-09-22; 0 (the default since 2026-09-23,
+#: "Never" is the default for Hand Off After) means it never lapses this way.
+DEFAULT_CLAIM_IDLE_MINUTES = 0
+# A shared session is meant to be resumed in full, so it is capped far above a transfer (500).
+SESSION_MAX_ITEMS = 5000
+SESSION_MAX_PAYLOAD_BYTES = 512 * 1024
+#: How long a pushed "take over the session" stays deliverable to a backgrounded target.
+ADOPT_SESSION_TTL = timedelta(minutes=2)
+
+
+def _claim_idle_timeout(session: Session, user_id: str | None) -> timedelta | None:
+    """This account's idle-lapse window, or None for "never lapses from idleness"."""
+    user = session.get(User, user_id) if user_id else None
+    minutes = DEFAULT_CLAIM_IDLE_MINUTES if user is None else int(user.playback_claim_timeout_minutes)
+    return None if minutes <= 0 else timedelta(minutes=minutes)
+
+
+def _claim_valid(
+    row: "AccountPlaybackSession | None",
+    now: datetime | None = None,
+    idle_timeout: timedelta | None = timedelta(minutes=DEFAULT_CLAIM_IDLE_MINUTES),
+) -> bool:
+    """Whether the stored claim still entitles its owner to play the session.
+
+    ⚠ Derived, never written. A lapsed claim keeps its `claim_id` on purpose: the holder, returning
+    from a stretch offline, re-validates it simply by reporting again — unless another device claimed
+    in the meantime, which replaced the id. Nothing may clear a claim for having lapsed.
+
+    ⚠ TWO CLOCKS, and they are not interchangeable (§31). A claim that says it is **playing** is a
+    MOVING claim: its position is wrong within seconds of the reports stopping, and the claim itself
+    is wrong if the app died — so it is believed only while the owner reported inside `LIVE_WINDOW`
+    (45s). That is what makes closing the playing app hand the session back almost at once, instead
+    of leaving every other device showing "playing remotely" on a claim nobody is honouring.
+    A **paused** claim drifts nowhere, but its OWNER can still be gone: every client heartbeats its
+    claim every 15s while it is open, playing or paused (user, 2026-09-23), so silence past
+    `LIVE_WINDOW` means the app is closed, suspended or offline, and the session is free for every
+    other device to show idle and claim. On top of that a live, heartbeating owner that has sat
+    paused loses the claim after the per-user idle window; `idle_timeout=None` ("Never") only
+    switches THAT rule off, never the heartbeat.
+    """
+    if row is None or not row.owner_session_id or not row.claim_id:
+        return False
+    now = now or datetime.now(timezone.utc)
+    heard = row.owner_reported_at or row.claimed_at
+    if heard is None:
+        return False
+    if as_utc(heard) < now - LIVE_WINDOW:
+        return False
+    if row.status == "playing" or idle_timeout is None:
+        return True
+    idle_since = row.paused_since or heard
+    return as_utc(idle_since) >= now - idle_timeout
+
+
+def _account_session(session: Session, user_id: str) -> AccountPlaybackSession:
+    row = session.get(AccountPlaybackSession, user_id)
+    if row is None:
+        row = AccountPlaybackSession(user_id=user_id, queue_version=0, status="stopped")
+        session.add(row)
+        session.flush()
+    return row
+
+
+def _session_snapshot(row: AccountPlaybackSession) -> PlaybackSnapshot:
+    if row.queue_json:
+        try:
+            return PlaybackSnapshot.model_validate_json(row.queue_json)
+        except Exception:  # noqa: BLE001 - a corrupt copy is an empty queue, not a 500 on every poll.
+            pass
+    return PlaybackSnapshot(items=[], current_index=0, position_seconds=0.0, playing=False)
+
+
+def _validate_session_items(items: list[PlaybackSnapshotItem]) -> None:
+    if len(items) > SESSION_MAX_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Queue exceeds {SESSION_MAX_ITEMS} items")
+    for item in items:
+        if item.type not in {"track", "episode"}:
+            raise HTTPException(status_code=400, detail="Queue items must be tracks or episodes")
+        if not item.id or len(item.id) > 64:
+            raise HTTPException(status_code=400, detail="Queue item ids are missing or too long")
+
+
+def _store_session_queue(row: AccountPlaybackSession, items: list[PlaybackSnapshotItem]) -> None:
+    """Replace the stored queue, bumping `queue_version` only when its CONTENTS changed.
+
+    Ids only: display titles are the viewer's to resolve (from its mirror, or `resolve=true`).
+    """
+    _validate_session_items(items)
+    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id) for i in items]
+    # exclude_none: every absent title/artist/album_id is ~50 bytes of nulls, which alone pushed a
+    # full-size queue past the payload cap.
+    encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json(exclude_none=True)
+    if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Queue is too large")
+    if encoded != row.queue_json:
+        row.queue_json = encoded
+        row.queue_version = (row.queue_version or 0) + 1
+    row.queue_length = len(clean)
+    if row.queue_length == 0:
+        row.current_index = 0
+    else:
+        row.current_index = max(0, min(row.current_index or 0, row.queue_length - 1))
+
+
+def _set_session_current(session: Session, row: AccountPlaybackSession) -> None:
+    """Derive the now-playing display from the item at `current_index` — the library wins (§31)."""
+    items = _session_snapshot(row).items
+    item = items[row.current_index] if 0 <= (row.current_index or 0) < len(items) else None
+    row.track_id = row.episode_id = None
+    row.title = row.artist = row.album = None
+    row.duration_seconds = None
+    if item is None:
+        return
+    if item.type == "episode":
+        episode = session.get(Episode, item.id)
+        if episode:
+            podcast = episode.podcast
+            row.episode_id = episode.id
+            row.title = episode.title
+            row.artist = (podcast.author or podcast.title) if podcast else None
+            row.album = podcast.title if podcast else None
+            row.duration_seconds = round(episode.duration_ms / 1000) if episode.duration_ms else None
+        return
+    track = session.get(Track, item.id)
+    if track:
+        row.track_id = track.id
+        row.title = track.title
+        row.artist = track.album.artist.name if track.album and track.album.artist else None
+        row.album = track.album.title if track.album else None
+        row.duration_seconds = round(track.duration_ms / 1000) if track.duration_ms else None
+
+
+def _resolve_snapshot_titles(session: Session, items: list[PlaybackSnapshotItem]) -> None:
+    """Fill titles in for the WEB, which has no library mirror. One query per kind, never per item."""
+    track_ids = [item.id for item in items if item.type != "episode"]
+    episode_ids = [item.id for item in items if item.type == "episode"]
+    tracks = {
+        row.id: row for row in session.scalars(select(Track).where(Track.id.in_(track_ids)))
+    } if track_ids else {}
+    episodes = {
+        row.id: row for row in session.scalars(select(Episode).where(Episode.id.in_(episode_ids)))
+    } if episode_ids else {}
+    for item in items:
+        if item.type == "episode":
+            episode = episodes.get(item.id)
+            if episode:
+                item.title = episode.title
+                item.artist = episode.podcast.title if episode.podcast else None
+            continue
+        track = tracks.get(item.id)
+        if track:
+            item.title = track.title
+            item.artist = track.album.artist.name if track.album and track.album.artist else None
+            item.album_id = track.album_id
+
+
+def _serialize_account_session(
+    session: Session,
+    row: AccountPlaybackSession,
+    auth_session: AuthSession | None,
+    *,
+    include_items: bool = False,
+    resolve: bool = False,
+    claim_id: str | None = None,
+) -> AccountSessionOut:
+    now = datetime.now(timezone.utc)
+    valid = _claim_valid(row, now, _claim_idle_timeout(session, row.user_id))
+    owner = None
+    if valid:
+        owner_row = session.get(AuthSession, row.owner_session_id)
+        owner = AccountSessionOwner(
+            session_id=row.owner_session_id,
+            device_label=owner_row.device_label if owner_row else None,
+            client=owner_row.client if owner_row else None,
+        )
+        status_value = row.status
+    else:
+        # An orphan is shown where it was left, paused, so any device can press Play and take it.
+        status_value = "paused" if (row.queue_length or 0) > 0 else "stopped"
+    items = None
+    if include_items:
+        items = _session_snapshot(row).items
+        if resolve:
+            _resolve_snapshot_titles(session, items)
+    episode = session.get(Episode, row.episode_id) if row.episode_id else None
+    track = session.get(Track, row.track_id) if row.track_id else None
+    return AccountSessionOut(
+        status=status_value,
+        owner=owner,
+        claim_valid=valid,
+        you_own=bool(valid and auth_session is not None and row.owner_session_id == auth_session.id),
+        claim_is_yours=bool(auth_session is not None and row.owner_session_id == auth_session.id),
+        claim_id=claim_id,
+        queue_version=row.queue_version or 0,
+        queue_length=row.queue_length or 0,
+        current_index=row.current_index or 0,
+        position_seconds=float(row.position_seconds or 0.0),
+        position_at=as_utc(row.position_at) if row.position_at else None,
+        shuffle=bool(row.shuffle),
+        repeat=row.repeat or "off",
+        track_id=row.track_id,
+        episode_id=row.episode_id,
+        podcast_id=episode.podcast_id if episode else None,
+        album_id=track.album_id if track else None,
+        title=row.title,
+        artist=row.artist,
+        album=row.album,
+        duration_seconds=row.duration_seconds,
+        updated_at=as_utc(row.updated_at) if row.updated_at else None,
+        items=items,
+    )
+
+
+def _apply_claimed_report(
+    row: AccountPlaybackSession, state: SessionPlayerState, payload: PlayerStateUpdate, now: datetime
+) -> None:
+    """Fold the claim holder's /player/status heartbeat into the shared session.
+
+    The per-device row has already resolved display fields against the library, so they are copied
+    rather than derived a second time. Reporting also re-validates a soft-lapsed claim — that is the
+    "claim holder wins when it comes back" rule.
+    """
+    previous = row.status
+    row.status = state.status
+    if row.status == "playing":
+        row.paused_since = None
+    elif previous == "playing" or row.paused_since is None:
+        row.paused_since = now
+    if row.queue_length:
+        row.current_index = max(0, min(payload.current_index, row.queue_length - 1))
+    row.position_seconds = float(payload.position_seconds or 0)
+    row.position_at = now
+    row.shuffle = state.shuffle
+    row.repeat = state.repeat
+    row.track_id = state.track_id
+    row.episode_id = state.episode_id
+    row.title = state.title
+    row.artist = state.artist
+    row.album = state.album
+    row.duration_seconds = state.duration_seconds
+    row.owner_session_id = state.session_id
+    row.owner_reported_at = now
+    row.updated_at = now
+
+
+def _stop_previous_owner(session: Session, user: User, owner_session_id: str, new_label: str | None) -> None:
+    """Tell a displaced owner to stop, ONCE — the same send-once guard ownership resolution uses."""
+    already = session.scalar(
+        select(PlaybackCommand.id).where(
+            PlaybackCommand.user_id == user.id,
+            PlaybackCommand.device_id == owner_session_id,
+            PlaybackCommand.status == "pending",
+            PlaybackCommand.action == "stop",
+        )
+    )
+    if already:
+        return
+    session.add(PlaybackCommand(user_id=user.id, device_id=owner_session_id, action="stop", status="pending"))
+    session.commit()
+    try:
+        create_notification(
+            session,
+            title="Playback moved",
+            body=f"Now on {new_label or 'another device'}",
+            event_type="remote_playback_command",
+            target_url="/player",
+            user_id=user.id,
+            deliver_apns=True,
+            deliver_web=False,
+            device_id=apns_device_for_session(session, user.id, owner_session_id),
+        )
+    except Exception:  # noqa: BLE001 - the stop stands even if the wake cannot be sent.
+        pass
+
+
+@router.get(
+    "/player/session",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Read my account's shared playback session",
+)
+def get_account_session(
+    queue: bool = False,
+    resolve: bool = False,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """What the account is listening to, where it was left, and who (if anyone) holds the claim.
+
+    ⚠ A read never writes: an account that has never played gets an empty projection, not a row.
+    """
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None:
+        return AccountSessionOut(status="stopped")
+    return _serialize_account_session(session, row, auth_session, include_items=queue, resolve=resolve)
+
+
+def _require_remote_playback(user: User) -> None:
+    """Refuse the shared-session verbs while the account has cross-device playback switched off.
+
+    ⚠ Deliberately only these two. Turning the setting off means "my devices stop seeing and driving
+    each other" (§31), and claiming or transferring the SHARED session is exactly that — but the
+    command channel stays open, because automations and IFTTT drive a device through it and
+    silently stopping those would be a second, unasked-for change (§3/§24).
+    """
+    if not bool(getattr(user, "remote_playback_enabled", True)):
+        raise HTTPException(
+            status_code=409,
+            detail={"detail": "remote_playback_disabled"},
+        )
+
+
+@router.post(
+    "/player/session/claim",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Take the shared session so this device plays it",
+)
+def claim_account_session(
+    payload: SessionClaimRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """Make the caller the owner. Always succeeds — pressing Play, or "Play here", is a steal.
+
+    Without a snapshot the stored queue is taken where it was left; with one (a fresh play) it is
+    replaced. A previous VALID owner elsewhere is sent one stop. The response carries the new
+    `claim_id`, which the caller must send on every report after, and the whole queue.
+    """
+    origin = _require_session(auth_session)
+    _require_remote_playback(user)
+    now = datetime.now(timezone.utc)
+    row = _account_session(session, user.id)
+    previous_owner = (
+        row.owner_session_id
+        if _claim_valid(row, now, _claim_idle_timeout(session, user.id))
+        else None
+    )
+    if payload.snapshot is not None:
+        snap = payload.snapshot
+        if snap.items and not 0 <= snap.current_index < len(snap.items):
+            raise HTTPException(status_code=400, detail="current_index is outside the queue")
+        _store_session_queue(row, snap.items)
+        row.current_index = snap.current_index if snap.items else 0
+        row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
+        row.shuffle = bool(snap.shuffle)
+        row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
+    elif previous_owner and row.status == "playing" and row.position_at:
+        # Taking a session that is playing right now: resume where it IS, not where it last said.
+        advanced = (row.position_seconds or 0.0) + (now - as_utc(row.position_at)).total_seconds()
+        if row.duration_seconds:
+            advanced = min(advanced, float(row.duration_seconds))
+        row.position_seconds = max(0.0, advanced)
+    row.claim_id = uuid_str()
+    row.owner_session_id = origin.id
+    row.claimed_at = now
+    row.owner_reported_at = now
+    row.position_at = now
+    # Claimed to be played: viewers see it playing at once rather than after the first heartbeat.
+    # A claimer that fails to start says "paused" in its next report.
+    row.status = "playing" if (row.queue_length or 0) > 0 else "stopped"
+    row.paused_since = None if row.status == "playing" else now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    if previous_owner and previous_owner != origin.id:
+        _stop_previous_owner(session, user, previous_owner, origin.device_label)
+    return _serialize_account_session(session, row, auth_session, include_items=True, claim_id=row.claim_id)
+
+
+@router.post(
+    "/player/session/release",
+    tags=["users"],
+    summary="Give up the claim on the shared session (the app's dying gasp)",
+)
+def release_account_session(
+    payload: SessionReleaseRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Idempotent and always 200: a gasp that arrives after someone else claimed changes nothing."""
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None or not payload.claim_id or row.claim_id != payload.claim_id:
+        return {"ok": True, "released": False}
+    now = datetime.now(timezone.utc)
+    if payload.position_seconds is not None:
+        row.position_seconds = max(0.0, float(payload.position_seconds))
+    if payload.current_index is not None and row.queue_length:
+        row.current_index = max(0, min(payload.current_index, row.queue_length - 1))
+        _set_session_current(session, row)
+    row.claim_id = None
+    row.owner_session_id = None
+    row.status = "paused" if (row.queue_length or 0) > 0 else "stopped"
+    row.paused_since = now
+    row.position_at = now
+    row.updated_at = now
+    session.commit()
+    return {"ok": True, "released": True}
+
+
+@router.post(
+    "/player/session/queue",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Publish the claim holder's queue to the shared session",
+    responses={409: {"description": "claim_lost — another device holds the session now"}},
+)
+def publish_account_session_queue(
+    payload: SessionQueuePublish,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """The owner is authoritative for its queue while it holds the claim; this simply stores it.
+
+    Other devices' edits reach an owned session as COMMANDS to the owner, which applies them and
+    publishes here — so there is never a second writer to reconcile against.
+    """
+    origin = _require_session(auth_session)
+    row = session.get(AccountPlaybackSession, user.id)
+    if row is None or row.claim_id != payload.claim_id:
+        raise HTTPException(status_code=409, detail="claim_lost")
+    snap = payload.snapshot
+    if snap.items and not 0 <= snap.current_index < len(snap.items):
+        raise HTTPException(status_code=400, detail="current_index is outside the queue")
+    now = datetime.now(timezone.utc)
+    _store_session_queue(row, snap.items)
+    row.current_index = snap.current_index if snap.items else 0
+    row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
+    row.position_at = now
+    row.shuffle = bool(snap.shuffle)
+    row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
+    row.owner_session_id = origin.id
+    row.owner_reported_at = now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    return _serialize_account_session(session, row, auth_session)
+
+
+@router.post(
+    "/player/session/edit",
+    response_model=AccountSessionOut,
+    tags=["users"],
+    summary="Edit the shared session while no device holds it",
+    responses={409: {"description": "owned (send a command to the owner instead) or queue_changed"}},
+)
+def edit_account_session(
+    payload: SessionEditRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> AccountSessionOut:
+    """Queue, position and mode edits for an ORPHANED session, which has nobody to command.
+
+    ⚠ Refused while a claim is valid: the owner is the only writer of an owned session, and every one
+    of these has a command-channel equivalent that reaches it (jump/remove/move/seek/state, and
+    /player/enqueue for inserts).
+    """
+    now = datetime.now(timezone.utc)
+    row = _account_session(session, user.id)
+    if _claim_valid(row, now, _claim_idle_timeout(session, user.id)):
+        raise HTTPException(status_code=409, detail={"detail": "owned", "owner_session_id": row.owner_session_id})
+    if payload.base_version is not None and payload.base_version != (row.queue_version or 0):
+        raise HTTPException(status_code=409, detail={"detail": "queue_changed", "queue_version": row.queue_version or 0})
+    op = (payload.op or "").strip().lower()
+    items = list(_session_snapshot(row).items)
+    current = row.current_index or 0
+
+    def index_ok(value: int | None) -> int:
+        if value is None or not 0 <= value < len(items):
+            raise HTTPException(status_code=400, detail="index is outside the queue")
+        return value
+
+    if op in {"insert_next", "insert_end"}:
+        new_items = payload.items or []
+        if not new_items:
+            raise HTTPException(status_code=400, detail="Nothing to queue")
+        at = len(items) if (op == "insert_end" or not items) else current + 1
+        items[at:at] = new_items
+        _store_session_queue(row, items)
+    elif op == "remove":
+        index = index_ok(payload.index)
+        items.pop(index)
+        if index < current:
+            current -= 1
+        elif index == current:
+            row.position_seconds = 0.0
+        row.current_index = current
+        _store_session_queue(row, items)
+    elif op == "move":
+        index = index_ok(payload.index)
+        to_index = index_ok(payload.to_index)
+        items.insert(to_index, items.pop(index))
+        if index == current:
+            current = to_index
+        elif index < current <= to_index:
+            current -= 1
+        elif to_index <= current < index:
+            current += 1
+        row.current_index = current
+        _store_session_queue(row, items)
+    elif op == "jump":
+        row.current_index = index_ok(payload.index)
+        row.position_seconds = 0.0
+    elif op == "seek":
+        if payload.position_seconds is None:
+            raise HTTPException(status_code=400, detail="position_seconds is required")
+        limit = float(row.duration_seconds) if row.duration_seconds else None
+        target = max(0.0, float(payload.position_seconds))
+        row.position_seconds = min(target, limit) if limit else target
+    elif op == "state":
+        if payload.shuffle is not None:
+            row.shuffle = bool(payload.shuffle)
+        if payload.repeat in {"off", "one", "all"}:
+            row.repeat = payload.repeat
+    else:
+        raise HTTPException(status_code=400, detail="Unknown op")
+    row.position_at = now
+    row.updated_at = now
+    _set_session_current(session, row)
+    session.commit()
+    return _serialize_account_session(session, row, auth_session)
+
+
+@router.post(
+    "/player/session/transfer",
+    tags=["users"],
+    summary="Ask another of my devices to take over the shared session",
+    responses={404: {"description": "Not a session of yours"}, 409: {"description": "Unreachable"}},
+)
+def transfer_account_session(
+    payload: SessionTransferRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    auth_session: AuthSession | None = Depends(get_current_auth_session),
+) -> dict:
+    """Send the session to a named device. The target CLAIMS it on receipt, and that claim stops the
+    current owner — so nothing here stops anybody, and a target that never wakes costs nothing.
+
+    Without a snapshot the stored session is what moves ("send to device"). With one, the target is
+    told to play THAT — how a device watching another plays an album there instead of locally. The
+    snapshot rides on `playback_handoffs` (the hot command table stays row-narrow) and the target
+    claims with it, so the queue is replaced in the same write that makes it the owner.
+    """
+    _require_session(auth_session)
+    _require_remote_playback(user)
+    target = session.scalar(
+        select(AuthSession).where(AuthSession.id == payload.to_session_id, AuthSession.user_id == user.id)
+    )
+    if not target:
+        raise HTTPException(status_code=404, detail="No such device session")
+    presence = _session_presence(session.get(SessionPlayerState, target.id), target.last_used_at)
+    if presence == "unreachable":
+        raise HTTPException(status_code=409, detail={"detail": "device_unreachable", "device_label": target.device_label})
+    now = datetime.now(timezone.utc)
+    handoff = None
+    if payload.snapshot is not None:
+        snapshot = payload.snapshot
+        if not snapshot.items:
+            raise HTTPException(status_code=400, detail="Nothing to play")
+        _validate_session_items(snapshot.items)
+        if not 0 <= snapshot.current_index < len(snapshot.items):
+            raise HTTPException(status_code=400, detail="current_index is outside the queue")
+        encoded = snapshot.model_dump_json(exclude_none=True)
+        if len(encoded.encode("utf-8")) > SESSION_MAX_PAYLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Queue is too large")
+        handoff = PlaybackHandoff(
+            user_id=user.id,
+            from_session_id=auth_session.id,
+            to_session_id=target.id,
+            payload_json=encoded,
+            item_count=len(snapshot.items),
+            status="pending",
+            created_at=now,
+            expires_at=now + ADOPT_SESSION_TTL,
+        )
+        session.add(handoff)
+        session.flush()
+    command = PlaybackCommand(
+        user_id=user.id,
+        device_id=target.id,
+        action="adopt_session",
+        target_type="handoff" if handoff else "session",
+        target_id=handoff.id if handoff else None,
+        status="pending",
+    )
+    session.add(command)
+    session.flush()
+    if handoff:
+        handoff.command_id = command.id
+    session.commit()
+    try:
+        create_notification(
+            session,
+            title="Playback moved",
+            body=f"Continue on {target.device_label or 'this device'}",
+            event_type="remote_playback_command",
+            target_url="/player",
+            user_id=user.id,
+            deliver_apns=True,
+            deliver_web=False,
+            device_id=apns_device_for_session(session, user.id, target.id),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "command_id": command.id, "to_device_label": target.device_label}
 
 
 # ── Play history (local PlayEvent + best-effort Jellyfin report) ───────────────
@@ -1964,6 +2264,35 @@ def library_top(
 
 # ── Offline delta sync ────────────────────────────────────────────────────────
 
+def _library_iso(dt: datetime | None) -> str | None:
+    """The one wire form of a library row's `updated_at`: `/library/changes` sends it and
+    `/library/checksum` hashes it, so a mirror that stored what it was sent reproduces the digest."""
+    # SQLite stores these tz-naive; they are UTC, so emit a UTC-aware ISO string consistent with
+    # server_time for client cursor math.
+    if not dt:
+        return None
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+
+
+@router.get("/library/checksum", tags=["library"], summary="Library row counts and id digests (mirror integrity check)", response_model=dict)
+def library_checksum(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.library_view)),
+) -> dict:
+    """What an offline mirror must hold: per table, the row count and the SHA-256 of every
+    `"<id>|<updated_at>"` line (updated_at exactly as `/library/changes` sends it, "" when null),
+    sorted by id and joined with "\\n". Covers additions, deletions AND edits, so a client that
+    checks after each delta sync needs no periodic full resync -- only one when this disagrees (a
+    cursor the server kept rejecting froze a mirror for a day unnoticed, 2026-09-23).
+    """
+    out: dict[str, dict] = {}
+    for key, model in (("artists", Artist), ("albums", Album), ("tracks", Track)):
+        rows = sorted(session.execute(select(model.id, model.updated_at)).all(), key=lambda row: row[0])
+        lines = [f"{row_id}|{_library_iso(updated) or ''}" for row_id, updated in rows]
+        out[key] = {"count": len(lines), "digest": hashlib.sha256("\n".join(lines).encode()).hexdigest()}
+    return out
+
+
 @router.get("/library/changes", tags=["library"], summary="Library rows changed since a timestamp (delta sync)", response_model=dict)
 def library_changes(
     since: str | None = None,
@@ -1986,12 +2315,7 @@ def library_changes(
         query = query.where(model.updated_at <= server_time)
         return query.where(model.updated_at > since_dt) if since_dt else query
 
-    def _iso(dt):
-        # SQLite stores these tz-naive; they are UTC, so emit a UTC-aware ISO string
-        # consistent with server_time for client cursor math.
-        if not dt:
-            return None
-        return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).isoformat()
+    _iso = _library_iso
 
     artists = [
         {"id": a.id, "name": a.name, "sort_name": a.sort_name, "musicbrainz_id": a.musicbrainz_id,
@@ -2654,6 +2978,7 @@ def library_artists(
         LibraryArtistRow(
             id=a.id, name=a.name, sort_name=a.sort_name, cover_path=a.cover_path,
             cover_locked=a.cover_locked, album_count=len(a.albums),
+            updated_at=_library_iso(a.updated_at),
         )
         for a in rows
     ]
@@ -2689,6 +3014,7 @@ def library_albums(
             id=al.id, title=al.title, sort_name=al.sort_name, artist_id=al.artist_id,
             artist_name=(al.artist.name if al.artist else ""),
             cover_path=al.cover_path, cover_locked=al.cover_locked, track_count=len(al.tracks),
+            updated_at=_library_iso(al.updated_at),
         )
         for al in rows
     ]
@@ -2731,6 +3057,7 @@ def library_tracks(
             track_number=t.track_number, disc_number=t.disc_number,
             duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
             replaygain_track_gain=t.replaygain_track_gain,
+            updated_at=_library_iso(t.updated_at),
         )
         for t in rows
     ]
@@ -2821,7 +3148,6 @@ def propose_library_metadata(
     batch = ProposalBatch(
         title=f"Update {payload.target_type} metadata",
         kind=ProposalKind.metadata,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -2904,7 +3230,7 @@ def propose_library_remove(
         # with the real album).
         if payload.target_type == "album" and not library_target_tracks(target):
             artist_name = target.artist.name if target.artist else "Unknown Artist"
-            batch = ProposalBatch(title="Remove empty album", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title="Remove empty album", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             artist_item = ProposalItem(batch_id=batch.id, title=artist_name, kind=ProposalKind.delete)
@@ -2929,7 +3255,6 @@ def propose_library_remove(
     batch = ProposalBatch(
         title=f"{remove_action_title(payload.action)} {payload.target_type}",
         kind=batch_kind,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -3293,7 +3618,6 @@ def queue_musicbrainz_metadata_fixes(session: Session, results: list[dict]) -> P
     batch = ProposalBatch(
         title="MusicBrainz metadata fixes",
         kind=ProposalKind.metadata,
-        tree_path="/library",
     )
     session.add(batch)
     session.flush()
@@ -3329,7 +3653,7 @@ def queue_musicbrainz_replacement_downloads(session: Session, results: list[dict
     replacement_results = [result for result in results if result.get("replacement_request")]
     if not replacement_results:
         return None
-    batch = ProposalBatch(title="MusicBrainz replacement downloads", kind=ProposalKind.download, tree_path="/library")
+    batch = ProposalBatch(title="MusicBrainz replacement downloads", kind=ProposalKind.download)
     session.add(batch)
     session.flush()
     artist_items: dict[str, ProposalItem] = {}
@@ -4289,7 +4613,7 @@ def create_wishlist_item(
         .where(WishlistItem.artist == payload.artist)
         .where(WishlistItem.album == payload.album)
         .where(WishlistItem.track == payload.track)
-        .where(WishlistItem.status.in_(["wanted", "review", "approved"]))
+        .where(WishlistItem.status.in_(["wanted", "requested", "searching", "review", "approved", "staged", "downloading"]))
     )
     if existing:
         write_app_log(
@@ -4303,11 +4627,37 @@ def create_wishlist_item(
             track=payload.track,
         )
         return serialize_wishlist_item(existing)
+    # Requesting something again replaces its declined (or failed) row rather than listing it twice.
+    for declined in session.scalars(
+        select(WishlistItem)
+        .where(WishlistItem.user_id == user.id)
+        .where(WishlistItem.kind == payload.kind)
+        .where(WishlistItem.artist == payload.artist)
+        .where(WishlistItem.album == payload.album)
+        .where(WishlistItem.track == payload.track)
+        .where(WishlistItem.status.in_(["rejected", "failed"]))
+    ):
+        session.delete(declined)
     item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
     item.status_changed_at = datetime.now(timezone.utc)
+    # Gate 1 (2026-09-23): an approver's own request skips straight to searching, exactly as
+    # before. Everyone else's request waits at `requested` until a `wishlist:approve_all` holder
+    # (or admin) approves it from /wishlist/queue -- nothing searches until a human says so.
+    is_approver = user_has_permission(user, Permission.wishlist_approve_all)
+    if is_approver:
+        item.status = "searching"
+        item.stage = ItemStage.searching.value
+    else:
+        item.status = "requested"
+        item.stage = ItemStage.requested.value
     session.add(item)
     session.commit()
     session.refresh(item)
+    if is_approver:
+        # Enqueued AFTER the commit so the worker cannot claim the task before the row it needs
+        # exists.  enqueue_task dedupes identical payloads, so a double-tap costs nothing.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+        session.commit()
     write_app_log(
         "Wishlist item created",
         feature=payload.source or "wishlist",
@@ -4331,146 +4681,146 @@ def remove_wishlist_item(
     if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     item.status = "removed"
+    item.stage = ItemStage.rejected.value
+    item.status_changed_at = datetime.now(timezone.utc)
+    session.commit()
+    # ⚠️ A removed request takes its work with it: the candidate search is cancelled, any live
+    # transfer stopped and its file deleted, and its rows and emptied batches removed. Leaving them
+    # is how sandalphon ended up holding two batches of "finding candidates" rows for a request
+    # whose own row already read Declined, with nothing in any UI able to clear them.
+    purge_wishlist_work(session, item, actor_id=user.id)
+    session.refresh(item)
+    return serialize_wishlist_item(item)
+
+
+@router.post("/wishlist/{item_id}/cancel", response_model=WishlistOut, tags=["wishlist"], summary="Stop a request's candidate search")
+def cancel_wishlist_search(
+    item_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> WishlistOut:
+    """Stop a request that is still searching and send it back to gate 1 (Request approval).
+
+    The one cancel that has no batch to go through: while `search_wishlist_item` runs, the request
+    is its `WishlistItem` and nothing else. Open to the requester and to approvers, like every other
+    cancel. Anything not searching is a silent no-op -- the row comes back unchanged.
+    """
+    item = session.get(WishlistItem, item_id)
+    if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
+        raise HTTPException(status_code=404, detail="Wishlist item not found")
+    if wishlist_stage(item) is not ItemStage.searching:
+        return serialize_wishlist_item(item)
+    stop_wishlist_search_tasks(session, {item.id})
+    # Candidates the search already committed go too. `purge_wishlist_work` declines the row on the
+    # way (it is shared with Remove), so the gate-1 state is written after it, not before.
+    purge_wishlist_work(session, item, actor_id=user.id)
+    item.status = "requested"
+    item.stage = ItemStage.requested.value
+    item.batch_id = None
+    item.item_id = None
     item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(item)
     return serialize_wishlist_item(item)
 
 
-@router.get("/wishlist/approvals", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="Get wishlist items pending approval")
-def list_wishlist_approvals(
+@router.get("/wishlist/queue", response_model=list[WishlistOut], tags=["wishlist"], summary="List requests waiting at gate 1")
+def list_wishlist_queue(
     session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.discover)),
-) -> list[ProposalBatchOut]:
-    query = (
-        select(ProposalBatch)
-        .options(selectinload(ProposalBatch.items))
-        .where(ProposalBatch.kind == ProposalKind.download)
-        .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
-        .order_by(ProposalBatch.created_at.desc())
+    _: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> list[WishlistOut]:
+    """Every user's rows still waiting for gate 1 (Request approval), oldest first.
+
+    Gate 1: nothing searches until a `wishlist:approve_all` holder (or admin) approves the
+    request here. An approver's own requests skip this gate entirely (see create_wishlist_item),
+    so this list is always someone ELSE's requests.
+    """
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.status == "requested")
+            .order_by(WishlistItem.created_at.asc())
+        )
     )
-    batches = prune_settled_batches(session, list(session.scalars(query)))
-    if user_has_permission(user, Permission.wishlist_approve_all):
-        return [serialize_batch(batch) for batch in batches]
-    visible_batches = []
-    for batch in batches:
-        if any((json.loads(item.payload_json or "{}").get("user_id") == user.id) for item in batch.items):
-            visible_batches.append(batch)
-    return [serialize_batch(batch) for batch in visible_batches]
+    return [serialize_wishlist_item(item) for item in items]
 
 
-@router.post("/wishlist/approvals", response_model=ProposalBatchOut, tags=["wishlist"], summary="Approve or deny wishlist batch")
-def propose_wishlist_items(
-    payload: WishlistApprovalRequest | None = None,
+@router.post("/wishlist/queue/approve", response_model=list[WishlistOut], tags=["wishlist"], summary="Approve requests at gate 1")
+def approve_wishlist_queue(
+    payload: WishlistQueueActionRequest,
     session: Session = Depends(get_session),
-    # Moving a "wanted" item into a real download batch (Task Queue) is a review action, not a
-    # normal "discover" capability — a plain discover-only user must NOT be able to self-approve
-    # their own wishlist request. Only wishlist_approve_all holders (or admins) may submit here,
-    # for anyone's items. (The web UI already only shows the submit button to canApproveAll users;
-    # this closes the matching server-side gap that let other clients call this directly.)
     user: User = Depends(require_permission(Permission.wishlist_approve_all)),
-) -> ProposalBatchOut:
-    reconcile_stale_approved_wishlist_items(session, user)
-    query = select(WishlistItem).options(selectinload(WishlistItem.user)).where(WishlistItem.status == "wanted")
-    all_wanted_items = list(session.scalars(query.order_by(WishlistItem.artist.asc(), WishlistItem.album.asc(), WishlistItem.track.asc())))
-    denied_items: list[WishlistItem] = []
-    if payload and payload.item_ids:
-        selected_ids = set(payload.item_ids)
-        items = [item for item in all_wanted_items if item.id in selected_ids]
-        if payload.deny_unselected and user_has_permission(user, Permission.wishlist_approve_all):
-            denied_items = [item for item in all_wanted_items if item.id not in selected_ids]
-    else:
-        items = all_wanted_items
-    if not items:
-        raise HTTPException(status_code=400, detail="No wishlist items are ready")
-
-    batch = ProposalBatch(title="Wishlist download review", kind=ProposalKind.download, tree_path="/wishlist")
-    session.add(batch)
-    session.flush()
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
-    album_lookup_cache: dict[tuple[str, str], dict | None] = {}
-    for wishlist_item in items:
-        artist_name = wishlist_item.artist
-        album_name = wishlist_item.album or "Singles"
-        if artist_name not in artist_items:
-            artist_item = ProposalItem(
-                batch_id=batch.id,
-                title=artist_name,
-                kind=ProposalKind.download,
-                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "artist", "artist": artist_name}),
-            )
-            session.add(artist_item)
-            session.flush()
-            artist_items[artist_name] = artist_item
-        album_key = (artist_name, album_name)
-        if album_key not in album_items:
-            album_item = ProposalItem(
-                batch_id=batch.id,
-                parent_id=artist_items[artist_name].id,
-                title=album_name,
-                kind=ProposalKind.download,
-                payload_json=json.dumps({"user_id": wishlist_item.user_id, "kind": "album", "artist": artist_name, "album": album_name}),
-            )
-            session.add(album_item)
-            session.flush()
-            album_items[album_key] = album_item
-        # Expand an album-level wishlist entry into one download request per track so the
-        # Soulseek per-track folder matcher can match each track against the found album
-        # folder. Fall back to the single album-level request if MusicBrainz has no tracklist.
-        track_payloads: list[dict] = []
-        if wishlist_item.kind == "album" and not wishlist_item.track and wishlist_item.album:
-            cache_key = (wishlist_item.artist, wishlist_item.album)
-            if cache_key not in album_lookup_cache:
-                try:
-                    album_lookup_cache[cache_key] = lookup_album_tracks(wishlist_item.artist, wishlist_item.album)
-                except Exception:
-                    album_lookup_cache[cache_key] = None
-            record = album_lookup_cache.get(cache_key)
-            for track in (record or {}).get("tracks", []) or []:
-                title = track.get("title")
-                if not title:
-                    continue
-                track_payloads.append(
-                    {
-                        "action": "wishlist_request",
-                        "kind": "track",
-                        "artist": wishlist_item.artist,
-                        "album": wishlist_item.album,
-                        "track": title,
-                        "track_number": track.get("track_number"),
-                        "disc_number": track.get("disc_number"),
-                        "duration_ms": track.get("length"),
-                        "musicbrainz_album_id": track.get("musicbrainz_album_id") or (record or {}).get("musicbrainz_album_id"),
-                        "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
-                    }
-                )
-        if not track_payloads:
-            track_payloads = [wishlist_download_payload(wishlist_item, album_lookup_cache)]
-        for track_payload in track_payloads:
-            session.add(
-                ProposalItem(
-                    batch_id=batch.id,
-                    parent_id=album_items[album_key].id,
-                    title=track_payload.get("track") or wishlist_item.album or wishlist_item.artist,
-                    kind=ProposalKind.download,
-                    payload_json=json.dumps(
-                        track_payload | {"user_id": wishlist_item.user_id, "wishlist_item_id": wishlist_item.id}
-                    ),
-                )
-            )
-        wishlist_item.status = "review"
-        wishlist_item.status_changed_at = datetime.now(timezone.utc)
-    notify_wishlist_decisions(session, items, "Wishlist request approved", "added to the task queue", "wishlist_approved", "/downloads")
-    for denied_item in denied_items:
-        denied_item.status = "rejected"
-        denied_item.status_changed_at = datetime.now(timezone.utc)
-    if denied_items:
-        notify_wishlist_decisions(session, denied_items, "Wishlist request denied", "not selected for download", "wishlist_denied", "/wishlist")
+) -> list[WishlistOut]:
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.id.in_(payload.item_ids))
+        )
+    )
+    now = datetime.now(timezone.utc)
+    approved: list[WishlistItem] = []
+    for item in items:
+        # Anything not still at gate 1 is ignored silently -- a double-tap or a stale client list
+        # must not re-trigger a search for a row already searching/declined/etc.
+        if item.status != "requested":
+            continue
+        item.status = "searching"
+        item.stage = ItemStage.searching.value
+        item.status_changed_at = now
+        approved.append(item)
     session.commit()
-    session.refresh(batch)
-    enqueue_task(session, "search_candidates", {"batch_id": batch.id})
-    return serialize_batch(batch)
+    for item in approved:
+        session.refresh(item)
+        # Enqueued AFTER the commit, same reasoning as create_wishlist_item: the worker must never
+        # be able to claim the task before the row it needs exists.
+        enqueue_task(session, "search_wishlist_item", {"wishlist_item_id": item.id})
+        write_app_log(
+            "Wishlist request approved at gate 1",
+            feature="wishlist",
+            user_id=user.id,
+            item_id=item.id,
+            requester_id=item.user_id,
+        )
+    session.commit()
+    return [serialize_wishlist_item(item) for item in approved]
+
+
+@router.post("/wishlist/queue/reject", response_model=list[WishlistOut], tags=["wishlist"], summary="Decline requests at gate 1")
+def reject_wishlist_queue(
+    payload: WishlistQueueActionRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.wishlist_approve_all)),
+) -> list[WishlistOut]:
+    items = list(
+        session.scalars(
+            select(WishlistItem)
+            .options(selectinload(WishlistItem.user))
+            .where(WishlistItem.id.in_(payload.item_ids))
+        )
+    )
+    now = datetime.now(timezone.utc)
+    rejected: list[WishlistItem] = []
+    for item in items:
+        if item.status != "requested":
+            continue
+        # Declined, and it STAYS visible on the requester's wishlist -- they remove it themselves.
+        # Nothing has searched yet at gate 1, so there is no candidate work to purge.
+        item.status = "rejected"
+        item.stage = ItemStage.rejected.value
+        item.status_changed_at = now
+        rejected.append(item)
+    session.commit()
+    for item in rejected:
+        write_app_log(
+            "Wishlist request declined at gate 1",
+            feature="wishlist",
+            user_id=user.id,
+            item_id=item.id,
+            requester_id=item.user_id,
+        )
+    return [serialize_wishlist_item(item) for item in rejected]
 
 
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
@@ -5544,11 +5894,6 @@ def decline_playlist_share(
     return {"declined": True}
 
 
-@router.post("/playlists/sync", response_model=TaskOut, tags=["playlists"], summary="Remap Nudibranch tracks to Jellyfin item IDs", description="Queues the track-mapping job, which is also triggered automatically after a Jellyfin library scan or track import. Only tracks not yet mapped are processed.")
-def sync_playlists(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
-
-
 @router.get("/playlists/sync/stats", response_model=PlaylistSyncStatsOut, tags=["playlists"], summary="Track remap job stats")
 def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depends(require_permission(Permission.playlists_manage))) -> dict:
     last_run_at = session.get(AppSetting, "mapping_last_run_at")
@@ -5563,59 +5908,19 @@ def playlist_sync_stats(session: Session = Depends(get_session), _: User = Depen
 
 # ── (removed) proposal-based position reorder — position is order from Jellyfin ──
 
-@router.post("/playlists/favorites/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder Favorites entry")
-def propose_favorite_position(
-    entry_id: str,
-    payload: PlaylistPositionProposalRequest,
-    session: Session = Depends(get_session),
-    user: User = Depends(require_permission(Permission.playlists_manage)),
-) -> ProposalBatchOut:
-    playlist = get_or_create_favorites(session, user.id)
-    entry = session.scalar(
-        select(PlaylistTrack)
-        .where(PlaylistTrack.id == entry_id, PlaylistTrack.playlist_id == playlist.id)
-        .options(selectinload(PlaylistTrack.track))
-    )
-    if not entry:
-        raise HTTPException(status_code=404, detail="Playlist entry not found")
-    if entry.position == payload.position:
-        raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
-
-    batch = ProposalBatch(
-        title=f"Update {playlist.name} order",
-        kind=ProposalKind.playlist,
-        tree_path=f"/playlists/{playlist.name}",
-    )
-    session.add(batch)
-    session.flush()
-    session.add(
-        ProposalItem(
-            batch_id=batch.id,
-            title=entry.track.title,
-            kind=ProposalKind.playlist,
-            old_value=str(entry.position),
-            new_value=str(payload.position),
-            payload_json=json.dumps(
-                {
-                    "action": "set_position",
-                    "playlist_track_id": entry.id,
-                    "position": payload.position,
-                }
-            ),
-        )
-    )
-    session.commit()
-    session.refresh(batch)
-    return serialize_batch(batch)
-
-
 @router.post("/playlists/entries/{entry_id}/position", response_model=ProposalBatchOut, tags=["playlists"], summary="Reorder playlist entry")
 def propose_playlist_position(
     entry_id: str,
     payload: PlaylistPositionProposalRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.playlists_manage)),
+    user: User = Depends(require_permission(Permission.playlists_manage)),
 ) -> ProposalBatchOut:
+    """Reorder one entry of any playlist, Favorites included.
+
+    The separate `/playlists/favorites/entries/{id}/position` route this replaced existed only to
+    scope the lookup to the caller's own Favorites; that check is the `user_id` guard below, so
+    one route now covers both and there is no second copy of the proposal-building to drift.
+    """
     entry = session.scalar(
         select(PlaylistTrack)
         .where(PlaylistTrack.id == entry_id)
@@ -5623,13 +5928,16 @@ def propose_playlist_position(
     )
     if not entry:
         raise HTTPException(status_code=404, detail="Playlist entry not found")
+    if entry.playlist and entry.playlist.user_id and entry.playlist.user_id != user.id and not user.is_admin:
+        # Someone else's playlist is not yours to reorder -- and Favorites is per user, so this is
+        # exactly the check the Favorites-only route was carrying.
+        raise HTTPException(status_code=404, detail="Playlist entry not found")
     if entry.position == payload.position:
         raise HTTPException(status_code=400, detail="Playlist order is already set to that value")
 
     batch = ProposalBatch(
         title=f"Update {entry.playlist.name} order",
         kind=ProposalKind.playlist,
-        tree_path=f"/playlists/{entry.playlist.name}",
     )
     session.add(batch)
     session.flush()
@@ -5654,6 +5962,14 @@ def tool_jellyfin_scan(
     _: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
     return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
+
+
+@router.post("/tools/rescan-slskd-shares", response_model=TaskOut, tags=["tools"], summary="Rescan Soulseek shares")
+def tool_rescan_slskd_shares(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.tools_manage)),
+) -> TaskOut:
+    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {}))
 
 
 @router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
@@ -5745,7 +6061,7 @@ def propose_check_file_fix(
         if not track:
             raise HTTPException(status_code=404, detail="Track record not found")
         if payload.action == "download_record":
-            batch = ProposalBatch(title=f"Download missing file for {track.title}", kind=ProposalKind.download, tree_path="/library")
+            batch = ProposalBatch(title=f"Download missing file for {track.title}", kind=ProposalKind.download)
             session.add(batch)
             session.flush()
             session.add(
@@ -5765,7 +6081,7 @@ def propose_check_file_fix(
                 )
             )
         else:
-            batch = ProposalBatch(title=f"Remove missing record for {track.title}", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title=f"Remove missing record for {track.title}", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             session.add(
@@ -5786,7 +6102,7 @@ def propose_check_file_fix(
         if library_root not in [file_path, *file_path.parents] or not file_path.exists() or not file_path.is_file():
             raise HTTPException(status_code=400, detail="File must be inside the library folder")
         if payload.action == "delete_file":
-            batch = ProposalBatch(title=f"Delete untracked file {file_path.name}", kind=ProposalKind.delete, tree_path="/library")
+            batch = ProposalBatch(title=f"Delete untracked file {file_path.name}", kind=ProposalKind.delete)
             session.add(batch)
             session.flush()
             session.add(
@@ -5802,7 +6118,7 @@ def propose_check_file_fix(
             session.refresh(batch)
             return serialize_batch(batch)
         metadata = read_audio_metadata(file_path)
-        batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files, tree_path="/library")
+        batch = ProposalBatch(title=f"Create record for {file_path.name}", kind=ProposalKind.import_files)
         session.add(batch)
         session.flush()
         session.add(
@@ -5953,60 +6269,111 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
         if batch.items:
             actionable_items = [
                 item for item in batch.items
-                if item.selected and approval_item_is_actionable(item)
+                # The one definition of "is this a real change, or a grouping row?" -- the same
+                # rule the wire's `actionable` flag and the worker's own work selection use.
+                if item.selected and queue_state.is_actionable(item)
             ]
+            # ⚠️ Settled is not the same as completed. A batch whose selected work FAILED is marked
+            # failed and kept in the list, because it belongs in Issues. This used to write
+            # `completed` and drop it, which is how every exhausted request vanished from Issues.
+            any_failed = any(item.selected and item.status is ProposalStatus.failed for item in batch.items)
             if actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
-                batch.status = ProposalStatus.completed
-                settled.add(batch.id)
+                if any_failed:
+                    batch.status = ProposalStatus.failed
+                else:
+                    batch.status = ProposalStatus.completed
+                    settled.add(batch.id)
             elif not actionable_items and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
-                batch.status = ProposalStatus.completed
-                settled.add(batch.id)
+                if any_failed:
+                    batch.status = ProposalStatus.failed
+                else:
+                    batch.status = ProposalStatus.completed
+                    settled.add(batch.id)
         elif batch.kind != ProposalKind.download:
-            # An empty non-download batch is an abandoned/failed tool run — safe to retire.
-            batch.status = ProposalStatus.completed
+            # An empty non-download batch is an abandoned/failed tool run. DELETED, not marked
+            # completed: an empty batch is a husk no UI can act on, and removing rows one at a
+            # time used to leave one behind every single time.
+            session.delete(batch)
             settled.add(batch.id)
         elif batch.created_at and as_utc(batch.created_at) < datetime.now(timezone.utc) - timedelta(minutes=10):
             # An empty DOWNLOAD batch is left alone while fresh — a candidate search commits its
             # batch before attaching items and must not be finalized mid-search — but one older
-            # than any plausible in-flight search is a dead leftover and can be retired too.
-            batch.status = ProposalStatus.completed
+            # than any plausible in-flight search is dead leftover and goes the same way.
+            session.delete(batch)
             settled.add(batch.id)
-    if settled:
+    if session.dirty or session.deleted:
         session.commit()
     return [batch for batch in batches if batch.id not in settled]
 
 
-def approval_item_is_actionable(item: ProposalItem) -> bool:
-    """Ignore selected tree containers when deciding whether a batch still has work."""
-    payload = json.loads(item.payload_json or "{}")
-    if item.kind == ProposalKind.import_files:
-        return bool(item.old_value and item.new_value)
-    if item.kind == ProposalKind.metadata:
-        return bool(payload.get("target_type"))
-    if item.kind in {ProposalKind.delete, ProposalKind.file_move, ProposalKind.playlist, ProposalKind.download, ProposalKind.lyrics}:
-        return bool(payload.get("action"))
-    return False
+def resolve_requester_names(session: Session, batches: list[ProposalBatch]) -> dict[str, str]:
+    """Display names for every requester appearing in these batches, in one query.
+
+    Without this the UI shows a raw user id next to someone's request, which is exactly the kind of
+    implementation detail that must never reach a row (CLAUDE.md section 0).
+    """
+    ids = {item.requester_id for batch in batches for item in batch.items if item.requester_id}
+    if not ids:
+        return {}
+    rows = session.execute(select(User.id, User.display_name).where(User.id.in_(ids))).all()
+    return {row[0]: row[1] for row in rows}
+
+
+def filter_batches_for_bucket(
+    batches: list[ProposalBatch],
+    bucket: QueueBucket | None,
+    stages: set[ItemStage] | None = None,
+) -> list[ProposalBatch]:
+    """Narrow to a Task Queue bucket. Done in Python because `bucket` is derived, not stored."""
+    if bucket is None and not stages:
+        return batches
+    kept = []
+    for batch in batches:
+        flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+        batch_stage = queue_state.resolve_batch_stage(list(batch.items), batch.status)
+        if bucket is not None and queue_state.bucket_for(flow, batch_stage) is not bucket:
+            continue
+        if stages and batch_stage not in stages:
+            continue
+        kept.append(batch)
+    return kept
 
 
 @router.get("/approvals", response_model=list[ProposalBatchOut], tags=["approvals"], summary="List pending approval batches")
 def list_approvals(
+    bucket: QueueBucket | None = None,
+    flow: ProposalFlow | None = None,
+    kind: ProposalKind | None = None,
+    requester: str | None = None,
+    include_settled: bool = False,
+    limit: int = 200,
+    offset: int = 0,
     session: Session = Depends(get_session),
     _: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> list[ProposalBatchOut]:
-    batches = list(
-        session.scalars(
-            select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
-            .where(
-                ProposalBatch.status.in_(
-                    [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
-                )
-            )
-            .order_by(ProposalBatch.created_at.desc())
-        )
+    # No query params == exactly the previous behaviour, so existing clients are unaffected.
+    statuses = [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
+    if include_settled:
+        statuses = statuses + [ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled]
+    query = (
+        select(ProposalBatch)
+        .options(selectinload(ProposalBatch.items))
+        .where(ProposalBatch.status.in_(statuses))
     )
+    if flow is not None:
+        query = query.where(ProposalBatch.flow == flow)
+    if kind is not None:
+        query = query.where(ProposalBatch.kind == kind)
+    if requester:
+        query = query.where(
+            ProposalBatch.items.any(ProposalItem.requester_id == requester)
+        )
+    batches = list(session.scalars(query.order_by(ProposalBatch.created_at.desc())))
     batches = prune_settled_batches(session, batches)
-    return [serialize_batch(batch) for batch in batches]
+    batches = filter_batches_for_bucket(batches, bucket)
+    batches = batches[offset : offset + limit] if limit else batches[offset:]
+    names = resolve_requester_names(session, batches)
+    return [serialize_batch(batch, names) for batch in batches]
 
 
 @router.post("/approvals/{batch_id}/selection", tags=["approvals"], summary="Update approval item selection", response_model=ProposalBatchOut)
@@ -6023,18 +6390,239 @@ def update_selection(
     return serialize_batch(batch)
 
 
+def _approve_or_explain(
+    session: Session, batch_id: str, item_ids: list[str] | None, user: User
+) -> TaskOut:
+    """Approve, and make every refusal a status code rather than a silent no-op.
+
+    ⚠️ 409 is the whole point of this helper. Approving a set that resolves to nothing approvable
+    used to return 200 with a task that did nothing, which is what "I pressed Approve and nothing
+    happened" was: the client had no way to tell success from a no-op.
+    """
+    try:
+        task = approve_batch(session, batch_id, item_ids, actor=user)
+    except ApprovalNotPermitted as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
+    except NothingToApprove as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return serialize_task(task)
+
+
 @router.post("/approvals/{batch_id}/approve", response_model=TaskOut, tags=["approvals"], summary="Approve proposal batch")
 def approve(
     batch_id: str,
     payload: ProposalApproveRequest | None = None,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.approvals_manage)),
+    user: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> TaskOut:
+    return _approve_or_explain(session, batch_id, payload.item_ids if payload else None, user)
+
+
+def prune_batch_to_requester(batch: ProposalBatch, requester_id: str) -> list[ProposalItem]:
+    """This requester's own items, plus the ancestor chain that gives them somewhere to hang.
+
+    A download batch is shared: `create_album_download_candidate_batch` groups several requests
+    into one batch, so handing a `discover`-only user the whole thing would leak other people's
+    requests.  Dropping the containers instead would dump candidate rows flat with no artist/album
+    to nest under, which is what the tree rendering needs.
+    """
+    by_id = {item.id: item for item in batch.items}
+    keep: set[str] = set()
+    for item in batch.items:
+        if item.requester_id != requester_id:
+            continue
+        keep.add(item.id)
+        parent_id = item.parent_id
+        while parent_id and parent_id in by_id and parent_id not in keep:
+            keep.add(parent_id)
+            parent_id = by_id[parent_id].parent_id
+    return [item for item in batch.items if item.id in keep]
+
+
+@router.get("/requests", response_model=list[ProposalBatchOut], tags=["wishlist"], summary="My music requests and their progress")
+def list_requests(
+    bucket: QueueBucket | None = None,
+    include_settled: bool = False,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> list[ProposalBatchOut]:
+    """What the requester is waiting on.
+
+    This is the route that did not exist.  `GET /wishlist/approvals` decided visibility from a
+    TOP-LEVEL `payload_json["user_id"]`, but candidate items only ever carried it nested at
+    `payload["request"]["user_id"]` -- so a `discover`-only user got an empty list and had no way
+    to see their own request's candidates or progress at all.
+
+    An approver gets the unfiltered view of both request gates; everyone else gets their own items
+    with the ancestor chain kept.
+    """
+    statuses = [ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]
+    if include_settled:
+        statuses = statuses + [ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled]
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.status.in_(statuses))
+            .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
+            # (The "/wishlist" exclusion that used to sit here went with the intent batch it hid: a
+            # searching request has no batch at all now, so there is nothing left to filter out.)
+            .order_by(ProposalBatch.created_at.desc())
+        )
+    )
+    batches = filter_batches_for_bucket(batches, bucket)
+
+    is_approver = user.is_admin or any(
+        permission.permission in {Permission.approvals_manage, Permission.wishlist_approve_all}
+        for permission in user.permissions
+    )
+    names = resolve_requester_names(session, batches)
+    out: list[ProposalBatchOut] = []
+    can_manage = user_has_permission(user, Permission.approvals_manage)
+    for batch in batches:
+        if is_approver:
+            serialized = serialize_batch(batch, names)
+            flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+            if not can_manage and flow is not ProposalFlow.download_review:
+                # `wishlist:approve_all` approves download requests only (`/requests/{id}/approve`
+                # 403s anything else), so "Add to library" must not advertise an approve it can't do.
+                for item in serialized.items:
+                    item.can_approve = False
+            out.append(serialized)
+            continue
+        mine = prune_batch_to_requester(batch, user.id)
+        if not mine:
+            continue
+        serialized = serialize_batch(batch, names)
+        keep_ids = {item.id for item in mine}
+        serialized.items = [item for item in serialized.items if item.id in keep_ids]
+        flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+        if flow is ProposalFlow.library_review:
+            # The batch-level title names every artist in the shared batch; a requester must only
+            # see the artists in THEIR OWN pruned view, or e.g. a Daft Punk requester would read
+            # "Add to library: Daft Punk, Nirvana" for a Nirvana track they never asked for.
+            serialized.title = queue_state.library_review_title(mine)
+        # A requester may stop their own request but never start one, and never retry -- retry
+        # restarts a download, so it is approval-equivalent and gated like one.
+        for item in serialized.items:
+            item.can_approve = False
+            item.can_retry = False
+        out.append(serialized)
+    return out
+
+
+@router.post("/requests/{batch_id}/approve", response_model=TaskOut, tags=["wishlist"], summary="Approve a music request")
+def approve_request(
+    batch_id: str,
+    payload: ProposalApproveRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
+) -> TaskOut:
+    """Approve a download request (gate a) -- the Review bucket's action.
+
+    Separate from `/approvals/{id}/approve` because it admits `wishlist:approve_all`, whose whole
+    job is approving other people's music.  It is scoped to `download_review` batches so that
+    permission can never reach a metadata, import or delete proposal, and `approve_batch` still
+    applies the anti-self-approval rule on top.
+    """
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Request not found")
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    if flow is not ProposalFlow.download_review:
+        raise HTTPException(status_code=403, detail="This endpoint only approves download requests")
+    return _approve_or_explain(session, batch_id, payload.item_ids if payload else None, user)
+
+
+def _may_act_on_request_batch(batch: ProposalBatch, user: User, *, require_approver: bool) -> None:
+    """Shared gate for retry/cancel on a request batch.
+
+    Cancel is available to the person who asked for it -- stopping your own request is not a
+    privileged act. Retry is NOT: it starts a download, so it is approval-equivalent and needs the
+    same permission approving does.
+    """
+    is_approver = user.is_admin or any(
+        permission.permission in {Permission.approvals_manage, Permission.wishlist_approve_all}
+        for permission in user.permissions
+    )
+    if is_approver:
+        return
+    if require_approver:
+        raise HTTPException(status_code=403, detail="Requires approvals:manage or wishlist:approve_all")
+    requesters = {item.requester_id for item in batch.items if item.requester_id}
+    if requesters and requesters != {user.id}:
+        # Batches are shared between requesters; cancelling one must not stop someone else's track.
+        raise HTTPException(status_code=403, detail="This request includes other people's items")
+    if not requesters:
+        raise HTTPException(status_code=403, detail="Requires approvals:manage")
+
+
+@router.post("/approvals/{batch_id}/cancel", response_model=ProposalBatchOut, tags=["approvals"], summary="Cancel queued or running downloads")
+def cancel_batch_items(
+    batch_id: str,
+    payload: CancelRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _may_act_on_request_batch(batch, user, require_approver=False)
     try:
-        task = approve_batch(session, batch_id, payload.item_ids if payload else None)
+        cancel_items(session, batch_id, payload.item_ids if payload else None, actor_id=user.id)
     except ValueError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
-    return serialize_task(task)
+    session.refresh(batch)
+    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+
+
+@router.post("/approvals/{batch_id}/retry", response_model=ProposalBatchOut, tags=["approvals"], summary="Retry failed or cancelled downloads")
+def retry_batch_items(
+    batch_id: str,
+    payload: RetryRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    batch = session.get(ProposalBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _may_act_on_request_batch(batch, user, require_approver=True)
+    try:
+        retried = retry_items(session, batch_id, payload.item_ids if payload else None, payload.mode if payload else "next_candidate")
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    session.refresh(batch)
+    result = serialize_batch(batch, resolve_requester_names(session, [batch]))
+    result.retried_item_ids = retried  # Round 4 #2: tell the client exactly what changed
+    return result
+
+
+@router.post("/approvals/items/{item_id}/cancel", response_model=ProposalBatchOut, tags=["approvals"], summary="Cancel one item")
+def cancel_single_item(
+    item_id: str,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    item = session.get(ProposalItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    return cancel_batch_items(item.batch_id, CancelRequest(item_ids=[item_id]), session, user)
+
+
+@router.post("/approvals/items/{item_id}/retry", response_model=ProposalBatchOut, tags=["approvals"], summary="Retry one item")
+def retry_single_item(
+    item_id: str,
+    payload: RetryRequest | None = None,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> ProposalBatchOut:
+    item = session.get(ProposalItem, item_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    mode = payload.mode if payload else "next_candidate"
+    return retry_batch_items(item.batch_id, RetryRequest(item_ids=[item_id], mode=mode), session, user)
 
 
 @router.post("/approvals/{batch_id}/reject", tags=["approvals"], summary="Reject proposal items", response_model=ProposalBatchOut)
@@ -6042,13 +6630,120 @@ def reject(
     batch_id: str,
     payload: ProposalRejectRequest,
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.approvals_manage)),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
 ) -> ProposalBatchOut:
-    reject_items(session, batch_id, payload.item_ids)
+    # `wishlist:approve_all` approves music requests from Review (`/requests/{id}/approve`), so it
+    # must be able to decline them too -- otherwise the Review reject button 403s for exactly the
+    # people whose job it is. Scoped like that route: download requests (gate a) only, never a
+    # metadata, import or delete proposal.
+    target = session.get(ProposalBatch, batch_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _assert_may_remove(target, user)
+    item_ids = payload.item_ids or [item.id for item in target.items]
+    # ⚠️ Removal CANCELS first (the user's rule, 2026-09-22). `remove_items` stops any live
+    # transfer and deletes its partial file before the row goes, so nothing can be removed from the
+    # Task Queue while it is still running.
+    remove_items(session, item_ids, actor_id=user.id)
+    session.commit()
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found")
-    return serialize_batch(batch)
+        # The batch was emptied and deleted with its last row. Answer with the shape the clients
+        # decode rather than a 404: the removal succeeded, there is simply nothing left of it.
+        return ProposalBatchOut(
+            id=batch_id,
+            title="",
+            kind=ProposalKind.download,
+            status=ProposalStatus.rejected,
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+            items=[],
+        )
+    return serialize_batch(batch, resolve_requester_names(session, [batch]))
+
+
+def _assert_may_remove(batch: ProposalBatch, user: User) -> None:
+    """`wishlist:approve_all` approves music requests from Review, so it must be able to decline
+    them too -- otherwise the Review remove button 403s for exactly the people whose job it is.
+    Scoped like that route: download requests (gate a) only, never a metadata, import or delete
+    proposal."""
+    if user_has_permission(user, Permission.approvals_manage):
+        return
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    if flow is not ProposalFlow.download_review:
+        raise HTTPException(status_code=403, detail="Only download requests can be removed with this permission")
+
+
+@router.post("/approvals/cancel", response_model=QueueBulkResult, tags=["approvals"], summary="Cancel an arbitrary set of items")
+def cancel_selected_items(
+    payload: QueueItemsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> QueueBulkResult:
+    """Stop work on any set of ids, across any batches -- the clients' "Cancel selected".
+
+    Deliberately idempotent: an id that is already settled, or that no longer exists, is skipped
+    rather than refused, because a bulk selection is always slightly stale by the time it arrives.
+    """
+    canceled = 0
+    batch_ids: set[str] = set()
+    for batch_id, ids in _group_item_ids_by_batch(session, payload.item_ids).items():
+        batch = session.get(ProposalBatch, batch_id)
+        if not batch:
+            continue
+        _may_act_on_request_batch(batch, user, require_approver=False)
+        canceled += len(cancel_items(session, batch_id, sorted(ids), actor_id=user.id))
+        batch_ids.add(batch_id)
+    return QueueBulkResult(canceled=canceled, batches=_serialize_surviving_batches(session, batch_ids))
+
+
+@router.post("/approvals/remove", response_model=QueueBulkResult, tags=["approvals"], summary="Remove an arbitrary set of items")
+def remove_selected_items(
+    payload: QueueItemsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_any_permission(Permission.approvals_manage, Permission.wishlist_approve_all)),
+) -> QueueBulkResult:
+    """Remove any set of ids, across any batches -- the clients' "Remove selected".
+
+    Cancels before removing, exactly like the per-batch route, and takes any emptied container and
+    any emptied batch with it.
+    """
+    grouped = _group_item_ids_by_batch(session, payload.item_ids)
+    for batch_id in grouped:
+        batch = session.get(ProposalBatch, batch_id)
+        if batch:
+            _assert_may_remove(batch, user)
+    canceled, removed, batch_ids = remove_items(
+        session, [item_id for ids in grouped.values() for item_id in sorted(ids)], actor_id=user.id
+    )
+    session.commit()
+    return QueueBulkResult(
+        canceled=canceled, removed=removed, batches=_serialize_surviving_batches(session, batch_ids)
+    )
+
+
+def _group_item_ids_by_batch(session: Session, item_ids: list[str]) -> dict[str, set[str]]:
+    grouped: dict[str, set[str]] = {}
+    for item_id in dict.fromkeys(item_ids):
+        item = session.get(ProposalItem, item_id)
+        if item:
+            grouped.setdefault(item.batch_id, set()).add(item.id)
+    return grouped
+
+
+def _serialize_surviving_batches(session: Session, batch_ids: set[str]) -> list[ProposalBatchOut]:
+    """The touched batches that still exist. One that the action emptied is simply absent."""
+    if not batch_ids:
+        return []
+    batches = list(
+        session.scalars(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.id.in_(batch_ids))
+        )
+    )
+    names = resolve_requester_names(session, batches)
+    return [serialize_batch(batch, names) for batch in batches]
 
 
 @router.get("/tasks", response_model=list[TaskOut], tags=["tasks"], summary="List background tasks")
@@ -6131,6 +6826,48 @@ def get_connection_status(
     }
 
 
+def _current_slskd_port_check_task(session: Session) -> Task | None:
+    return session.scalar(
+        select(Task)
+        .where(Task.type == "slskd_port_check")
+        .where(Task.status.in_([TaskStatus.queued, TaskStatus.running]))
+        .order_by(Task.created_at.desc())
+        .limit(1)
+    )
+
+
+def _slskd_port_check_out(session: Session, task: Task | None) -> SlskdPortCheckOut:
+    last = load_last_slskd_check(session) or {}
+    return SlskdPortCheckOut(
+        checking=task is not None,
+        ok=last.get("ok"),
+        status=last.get("status"),
+        checked_at=last.get("checked_at"),
+        public_address=last.get("public_address"),
+        port=last.get("port"),
+        steps=last.get("steps") or [],
+    )
+
+
+@router.post("/settings/slskd/port-check", response_model=SlskdPortCheckOut, tags=["settings"], summary="Run the Soulseek listen-port reachability check")
+def trigger_slskd_port_check(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> SlskdPortCheckOut:
+    """Enqueued on the worker, not run inline here -- the identity step can take up to ~90s
+    (it browses slskd's own share). The client polls GET until `checking` goes false."""
+    enqueue_task(session, "slskd_port_check", {})
+    return _slskd_port_check_out(session, _current_slskd_port_check_task(session))
+
+
+@router.get("/settings/slskd/port-check", response_model=SlskdPortCheckOut, tags=["settings"], summary="Last Soulseek listen-port reachability check result")
+def get_slskd_port_check(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> SlskdPortCheckOut:
+    return _slskd_port_check_out(session, _current_slskd_port_check_task(session))
+
+
 @router.get("/settings/jellyfin-users", tags=["settings"], summary="List Jellyfin users available with the configured API key", response_model=list[JellyfinUserOut])
 def list_jellyfin_users(
     session: Session = Depends(get_session),
@@ -6157,7 +6894,10 @@ def update_integrations(
 ) -> IntegrationSettings:
     old_url = integration_settings(session).get("jellyfin_url", "")
     new_url = (payload.jellyfin_url or "").rstrip("/")
-    update_integration_settings(session, payload.model_dump())
+    values = payload.model_dump()
+    for key in ("server_primary_address", "server_secondary_address"):
+        values[key] = _normalized_server_address(values.get(key))
+    update_integration_settings(session, values)
     if new_url and new_url != old_url.rstrip("/"):
         # Jellyfin URL changed — item IDs from the old server are invalid, clear them
         # so the next remap job rebuilds the mapping against the new server.
@@ -6199,6 +6939,61 @@ def list_notifications(
     )
     notifications = list(session.scalars(query.order_by(Notification.created_at.desc()).limit(100)))
     return [NotificationOut.model_validate(notification, from_attributes=True) for notification in notifications]
+
+
+def _normalized_server_address(raw: str | None) -> str:
+    """`scheme://host[:port]` with no path or trailing slash, or "" for none. The apps append
+    `/api/v1` themselves, so anything past the origin would break every URL they build."""
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(status_code=422, detail="Server addresses must be a full http:// or https:// address.")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+@router.get("/server/addresses", tags=["system"], summary="This server's configured addresses", response_model=ServerAddressesOut)
+def get_server_addresses(
+    session: Session = Depends(get_session),
+    _: User = Depends(get_current_user),
+) -> ServerAddressesOut:
+    """Read by the apps after signing in, to fill in the fallback address automatically. Any
+    signed-in user may read it: it is how their own client reaches this server."""
+    values = integration_settings(session)
+    return ServerAddressesOut(
+        primary=values.get("server_primary_address") or None,
+        secondary=values.get("server_secondary_address") or None,
+    )
+
+
+@router.put("/server/addresses", tags=["settings"], summary="Set this server's configured addresses", response_model=ServerAddressesOut)
+def update_server_addresses(
+    payload: ServerAddressesOut,
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> ServerAddressesOut:
+    """Just the two addresses. The apps edit these without ever holding the other integration
+    settings, which `PUT /settings/integrations` would overwrite with whatever they sent."""
+    update_integration_settings(session, {
+        "server_primary_address": _normalized_server_address(payload.primary),
+        "server_secondary_address": _normalized_server_address(payload.secondary),
+    })
+    session.commit()
+    values = integration_settings(session)
+    return ServerAddressesOut(
+        primary=values.get("server_primary_address") or None,
+        secondary=values.get("server_secondary_address") or None,
+    )
+
+
+@router.get("/ping", tags=["system"], summary="Reachability and identity probe", response_model=dict)
+def ping(session: Session = Depends(get_session)) -> dict:
+    """Unauthenticated and cheap. The apps race this against a server's primary and secondary
+    addresses and use the fastest one that answers with the same `instance_id`, which is how they
+    tell this server apart from some other machine at the same LAN address. Never touches a user
+    session, so it bumps nothing."""
+    return {"ok": True, "instance_id": instance_id(session)}
 
 
 @router.get("/notifications/push-identity", tags=["notifications"], summary="This server's APNS push identity", response_model=PushIdentityResponse)
@@ -6325,10 +7120,19 @@ def deregister_device(
 
 @router.post("/notifications/read", tags=["notifications"], summary="Mark notifications as read", response_model=dict)
 def mark_notifications_read(
+    payload: NotificationReadRequest | None = None,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ) -> dict:
-    notifications = list(session.scalars(select(Notification).where(Notification.user_id == user.id)))
+    """Marks the caller's notifications read: all of them, or only `ids` when given. The apps send
+    ids for a banner cleared from the OS notification centre, which acknowledges that one row and
+    nothing else."""
+    query = select(Notification).where(Notification.user_id == user.id)
+    if payload is not None and payload.ids is not None:
+        if not payload.ids:
+            return {"updated": 0}
+        query = query.where(Notification.id.in_(payload.ids))
+    notifications = list(session.scalars(query))
     for notification in notifications:
         if notification.status == NotificationStatus.unread:
             notification.status = NotificationStatus.read
@@ -6424,42 +7228,6 @@ def metadata_target_title(target_type: str, target) -> str:
 
 def normalized_music_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
-
-
-def wishlist_download_payload(item: WishlistItem, album_lookup_cache: dict[tuple[str, str], dict | None]) -> dict:
-    payload = {
-        "action": "wishlist_request",
-        "kind": item.kind,
-        "artist": item.artist,
-        "album": item.album,
-        "track": item.track,
-    }
-    if not item.track or not item.album:
-        return payload
-    cache_key = (item.artist, item.album)
-    if cache_key not in album_lookup_cache:
-        try:
-            album_lookup_cache[cache_key] = lookup_album_tracks(item.artist, item.album)
-        except Exception:
-            album_lookup_cache[cache_key] = None
-    record = album_lookup_cache.get(cache_key)
-    if not record:
-        return payload
-    expected_title = normalized_music_name(item.track)
-    for track in record.get("tracks", []):
-        if normalized_music_name(track.get("title")) != expected_title:
-            continue
-        payload.update(
-            {
-                "track_number": track.get("track_number"),
-                "disc_number": track.get("disc_number"),
-                "duration_ms": track.get("length"),
-                "musicbrainz_album_id": track.get("musicbrainz_album_id") or record.get("musicbrainz_album_id"),
-                "musicbrainz_recording_id": track.get("musicbrainz_recording_id"),
-            }
-        )
-        break
-    return payload
 
 
 def library_target_tracks(target) -> list[Track]:
@@ -6564,6 +7332,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         remote_playback_enabled=bool(getattr(user, "remote_playback_enabled", True)),
+        playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 0) or 0),
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,
         jellyfin_user_id=user.jellyfin_user_id or None,
@@ -6667,7 +7436,7 @@ def _resolve_target_label(session: Session, target_type: str | None, target_id: 
 _MODE_BEARING_ACTIONS = {"play", "state"}
 
 #: Actions that address a position in the target's published queue rather than the transport.
-#: They carry a payload about the QUEUE, so like `adopt_handoff` they are exempt from COMMAND_TTL's
+#: They carry a payload about the QUEUE, so like the enqueue actions they are exempt from COMMAND_TTL's
 #: "an instruction about now" reasoning — but they are still small and idempotent enough to expire.
 _QUEUE_ACTIONS = {"jump", "remove", "move"}
 
@@ -6728,10 +7497,77 @@ def jellyfin_now_playing(session: Session) -> list[dict]:
     return sessions
 
 
-def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
-    status = item.status
+_WISHLIST_STAGE_LABELS: dict[ItemStage, str] = {
+    ItemStage.waiting: "Waiting",
+    # Gate 1 (2026-09-23): a request that has not yet been approved to search at all.
+    ItemStage.requested: "Request approval",
+    ItemStage.searching: "Searching",
+    # A wishlist row only ever reaches `awaiting_approval` for gate (a) -- candidates ready,
+    # needing approval to download. Gate (b) (import) is the `staged` status below instead.
+    ItemStage.awaiting_approval: "Download approval",
+    ItemStage.approved: "Waiting to download",
+    ItemStage.queued: "Waiting to download",
+    ItemStage.downloading: "Downloading",
+    ItemStage.retrying: "Retrying",
+    ItemStage.staging: "Moving into place",
+    ItemStage.verifying: "Verifying",
+    # Deliberately not "Completed": the files exist but have NOT been approved into the library
+    # yet.  Reporting this as done is the bug where a rejected import still read "completed".
+    ItemStage.staged: "Import approval",
+    ItemStage.importing: "Importing",
+    ItemStage.completed: "In your library",
+    ItemStage.failed: "Needs attention",
+    ItemStage.canceled: "Canceled",
+    ItemStage.rejected: "Declined",
+}
+
+
+# A terminal legacy `status` always wins over the `stage` cache below -- the same ordering
+# `resolve_stage` uses for `ProposalItem`, and for the same reason: the cache is written once (at
+# approval, or by a retry) and nothing revisits it once the request stops being live, so a request
+# that later failed or was declined could keep reading its last live stage ("Retrying") forever.
+_WISHLIST_TERMINAL_STATUS_STAGE: dict[str, ItemStage] = {
+    "completed": ItemStage.completed,
+    "rejected": ItemStage.rejected,
+    "removed": ItemStage.rejected,
+    "canceled": ItemStage.canceled,
+    "failed": ItemStage.failed,
+}
+
+
+def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) -> ItemStage:
+    """The request's stage. A terminal `status` beats the cache; otherwise the denormalized `stage`
+    the worker keeps current is preferred, same as `resolve_stage` does for `ProposalItem`."""
+    status = (item.status or "").casefold()
+    if status in _WISHLIST_TERMINAL_STATUS_STAGE:
+        return _WISHLIST_TERMINAL_STATUS_STAGE[status]
+    if item.stage:
+        try:
+            return ItemStage(item.stage)
+        except ValueError:
+            pass
     if status == "approved" and downloading_ids and item.id in downloading_ids:
-        status = "downloading"
+        return ItemStage.downloading
+    return {
+        "wanted": ItemStage.waiting,
+        "requested": ItemStage.requested,
+        "searching": ItemStage.searching,
+        "review": ItemStage.awaiting_approval,
+        "awaiting_approval": ItemStage.awaiting_approval,
+        "approved": ItemStage.approved,
+        "downloading": ItemStage.downloading,
+        "staged": ItemStage.staged,
+        "completed": ItemStage.completed,
+        "rejected": ItemStage.rejected,
+        "canceled": ItemStage.canceled,
+        "failed": ItemStage.failed,
+        "removed": ItemStage.rejected,
+    }.get(status, ItemStage.waiting)
+
+
+def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
+    stage = wishlist_stage(item, downloading_ids)
+    label = _WISHLIST_STAGE_LABELS.get(stage, stage.value)
     return WishlistOut(
         id=item.id,
         user_id=item.user_id,
@@ -6740,14 +7576,26 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
         artist=item.artist,
         album=item.album,
         track=item.track,
-        status=status,
+        stage=stage,
+        status_code=stage.value,
+        status_label=label,
+        batch_id=item.batch_id,
+        item_id=item.item_id,
+        progress=ProgressOut(
+            value=100.0 if stage is ItemStage.completed else 0.0,
+            label=label,
+            indeterminate=stage in (ItemStage.searching, ItemStage.verifying, ItemStage.importing),
+            stage=stage,
+        ),
         created_at=item.created_at,
         status_changed_at=item.status_changed_at or item.created_at,
     )
 
 
 def terminal_wishlist_expired(item: WishlistItem) -> bool:
-    if item.status not in {"rejected", "completed", "removed"}:
+    # "rejected" deliberately never expires: a declined request stays on the requester's list until
+    # they remove it or request it again (which replaces it -- see create_wishlist_item).
+    if item.status not in {"completed", "removed"}:
         return False
     changed_at = item.status_changed_at or item.created_at
     if changed_at.tzinfo is None:
@@ -6773,18 +7621,21 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
     if not items:
         return
     active_ids = active_wishlist_download_ids(session)
-    # A download that finished is no longer "active", so an item whose download COMPLETED must
-    # be marked completed — otherwise an item that downloaded + imported reverts to "Awaiting
-    # Approval" (the queue_download item went terminal, reconcile then demoted approved→wanted).
-    # Keyed on the exact wishlist_item_id carried by the download item, so it works even when
+    # A download that finished is no longer "active", so without this branch the demotion below
+    # would read it as an abandoned download and knock it back to "wanted". But a completed
+    # DOWNLOAD only means the file reached staging (gate a) -- it is NOT in the library yet, so
+    # this must land on "staged", never "completed": `complete_linked_wishlist_item` is the one
+    # place "completed" is written, and only at the real library import. Keyed on the exact
+    # wishlist_item_id carried by the download item, so it works even when
     # mark_matching_wishlist_completed missed it on fuzzy metadata (deluxe titles, feat., quotes).
     completed_ids = completed_wishlist_download_ids(session)
     changed = False
     now = datetime.now(timezone.utc)
     for item in items:
         if item.id in completed_ids:
-            if item.status != "completed":
-                item.status = "completed"
+            if item.status not in {"staged", "completed"}:
+                item.status = "staged"
+                item.stage = ItemStage.staged.value
                 item.status_changed_at = now
                 changed = True
             continue
@@ -6799,7 +7650,9 @@ def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> Non
 
 
 def completed_wishlist_download_ids(session: Session) -> set[str]:
-    """Wishlist item ids whose linked download ProposalItem has completed (downloaded+imported).
+    """Wishlist item ids whose linked download ProposalItem has completed -- i.e. downloaded and
+    verified into staging. ⚠️ NOT "in the library": that needs gate (b) too, so callers must land
+    this on "staged", never "completed" (see `reconcile_stale_approved_wishlist_items`).
 
     Only count ACTUAL download leaves (queue_download / queue_ytdlp_download). A completed
     `wishlist_request` item just means the candidate search ran — search_candidates marks the
@@ -6837,13 +7690,13 @@ def active_wishlist_download_ids(session: Session) -> set[str]:
             select(ProposalBatch)
             .options(selectinload(ProposalBatch.items))
             .where(ProposalBatch.kind == ProposalKind.download)
-            .where(ProposalBatch.tree_path.in_(["/task-queue", "/downloads"]))
+            .where(ProposalBatch.flow == ProposalFlow.download_review)
             .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
         )
     )
     for batch in batches:
         for item in batch.items:
-            if item.kind != ProposalKind.download or item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.failed}:
+            if item.kind != ProposalKind.download or item.status in (queue_state.SETTLED_ITEM_STATUSES | {ProposalStatus.failed}):
                 continue
             payload = json.loads(item.payload_json or "{}")
             # queue_download = slskd; queue_ytdlp_download = the YouTube fallback retry. Both
@@ -6878,31 +7731,6 @@ def downloading_wishlist_ids(session: Session) -> set[str]:
             if wishlist_item_id:
                 ids.add(wishlist_item_id)
     return ids
-
-
-def notify_wishlist_decisions(
-    session: Session,
-    items: list[WishlistItem],
-    title: str,
-    action_text: str,
-    event_type: str,
-    target_url: str,
-) -> None:
-    items_by_user: dict[str, list[WishlistItem]] = {}
-    for item in items:
-        items_by_user.setdefault(item.user_id, []).append(item)
-    for user_id, user_items in items_by_user.items():
-        names = [item.track or item.album or item.artist for item in user_items]
-        shown = ", ".join(names[:5])
-        extra = "" if len(names) <= 5 else f" and {len(names) - 5} more"
-        create_notification(
-            session,
-            title=title,
-            body=f"{shown}{extra} {action_text}.",
-            event_type=event_type,
-            target_url=target_url,
-            user_id=user_id,
-        )
 
 
 def load_user(session: Session, user_id: str) -> User:
@@ -6976,29 +7804,99 @@ def count_admins(session: Session) -> int:
     return session.scalar(select(func.count()).select_from(User).where(User.is_admin.is_(True))) or 0
 
 
-def serialize_batch(batch: ProposalBatch) -> ProposalBatchOut:
+def serialize_proposal_item(
+    item: ProposalItem,
+    flow: ProposalFlow,
+    requester_names: dict[str, str] | None = None,
+    approvable_ids: set[str] | None = None,
+) -> ProposalItemOut:
+    """One item, with its stage/bucket/progress/candidate resolved server-side.
+
+    Every derived value is computed once, here, from a single payload parse -- the clients used to
+    each re-derive them by pattern-matching the payload's free text, which is how four different
+    status vocabularies grew, and `payload_json` is no longer sent at all.
+
+    `approvable_ids` comes from `queue_state.approvable_item_ids` over the WHOLE batch, because a
+    container's answer depends on its descendants; passing None falls back to this row alone, which
+    is right only for a leaf.
+    """
+    payload = queue_state.payload_of(item)
+    stage = queue_state.resolve_stage(item, payload)
+    request_block = payload.get("request")
+    requester_id = item.requester_id or (
+        request_block.get("user_id") if isinstance(request_block, dict) else None
+    )
+    requester_name = (requester_names or {}).get(requester_id or "")
+    candidate = queue_state.candidate_out(payload)
+    failure = queue_state.failure_out(payload, stage)
+    request_ref = queue_state.request_out(item, payload, requester_name)
+    actionable = queue_state.is_actionable(item, payload)
+    return ProposalItemOut(
+        id=item.id,
+        batch_id=item.batch_id,
+        parent_id=item.parent_id,
+        title=item.title,
+        kind=item.kind,
+        status=item.status,
+        selected=item.selected,
+        old_value=item.old_value,
+        new_value=item.new_value,
+        stage=stage,
+        status_code=stage.value,
+        status_label=queue_state.status_label(item, stage, payload, flow),
+        bucket=queue_state.bucket_for(flow, stage),
+        action=payload.get("action") or None,
+        actionable=actionable,
+        progress=ProgressOut(**queue_state.item_progress(item, stage, payload, flow)),
+        candidate=CandidateOut(**candidate) if candidate else None,
+        failure=FailureOut(**failure) if failure else None,
+        request=RequestRefOut(**request_ref) if request_ref else None,
+        can_approve=(
+            item.id in approvable_ids
+            if approvable_ids is not None
+            else (actionable and queue_state.can_approve(stage, flow))
+        ),
+        can_retry=queue_state.can_retry(stage, flow),
+        can_cancel=queue_state.can_cancel(stage),
+    )
+
+
+def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None = None) -> ProposalBatchOut:
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    items = list(batch.items)
+    stage = queue_state.resolve_batch_stage(items, batch.status)
+    requesters: list[RequestRefOut] = []
+    seen: set[str] = set()
+    for item in items:
+        payload = queue_state.payload_of(item)
+        ref = queue_state.request_out(item, payload, (requester_names or {}).get(item.requester_id or ""))
+        if not ref:
+            continue
+        key = str(ref.get("requester_id") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        requesters.append(RequestRefOut(**ref))
+    title = queue_state.library_review_title(items) if flow is ProposalFlow.library_review else batch.title
+    # Computed once over the whole batch: a container is approvable only because of what is under
+    # it, so this cannot be decided row by row.
+    approvable = queue_state.approvable_item_ids(items, flow)
     return ProposalBatchOut(
         id=batch.id,
-        title=batch.title,
+        title=title,
         kind=batch.kind,
         status=batch.status,
-        tree_path=batch.tree_path,
+        flow=flow,
+        stage=stage,
+        bucket=queue_state.bucket_for(flow, stage),
+        progress=ProgressOut(**queue_state.batch_progress(items, batch.status)),
+        requesters=requesters,
+        counts=queue_state.batch_counts(items),
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         items=[
-            ProposalItemOut(
-                id=item.id,
-                batch_id=item.batch_id,
-                parent_id=item.parent_id,
-                title=item.title,
-                kind=item.kind,
-                status=item.status,
-                selected=item.selected,
-                old_value=item.old_value,
-                new_value=item.new_value,
-                payload_json=item.payload_json,
-            )
-            for item in batch.items
+            serialize_proposal_item(item, flow, requester_names, approvable)
+            for item in items
         ],
     )
 

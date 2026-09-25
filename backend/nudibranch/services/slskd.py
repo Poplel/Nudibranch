@@ -25,6 +25,33 @@ def slskd_headers(api_key: str) -> dict[str, str]:
     return {"X-API-Key": api_key} if api_key else {}
 
 
+def rescan_slskd_shares(slskd_url: str, api_key: str) -> dict[str, Any]:
+    """Ask slskd to reindex its shared folders and report the resulting share counts.
+
+    Unlike the Nudibranch library, slskd's own share index does NOT follow the library folder
+    automatically — files added by imports/downloads sit unshared (and therefore undownloadable
+    by anyone else on the network) until something calls this. `PUT /api/v0/shares` starts the
+    rescan; slskd does it asynchronously, so the `shares` block read back here (from
+    `GET /api/v0/application`) is a same-call sanity check, not proof the scan has finished —
+    `scanning` reports whether it is still in progress.
+    """
+    if not slskd_url:
+        raise ValueError("slskd URL is required")
+    if not api_key:
+        raise ValueError("slskd API key is required")
+    with httpx.Client(base_url=slskd_url.rstrip("/"), headers=slskd_headers(api_key), timeout=15) as client:
+        client.put("/api/v0/shares").raise_for_status()
+        response = client.get("/api/v0/application")
+        response.raise_for_status()
+        shares = response.json().get("shares") or {}
+    return {
+        "files": shares.get("files"),
+        "directories": shares.get("directories"),
+        "scanning": shares.get("scanning"),
+        "ready": shares.get("ready"),
+    }
+
+
 def search_slskd(slskd_url: str, api_key: str, query: str, limit: int = 4) -> list[dict[str, Any]]:
     return search_slskd_detailed(slskd_url, api_key, query, limit)["candidates"]
 

@@ -5,7 +5,6 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from nudibranch.db.init import hash_secret
 from nudibranch.db.models import AuthSession, Permission, StaticApiKey, User
 from nudibranch.db.session import get_session
 from nudibranch.services.auth import hash_token
@@ -87,12 +86,6 @@ def get_current_user(
         request.state.auth_session = None
         return static_key.user
 
-    # Legacy fallback: env full-access key + web clients still holding a pre-refactor api_key.
-    user = session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
-    if user:
-        request.state.auth_session = None
-        return user
-
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
@@ -116,10 +109,10 @@ def resolve_media_user(session: Session, token: str) -> User | None:
 
     Audio/cover/lyrics are loaded by ``<audio>``/``<img>`` elements that cannot
     send an Authorization header, so they pass the token in the query string.
-    This mirrors ``get_current_user``'s precedence — session token, static API
-    key, then the legacy ``api_key_hash`` — so a logged-in session token works
-    for media the same way it does for header-authed routes. Returns ``None`` if
-    the token matches nothing (callers raise their own 401/permission error).
+    This mirrors ``get_current_user``'s precedence — session token, then static
+    API key — so a logged-in session token works for media the same way it does
+    for header-authed routes. Returns ``None`` if the token matches nothing
+    (callers raise their own 401/permission error).
     """
     if not token:
         return None
@@ -145,7 +138,7 @@ def resolve_media_user(session: Session, token: str) -> User | None:
             session.commit()
         return static_key.user
 
-    return session.scalar(select(User).where(User.api_key_hash == hash_secret(token)))
+    return None
 
 
 def require_admin(user: User = Depends(get_current_user)) -> User:
@@ -170,4 +163,29 @@ def require_permission(permission: Permission):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Requires {permission.value}")
 
     dependency.__nudibranch_permission__ = permission
+    return dependency
+
+
+def require_any_permission(*permissions: Permission):
+    """Admit a user holding ANY of these permissions.
+
+    Needed because approving a music request is legitimately two different jobs: `approvals:manage`
+    (approve anything) and `wishlist:approve_all` (approve other people's music requests).  The
+    route only decides *entry*; the narrower rule -- that a `wishlist:approve_all` holder may not
+    approve a batch containing only their own requests -- is enforced in `approve_batch`, so it
+    cannot be bypassed by a future route that forgets it.
+    """
+
+    def dependency(user: User = Depends(get_current_user)) -> User:
+        if user.is_admin:
+            return user
+        held = {user_permission.permission for user_permission in user.permissions}
+        if held & set(permissions):
+            return user
+        names = " or ".join(permission.value for permission in permissions)
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Requires {names}")
+
+    # The OpenAPI customisation reads a single permission; report the first as the headline one.
+    if permissions:
+        dependency.__nudibranch_permission__ = permissions[0]
     return dependency

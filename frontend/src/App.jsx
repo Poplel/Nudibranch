@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Compass,
   Database,
   FileAudio,
@@ -55,18 +56,64 @@ import {
   Sun,
   Trash2,
   Upload,
-  UserCheck,
   Users,
   Wrench,
   X,
   Zap,
 } from "lucide-react";
 import "./styles.css";
+// The web app's own version, shown in the Settings footer. package.json is its single source.
+import { version as WEB_VERSION } from "../package.json";
 
 const API_BASE = "/api/v1";
 const TOKEN_KEY = "nudibranch_api_key";
 const APPEARANCE_LAST_KEY = "nudibranch_appearance_last";
 const DEVICE_LABEL_KEY = "nudibranch_device_label";
+
+// ── The account's shared playback session (§A1b) ──
+// A longer local queue is published as a window around the current item, and every index this tab
+// reports is re-based onto that window. Matches the server's SESSION_MAX_ITEMS.
+const SESSION_MAX_ITEMS = 5000;
+const SESSION_LOOK_BACK = 400;
+// The `session_id` the docked player sees for an orphaned session, which belongs to no device.
+const ACCOUNT_SESSION_ROW = "account-session";
+
+function queueItemId(item) {
+  return item?._episodeId || item?.id;
+}
+
+function toSnapshotItem(item) {
+  return {
+    type: item?._kind === "episode" ? "episode" : "track",
+    id: queueItemId(item),
+    podcast_id: item?._podcastId || null,
+  };
+}
+
+/// Order and identity only. Two queues with the same key publish the same shared queue.
+function sessionQueueKeyOf(queue) {
+  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}:${queueItemId(item)}`).join("|");
+}
+
+function snapshotItemsKey(items) {
+  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}:${item.id}`).join("|");
+}
+
+/// The part of a local queue that is published, and where the current item sits in it.
+function sessionWindow(queue, index) {
+  const length = queue.length;
+  const anchor = Math.min(Math.max(index, 0), Math.max(0, length - 1));
+  const start = Math.max(0, Math.min(anchor - SESSION_LOOK_BACK, length - SESSION_MAX_ITEMS));
+  const slice = queue.slice(start, start + SESSION_MAX_ITEMS);
+  return { start, length: slice.length, index: slice.length ? anchor - start : 0, items: slice.map(toSnapshotItem) };
+}
+
+/// The server's 409s nest their code one level down (`{"detail":{"detail":"owned"}}`), except
+/// `claim_lost`, which is a plain string.
+function sessionErrorCode(data) {
+  const detail = data?.detail;
+  return typeof detail === "string" ? detail : (detail?.detail || null);
+}
 
 // Stable per-browser device label so re-logins reuse one session instead of
 // piling up a fresh "Web" session every time (backend dedupes by device_label).
@@ -79,10 +126,19 @@ function getDeviceLabel() {
   return label;
 }
 const DEFAULT_APPEARANCE = { dark: false, accentColor: "#356df3", backgroundTint: "#356df3" };
+// Minutes a playback claim survives with nothing playing before the session is up for grabs.
+// 0 means it never expires. Matches the server's own default for a new account.
+// "Never" is the default (the user, 2026-09-23) — matches the server's own default for new/migrated
+// accounts. Only the pre-hydration fallback before `GET /me` answers; real accounts get their own
+// `playback_claim_timeout_minutes` from the server.
+const DEFAULT_CLAIM_TIMEOUT_MINUTES = 0;
 
 // Nav order mirrors the iOS app's: the four things you reach for constantly first, then the
 // management pages. "Discover" is not its own page any more — searching for music and tracking
 // what you asked for are one flow, so both live under Wishlist (see WishlistWorkspace).
+// "Approvals" is gone: other users' wishlist requests now surface inside the Task Queue's
+// Review bucket alongside the candidates they produce, instead of a third, differently-named
+// queue (matches the iOS rebuild -- see CLAUDE-wip-requests-rework.md).
 const navItems = [
   ["Home", House],
   ["Library", Music],
@@ -90,7 +146,6 @@ const navItems = [
   ["Podcasts", Mic2],
   ["Playlists", FileAudio],
   ["Import/Add", HardDriveUpload],
-  ["Approvals", UserCheck],
   ["Task Queue", ListChecks],
   ["Activity", Database],
   ["Tools", Wrench],
@@ -104,7 +159,6 @@ const pageDescriptions = {
   Library: "Browse artists, albums, and tracks in the library.",
   "Import/Add": "Scan new files, add album records, and prepare them for review.",
   Wishlist: "Search for music and track what you have requested.",
-  Approvals: "Review other users' wishlist requests.",
   "Task Queue": "Review requested changes before they run.",
   Playlists: "Create, import, and manage playlists.",
   Podcasts: "Subscribe to podcasts and play episodes.",
@@ -262,6 +316,10 @@ function App() {
     }
   };
   const [page, setPage] = useState("Library");
+  // Read inside the polling interval below without forcing it to be torn down and recreated on
+  // every nav click / wishlist tab flip — see where they're assigned, beside that effect.
+  const pageRef = useRef(page);
+  const wishlistTabRef = useRef("discover");
   const [albumDetail, setAlbumDetail] = useState(null);
   const [artistDetail, setArtistDetail] = useState(null);
   const [homeVersion, setHomeVersion] = useState(0);
@@ -282,6 +340,10 @@ function App() {
   const [accentColor, setAccentColor] = useState(initialAppearance.accentColor);
   const [backgroundTint, setBackgroundTint] = useState(initialAppearance.backgroundTint);
   const [crossfadeDuration, setCrossfadeDuration] = useState(0.5);
+  // Account-level playback settings, saved through the same PUT /me/appearance as the colours.
+  // Both are REQUIRED in that body — leaving either out is a 422.
+  const [remotePlaybackEnabled, setRemotePlaybackEnabled] = useState(true);
+  const [claimTimeoutMinutes, setClaimTimeoutMinutes] = useState(DEFAULT_CLAIM_TIMEOUT_MINUTES);
   // Device-local, like iOS — the EQ is a property of these speakers/headphones, not the account.
   const [equalizer, setEqualizer] = useState(readStoredEqualizer);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
@@ -310,12 +372,30 @@ function App() {
   const lastEpisodeProgressRef = useRef(null);
   const commandPollingRef = useRef(false);
   const commandPollNowRef = useRef(null);
+  // Shared-session plumbing (§A1b). Claims and queue publishes run strictly one after another on
+  // `sessionOpChainRef`: two claims racing each other could leave the server holding the older one,
+  // and the tab would then read its own claim as lost and stop.
+  const sessionOpChainRef = useRef(Promise.resolve());
+  const sessionClaimsInFlightRef = useRef(0);
+  const lastPublishedKeyRef = useRef(null);
+  const sessionRecoverAtRef = useRef(0);
+  const sessionRefreshNowRef = useRef(null);
+  const sessionReleaseRef = useRef(null);
   const [approvals, setApprovals] = useState([]);
   const [tasks, setTasks] = useState([]);
   const [appLogs, setAppLogs] = useState([]);
   const [notifications, setNotifications] = useState([]);
   const [wishlist, setWishlist] = useState([]);
-  const [wishlistApprovals, setWishlistApprovals] = useState([]);
+  // Gate 1 (`GET /wishlist/queue`, requested rows awaiting a human before anything searches) —
+  // only ever populated for a wishlist:approve_all holder or admin; see the Wishlist page's Queue
+  // tab. Which sub-tab is showing lives here too, so the poll below can tell whether it needs
+  // /wishlist/queue at all.
+  const [wishlistQueue, setWishlistQueue] = useState([]);
+  const [wishlistTab, setWishlistTab] = useState("discover");
+  // The requester's own batches (GET /requests) -- also doubles as the Task Queue's data
+  // source for a wishlist:approve_all holder who lacks approvals:manage (GET /approvals is
+  // admin-only; /requests admits wishlist:approve_all and returns the same bucketed shape).
+  const [requests, setRequests] = useState([]);
   const [playlists, setPlaylists] = useState([]);
   const [users, setUsers] = useState([]);
   const [jellyfinUsers, setJellyfinUsers] = useState(null);
@@ -328,7 +408,6 @@ function App() {
   const [importAlbumSearchOpen, setImportAlbumSearchOpen] = useState(false);
   const [importDownloadRequests, setImportDownloadRequests] = useState([]);
   const [wishlistInspectorActions, setWishlistInspectorActions] = useState(null);
-  const [approvalsInspectorActions, setApprovalsInspectorActions] = useState(null);
   const [playlistInspectorActions, setPlaylistInspectorActions] = useState(null);
   const [podcastInspectorActions, setPodcastInspectorActions] = useState(null);
   const [mappingSyncStats, setMappingSyncStats] = useState(null);
@@ -371,6 +450,33 @@ function App() {
   const activeRemoteSession = remoteSessions.find(
     (r) => !r.current && r.presence === "live" && (r.status === "playing" || r.status === "paused"),
   );
+  // ── The account's shared playback session (§A1b) ──
+  // Declared up here beside `activeRemoteSession` for the same temporal-dead-zone reason: the docked
+  // player's mount condition and `playerDocked` read what these derive.
+  /// GET /player/session, without its items. Null until first read, and while cross-device playback
+  /// is off.
+  const [accountSession, setAccountSession] = useState(null);
+  /// The `updated_at` of an orphaned session the user closed in this tab. It stays hidden here until
+  /// the session changes, and is never hidden anywhere else.
+  const [orphanDismissedAt, setOrphanDismissedAt] = useState(null);
+  /// This tab's claim on the shared session: `{ id, start, length }`, where `start`/`length` describe
+  /// the window of the local queue it published. MEMORY ONLY: a reloaded tab has nothing playing, so
+  /// it starts as a viewer or as the resumer of an orphan.
+  const sessionClaimRef = useRef(null);
+  const remotePlaybackOn = Boolean(user?.remote_playback_enabled);
+  /// An ORPHAN is a session nobody holds a valid claim on (or one this very session held before a
+  /// reload lost its claim id). It is shown paused where it was left, and Play here claims it.
+  /// ⚠ A remote that is genuinely PLAYING still wins the dock: that is what the account is listening
+  /// to right now, whatever the shared row says.
+  const orphanSession = remotePlaybackOn && !currentTrack && accountSession
+    && (accountSession.queue_length || 0) > 0
+    && (!accountSession.claim_valid || (accountSession.you_own && !sessionClaimRef.current))
+    && !(orphanDismissedAt && orphanDismissedAt === accountSession.updated_at)
+    && activeRemoteSession?.status !== "playing"
+    ? { ...accountSession, session_id: ACCOUNT_SESSION_ROW, status: "paused", _orphan: true }
+    : null;
+  /// What the docked player shows when nothing plays here: the orphan, or another live session.
+  const displayedRemote = orphanSession || activeRemoteSession || null;
   const [playerPopped, setPlayerPopped] = useState(false);
   const [playerDockHeight, setPlayerDockHeight] = useState(0);
   const [playerToastHeight, setPlayerToastHeight] = useState(0);
@@ -386,26 +492,9 @@ function App() {
   const appearanceSaveVersion = useRef(0);
 
   const theme = dark ? "app dark" : "app";
-  const queueGroups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
-  const queueSelectionCount = useMemo(
-    () => queueGroups.reduce((total, group) => total + group.items.filter((item) => item.selected).length, 0),
-    [queueGroups],
-  );
-  const queueItemCount = useMemo(
-    () => queueGroups.reduce((total, group) => total + group.items.length, 0),
-    [queueGroups],
-  );
-  const queueGroupCount = queueGroups.length;
-  const queueSummary = useMemo(
-    () =>
-      queueItemCount === 0
-        ? "No queued changes."
-        : `${queueSelectionCount} of ${queueItemCount} visible changes selected across ${queueGroupCount} group${queueGroupCount === 1 ? "" : "s"}.`,
-    [queueGroupCount, queueItemCount, queueSelectionCount],
-  );
   const visibleNavItems = useMemo(() => navItems.filter(([label]) => canViewPage(user, label)), [user]);
   const activeImportTask = tasks.some((task) => task.type === "propose_import" && ["queued", "running"].includes(task.status));
-  const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing");
+  const activeWork = tasks.some((task) => ["queued", "running"].includes(task.status)) || approvals.some((batch) => batch.status === "executing") || requests.some((batch) => batch.status === "executing");
   const unreadNotifications = useMemo(() => notifications.filter((notification) => notification.status === "unread"), [notifications]);
   const activeSeverity = useMemo(
     () => unreadNotifications.reduce((highest, notification) => maxSeverity(highest, notificationSeverity(notification)), "info"),
@@ -427,7 +516,16 @@ function App() {
     : -1;
   // The remote dock occupies the same slot and the same height variables, so anything keyed on
   // "a player is docked" has to count it too — otherwise content sits under it.
-  const playerDocked = (playerOpen && !playerPopped) || Boolean(!playerOpen && activeRemoteSession);
+  const playerDocked = (playerOpen && !playerPopped) || Boolean(!playerOpen && displayedRemote);
+  /// The latest values the shared-session code needs from inside async work and timers, which would
+  /// otherwise close over a stale render.
+  const sessionLiveRef = useRef({});
+  sessionLiveRef.current = { playerQueue, currentTrackIndex, shuffle, repeat, token, remotePlaybackOn, accountSession };
+  /// Fingerprint of the local queue's CONTENTS (order included, playhead excluded): the owner
+  /// republishes the shared queue only when this changes.
+  const sessionQueueKey = useMemo(() => sessionQueueKeyOf(playerQueue), [playerQueue]);
+  /// A paused orphan changes nothing on its own, so it is not worth the fast poll or the clock tick.
+  const liveRemoteViewers = orphanSession ? 0 : remoteViewers;
   const appearanceVars = useMemo(() => buildAppearanceVars(dark, accentColor, backgroundTint), [dark, accentColor, backgroundTint]);
   const nextAudioUrl = useMemo(() => {
     const next = playerQueue[currentTrackIndex + 1];
@@ -523,6 +621,11 @@ function App() {
     refreshAll();
   }, [token]);
 
+  // Latest-value refs for the interval below, which is intentionally NOT recreated on every
+  // `page`/`wishlistTab` change (that would reset the 2.5–10s cadence on every nav click).
+  pageRef.current = page;
+  wishlistTabRef.current = wishlistTab;
+
   // Polling interval — dep changes here only re-create the interval (no immediate fetch).
   useEffect(() => {
     if (!token) return;
@@ -540,14 +643,34 @@ function App() {
       if (hasPermission(user, "approvals:manage")) refreshApprovals();
       refreshNotifications();
       if (hasPermission(user, "playlists:manage")) refreshPlaylists();
-      if (hasPermission(user, "discover")) {
+      // The Wishlist page refreshes itself only while it's the page actually on screen AND the
+      // tab/document is visible — never against a page nobody can see (the user, 2026-09-23).
+      // /wishlist/queue only matters on top of that when the Queue tab itself is showing.
+      if (
+        (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all"))
+        && pageRef.current === "Wishlist"
+        && document.visibilityState === "visible"
+      ) {
         refreshWishlist();
-        refreshWishlistApprovals();
+        if (wishlistTabRef.current === "queue" && hasPermission(user, "wishlist:approve_all")) {
+          refreshWishlistQueue();
+        }
       }
+      // /requests is the requester's own progress feed AND the Task Queue's data source for a
+      // wishlist:approve_all holder who lacks approvals:manage (GET /approvals 403s for them).
+      if (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all")) refreshRequests();
       if (hasPermission(user, "activity:read")) refreshUserPlayback();
     }, activeWork ? 2500 : 10000);
     return () => window.clearInterval(interval);
   }, [token, user?.id, user?.is_admin, stablePermissionKey(user?.permissions || []), activeWork]);
+
+  // Returning to the Wishlist page (or switching into its Queue tab) shouldn't wait out the
+  // throttled interval above before showing current data.
+  useEffect(() => {
+    if (!token || page !== "Wishlist") return;
+    if (hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all")) refreshWishlist();
+    if (wishlistTab === "queue" && hasPermission(user, "wishlist:approve_all")) refreshWishlistQueue();
+  }, [token, page, wishlistTab]);
 
   useEffect(() => {
     if (!user || visibleNavItems.length === 0) return;
@@ -568,7 +691,9 @@ function App() {
     setDark(user.theme === "dark");
     setAccentColor(user.accent_color || DEFAULT_APPEARANCE.accentColor);
     setBackgroundTint(user.background_tint || DEFAULT_APPEARANCE.backgroundTint);
-    setCrossfadeDuration(user.crossfade_duration ?? 0.5);
+    setCrossfadeDuration(user.crossfade_duration);
+    setRemotePlaybackEnabled(user.remote_playback_enabled);
+    setClaimTimeoutMinutes(user.playback_claim_timeout_minutes);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -580,23 +705,34 @@ function App() {
 
   useEffect(() => {
     if (!user?.id || !appearanceReady) return;
+    // ⚠️ `remote_playback_enabled` and `playback_claim_timeout_minutes` are REQUIRED by
+    // PUT /me/appearance — a body without them is a 422 — so every save carries the whole set.
     const appearance = {
       theme: dark ? "dark" : "light",
       accent_color: accentColor,
       background_tint: backgroundTint,
       crossfade_duration: crossfadeDuration,
+      remote_playback_enabled: remotePlaybackEnabled,
+      playback_claim_timeout_minutes: claimTimeoutMinutes,
     };
     if (
-      (user.theme || "light") === appearance.theme &&
-      (user.accent_color || DEFAULT_APPEARANCE.accentColor) === appearance.accent_color &&
-      (user.background_tint || DEFAULT_APPEARANCE.backgroundTint) === appearance.background_tint &&
-      (user.crossfade_duration ?? 0.5) === appearance.crossfade_duration
+      user.theme === appearance.theme &&
+      user.accent_color === appearance.accent_color &&
+      user.background_tint === appearance.background_tint &&
+      user.crossfade_duration === appearance.crossfade_duration &&
+      user.remote_playback_enabled === appearance.remote_playback_enabled &&
+      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes
     ) {
       return;
     }
     const timeout = window.setTimeout(() => saveOwnAppearance(appearance), 250);
     return () => window.clearTimeout(timeout);
-  }, [user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration, appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration]);
+  }, [
+    user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration,
+    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes,
+    appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration,
+    remotePlaybackEnabled, claimTimeoutMinutes,
+  ]);
 
   useEffect(() => {
     if (!token || !user) return;
@@ -664,6 +800,8 @@ function App() {
   }
 
   function logout() {
+    // While the token still works: a signed-out tab is nobody's player.
+    releaseSessionClaim();
     localStorage.removeItem(TOKEN_KEY);
     setToken("");
     setUser(null);
@@ -674,14 +812,16 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, wishlistApprovalData, approvalData, playlistData, backupData] = await Promise.all([
+      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, requestData, approvalData, playlistData, backupData] = await Promise.all([
         api("/permissions"),
         hasPermission(me, "library:view") ? api("/library/tree") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
         hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
         api("/notifications"),
         hasPermission(me, "discover") ? api("/wishlist") : Promise.resolve([]),
-        hasPermission(me, "discover") ? api("/wishlist/approvals") : Promise.resolve([]),
+        // /requests is the requester's own progress feed AND the Task Queue's data source for a
+        // wishlist:approve_all holder who lacks approvals:manage (GET /approvals is admin-only).
+        hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all") ? api("/requests") : Promise.resolve([]),
         hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
         hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
         hasPermission(me, "tools:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
@@ -694,7 +834,7 @@ function App() {
       handleCompletedTaskEffects(taskData, { emit: false });
       setNotifications((current) => mergeTrayNotifications(notificationData, current));
       setWishlist(wishlistData);
-      setWishlistApprovals(wishlistApprovalData);
+      setRequests(requestData);
       setApprovals(approvalData);
       setPlaylists(playlistData);
       setBackups(backupData.backups || []);
@@ -1118,11 +1258,11 @@ function App() {
     }
   }
 
-  async function refreshWishlistApprovals() {
+  async function refreshRequests() {
     try {
-      setWishlistApprovals(await api("/wishlist/approvals"));
+      setRequests(await api("/requests"));
     } catch {
-      // Wishlist approval polling is best-effort.
+      // Requests polling is best-effort.
     }
   }
 
@@ -1131,6 +1271,51 @@ function App() {
       setWishlist(await api("/wishlist"));
     } catch {
       // Wishlist status polling is best-effort.
+    }
+  }
+
+  // Gate 1 (`GET /wishlist/queue`) — 403s for anyone without wishlist:approve_all/admin, so this
+  // is only ever called from behind that same check.
+  async function refreshWishlistQueue() {
+    try {
+      setWishlistQueue(await api("/wishlist/queue"));
+    } catch {
+      // Queue polling is best-effort, same as every other poll here.
+    }
+  }
+
+  // Approve moves a `requested` row straight to searching — the candidate search itself is
+  // gate 2's job (Download approval, back in the Task Queue), not this one.
+  async function approveWishlistQueueItems(itemIds) {
+    if (itemIds.length === 0) return;
+    setLoading(true);
+    try {
+      await api("/wishlist/queue/approve", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds }),
+      });
+      await Promise.all([refreshWishlistQueue(), refreshWishlist(), refreshRequests()]);
+    } catch (approveError) {
+      notify("Approve failed", approveError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Reject = Declined, and it stays visible on the requester's own wishlist for them to remove.
+  async function rejectWishlistQueueItems(itemIds) {
+    if (itemIds.length === 0) return;
+    setLoading(true);
+    try {
+      await api("/wishlist/queue/reject", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: itemIds }),
+      });
+      await Promise.all([refreshWishlistQueue(), refreshWishlist()]);
+    } catch (rejectError) {
+      notify("Reject failed", rejectError.message, "ui_error");
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -1175,23 +1360,70 @@ function App() {
     }
   }
 
-  async function submitWishlistApprovals(itemIds = null, options = {}) {
+  // Re-request a declined or failed wishlist item: the server matches on kind/artist/album/track
+  // and replaces the old row (deletes the stale "rejected"/"failed" one and starts a fresh search),
+  // so this is just a plain create with the same fields, not a special endpoint.
+  async function requestWishlistItemAgain(item) {
+    return createWishlistItem({ kind: item.kind, artist: item.artist, album: item.album, track: item.track, source: "wishlist" });
+  }
+
+  // Stop this work without destroying the request -- the wishlist row goes back to searching
+  // (server-side), unlike reject/decline. Available to the requester on their own batch and to
+  // any approver on anyone's (server enforces both via `_may_act_on_request_batch`).
+  // One bulk route for any set of ids, across any number of batches (`POST /approvals/cancel`),
+  // and idempotent — so a selection spanning several albums is one request, not one per batch.
+  async function cancelApprovalItems(items) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const wantedItems = itemIds?.length ? wishlist.filter((item) => itemIds.includes(item.id)) : wishlist.filter((item) => item.status === "wanted");
-      const batch = await api("/wishlist/approvals", {
+      // No success pop-up (the user, 2026-09-23) — the row's own state (back to Download
+      // approval, progress bar gone) is the feedback. A cancel touching nothing cancelable
+      // is a silent no-op: the server answers 0 cancelled and there is nothing to say.
+      await api("/approvals/cancel", {
         method: "POST",
-        body: JSON.stringify({ item_ids: itemIds?.length ? itemIds : null, deny_unselected: Boolean(options.denyUnselected) }),
+        body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
       });
-      setWishlistApprovals((current) => [batch, ...current.filter((item) => item.id !== batch.id)]);
-      await refreshApprovals();
-      const wishlistData = await api("/wishlist");
-      setWishlist(wishlistData);
-      setToast({ title: "Wishlist review queued", body: `${wantedItems.length} wishlist items were submitted.` });
-      return batch;
-    } catch (wishlistError) {
-      notify("Wishlist review failed", wishlistError.message, "ui_error");
-      throw wishlistError;
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
+    } catch (cancelError) {
+      notify("Cancel failed", cancelError.message, "ui_error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // The wishlist's Cancel. A request still searching has no batch rows to cancel through, so it
+  // goes to `/wishlist/{id}/cancel`, which stops the search and sends it back to Request approval;
+  // anything further along is an ordinary download cancel.
+  async function cancelWishlistRequests(items) {
+    const searches = items.filter((item) => item.wishlist_item_id);
+    const downloads = items.filter((item) => !item.wishlist_item_id);
+    if (searches.length > 0) {
+      try {
+        await Promise.all(searches.map((item) => api(`/wishlist/${item.wishlist_item_id}/cancel`, { method: "POST" })));
+        await refreshWishlist();
+      } catch (cancelError) {
+        notify("Cancel failed", cancelError.message, "ui_error");
+      }
+    }
+    if (downloads.length > 0) await cancelApprovalItems(downloads);
+  }
+
+  // mode: "next_candidate" (try the next ranked source) | "same_candidate" | "research" (discard
+  // candidates and search again -- re-enters the approval gate, never auto-starts a download).
+  async function retryApprovalItems(items, mode = "next_candidate") {
+    setLoading(true);
+    try {
+      const itemsByBatch = groupBy(items, (item) => item.batch_id);
+      for (const [batchId, batchItems] of itemsByBatch) {
+        await api(`/approvals/${batchId}/retry`, {
+          method: "POST",
+          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), mode }),
+        });
+      }
+      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : "Trying the next candidate." });
+      await Promise.all([refreshApprovals(), refreshRequests()]);
+    } catch (retryError) {
+      notify("Retry failed", retryError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -1987,10 +2219,13 @@ function App() {
     // forwardQueueAddition already applies to Add to Queue / Play Next.
     if (!opts.localOnly && forwardPlayToRemote(queue, wantShuffle)) return;
     if (opts.shuffle != null) setShuffle(Boolean(opts.shuffle));
+    // A fresh play here makes this tab the account's player. ⚠ Not awaited: audio never waits for
+    // the claim, and a claim that fails is retried by the next "playing" report.
+    claimFreshSession(queue, 0, wantShuffle);
     setPlayerQueue(queue);
     setPlayerOpen(true);
     setQueueOpen(false);
-    await loadPlayerTrack(queue[0]);
+    await loadPlayerTrack(queue[0], queue);
   }
 
   function resolvePlayableFromLibrary(targetType, targetId) {
@@ -2185,64 +2420,586 @@ function App() {
     return undefined;
   }
 
-  /// Adopt a queue handed over by another of this account's sessions.
-  ///
-  /// ⚠ Returns "retry" for a transient failure so the poll loop leaves the command PENDING. A
-  /// handoff carries a queue rather than an instruction, so acking a network blip would drop
-  /// someone's playback with nothing to recover from. It is bounded by the server's five-minute
-  /// expiry, after which the fetch 410s — a permanent outcome, which acks.
-  async function adoptHandoff(handoffId) {
-    if (!handoffId) return undefined;
-    let handoff;
+  // ── The account's shared playback session (§A1b) ─────────────────────────────────────────────
+  //
+  // One queue and one position per account, stored on the server and outliving every tab. The tab
+  // that plays it holds a CLAIM (`sessionClaimRef`) and sends it on every /player/status; every
+  // other device views it through the same remote player that already existed.
+  // ⚠ None of this touches the remote clock, the assertions or the seek path. An OWNED session is
+  // still driven through the command channel, exactly as before; only an ORPHAN, which has nobody
+  // to command, is edited on the server directly (`/player/session/edit`).
+
+  /// A request whose failure is an answer (409 claim_lost / owned / queue_changed) rather than an
+  /// error — `api()` flattens those into a message string. Throws only on a network failure.
+  async function sessionRequest(path, body, method = "POST") {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionLiveRef.current.token}` },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const data = await response.json().catch(() => null);
+    return { ok: response.ok, status: response.status, data };
+  }
+
+  /// Newer-or-equal wins, so a slow poll landing after an edit's answer cannot put the old state back.
+  function applyAccountSession(data) {
+    if (!data) return;
+    const { items, claim_id: _claimId, ...row } = data;
+    // ⚠️ A claim this tab holds is dead once the latest claim is someone else's, valid or not: a
+    // tab whose claim LAPSED (paused past the idle limit) is never sent the `stop` a valid owner
+    // gets, so without this it kept showing its own old track after another device played.
+    // Only a read NEWER than our claim counts: a GET sent just before claiming can land after it.
+    const held = sessionClaimRef.current;
+    if (held && row.claim_is_yours === false && Date.parse(row.updated_at || "") > Date.parse(held.at || "")) {
+      handleSessionClaimLost(held.id);
+    }
+    setAccountSession((previous) => {
+      const before = Date.parse(previous?.updated_at || "") || 0;
+      const after = Date.parse(row.updated_at || "") || 0;
+      return before && after && after < before ? previous : row;
+    });
+  }
+
+  const refreshAccountSession = useCallback(async () => {
+    if (!sessionLiveRef.current.remotePlaybackOn) { setAccountSession(null); return; }
     try {
-      handoff = await api(`/player/handoffs/${encodeURIComponent(handoffId)}`);
-    } catch (error) {
-      // 404/410 are permanent (gone, expired, already taken); anything else is worth another poll.
-      const permanent = /\b(404|410)\b/.test(String(error?.message || ""));
-      return permanent ? undefined : "retry";
+      applyAccountSession(await api("/player/session"));
+    } catch {
+      /* ambient, like the sessions poll */
     }
-    const snapshot = handoff?.snapshot;
-    if (!snapshot?.items?.length) return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api]);
 
-    const tracks = await resolveSnapshotItems(snapshot.items);
-    if (tracks.length === 0) {
-      // Leave the local queue exactly as it was — a handoff that cannot play here must not also
-      // destroy what this device already had.
-      await api(`/player/handoffs/${encodeURIComponent(handoffId)}/rejected`, {
+  /// Run claims and publishes strictly in order (see `sessionOpChainRef`).
+  function runSessionOp(fn) {
+    const run = sessionOpChainRef.current.then(fn);
+    sessionOpChainRef.current = run.catch(() => {});
+    return run;
+  }
+
+  /// Claim the shared session. `apply` runs inside the serialized op, BEFORE the in-flight count
+  /// drops, so no report can observe a half-installed claim. Resolves with the claim response.
+  function claimSession(snapshot, apply) {
+    sessionClaimsInFlightRef.current += 1;
+    return runSessionOp(async () => {
+      try {
+        const result = await sessionRequest("/player/session/claim", snapshot ? { snapshot } : {});
+        if (!result.ok || !result.data?.claim_id) throw new Error(`claim refused (${result.status})`);
+        apply?.(result.data);
+        return result.data;
+      } finally {
+        sessionClaimsInFlightRef.current -= 1;
+      }
+    });
+  }
+
+  function sessionSnapshot(win, positionSeconds, playing, shuffleOn, repeatMode) {
+    return {
+      version: 1,
+      items: win.items,
+      current_index: win.index,
+      position_seconds: Math.max(0, positionSeconds || 0),
+      playing,
+      shuffle: Boolean(shuffleOn),
+      repeat: repeatMode,
+    };
+  }
+
+  /// A fresh local play: this tab takes the session and replaces its queue.
+  function claimFreshSession(queue, index = 0, shuffleOn = shuffle) {
+    if (!sessionLiveRef.current.remotePlaybackOn || !queue?.length) return;
+    const win = sessionWindow(queue, index);
+    const key = sessionQueueKeyOf(queue);
+    claimSession(sessionSnapshot(win, 0, true, shuffleOn, sessionLiveRef.current.repeat), (data) => {
+      sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: win.start, length: win.length };
+      lastPublishedKeyRef.current = key;
+      applyAccountSession(data);
+    }).catch(() => { /* the next "playing" report retries — maybeRecoverSessionClaim */ });
+  }
+
+  /// Publish this tab's queue as the shared one. Only the owner may, and it is authoritative while it
+  /// holds the claim — edits from other devices reach it as commands and come back out through here.
+  function publishSessionQueue({ force = false } = {}) {
+    return runSessionOp(async () => {
+      const claim = sessionClaimRef.current;
+      const live = sessionLiveRef.current;
+      if (!claim || !live.remotePlaybackOn) return;
+      const key = sessionQueueKeyOf(live.playerQueue);
+      if (!force && key === lastPublishedKeyRef.current) return;
+      const win = sessionWindow(live.playerQueue, live.currentTrackIndex);
+      const ctl = playbackControlRef.current;
+      const result = await sessionRequest("/player/session/queue", {
+        claim_id: claim.id,
+        snapshot: sessionSnapshot(win, ctl?.position?.(), Boolean(ctl?.isPlaying?.()), live.shuffle, live.repeat),
+      });
+      if (result.status === 409) { handleSessionClaimLost(claim.id); return; }
+      if (!result.ok) return;
+      if (sessionClaimRef.current?.id === claim.id) {
+        sessionClaimRef.current = { ...claim, start: win.start, length: win.length };
+      }
+      lastPublishedKeyRef.current = key;
+      applyAccountSession(result.data);
+    }).catch(() => {});
+  }
+
+  /// Stop here and show whatever now holds the session. Playback MOVED, so this stops rather than
+  /// pauses. ⚠ `playerOpen` stays true: unmounting the player would throw away the form it was in —
+  /// docked, fullscreen or popped out — at the moment the music moved. The view follows the playback.
+  function followSharedSession() {
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+    playbackControlRef.current?.stop?.();
+    unshuffledQueueRef.current = null;
+    setPlayerQueue([]);
+    setCurrentTrack(null);
+    setAudioUrl("");
+    setPlayerOpen(true);
+    // After the element's own pause event has reported "paused", so the last word is "stopped" and
+    // this tab is not listed as a paused session someone could resume.
+    setTimeout(() => reportPlayerStatus(null, "stopped", { queue_length: 0, current_index: 0 }), 400);
+    setToast({ title: "Playback moved", body: "Continues on another device." });
+    refreshRemoteSessions();
+    refreshAccountSession();
+  }
+
+  /// ⚠ Acts only when the claim a request was SENT with is still this tab's current one. Claiming
+  /// again (Play here, adopt_session while already the owner) mints a new id, and answers to requests
+  /// carrying the superseded one arrive afterwards — obeying those would stop our own playback.
+  function handleSessionClaimLost(claimId) {
+    const claim = sessionClaimRef.current;
+    if (!claim || claim.id !== claimId || sessionClaimsInFlightRef.current > 0) return;
+    followSharedSession();
+  }
+
+  /// The dying gasp. With `keepalive` it outlives the page (`pagehide`); sendBeacon cannot carry the
+  /// Authorization header, so it is a fetch.
+  function releaseSessionClaim({ keepalive = false } = {}) {
+    const claim = sessionClaimRef.current;
+    if (!claim) return;
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+    const live = sessionLiveRef.current;
+    const relative = live.currentTrackIndex - claim.start;
+    const body = {
+      claim_id: claim.id,
+      position_seconds: Math.max(0, playbackControlRef.current?.position?.() || 0),
+      ...(relative >= 0 && relative < claim.length ? { current_index: relative } : {}),
+    };
+    try {
+      fetch(`${API_BASE}/player/session/release`, {
         method: "POST",
-        body: JSON.stringify({ reason: "nothing_resolved" }),
+        keepalive,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${live.token}` },
+        body: JSON.stringify(body),
       }).catch(() => {});
-      notify("Playback not moved", "Nothing in that queue is available here.", "ui_notice");
-      return undefined;
+    } catch {
+      /* the claim lapses on its own after five silent minutes */
     }
+  }
+  sessionReleaseRef.current = releaseSessionClaim;
 
-    // Start where the sender was, or at the first item after it that resolved here.
-    const wantedId = snapshot.items[snapshot.current_index]?.id;
-    let startIndex = tracks.findIndex((t) => (t._episodeId || t.id) === wantedId);
-    if (startIndex < 0) {
-      const laterIds = new Set(snapshot.items.slice(snapshot.current_index + 1).map((i) => i.id));
-      startIndex = tracks.findIndex((t) => laterIds.has(t._episodeId || t.id));
+  /// Playing with no claim — a claim that failed on a network blip, or a page restored from the
+  /// back/forward cache after its dying gasp. The rule (§A1b): a device that is validly PLAYING the
+  /// session elsewhere wins and this tab follows it; otherwise this tab claims with its own queue.
+  function maybeRecoverSessionClaim() {
+    const live = sessionLiveRef.current;
+    if (!live.remotePlaybackOn || sessionClaimRef.current || sessionClaimsInFlightRef.current > 0) return;
+    if (!live.playerQueue.length) return;
+    const now = Date.now();
+    if (now - sessionRecoverAtRef.current < 30000) return;
+    sessionRecoverAtRef.current = now;
+    (async () => {
+      const read = await sessionRequest("/player/session", undefined, "GET");
+      if (!read.ok || sessionClaimRef.current || sessionClaimsInFlightRef.current > 0) return;
+      const shared = read.data;
+      if (shared?.claim_valid && !shared.you_own && shared.status === "playing") {
+        followSharedSession();
+        return;
+      }
+      const current = sessionLiveRef.current;
+      const win = sessionWindow(current.playerQueue, current.currentTrackIndex);
+      const key = sessionQueueKeyOf(current.playerQueue);
+      const ctl = playbackControlRef.current;
+      await claimSession(
+        sessionSnapshot(win, ctl?.position?.(), true, current.shuffle, current.repeat),
+        (data) => {
+          sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: win.start, length: win.length };
+          lastPublishedKeyRef.current = key;
+          applyAccountSession(data);
+        },
+      );
+    })().catch(() => {});
+  }
+
+  /// Turn the shared queue's items into playable rows, ALIGNED with the items (null where one cannot
+  /// be played here). The web has no library mirror, so titles come from the in-memory library tree
+  /// where it has the track, and otherwise from the server's resolver.
+  async function playablesFromSessionItems(items) {
+    const libraryTracks = new Map();
+    const wanted = new Set(items.filter((item) => item.type !== "episode").map((item) => item.id));
+    if (wanted.size > 0) {
+      for (const artist of library || []) {
+        for (const album of artist.albums || []) {
+          for (const track of album.tracks || []) {
+            if (wanted.has(track.id)) libraryTracks.set(track.id, hydrateTrack(track, artist, album));
+          }
+        }
+      }
     }
+    const titles = new Map();
+    for (const item of items) if (item.title) titles.set(item.id, item);
+    for (const row of remoteQueue) {
+      if (row.title && !titles.has(row.id)) titles.set(row.id, { title: row.title, artist: row._artist, album_id: row._albumId });
+    }
+    const unresolved = items.some((item) => !titles.has(item.id) && !libraryTracks.has(item.id));
+    if (unresolved) {
+      try {
+        const fresh = await api("/player/session?queue=1&resolve=true");
+        for (const item of fresh?.items || []) if (item.title) titles.set(item.id, item);
+      } catch {
+        /* whatever resolved already still plays */
+      }
+    }
+    return items.map((item) => {
+      const known = titles.get(item.id);
+      if (item.type === "episode") {
+        // Built from the ids alone: the stream is the server's relay, so no podcast lookup is needed.
+        // No `_resumeMs`, deliberately — the session says where the listener is, not the episode.
+        if (!known) return null;
+        return {
+          id: item.id,
+          title: known.title,
+          _kind: "episode",
+          _episodeId: item.id,
+          _streamPath: `/podcasts/episodes/${encodeURIComponent(item.id)}/stream`,
+          _artist: known.artist || "Podcast",
+          _album: known.artist || "Podcast",
+          _podcastId: item.podcast_id || null,
+          _coverUrl: item.podcast_id && token
+            ? `${API_BASE}/podcasts/${encodeURIComponent(item.podcast_id)}/cover?api_key=${encodeURIComponent(token)}`
+            : "",
+          _resumeMs: 0,
+          _durationMs: 0,
+        };
+      }
+      const fromLibrary = libraryTracks.get(item.id);
+      if (fromLibrary) return fromLibrary;
+      if (!known) return null;
+      return { id: item.id, title: known.title, album_id: known.album_id || undefined, _artist: known.artist || "", _album: "" };
+    });
+  }
+
+  /// Install a claimed session's queue and play it from where the session was.
+  async function playClaimedSession(data, { position = true } = {}) {
+    const items = data.items || [];
+    const resolved = await playablesFromSessionItems(items);
+    const tracks = resolved.filter(Boolean);
+    if (tracks.length === 0) {
+      sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: 0, length: items.length };
+      releaseSessionClaim();
+      notify("Playback", "Nothing in that queue is available here.", "ui_notice");
+      return false;
+    }
+    const wantIndex = Math.min(Math.max(data.current_index || 0, 0), Math.max(0, items.length - 1));
+    let startIndex = -1;
+    let exact = false;
+    let at = 0;
+    resolved.forEach((entry, i) => {
+      if (!entry) return;
+      if (i === wantIndex) { startIndex = at; exact = true; } else if (startIndex < 0 && i > wantIndex) startIndex = at;
+      at += 1;
+    });
     if (startIndex < 0) startIndex = 0;
-
+    // Everything resolved: what plays here IS the shared queue, so there is nothing to republish.
+    // Otherwise this tab's shorter queue is published, since the owner is authoritative.
+    sessionClaimRef.current = { id: data.claim_id, at: data.updated_at, start: 0, length: tracks.length === items.length ? items.length : tracks.length };
+    lastPublishedKeyRef.current = tracks.length === items.length ? sessionQueueKeyOf(tracks) : null;
+    applyAccountSession(data);
+    setOrphanDismissedAt(null);
+    // Already in playback order, and the pre-shuffle order was never shared, so there is nothing to
+    // restore: set the flag without reshuffling.
+    unshuffledQueueRef.current = null;
+    setShuffle(Boolean(data.shuffle));
+    setRepeat(["off", "one", "all"].includes(data.repeat) ? data.repeat : "off");
     setPlayerQueue(tracks);
     setPlayerOpen(true);
-    // An adopted queue arrives already in playback order and its pre-shuffle order stayed on the
-    // sending device, so there is nothing to restore. setShuffleState's off-branch handles a null
-    // snapshot by leaving the queue as it is, which is the right degradation.
-    unshuffledQueueRef.current = null;
-    setShuffleState(Boolean(snapshot.shuffle));
-    setRepeat(["off", "one", "all"].includes(snapshot.repeat) ? snapshot.repeat : "off");
-    await loadPlayerTrack(tracks[startIndex]);
-    if (snapshot.position_seconds > 0) seekWithRetry(Math.round(snapshot.position_seconds));
-    // The SERVER decides whether to start playing — it decays autoplay for a handoff collected late,
-    // so audio never starts on a device the user has since walked away from.
-    if (handoff.autoplay_effective === false) {
-      setTimeout(() => playbackControlRef.current?.pause?.(), 0);
+    setQueueOpen(false);
+    await loadPlayerTrack(tracks[startIndex], tracks);
+    if (position && exact && data.position_seconds > 0) seekWithRetry(data.position_seconds);
+    if (tracks.length !== items.length) publishSessionQueue({ force: true });
+    return true;
+  }
+
+  /// Take the stored session here: Play on an orphan, "Play here", or an adopt_session. The server
+  /// stops whichever device held it. Returns "retry" for a transient failure.
+  async function takeSharedSession({ quiet = false } = {}) {
+    if (!sessionLiveRef.current.remotePlaybackOn) return "done";
+    return whileAdopting(async () => {
+      let data;
+      try {
+        data = await claimSession(null, dropSupersededClaim);
+      } catch {
+        if (!quiet) notify("Playback", "Couldn't start playback here.", "ui_error");
+        return "retry";
+      }
+      await playClaimedSession(data);
+      return "done";
+    });
+  }
+
+  /// A claim being installed counts as in flight until its queue is playing: until then no answer
+  /// about an older claim may stop this tab, and no "playing" report may claim with the old queue.
+  async function whileAdopting(fn) {
+    sessionClaimsInFlightRef.current += 1;
+    try {
+      return await fn();
+    } finally {
+      sessionClaimsInFlightRef.current -= 1;
     }
-    await api(`/player/handoffs/${encodeURIComponent(handoffId)}/adopted`, { method: "POST" }).catch(() => {});
-    setToast({ title: "Playback moved here", body: `From ${handoff.from_device_label || "another device"}.` });
+  }
+
+  /// A new claim replaces whatever this tab held, even before its queue is installed.
+  function dropSupersededClaim() {
+    sessionClaimRef.current = null;
+    lastPublishedKeyRef.current = null;
+  }
+
+  /// adopt_session: another device sent the session here. With a handoff it carries a queue to play
+  /// instead (someone watching this tab played an album "here"); without one it moves the stored
+  /// session. ⚠ "retry" leaves the command pending — it carries playback, and the server's two-minute
+  /// expiry on the command is what bounds the retry.
+  async function adoptSharedSession(cmd) {
+    if (!sessionLiveRef.current.remotePlaybackOn) return undefined;
+    if (cmd.target_type !== "handoff") {
+      const outcome = await takeSharedSession({ quiet: true });
+      return outcome === "retry" ? "retry" : undefined;
+    }
+    return whileAdopting(() => adoptSnapshotHandoff(cmd));
+  }
+
+  async function adoptSnapshotHandoff(cmd) {
+    let read;
+    try {
+      read = await sessionRequest(`/player/handoffs/${encodeURIComponent(cmd.target_id || "")}`, undefined, "GET");
+    } catch {
+      return "retry";
+    }
+    if (read.status === 404 || read.status === 410) return undefined;
+    if (!read.ok) return "retry";
+    const snapshot = read.data?.snapshot;
+    if (!snapshot?.items?.length) return undefined;
+    let data;
+    try {
+      data = await claimSession(snapshot, dropSupersededClaim);
+    } catch {
+      return "retry";
+    }
+    const played = await playClaimedSession(data, { position: true });
+    await api(`/player/handoffs/${encodeURIComponent(cmd.target_id)}/${played ? "adopted" : "rejected"}`, {
+      method: "POST",
+      ...(played ? {} : { body: JSON.stringify({ reason: "nothing_resolved" }) }),
+    }).catch(() => {});
     return undefined;
+  }
+
+  /// enqueue_next / enqueue_end: another device added to the queue this tab is playing. Same ack
+  /// discipline as adopt_session: it carries items, so a network blip must not drop them.
+  async function adoptEnqueue(handoffId, next) {
+    if (!handoffId) return undefined;
+    let read;
+    try {
+      read = await sessionRequest(`/player/handoffs/${encodeURIComponent(handoffId)}`, undefined, "GET");
+    } catch {
+      return "retry";
+    }
+    if (read.status === 404 || read.status === 410) return undefined;
+    if (!read.ok) return "retry";
+    const items = read.data?.snapshot?.items || [];
+    if (items.length === 0) return undefined;
+    // Ids from the library tree and the podcast feeds, not the session resolver: these items are not
+    // in the shared queue yet, so the resolver knows nothing about them.
+    const tracks = await resolveSnapshotItems(items);
+    const outcome = tracks.length ? "adopted" : "rejected";
+    if (tracks.length) {
+      if (!currentTrack) {
+        await playTracks(tracks, { localOnly: true });
+      } else {
+        const anchor = currentTrackIndex;
+        setPlayerQueue((current) => {
+          const at = next && anchor >= 0 && anchor < current.length ? anchor + 1 : current.length;
+          return [...current.slice(0, at), ...tracks, ...current.slice(at)];
+        });
+      }
+    }
+    await api(`/player/handoffs/${encodeURIComponent(handoffId)}/${outcome}`, {
+      method: "POST",
+      ...(tracks.length ? {} : { body: JSON.stringify({ reason: "nothing_resolved" }) }),
+    }).catch(() => {});
+    return undefined;
+  }
+
+  /// The published window's index → this tab's own queue.
+  function localQueueIndex(index) {
+    return (sessionClaimRef.current?.start || 0) + index;
+  }
+
+  /// Remove one entry, by position. Removing the current item continues with whatever took its
+  /// place, and removing the last one stops — the same as the apps.
+  function removeQueueEntryAt(index) {
+    if (index < 0 || index >= playerQueue.length) return undefined;
+    const remaining = playerQueue.filter((_, i) => i !== index);
+    if (index !== currentTrackIndex) {
+      setPlayerQueue(remaining);
+      return undefined;
+    }
+    if (remaining.length === 0) {
+      playbackControlRef.current?.stop?.();
+      setPlayerQueue([]);
+      setCurrentTrack(null);
+      setAudioUrl("");
+      return undefined;
+    }
+    setPlayerQueue(remaining);
+    return loadPlayerTrack(remaining[Math.min(index, remaining.length - 1)], remaining);
+  }
+
+  /// Move one entry. ⚠ `destination` has the apps' list-move meaning — the slot BEFORE removal, from
+  /// 0 to the queue's length — because the iOS receiver defines what a `move` command means.
+  function moveQueueEntry(from, destination) {
+    if (from < 0 || from >= playerQueue.length || destination < 0 || destination > playerQueue.length) return;
+    const next = [...playerQueue];
+    const [moving] = next.splice(from, 1);
+    const insertion = Math.min(Math.max(destination - (from < destination ? 1 : 0), 0), next.length);
+    next.splice(insertion, 0, moving);
+    setPlayerQueue(next);
+  }
+
+  /// Edit an ORPHANED session in place. `versioned` sends `base_version`, so an index can never land
+  /// on a different item than the one the user saw; a seek or a mode change names no index and
+  /// would only be refused for nothing.
+  async function orphanEdit(body, { versioned = false, optimistic = null } = {}) {
+    const shared = sessionLiveRef.current.accountSession;
+    if (optimistic) setAccountSession((previous) => (previous ? { ...previous, ...optimistic } : previous));
+    try {
+      const result = await sessionRequest(
+        "/player/session/edit",
+        versioned ? { ...body, base_version: shared?.queue_version ?? 0 } : body,
+      );
+      if (result.ok) {
+        applyAccountSession(result.data);
+        return true;
+      }
+      const code = sessionErrorCode(result.data);
+      // "owned": a device took the session since we looked — an insert still means the same thing
+      // there, so it goes on as the ordinary queue addition. Anything else re-reads and stops.
+      const owner = result.data?.detail?.owner_session_id;
+      if (code === "owned" && owner && body.items?.length) {
+        enqueueOnRemote(owner, body.items, body.op === "insert_next");
+      } else if (code !== "owned" && code !== "queue_changed") {
+        notify("Remote playback", "That change didn't go through.", "ui_error");
+      }
+    } catch {
+      notify("Remote playback", "That change didn't go through.", "ui_error");
+    }
+    setRemoteQueueSession(null);
+    refreshAccountSession();
+    refreshRemoteSessions();
+    return false;
+  }
+
+  /// Transport on an orphan. Play takes it here; everything else just moves the stored session.
+  function orphanCommand(action, positionSeconds) {
+    const shared = sessionLiveRef.current.accountSession;
+    if (!shared) return undefined;
+    if (action === "resume" || action === "play") return takeSharedSession();
+    if (action === "seek" && positionSeconds !== undefined) {
+      const target = Math.max(0, positionSeconds);
+      return orphanEdit({ op: "seek", position_seconds: target }, { optimistic: { position_seconds: target } });
+    }
+    if (action === "previous" && (shared.position_seconds || 0) > 3) {
+      return orphanEdit({ op: "seek", position_seconds: 0 }, { optimistic: { position_seconds: 0 } });
+    }
+    if (action === "next" || action === "previous") {
+      const index = (shared.current_index || 0) + (action === "next" ? 1 : -1);
+      if (index < 0 || index >= (shared.queue_length || 0)) return undefined;
+      return orphanEdit({ op: "jump", index }, { versioned: true });
+    }
+    // Closing it hides it in this tab only. Sessions never go away (§A1b).
+    if (action === "stop") setOrphanDismissedAt(shared.updated_at || null);
+    return undefined;
+  }
+
+  function orphanMode({ loop, shuffle: shuffleOn } = {}) {
+    const body = { op: "state" };
+    const optimistic = {};
+    if (loop !== undefined) { body.repeat = loop; optimistic.repeat = loop; }
+    if (shuffleOn !== undefined) { body.shuffle = shuffleOn; optimistic.shuffle = shuffleOn; }
+    return orphanEdit(body, { optimistic });
+  }
+
+  /// A row clicked in an orphan's queue plays it, here — there is no other device to play it on.
+  async function orphanQueueJump(queueIndex) {
+    if (await orphanEdit({ op: "jump", index: queueIndex }, { versioned: true })) await takeSharedSession();
+  }
+
+  /// Apply a queue edit to the displayed remote/orphan list at once, re-numbering the rows so a
+  /// second click before the next read still addresses the item the user sees.
+  function editRemoteQueueLocally(edit) {
+    setRemoteQueue((rows) => edit([...rows]).map((row, at) => ({ ...row, _remoteIndex: at })));
+  }
+
+  function orphanQueueRemove(queueIndex) {
+    editRemoteQueueLocally((rows) => rows.filter((row) => row._remoteIndex !== queueIndex));
+    return orphanEdit({ op: "remove", index: queueIndex }, { versioned: true });
+  }
+
+  /// "Play next" on an orphan. The edit route's `to_index` is the slot AFTER removal.
+  function orphanQueuePlayNext(queueIndex, currentIndex) {
+    if (queueIndex === currentIndex || queueIndex === currentIndex + 1) return undefined;
+    const toIndex = queueIndex < currentIndex ? currentIndex : currentIndex + 1;
+    editRemoteQueueLocally((rows) => {
+      const [moving] = rows.splice(queueIndex, 1);
+      rows.splice(toIndex, 0, moving);
+      return rows;
+    });
+    return orphanEdit({ op: "move", index: queueIndex, to_index: toIndex }, { versioned: true });
+  }
+
+  /// Where the docked player's remote actions go: the orphan's edits, or the live session's commands.
+  function remoteCommandForView(action, positionSeconds) {
+    if (orphanSession) return orphanCommand(action, positionSeconds);
+    return activeRemoteSession ? remoteCommand(activeRemoteSession.session_id, action, positionSeconds) : undefined;
+  }
+
+  /// Send the session to a named device (`adopt_session`). It claims on receipt and that claim stops
+  /// whoever holds it now, so nothing stops here — a target that never wakes costs nothing.
+  async function sendSharedSessionTo(device) {
+    // The target resumes from the stored position; bring it up to the second first.
+    if (sessionClaimRef.current) await publishSessionQueue({ force: true });
+    let result = null;
+    try {
+      result = await sessionRequest("/player/session/transfer", { to_session_id: device.session_id });
+    } catch {
+      result = null;
+    }
+    if (result?.ok) {
+      setToast({ title: "Playback moving", body: `Continues on ${result.data?.to_device_label || deviceDisplayName(device)}.` });
+    } else {
+      notify("Playback not moved", sessionTransferError(result, device), "ui_error");
+    }
+    refreshRemoteSessions();
+    refreshAccountSession();
+  }
+
+  function sessionTransferError(result, device) {
+    if (sessionErrorCode(result?.data) === "device_unreachable") {
+      return `${result.data.detail.device_label || deviceDisplayName(device)} isn't reachable right now.`;
+    }
+    return "That device didn't accept the queue.";
+  }
+
+  async function playSharedSessionHere() {
+    if ((await takeSharedSession()) === "done") refreshRemoteSessions();
   }
 
   /// Resolve a snapshot's ids into playable rows, PRESERVING SNAPSHOT ORDER — the order is part of
@@ -2321,14 +3078,20 @@ function App() {
     // nobody asked for.
     if (action === "state") return undefined;
     if (action === "seek") return seekWithRetry(Number(cmd.position_seconds) || 0);
-    if (action === "adopt_handoff") return adoptHandoff(cmd.target_id);
-    // Another of this account's sessions clicked a row in what it sees as OUR published queue
-    // (the web queue panel's remote-jump, and the app's own queue view). The index is into the
-    // full local queue this session actually holds, not into any windowed copy — loadPlayerTrack
-    // re-derives currentTrackIndex from the track id, same as a local queue-row click does.
+    if (action === "adopt_session") return adoptSharedSession(cmd);
+    if (action === "enqueue_next" || action === "enqueue_end") return adoptEnqueue(cmd.target_id, action === "enqueue_next");
+    // Another of this account's devices edited what it sees as the shared queue — which is the
+    // window this tab PUBLISHED, so each index is re-based onto the local queue first. Every edit that
+    // changes the queue's contents is republished by the session-queue effect, so the far end sees it.
     if (action === "jump" && typeof cmd.queue_index === "number") {
-      const track = playerQueue[cmd.queue_index];
+      const track = playerQueue[localQueueIndex(cmd.queue_index)];
       return track ? loadPlayerTrack(track) : undefined;
+    }
+    if (action === "remove" && typeof cmd.queue_index === "number") {
+      return removeQueueEntryAt(localQueueIndex(cmd.queue_index));
+    }
+    if (action === "move" && typeof cmd.queue_index === "number" && typeof cmd.queue_to_index === "number") {
+      return moveQueueEntry(localQueueIndex(cmd.queue_index), localQueueIndex(cmd.queue_to_index));
     }
     if (isPlay) {
       let tracks = resolvePlayableFromLibrary(cmd.target_type, cmd.target_id);
@@ -2424,19 +3187,22 @@ function App() {
     return Math.max(advanced, reported);
   }
 
-  // The queue a remote session published. Fetched once per session rather than per poll: it changes
-  // only when that session's queue does, and `enqueueOnRemote` clears the marker to force a re-read.
+  // The shared queue, for the docked player's list when it shows another device or an orphan.
+  // Keyed on `queue_version`, which the server bumps only when the queue's CONTENTS change, so it is
+  // read once per change rather than per poll; clearing the marker (`setRemoteQueueSession(null)`)
+  // still forces a re-read after an edit this tab sent.
+  const remoteQueueKey = displayedRemote && accountSession ? `account:${accountSession.queue_version ?? 0}` : null;
   useEffect(() => {
-    const sessionId = activeRemoteSession?.session_id;
-    if (!token || !sessionId) { setRemoteQueue([]); return undefined; }
-    if (remoteQueueSession === sessionId) return undefined;
+    if (!token || !remoteQueueKey) { setRemoteQueue([]); return undefined; }
+    if (remoteQueueSession === remoteQueueKey) return undefined;
     let cancelled = false;
     (async () => {
       try {
-        const snapshot = await api(`/player/sessions/${encodeURIComponent(sessionId)}/queue?resolve=true`);
+        const snapshot = await api("/player/session?queue=1&resolve=true");
         if (cancelled) return;
-        // Shaped like a local queue entry so the player's list renders it without branching.
-        const index = Math.max(0, snapshot?.current_index || 0);
+        applyAccountSession(snapshot);
+        // Shaped like a local queue entry so the player's list renders it without branching. Which
+        // row is current is NOT baked in here: it moves on every report, not on a queue change.
         setRemoteQueue((snapshot?.items || []).map((item, at) => ({
           id: item.id,
           title: item.title || "Unknown track",
@@ -2444,35 +3210,75 @@ function App() {
           _album: "",
           _albumId: item.album_id || null,
           _kind: item.type === "episode" ? "episode" : "track",
+          _podcastId: item.podcast_id || null,
           _remoteIndex: at,
-          _remoteCurrent: at === index,
         })));
-        setRemoteQueueSession(sessionId);
+        // Marked with the version it actually returned, which may already be newer than the key.
+        setRemoteQueueSession(`account:${snapshot?.queue_version ?? 0}`);
       } catch {
-        if (!cancelled) { setRemoteQueue([]); setRemoteQueueSession(sessionId); }
+        if (!cancelled) { setRemoteQueue([]); setRemoteQueueSession(remoteQueueKey); }
       }
     })();
     return () => { cancelled = true; };
-  }, [token, activeRemoteSession?.session_id, remoteQueueSession, api]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, remoteQueueKey, remoteQueueSession, api]);
+
+  /// The list the docked player shows, with the current row taken from the session's LIVE index
+  /// (the owner's latest report), not from when the list was fetched.
+  const remoteCurrentIndex = accountSession ? (accountSession.current_index ?? -1) : -1;
+  const remoteQueueView = useMemo(
+    () => remoteQueue.map((row) => (row._remoteCurrent === (row._remoteIndex === remoteCurrentIndex)
+      ? row
+      : { ...row, _remoteCurrent: row._remoteIndex === remoteCurrentIndex })),
+    [remoteQueue, remoteCurrentIndex],
+  );
 
   // Only ticks while something is actually showing live remote state, so an idle tab does no work.
   useEffect(() => {
-    if (remoteViewers === 0) return undefined;
+    if (liveRemoteViewers === 0) return undefined;
     const timer = setInterval(() => setRemoteClockTick((t) => t + 1), 500);
     return () => clearInterval(timer);
-  }, [remoteViewers]);
+  }, [liveRemoteViewers]);
 
   // ⚠ Deliberately NOT gated on this tab being idle. Playing something here is no reason to lose
   // the ability to see and drive what is playing elsewhere. The RATE adapts instead: two seconds
-  // while a remote surface is open, ten otherwise.
+  // while a remote surface is open, ten otherwise. The shared session rides the same timer — it is
+  // what says whether there is an orphan to show and when the shared queue changed.
+  sessionRefreshNowRef.current = () => { refreshRemoteSessions(); refreshAccountSession(); };
   useEffect(() => {
     if (!token || !user?.id) return undefined;
-    if (document.visibilityState === "visible") refreshRemoteSessions();
+    if (document.visibilityState === "visible") { refreshRemoteSessions(); refreshAccountSession(); }
     const timer = setInterval(() => {
-      if (document.visibilityState === "visible") refreshRemoteSessions();
-    }, remoteViewers > 0 ? 2000 : 10000);
+      if (document.visibilityState === "visible") { refreshRemoteSessions(); refreshAccountSession(); }
+    }, liveRemoteViewers > 0 ? 2000 : 10000);
     return () => clearInterval(timer);
-  }, [token, user?.id, remoteViewers, refreshRemoteSessions]);
+  }, [token, user?.id, liveRemoteViewers, remotePlaybackOn, refreshRemoteSessions, refreshAccountSession]);
+
+  // The owner republishes the shared queue after ANY change to its contents — local edits and the
+  // ones other devices sent as commands alike. Debounced, so a burst of edits is one write.
+  useEffect(() => {
+    if (!sessionClaimRef.current && sessionClaimsInFlightRef.current === 0) return undefined;
+    if (sessionQueueKey === lastPublishedKeyRef.current) return undefined;
+    const timer = setTimeout(() => publishSessionQueue(), 700);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionQueueKey]);
+
+  // The dying gasp. `pagehide`, not `beforeunload`: it also fires when a phone browser discards a
+  // tab, and it is the one a back/forward-cache restore pairs with. A restored page has no claim any
+  // more, and its next "playing" report claims again (maybeRecoverSessionClaim).
+  useEffect(() => {
+    function onPageHide() { sessionReleaseRef.current?.({ keepalive: true }); }
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, []);
+
+  // Cross-device playback switched off, or signed out: this tab stops being anyone's player.
+  useEffect(() => {
+    if (remotePlaybackOn && token) return;
+    sessionReleaseRef.current?.();
+    setAccountSession(null);
+  }, [remotePlaybackOn, token]);
 
   /// Read back quickly for a short window after acting, rather than once at a guessed delay.
   ///
@@ -2537,16 +3343,48 @@ function App() {
         method: "POST",
         body: JSON.stringify({ action: "jump", device_id: sessionId, queue_index: queueIndex }),
       });
-      // The published queue copy's current_index is now stale; force a re-fetch once the far end
-      // has had a beat to collect the command (up to its 4s poll interval), act, report the new
-      // track (which flags its queue hash stale) and re-publish — so the queue panel's highlighted
-      // row catches up. Two staggered attempts cover both a fast and a worst-case poll cycle.
-      setTimeout(() => setRemoteQueueSession(null), 1500);
-      setTimeout(() => setRemoteQueueSession(null), 5000);
+      // The highlighted row follows the shared session's current_index, which moves as soon as the
+      // far end reports its new track: re-read the session once it has had a beat to collect the
+      // command (up to its 4s poll), rather than refetching the whole queue.
+      setTimeout(() => refreshAccountSession(), 1500);
+      setTimeout(() => refreshAccountSession(), 5000);
       confirmRemoteSoon();
     } catch {
       notify("Remote playback", "That device didn't accept the command.", "ui_error");
     }
+  }
+
+  /// Remove or reorder in another session's queue. The remote queue is editable from any device
+  /// (§A1b): the owner applies the command and republishes, and the list here updates at once and is
+  /// corrected by the re-read that the new `queue_version` triggers.
+  async function remoteQueueEdit(sessionId, body, applyLocally) {
+    editRemoteQueueLocally(applyLocally);
+    try {
+      await api("/player/commands", { method: "POST", body: JSON.stringify({ ...body, device_id: sessionId }) });
+      setTimeout(() => setRemoteQueueSession(null), 5000);
+      confirmRemoteSoon();
+    } catch {
+      setRemoteQueueSession(null);
+      notify("Remote playback", "That device didn't accept the queue change.", "ui_error");
+    }
+  }
+
+  function remoteQueueRemove(sessionId, queueIndex) {
+    return remoteQueueEdit(sessionId, { action: "remove", queue_index: queueIndex },
+      (rows) => rows.filter((row) => row._remoteIndex !== queueIndex));
+  }
+
+  /// "Play next": move the row to just after the current one. `queue_to_index` has the list-move
+  /// meaning the receivers share — the slot before removal (see `moveQueueEntry`).
+  function remoteQueuePlayNext(sessionId, queueIndex, currentIndex) {
+    if (queueIndex === currentIndex || queueIndex === currentIndex + 1) return undefined;
+    const landing = queueIndex < currentIndex ? currentIndex : currentIndex + 1;
+    return remoteQueueEdit(sessionId, { action: "move", queue_index: queueIndex, queue_to_index: currentIndex + 1 },
+      (rows) => {
+        const [moving] = rows.splice(queueIndex, 1);
+        rows.splice(landing, 0, moving);
+        return rows;
+      });
   }
 
   /// Change shuffle or repeat on another session without also sending it a transport action.
@@ -2599,114 +3437,6 @@ function App() {
     }
   }
 
-  /// A cheap fingerprint of the queue and where we are in it.
-  ///
-  /// ⚠ Covers ORDER and position-in-queue, deliberately not elapsed seconds: the stored copy exists
-  /// so another device can move this queue, and only needs re-sending when the queue itself changes.
-  /// Including the playhead would re-upload it on every heartbeat, which is what the hash avoids.
-  function queueHash() {
-    const parts = [String(currentTrackIndex), String(shuffle), repeat];
-    for (const item of playerQueue) parts.push(item._episodeId || item.id);
-    const joined = parts.join("|");
-    let hash = 0;
-    for (let i = 0; i < joined.length; i++) {
-      hash = ((hash << 5) - hash + joined.charCodeAt(i)) | 0;
-    }
-    return String(hash);
-  }
-
-  /// Publish this tab's queue so another device can move it. The local queue stays authoritative —
-  /// nothing ever reads this copy back to play from.
-  function publishQueue() {
-    if (playerQueue.length === 0) return;
-    api("/player/queue", {
-      method: "POST",
-      body: JSON.stringify({ hash: queueHash(), snapshot: buildQueueSnapshot() }),
-    }).catch(() => {});
-  }
-
-  /// The queue as ids, windowed. "Play library" really does page an entire library in here while the
-  /// server caps a transfer, so send what surrounds the current position and re-base the index.
-  function buildQueueSnapshot() {
-    const MAX = 500;
-    const LOOK_BACK = 50;
-    const anchorIndex = Math.min(Math.max(currentTrackIndex, 0), Math.max(0, playerQueue.length - 1));
-    const start = Math.max(0, Math.min(anchorIndex - LOOK_BACK, Math.max(0, playerQueue.length - MAX)));
-    const slice = playerQueue.slice(start, start + MAX);
-    return {
-      version: 1,
-      items: slice.map((item) => ({
-        type: item._kind === "episode" ? "episode" : "track",
-        id: item._episodeId || item.id,
-        podcast_id: item._podcastId || null,
-      })),
-      current_index: anchorIndex - start,
-      position_seconds: Math.round(playbackControlRef.current?.position?.() || 0),
-      playing: playbackControlRef.current?.isPlaying?.() || false,
-      shuffle,
-      repeat,
-    };
-  }
-
-  /// Hand this tab's queue to another session.
-  ///
-  /// ⚠ Local playback stops only AFTER the server accepts. Every refusal arrives in this request, so
-  /// a failed transfer costs nothing — stopping first would throw the queue away to find out.
-  async function transferPlaybackTo(sessionId, deviceLabel) {
-    if (playerQueue.length === 0) return;
-    // ⚠ One snapshot builder, not two. This used to carry its own copy of the windowing arithmetic,
-    // which is exactly how the two drifted: publish kept the position and transfer sent a zero.
-    const snapshot = buildQueueSnapshot();
-    try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({ to_session_id: sessionId, autoplay: snapshot.playing, snapshot }),
-      });
-      // Playback moved: stop rather than pause, so this tab becomes the idle remote showing the
-      // device that now owns the queue.
-      reportPlayerStatus(currentTrack, "stopped");
-      playbackControlRef.current?.stop?.();
-      setPlayerQueue([]);
-      setCurrentTrack(null);
-      // ⚠ `playerOpen` deliberately STAYS true. Closing it unmounts the player, which throws away
-      // whatever form it was in — docked, fullscreen or popped out — at the exact moment the user
-      // moved the music. The view should follow the playback, not the device: the same component
-      // stays mounted and re-renders against the session that now holds the queue.
-      setPlayerOpen(true);
-      setToast({ title: "Playback moved", body: `Continues on ${result?.to_device_label || deviceLabel || "that device"}.` });
-      refreshRemoteSessions();
-    } catch (error) {
-      // The server refuses an unreachable target before anything moves, so say which device and when
-      // it was last seen rather than reporting a failure the user cannot act on.
-      const detail = parseTransferError(error);
-      notify("Playback not moved", detail, "ui_error");
-      refreshRemoteSessions();
-    }
-  }
-
-  function parseTransferError(error) {
-    try {
-      const body = JSON.parse(String(error?.message || "{}"));
-      const inner = body?.detail;
-      if (inner?.detail === "device_unreachable") {
-        const label = inner.device_label || "That device";
-        if (inner.last_seen_at) {
-          return `${label} isn't reachable. Last seen ${fmtTimeAgo(inner.last_seen_at)}.`;
-        }
-        return `${label} isn't reachable right now.`;
-      }
-    } catch { /* fall through */ }
-    return "That device didn't accept the queue.";
-  }
-
-  /// The session whose queue a pick would move: whatever is actually playing, wherever it is,
-  /// falling back to this tab.
-  function playbackSourceSession() {
-    return remoteSessions.find((r) => r.presence === "live" && r.status === "playing")
-      || remoteSessions.find((r) => r.presence === "live" && (r.status === "playing" || r.status === "paused"))
-      || remoteSessions.find((r) => r.current);
-  }
-
   function deviceDisplayName(device) {
     // The current session is named for what it IS. Repeating this machine's own name in a picker
     // reads as a duplicate row rather than as "here".
@@ -2714,15 +3444,19 @@ function App() {
     return device.device_label || "Another device";
   }
 
-  /// "Play on" rows, shared by the docked player and the idle dock so the two cannot offer different
-  /// things. Picking a device MOVES playback there from wherever it is — you are not limited to
-  /// moving this tab's own queue. Unreachable devices are listed and DISABLED with a "last seen"
-  /// line: a picker that omits a device the user owns reads as broken.
+  /// Device rows, shared by the docked player and the idle dock so the two cannot offer different
+  /// things. What moves is the account's shared session, wherever it is — owned or orphaned — so you
+  /// are not limited to moving this tab's own queue. "Play here" claims it (the server stops the old
+  /// owner); "Play on X" sends it there (`adopt_session`), and X's claim stops the old owner.
+  /// Unreachable devices are listed and DISABLED with a "last seen" line: a picker that omits a
+  /// device the user owns reads as broken.
   function deviceMenuItems() {
     if (remoteSessions.length === 0) {
       return [{ label: "No sessions signed in", disabled: true }];
     }
-    const source = playbackSourceSession();
+    const shared = accountSession;
+    const ownerId = shared?.claim_valid ? shared.owner?.session_id : null;
+    const hasSession = Boolean(sessionClaimRef.current) || (shared?.queue_length || 0) > 0;
     return remoteSessions.map((device) => {
       const label = deviceDisplayName(device);
       if (device.presence === "unreachable") {
@@ -2731,54 +3465,31 @@ function App() {
           disabled: true,
         };
       }
-      const isSource = source && device.session_id === source.session_id
-        && (device.status === "playing" || device.status === "paused");
-      if (isSource) {
+      // This session can be the recorded owner without holding the claim (a reload lost the id), and
+      // then it has to be able to take the session back.
+      const isOwner = device.session_id === ownerId && (!device.current || Boolean(sessionClaimRef.current));
+      if (isOwner) {
         return { label: `${label} — ${device.status === "playing" ? "playing" : "paused"}`, disabled: true };
+      }
+      if (device.current) {
+        return { label: "Play here", disabled: !hasSession, action: () => playSharedSessionHere() };
       }
       return {
         label: `Play on ${label}`,
-        disabled: !source,
-        action: () => movePlaybackTo(source, device),
+        disabled: !hasSession,
+        action: () => sendSharedSessionTo(device),
       };
     });
-  }
-
-  /// Move playback from any session to any other.
-  ///
-  /// When the source is this tab the queue travels with the request and local playback stops on the
-  /// 200. When it is another device the server already holds that session's published queue and tells
-  /// it to stop itself — which is what lets this tab move a phone's music to a Mac it isn't.
-  async function movePlaybackTo(source, target) {
-    if (!source || source.session_id === target.session_id) return;
-    if (source.current) {
-      await transferPlaybackTo(target.session_id, deviceDisplayName(target));
-      return;
-    }
-    try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({
-          from_session_id: source.session_id,
-          to_session_id: target.session_id,
-          autoplay: source.status === "playing",
-        }),
-      });
-      setToast({
-        title: "Playback moved",
-        body: `Now on ${result?.to_device_label || deviceDisplayName(target)}.`,
-      });
-    } catch (error) {
-      notify("Playback not moved", parseTransferError(error), "ui_error");
-    }
-    refreshRemoteSessions();
   }
 
   // Returning to a backgrounded tab should not wait out a throttled interval before noticing a
   // queue that was handed here while it was hidden.
   useEffect(() => {
     function onVisible() {
-      if (document.visibilityState === "visible") commandPollNowRef.current?.();
+      if (document.visibilityState !== "visible") return;
+      commandPollNowRef.current?.();
+      // ...and to re-read the shared session: an orphan to show, or a queue that changed meanwhile.
+      sessionRefreshNowRef.current?.();
     }
     document.addEventListener("visibilitychange", onVisible);
     return () => document.removeEventListener("visibilitychange", onVisible);
@@ -2797,11 +3508,11 @@ function App() {
         for (const cmd of cmds || []) {
           let outcome;
           try { outcome = await remoteExecRef.current?.(cmd); } catch { /* keep going */ }
-          // ⚠ The one command that may be left unacked. A handoff carries a QUEUE rather than an
-          // instruction, so acking a transient network failure would drop someone's playback with
-          // nothing to retry from. Bounded by the server's five-minute handoff expiry, after which
-          // the fetch 410s — a permanent outcome, which acks. Remove that expiry and this retries
-          // forever.
+          // ⚠ The only commands that may be left unacked: adopt_session and enqueue_* carry PLAYBACK
+          // (a session to take, items to add) rather than an instruction, so acking a transient
+          // network failure would drop it with nothing to retry from. Bounded server-side — an
+          // adopt_session expires after two minutes, and an enqueue's handoff 410s after five, a
+          // permanent outcome which acks. Remove those expiries and this retries forever.
           if (outcome === "retry") continue;
           await api(`/player/commands/${cmd.id}/ack`, { method: "POST" }).catch(() => {});
         }
@@ -2827,15 +3538,19 @@ function App() {
   /// song obviously means "put it after what I'm listening to" — starting a second, silent player
   /// here is never what was asked for.
   function forwardQueueAddition(tracks, next) {
-    if (currentTrack || !activeRemoteSession) return false;
+    if (currentTrack) return false;
     const items = (tracks || [])
       .filter((track) => track?.id || track?._episodeId)
-      .map((track) => ({
-        type: track._kind === "episode" ? "episode" : "track",
-        id: track._episodeId || track.id,
-        podcast_id: track._podcastId || null,
-      }));
+      .map(toSnapshotItem);
     if (items.length === 0) return false;
+    // An orphan is the queue on screen, so the addition goes into it — nobody is playing it to
+    // command, and it resumes with the addition wherever Play is pressed next.
+    if (orphanSession) {
+      orphanEdit({ op: next ? "insert_next" : "insert_end", items });
+      setToast({ title: next ? "Playing next" : "Queue updated", body: "Added to the paused queue." });
+      return true;
+    }
+    if (!activeRemoteSession) return false;
     enqueueOnRemote(activeRemoteSession.session_id, items, next);
     setToast({
       title: next ? "Playing next" : "Queue updated",
@@ -2853,22 +3568,18 @@ function App() {
   /// which flips `remote` to null and is why pause/skip/resume looked broken afterwards: the
   /// docked player had quietly switched from controlling the other session to controlling this
   /// tab's own, mostly-empty local queue).
+  /// ⚠ Not while an ORPHAN is on screen: nobody is playing it, so Play means play it here, and the
+  /// fresh play claims (`claimFreshSession`).
   function forwardPlayToRemote(queue, wantShuffle) {
-    if (currentTrack || !activeRemoteSession) return false;
-    // Same cap `buildQueueSnapshot` uses for an already-loaded queue (mirrors the server's
-    // HANDOFF_MAX_ITEMS) — starting fresh at index 0, there is no "look back" to preserve, so this
-    // just takes the head. A library-sized "Shuffle all" started remotely still needs to fit.
-    const MAX = 500;
+    if (currentTrack || orphanSession || !activeRemoteSession) return false;
+    // Starting fresh at index 0 there is no "look back" to preserve, so this just takes the head, up
+    // to what the shared session holds. A library-sized "Shuffle all" started remotely still fits.
     const items = queue
       .filter((track) => track?.id || track?._episodeId)
-      .slice(0, MAX)
-      .map((track) => ({
-        type: track._kind === "episode" ? "episode" : "track",
-        id: track._episodeId || track.id,
-        podcast_id: track._podcastId || null,
-      }));
+      .slice(0, SESSION_MAX_ITEMS)
+      .map(toSnapshotItem);
     if (items.length === 0) return false;
-    transferSnapshotToRemote(activeRemoteSession.session_id, {
+    playSnapshotOnRemote(activeRemoteSession, {
       version: 1,
       items,
       current_index: 0,
@@ -2876,28 +3587,28 @@ function App() {
       playing: true,
       shuffle: wantShuffle,
       repeat,
-    }, activeRemoteSession.device_label);
+    });
     return true;
   }
 
-  /// Push a freshly-built snapshot (not this tab's own queue — nothing is playing here) to another
-  /// session and have it start playing. Reuses `/player/transfer`, the same endpoint the explicit
-  /// "Play on {device}" picker uses, with `autoplay: true`; unlike `transferPlaybackTo` there is no
-  /// local playback to stop first, since this tab was only ever viewing the remote card.
-  async function transferSnapshotToRemote(sessionId, snapshot, deviceLabel) {
+  /// Have another device play a freshly built snapshot. It rides `adopt_session` with a handoff: the
+  /// target claims WITH the snapshot, which replaces the shared queue in the same write that makes it
+  /// the owner. Nothing plays locally first, so there is nothing to stop here.
+  async function playSnapshotOnRemote(device, snapshot) {
+    let result = null;
     try {
-      const result = await api("/player/transfer", {
-        method: "POST",
-        body: JSON.stringify({ to_session_id: sessionId, autoplay: true, snapshot }),
-      });
-      setToast({ title: "Now playing", body: `Playing on ${result?.to_device_label || deviceLabel || "that device"}.` });
-      setRemoteQueueSession(null);
-      refreshRemoteSessions();
-      confirmRemoteSoon();
-    } catch (error) {
-      notify("Playback not started", parseTransferError(error), "ui_error");
-      refreshRemoteSessions();
+      result = await sessionRequest("/player/session/transfer", { to_session_id: device.session_id, snapshot });
+    } catch {
+      result = null;
     }
+    if (result?.ok) {
+      setToast({ title: "Now playing", body: `Playing on ${result.data?.to_device_label || deviceDisplayName(device)}.` });
+      confirmRemoteSoon();
+    } else {
+      notify("Playback not started", sessionTransferError(result, device), "ui_error");
+    }
+    refreshRemoteSessions();
+    refreshAccountSession();
   }
 
   function addTracksToPlayerQueue(tracks) {
@@ -2908,9 +3619,12 @@ function App() {
     setPlayerQueue((current) => [...current, ...playable]);
     setPlayerOpen(true);
     if (nothingPlaying) {
-      // Nothing is playing yet — start the first added track instead of sitting idle.
+      // Nothing is playing yet — start the first added track instead of sitting idle. That is a
+      // fresh play, so it claims the shared session like one.
+      const queue = [...playerQueue, ...playable];
+      claimFreshSession(queue, playerQueue.length);
       setQueueOpen(false);
-      loadPlayerTrack(playable[0]);
+      loadPlayerTrack(playable[0], queue);
     } else {
       setToast({ title: "Queue updated", body: `${playable.length} track${playable.length === 1 ? "" : "s"} added locally.` });
     }
@@ -2941,7 +3655,10 @@ function App() {
     });
   }
 
-  async function loadPlayerTrack(track) {
+  /// `queue` is the queue the track is being played FROM, for a caller that has just replaced it
+  /// and cannot wait for the state to land. Reference first, like `currentTrackIndex`, so a queue
+  /// holding the same track twice reports the occurrence actually playing.
+  async function loadPlayerTrack(track, queue = playerQueue) {
     if (!track?.id) return;
     try {
       setAudioUrl(trackStreamUrl(track, token));
@@ -2949,7 +3666,9 @@ function App() {
       // Podcast episodes track their own per-user resume position (see the resume effect)
       // and don't log a track play; library tracks record a play.
       if (track._kind !== "episode") recordPlay(track.id);
-      reportPlayerStatus(track, "playing", { queue_length: playerQueue.length || 1, current_index: Math.max(0, playerQueue.findIndex((queuedTrack) => queuedTrack.id === track.id)) });
+      const byReference = queue.indexOf(track);
+      const index = byReference >= 0 ? byReference : queue.findIndex((queuedTrack) => queuedTrack.id === track.id);
+      reportPlayerStatus(track, "playing", { queue_length: queue.length || 1, current_index: Math.max(0, index) });
     } catch (playError) {
       notify("Playback failed", playError.message, "ui_error");
     }
@@ -2969,6 +3688,20 @@ function App() {
   function reportPlayerStatus(track = currentTrack, status = "stopped", details = {}) {
     if (!user?.id) return;
     const isEpisode = track?._kind === "episode";
+    // The owner reports with its claim, and its index RE-BASED onto the window it published, so
+    // `current_index` always addresses the shared queue (§A1b).
+    const claim = remotePlaybackOn ? sessionClaimRef.current : null;
+    let queueLength = details.queue_length ?? playerQueue.length;
+    let currentIndex = details.current_index ?? Math.max(0, currentTrackIndex);
+    if (claim) {
+      const relative = currentIndex - claim.start;
+      if ((relative < 0 || relative >= claim.length) && playerQueue.length > 0) {
+        // Played past the edge of the published window: publish a new one around here.
+        publishSessionQueue({ force: true });
+      }
+      currentIndex = Math.min(Math.max(relative, 0), Math.max(0, claim.length - 1));
+      queueLength = claim.length;
+    }
     api("/player/status", {
       method: "POST",
       body: JSON.stringify({
@@ -2978,22 +3711,23 @@ function App() {
         artist: track?._artist || null,
         album: track?._album || null,
         status,
-        queue_length: details.queue_length ?? playerQueue.length,
-        current_index: details.current_index ?? Math.max(0, currentTrackIndex),
+        queue_length: queueLength,
+        current_index: currentIndex,
         position_seconds: details.position_seconds ?? null,
         duration_seconds: details.duration_seconds ?? null,
         shuffle,
         repeat,
         client: "web",
-        queue_hash: queueHash(),
+        ...(claim ? { claim_id: claim.id } : {}),
       }),
     })
       .then((reply) => {
-        // The server only asks when its stored copy disagrees with the hash we sent, so an unchanged
-        // queue is never re-uploaded however long it plays.
-        if (reply?.queue_stale) publishQueue();
+        // Another device claimed the session: stop, and follow it. Ignored for a claim this tab has
+        // since replaced itself (handleSessionClaimLost).
+        if (claim && reply?.claim_lost) handleSessionClaimLost(claim.id);
       })
       .catch(() => {});
+    if (status === "playing" && !claim) maybeRecoverSessionClaim();
     if (isEpisode && details.position_seconds != null) {
       reportEpisodeProgress(track, details.position_seconds, details.duration_seconds);
     }
@@ -3092,48 +3826,68 @@ function App() {
   // Task Queue selection is LOCAL UI state — toggling a checkbox never touches the backend.
   // It only decides what gets sent when "Run selected" is clicked, keeping selection
   // independent from what is actually running/downloading.
-  const [selectedApprovalIds, setSelectedApprovalIds] = useState(() => new Set());
-  const knownApprovalIdsRef = useRef(new Set());
+  //
+  // ⚠️ Selection is kept PER TAB (the user's choice, 2026-09-22): Review, Issues and Changes each
+  // remember their own set, and Approve/Reject only ever read the VISIBLE tab's set. A single
+  // global set let ticks made on one tab ride along with an approve on another.
+  const [queueBucket, setQueueBucket] = useState("review");
+  const [queueSelection, setQueueSelection] = useState(emptyQueueSelection);
+  const knownApprovalKeysRef = useRef(new Set());
+  const queueSource = hasPermission(user, "approvals:manage") ? approvals : requests;
 
-  // Reconcile local selection whenever the approvals list refreshes (polled ~2.5s):
-  //  - newly-appeared items seed from the server's default `selected` (fresh candidates come in
-  //    checked, preserving the old auto-select behaviour),
-  //  - ids that vanished (search finished/moved, item rejected/completed) are dropped,
-  //  - the user's own local toggles on still-present items are preserved.
+  // Reconcile local selection whenever the queue refreshes (polled ~2.5s), per tab:
+  //  - an item newly seen in a tab seeds from the server's default `selected` (fresh candidates
+  //    come in checked),
+  //  - ids that left the tab (search finished, rejected, completed, moved to Issues) are dropped,
+  //  - the user's own toggles on still-present items are preserved.
+  // It reconciles against the list the Task Queue actually renders: GET /approvals for a full
+  // approver, GET /requests otherwise. Reconciling against /approvals alone emptied a
+  // wishlist:approve_all holder's selection on every poll, because /approvals is empty for them.
   useEffect(() => {
-    const currentIds = new Set();
-    const seeds = [];
-    for (const batch of approvals) {
+    const current = { review: new Set(), issues: new Set(), changes: new Set() };
+    const seeds = { review: [], issues: [], changes: [] };
+    const keys = new Set();
+    for (const batch of queueSource) {
+      const ids = current[batch.bucket];
+      if (!ids) continue;
       for (const item of batch.items) {
-        currentIds.add(item.id);
-        if (!knownApprovalIdsRef.current.has(item.id) && item.selected) seeds.push(item.id);
+        ids.add(item.id);
+        const key = `${batch.bucket}:${item.id}`;
+        keys.add(key);
+        if (!knownApprovalKeysRef.current.has(key) && item.selected) seeds[batch.bucket].push(item.id);
       }
     }
-    setSelectedApprovalIds((prev) => {
-      const next = new Set();
-      let changed = false;
-      for (const id of prev) { if (currentIds.has(id)) next.add(id); else changed = true; }
-      for (const id of seeds) { if (!next.has(id)) { next.add(id); changed = true; } }
-      return changed ? next : prev;
+    setQueueSelection((prev) => {
+      let anyChanged = false;
+      const out = {};
+      for (const bucket of Object.keys(current)) {
+        const next = new Set();
+        let changed = false;
+        for (const id of prev[bucket]) { if (current[bucket].has(id)) next.add(id); else changed = true; }
+        for (const id of seeds[bucket]) { if (!next.has(id)) { next.add(id); changed = true; } }
+        out[bucket] = changed ? next : prev[bucket];
+        anyChanged = anyChanged || changed;
+      }
+      return anyChanged ? out : prev;
     });
-    knownApprovalIdsRef.current = currentIds;
-  }, [approvals]);
+    knownApprovalKeysRef.current = keys;
+  }, [queueSource]);
 
-  function toggleApprovalItems(itemIds, selected) {
-    setSelectedApprovalIds((prev) => {
-      const next = new Set(prev);
+  function toggleApprovalItems(bucket, itemIds, selected) {
+    setQueueSelection((prev) => {
+      const next = new Set(prev[bucket]);
       for (const id of itemIds) { if (selected) next.add(id); else next.delete(id); }
-      return next;
+      return { ...prev, [bucket]: next };
     });
   }
 
   // Candidate picker: choose exactly one file among a track's alternates (local only).
-  function selectOnlyApprovalItem(siblingIds, itemId) {
-    setSelectedApprovalIds((prev) => {
-      const next = new Set(prev);
+  function selectOnlyApprovalItem(bucket, siblingIds, itemId) {
+    setQueueSelection((prev) => {
+      const next = new Set(prev[bucket]);
       for (const id of siblingIds) next.delete(id);
       next.add(itemId);
-      return next;
+      return { ...prev, [bucket]: next };
     });
   }
 
@@ -3149,52 +3903,55 @@ function App() {
     }
   }
 
-  async function approveItems(items) {
+  // `viaRequests`: a wishlist:approve_all holder without approvals:manage can't call
+  // `/approvals/{id}/approve` (admin-only) -- they approve through `/requests/{id}/approve`
+  // instead, which is scoped server-side to download_review batches.
+  //
+  // ⚠️ No `/selection` call first: naming an id in the approve body SELECTS it server-side, and
+  // the extra round trip per batch was pure latency. Approve never silently no-ops either — it
+  // answers 409 when nothing in the selection can be approved — so report what happened.
+  async function approveItems(items, { viaRequests = false } = {}) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const batchIds = [...new Set(items.map((item) => item.batch_id))];
       const createdTasks = [];
       const itemsByBatch = groupBy(items, (item) => item.batch_id);
       for (const [batchId, batchItems] of itemsByBatch) {
-        const ids = batchItems.map((item) => item.id);
-        // Select exactly what we're running (select-only — deselections are never pushed, so a
-        // checkbox change can't cancel an already-running download), then approve those ids.
-        await api(`/approvals/${batchId}/selection`, {
-          method: "POST",
-          body: JSON.stringify({ item_ids: ids, selected: true }),
-        });
         createdTasks.push(
-          await api(`/approvals/${batchId}/approve`, {
+          await api(`/${viaRequests ? "requests" : "approvals"}/${batchId}/approve`, {
             method: "POST",
-            body: JSON.stringify({ item_ids: ids }),
+            body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
           }),
         );
       }
       setTasks((current) => createdTasks.reduce((next, task) => upsertTask(next, task), current));
-      setToast({ title: "Tasks queued", body: `${batchIds.length} change groups were sent to the task queue.` });
-      await refreshApprovals();
+      // No success pop-up (the user, 2026-09-23) — approval acts immediately and the row
+      // moving out of Review is the feedback.
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
       window.setTimeout(refreshLibrary, 3500);
     } catch (approvalError) {
-      notify("Task queue failed", approvalError.message, "ui_error");
+      notify("Approve failed", approvalError.message, "ui_error");
     } finally {
       setLoading(false);
     }
   }
 
-  async function rejectItems(items) {
+  // Remove ALWAYS implies cancel (the user, 2026-09-22), and `POST /approvals/remove` does both
+  // server-side in that order — rejecting a downloading item without cancelling first left the
+  // transfer running with nothing in the queue pointing at it.
+  async function removeApprovalItems(items) {
+    if (items.length === 0) return;
     setLoading(true);
     try {
-      const itemsByBatch = groupBy(items, (item) => item.batch_id);
-      for (const [batchId, batchItems] of itemsByBatch) {
-        await api(`/approvals/${batchId}/reject`, {
-          method: "POST",
-          body: JSON.stringify({ item_ids: batchItems.map((item) => item.id) }),
-        });
-      }
-      setToast({ title: "Changes rejected", body: "Selected items were removed from the queue." });
-      await refreshApprovals();
-    } catch (rejectError) {
-      notify("Reject failed", rejectError.message, "ui_error");
+      // No success pop-up (the user, 2026-09-23) — the two-tap arm on the button itself is the
+      // confirmation; the row leaving the tree is the result.
+      await api("/approvals/remove", {
+        method: "POST",
+        body: JSON.stringify({ item_ids: items.map((item) => item.id) }),
+      });
+      await Promise.all([refreshApprovals(), refreshRequests(), refreshWishlist()]);
+    } catch (removeError) {
+      notify("Remove failed", removeError.message, "ui_error");
     } finally {
       setLoading(false);
     }
@@ -3277,19 +4034,30 @@ function App() {
               separate remote dock, and it drifted immediately — different controls, no queue, no
               favourite, its own layout. The player takes a `remote` prop instead and reads its
               display and transport from that; the audio engine below is simply idle. */}
-          {(playerOpen || activeRemoteSession) && (
+          {(playerOpen || displayedRemote) && (
             <AudioPlayer
               headerActions={topbarUtilityActions}
-              remote={currentTrack ? null : activeRemoteSession}
-              remotePosition={activeRemoteSession ? interpolatedRemotePosition(activeRemoteSession) : 0}
-              remoteQueue={remoteQueue}
+              remote={currentTrack ? null : displayedRemote}
+              // An orphan does not move, so its position is simply where it was left. A live
+              // session's is the interpolated clock, untouched.
+              remotePosition={orphanSession
+                ? (orphanSession.position_seconds || 0)
+                : activeRemoteSession ? interpolatedRemotePosition(activeRemoteSession) : 0}
+              remoteQueue={remoteQueueView}
               onRemoteLive={(delta) => setRemoteViewers((n) => Math.max(0, n + delta))}
-              onRemoteCommand={(action, positionSeconds) =>
-                activeRemoteSession && remoteCommand(activeRemoteSession.session_id, action, positionSeconds)}
-              onRemoteMode={(mode) =>
-                activeRemoteSession && remoteMode(activeRemoteSession.session_id, mode)}
-              onRemoteQueueJump={(queueIndex) =>
-                activeRemoteSession && remoteQueueJump(activeRemoteSession.session_id, queueIndex)}
+              onRemoteCommand={remoteCommandForView}
+              onRemoteMode={(mode) => (orphanSession
+                ? orphanMode(mode)
+                : activeRemoteSession && remoteMode(activeRemoteSession.session_id, mode))}
+              onRemoteQueueJump={(queueIndex) => (orphanSession
+                ? orphanQueueJump(queueIndex)
+                : activeRemoteSession && remoteQueueJump(activeRemoteSession.session_id, queueIndex))}
+              onRemoteQueueRemove={(queueIndex) => (orphanSession
+                ? orphanQueueRemove(queueIndex)
+                : activeRemoteSession && remoteQueueRemove(activeRemoteSession.session_id, queueIndex))}
+              onRemoteQueuePlayNext={(queueIndex) => (orphanSession
+                ? orphanQueuePlayNext(queueIndex, remoteCurrentIndex)
+                : activeRemoteSession && remoteQueuePlayNext(activeRemoteSession.session_id, queueIndex, remoteCurrentIndex))}
               controlRef={playbackControlRef}
               equalizer={equalizer}
               currentTrack={currentTrack}
@@ -3324,6 +4092,9 @@ function App() {
               diagnostics={playerDiagnostics}
               onClose={() => {
                 reportPlayerStatus(currentTrack, "stopped");
+                // Closing the player leaves the session where it is, paused, for any device to
+                // resume — the claim goes, the session does not (§A1b).
+                releaseSessionClaim();
                 setPlayerOpen(false);
               }}
             />
@@ -3334,7 +4105,7 @@ function App() {
               complaint once the player moved into the topbar. Only one of the two renders at
               a time; the notification tray's outside-click ref only ever attaches to whichever
               copy is actually mounted. */}
-          {!(playerOpen || activeRemoteSession) && (
+          {!(playerOpen || displayedRemote) && (
             <div className="topbar-side topbar-side-right">{topbarUtilityActions}</div>
           )}
           {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
@@ -3380,7 +4151,7 @@ function App() {
               />
             ) : (
             <>
-            <PanelHeader page={page} queueSummary={queueSummary} displayName={user?.display_name} />
+            <PanelHeader page={page} displayName={user?.display_name} />
             {page === "Home" && (
               <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} />
             )}
@@ -3428,12 +4199,17 @@ function App() {
             {page === "Task Queue" && (
               <Approvals
                 approvals={approvals}
-                selectedIds={selectedApprovalIds}
-                onToggle={toggleApprovalItems}
-                onSelectOnly={selectOnlyApprovalItem}
+                requests={requests}
+                user={user}
+                bucket={queueBucket}
+                onBucketChange={setQueueBucket}
+                selectedIds={queueSelection[queueBucket]}
+                onToggle={(ids, selected) => toggleApprovalItems(queueBucket, ids, selected)}
+                onSelectOnly={(siblingIds, itemId) => selectOnlyApprovalItem(queueBucket, siblingIds, itemId)}
                 onApprove={approveItems}
-                onReject={rejectItems}
-                onRemove={(item) => rejectItems([item])}
+                onRemove={removeApprovalItems}
+                onCancel={cancelApprovalItems}
+                onRetry={retryApprovalItems}
               />
             )}
             {page === "Import/Add" && (
@@ -3468,6 +4244,10 @@ function App() {
                 setDark={setDark}
                 crossfadeDuration={crossfadeDuration}
                 setCrossfadeDuration={setCrossfadeDuration}
+                remotePlaybackEnabled={remotePlaybackEnabled}
+                setRemotePlaybackEnabled={setRemotePlaybackEnabled}
+                claimTimeoutMinutes={claimTimeoutMinutes}
+                setClaimTimeoutMinutes={setClaimTimeoutMinutes}
                 equalizer={equalizer}
                 setEqualizer={setEqualizer}
                 onSaveSearchThreshold={saveSearchThreshold}
@@ -3497,7 +4277,9 @@ function App() {
               <WishlistWorkspace
                 user={user}
                 wishlist={wishlist}
-                approvals={wishlistApprovals}
+                wishlistQueue={wishlistQueue}
+                tab={wishlistTab}
+                onTabChange={setWishlistTab}
                 onSearch={searchDiscover}
                 onFetchTracks={fetchDiscoverAlbumTracks}
                 onQueue={queueDiscoverDownloads}
@@ -3505,20 +4287,13 @@ function App() {
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onRemoveMany={removeWishlistItems}
-                onSubmit={submitWishlistApprovals}
+                onCancel={cancelWishlistRequests}
+                onRequestAgain={requestWishlistItemAgain}
                 onSearchAlbums={searchImportAlbums}
                 onLookupAlbum={lookupImportAlbum}
                 onInspectorActionsChange={setWishlistInspectorActions}
-              />
-            )}
-            {page === "Approvals" && (
-              <WishlistApprovalsView
-                wishlist={wishlist}
-                user={user}
-                onRemove={removeWishlistItem}
-                onRemoveMany={removeWishlistItems}
-                onSubmit={submitWishlistApprovals}
-                onInspectorActionsChange={setApprovalsInspectorActions}
+                onApproveQueue={approveWishlistQueueItems}
+                onRejectQueue={rejectWishlistQueueItems}
               />
             )}
             {page === "Playlists" && (
@@ -3573,7 +4348,7 @@ function App() {
                 onInitialPodcastConsumed={() => setPodcastOpenRequest(null)}
               />
             )}
-            {!["Home", "Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Approvals", "Playlists", "Podcasts", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
+            {!["Home", "Library", "Task Queue", "Import/Add", "Activity", "Settings", "Tools", "Wishlist", "Playlists", "Podcasts", "Users", "Automations"].includes(page) && <Placeholder page={page} />}
             </>
             )}
           </section>
@@ -3589,10 +4364,10 @@ function App() {
             importFiles={importFiles}
             importDownloadRequests={importDownloadRequests}
             approvals={approvals}
+            requests={requests}
             wishlist={wishlist}
             playlists={playlists}
-            queueItemCount={queueItemCount}
-            queueSelectionCount={queueSelectionCount}
+            queueSelectionCount={queueSelection[queueBucket].size}
             tasks={tasks}
             downloadProgress={downloadProgressSummary(approvals)}
             importActions={{
@@ -3618,7 +4393,6 @@ function App() {
                   !(pendingPlaylistName && pendingPlaylistOriginalTracks && pendingPlaylistOriginalTracks.length > 0)),
             }}
             wishlistActions={wishlistInspectorActions}
-            approvalsActions={approvalsInspectorActions}
             playlistActions={playlistInspectorActions}
             podcastActions={podcastInspectorActions}
             mappingSyncStats={mappingSyncStats}
@@ -3769,8 +4543,8 @@ function TrayItem({ title, body, tone = "normal" }) {
   );
 }
 
-function PanelHeader({ page, queueSummary, displayName }) {
-  const description = page === "Task Queue" ? queueSummary : pageDescriptions[page];
+function PanelHeader({ page, displayName }) {
+  const description = pageDescriptions[page];
   let heading = page;
   if (page === "Home") {
     const hour = new Date().getHours();
@@ -5214,35 +5988,234 @@ function RemoveChoice({ title, onChoose, onCancel }) {
   );
 }
 
-function Approvals({ approvals, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
-  const groups = useMemo(() => groupApprovalBatches(approvals), [approvals]);
+// Review / Issues / Changes, matching the iOS app exactly. The server decides which bucket each
+// batch is in (`ProposalBatchOut.bucket`) — the client only filters, so the two clients can never
+// disagree about where something lives.
+//
+// ⚠️ In-progress work deliberately stays in the bucket it belongs to rather than moving to an
+// "active" tab. A download that is running is still the thing you were reviewing, and pulling it
+// out to watch it is what made the old flow feel like chasing work between screens.
+const QUEUE_BUCKETS = [
+  { id: "review", label: "Review", empty: ["Nothing to review", "Requests with candidates land here, ready to approve."] },
+  { id: "issues", label: "Issues", empty: ["Nothing needs attention", "Failed or cancelled downloads appear here, with retry."] },
+  { id: "changes", label: "Changes", empty: ["No pending changes", "Metadata, artwork, imports and staged downloads land here."] },
+];
 
-  if (groups.length === 0) {
-    return <EmptyState title="No queued changes" body="Import scans, download searches, and maintenance actions will add review items here." />;
+// Stages a download row is actually DOING something in, as opposed to sitting at a gate
+// (awaiting_approval/requested) or already finished (completed/failed/rejected/canceled) — this
+// is what earns the row the orange status pill + the real progress bar. `requested` (gate 1) is
+// deliberately absent: it never reaches the Task Queue and it is not "working" either way.
+const QUEUE_WORKING_STAGES = new Set(["approved", "queued", "downloading", "retrying"]);
+
+function emptyQueueSelection() {
+  return { review: new Set(), issues: new Set(), changes: new Set() };
+}
+
+// Two presses to run a batch: the first arms the button, the second commits within a few
+// seconds. Cheaper than a confirmation dialog for something done often, but still refuses to
+// fire on one stray click. Matches the iOS ConfirmButton (Components/ConfirmButton.swift) — it
+// disarms on a timeout and whenever `resetKey` changes (selection, bucket, lock state).
+function ConfirmButton({ label, confirmLabel = "Confirm", resetKey, disabled, onConfirm, icon: Icon, variant = "primary", className = "", title }) {
+  const [armed, setArmed] = useState(false);
+  const timeoutRef = useRef(null);
+
+  useEffect(() => {
+    setArmed(false);
+    window.clearTimeout(timeoutRef.current);
+  }, [resetKey, disabled]);
+  useEffect(() => () => window.clearTimeout(timeoutRef.current), []);
+
+  function handleClick() {
+    if (armed) {
+      window.clearTimeout(timeoutRef.current);
+      setArmed(false);
+      onConfirm();
+      return;
+    }
+    setArmed(true);
+    timeoutRef.current = window.setTimeout(() => setArmed(false), 4000);
+  }
+
+  return (
+    <button
+      className={`${variant}${armed ? " action-ready" : ""}${className ? ` ${className}` : ""}`}
+      onClick={handleClick}
+      disabled={disabled}
+      title={title}
+    >
+      {Icon && <Icon size={16} />}
+      {armed ? confirmLabel : label}
+    </button>
+  );
+}
+
+// One batch as a single tab should draw it: the rows the server files in THIS bucket, their
+// ancestors for context, and the other candidates of the same track (so a failed track in Issues
+// still offers its alternates to pick from). A batch spans tabs — an album with one failed track
+// has that track in Issues and the rest still downloading in Review — so filtering whole batches
+// by `batch.bucket` put every row of the album in Issues and none of it in Review.
+function batchRowsForBucket(batch, bucket) {
+  const items = batch.items || [];
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const hasChildren = new Set(items.map((item) => item.parent_id).filter(Boolean));
+  const keep = new Set();
+  for (const item of items) {
+    if (item.bucket !== bucket || hasChildren.has(item.id)) continue;
+    keep.add(item.id);
+    if (item.parent_id) {
+      for (const sibling of items) {
+        if (sibling.parent_id === item.parent_id && !hasChildren.has(sibling.id)) keep.add(sibling.id);
+      }
+    }
+  }
+  if (keep.size === 0) return null;
+  for (const id of [...keep]) {
+    let parent = byId.get(id)?.parent_id;
+    while (parent && !keep.has(parent)) {
+      keep.add(parent);
+      parent = byId.get(parent)?.parent_id;
+    }
+  }
+  return { ...batch, items: items.filter((item) => keep.has(item.id)) };
+}
+
+function Approvals({ approvals, requests, user, bucket, onBucketChange, selectedIds, onToggle, onSelectOnly, onApprove, onRemove, onCancel, onRetry }) {
+  const isFullApprover = hasPermission(user, "approvals:manage");
+  // GET /approvals is admin-only. A wishlist:approve_all holder without approvals:manage reads
+  // the Task Queue off GET /requests instead — its is_approver branch returns the same bucketed
+  // shape for the two request flows (download_review + library_review); see
+  // CLAUDE-wip-requests-rework.md.
+  const source = isFullApprover ? approvals : requests;
+  // ⚠️ No counts on the tabs. "Review (12)" counted batches, which read as a number of things to
+  // review and was wrong often enough to mislead (the user, 2026-09-22). Do not bring it back.
+  const inBucket = useMemo(
+    () => source.map((batch) => batchRowsForBucket(batch, bucket)).filter(Boolean),
+    [source, bucket]
+  );
+  const groups = useMemo(() => groupApprovalBatches(inBucket), [inBucket]);
+  const active = QUEUE_BUCKETS.find((b) => b.id === bucket) || QUEUE_BUCKETS[0];
+
+  // Every row rendered in this tab, and the subset a "Select all" should tick: one candidate per
+  // track rather than all five alternates, matching what ApprovalNode actually draws.
+  const allItems = useMemo(() => groups.flatMap((group) => group.items), [groups]);
+  const visibleItems = useMemo(() => visibleQueueItems(groups, selectedIds), [groups, selectedIds]);
+  const selectedItems = useMemo(() => allItems.filter((item) => selectedIds.has(item.id)), [allItems, selectedIds]);
+  // Approve sends only rows that are real work AND that the server says may be approved now —
+  // never a grouping row, and never a still-searching one. A row that cannot be approved is
+  // simply skipped, so one stuck request can no longer stop the whole selection from running.
+  const approvableItems = useMemo(
+    () => selectedItems.filter((item) => isExecutableApprovalItem(item, isFullApprover)),
+    [selectedItems, isFullApprover]
+  );
+  const cancelableItems = useMemo(() => selectedItems.filter((item) => item.can_cancel), [selectedItems]);
+  const allSelected = visibleItems.length > 0 && visibleItems.every((item) => selectedIds.has(item.id));
+  // Remove's own two-tap arm resets whenever the selection it would act on changes — the same
+  // rule ConfirmButton already applies everywhere else it's used.
+  const removeResetKey = `${bucket}:${selectedItems.map((item) => item.id).sort().join(",")}`;
+
+  function toggleSelectAll() {
+    if (allSelected) onToggle(allItems.map((item) => item.id), false);
+    else onToggle(visibleItems.map((item) => item.id), true);
   }
 
   return (
     <div className="approval-tree">
-      {groups.map((group) => (
-        <ApprovalBatch key={group.id} batch={group} selectedIds={selectedIds} onToggle={onToggle} onSelectOnly={onSelectOnly} onApprove={onApprove} onReject={onReject} onRemove={onRemove} />
-      ))}
+      {/* Reuses the Wishlist/Discover segmented control rather than inventing a second one. */}
+      <div className="workspace-tabs queue-buckets">
+        {QUEUE_BUCKETS.map((b) => (
+          <button
+            key={b.id}
+            type="button"
+            className={b.id === bucket ? "active" : ""}
+            onClick={() => onBucketChange(b.id)}
+          >
+            {b.label}
+          </button>
+        ))}
+      </div>
+      {/* ⚠️ The ONLY approve/reject/cancel/remove controls that read a selection, and they read
+          this tab's selection alone (App keeps one set per tab). Batch headers carry only
+          whole-batch retry/cancel, so no button on this screen can act on a row you cannot see. */}
+      {groups.length > 0 && (
+        /* .batch-header, not .bulk-row: that one is a four-column grid shaped for a tree row. */
+        <div className="batch-header queue-actions">
+          <div className="approval-actions">
+            <button className="secondary" onClick={toggleSelectAll}>
+              {allSelected ? "Deselect all" : "Select all"}
+            </button>
+            <p>{selectedItems.length} selected</p>
+          </div>
+          <div className="approval-actions">
+            <button
+              className="secondary"
+              onClick={() => onCancel(cancelableItems)}
+              disabled={cancelableItems.length === 0}
+              title="Stop this work — the requests stay and search again"
+            >
+              <Ban size={16} />
+              Cancel
+            </button>
+            {/* Remove implies cancel — the server stops live transfers, deletes the partial
+                files, then drops the rows and any batch they emptied. No pop-up: an in-place
+                two-tap arm instead, with a fixed width so "Remove" -> "Confirm" never reflows
+                the row (the user, 2026-09-23). */}
+            <ConfirmButton
+              variant="secondary"
+              className="queue-remove-confirm"
+              icon={X}
+              label="Remove"
+              confirmLabel="Confirm"
+              resetKey={removeResetKey}
+              disabled={selectedItems.length === 0}
+              title="Cancel if running, then remove from the queue"
+              onConfirm={() => onRemove(selectedItems)}
+            />
+            {/* Approve acts immediately — no pop-up, no arm/confirm step (the user, 2026-09-23). */}
+            <button
+              className="primary"
+              onClick={() => onApprove(approvableItems, { viaRequests: !isFullApprover })}
+              disabled={approvableItems.length === 0}
+            >
+              <Check size={16} />
+              Approve selected
+            </button>
+          </div>
+        </div>
+      )}
+
+      {groups.length === 0 ? (
+        <EmptyState title={active.empty[0]} body={active.empty[1]} />
+      ) : (
+        groups.map((group) => (
+          <ApprovalBatch
+            key={group.id}
+            batch={group}
+            selectedIds={selectedIds}
+            onToggle={onToggle}
+            onSelectOnly={onSelectOnly}
+            onRemove={onRemove}
+            onCancel={onCancel}
+            onRetry={onRetry}
+          />
+        ))
+      )}
     </div>
   );
 }
 
-function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, onReject, onRemove }) {
+function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onRemove, onCancel, onRetry }) {
   const [openItems, setOpenItems] = useState(() => new Set(batch.items.filter((item) => !item.parent_id).map((item) => item.id)));
-  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Set());
+  // parent item id → the id of the candidate row whose button opened the picker.
+  const [openCandidatePickers, setOpenCandidatePickers] = useState(() => new Map());
   const tree = useMemo(() => buildItemTree(batch.items), [batch.items]);
-  const itemById = useMemo(() => new Map(batch.items.map((item) => [item.id, item])), [batch.items]);
   const selectedItems = batch.items.filter((item) => selectedIds.has(item.id));
-  const selectedExecutableItems = selectedItems.filter(isExecutableApprovalItem);
-  const allSelected = batch.items.length > 0 && batch.items.every((item) => selectedIds.has(item.id));
-  const locked = batch.status === "executing";
-  // Only the SELECTED items gate the Run button — a still-searching row you haven't picked
-  // shouldn't block running the ones you have.
-  const selectedSearching = selectedItems.some(isCandidateSearchItem);
-  const runDisabled = locked || selectedExecutableItems.length === 0 || selectedSearching;
+  const groupVisibleItems = useMemo(() => visibleQueueItems([batch], selectedIds), [batch, selectedIds]);
+  const allSelected = groupVisibleItems.length > 0 && groupVisibleItems.every((item) => selectedIds.has(item.id));
+  // Batch-wide convenience alongside the per-row actions in the tree below (ApprovalNode) —
+  // useful for "retry this whole failed album at once" without ticking every leaf. Approve,
+  // reject, cancel-selected and remove-selected all live in the tab's bulk bar instead, so that
+  // a selection made on one tab can never be acted on from another.
+  const retryableItems = useMemo(() => batch.items.filter((item) => item.can_retry), [batch.items]);
 
   const prevBatchId = useRef(null);
   useEffect(() => {
@@ -5264,18 +6237,17 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
       <div className="batch-header">
         <div>
           <h2>{batch.title}</h2>
-          <p>
-            {batch.status} · {selectedItems.length} of {batch.items.length} selected
-          </p>
+          {/* No status line and no item total: a group merges several server batches, so there is
+              no single stage to print (each row carries the server's own `status_label`), and
+              "N of M" read as a to-do count — the count the user had removed. */}
         </div>
         <div className="approval-actions">
-          <button className="secondary" onClick={() => onReject(selectedItems)} disabled={locked || selectedItems.length === 0}>
-            Reject selected
-          </button>
-          <button className="primary" onClick={() => onApprove(selectedExecutableItems)} disabled={runDisabled}>
-            <Check size={16} />
-            {locked ? "Running" : selectedSearching ? "Waiting for candidates" : "Run selected"}
-          </button>
+          {retryableItems.length > 0 && (
+            <button className="secondary" onClick={() => onRetry(retryableItems, "next_candidate")} title="Try the next candidate for everything that failed">
+              <RefreshCw size={16} />
+              Retry ({retryableItems.length})
+            </button>
+          )}
         </div>
       </div>
       <div className="bulk-row">
@@ -5283,7 +6255,9 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
           <input
             type="checkbox"
             checked={allSelected}
-            onChange={(event) => onToggle(batch.items.map((item) => item.id), event.target.checked)}
+            onChange={(event) => (event.target.checked
+              ? onToggle(groupVisibleItems.map((item) => item.id), true)
+              : onToggle(batch.items.map((item) => item.id), false))}
           />
           Select all
         </label>
@@ -5303,11 +6277,11 @@ function ApprovalBatch({ batch, selectedIds, onToggle, onSelectOnly, onApprove, 
           selectedIds={selectedIds}
           onToggle={onToggle}
           onSelectOnly={onSelectOnly}
-          onReject={onReject}
           onRemove={onRemove}
+          onCancel={onCancel}
+          onRetry={onRetry}
           openCandidatePickers={openCandidatePickers}
           setOpenCandidatePickers={setOpenCandidatePickers}
-          itemById={itemById}
           key={item.id}
         />
       ))}
@@ -5323,13 +6297,12 @@ function ApprovalNode({
   selectedIds,
   onToggle,
   onSelectOnly,
-  onReject,
   onRemove,
-  allowBranchDelete = false,
+  onCancel,
+  onRetry,
   openCandidatePickers,
   setOpenCandidatePickers,
   depth = 0,
-  itemById,
 }) {
   const children = childrenById.get(item.id) || [];
   const metadataChanges = metadataChangeRows(item);
@@ -5340,37 +6313,53 @@ function ApprovalNode({
   const siblingCandidates = leafDownloadCandidate ? siblingItems(item, childrenById).filter((sibling) => sibling.kind === item.kind && (sibling.new_value || sibling.old_value)) : [];
   const hasAlternateCandidates = siblingCandidates.length > 1;
   const siblingIds = leafDownloadCandidate ? siblingCandidates.map((sibling) => sibling.id) : descendantIds;
+  // ⚠️ Keyed by the row that OPENED the picker, not just by the parent: with a parent-only key
+  // every sibling in the group rendered the "hide" state at once, so five rows all claimed to be
+  // the open menu (the user, 2026-09-22).
   const pickerOpen = leafDownloadCandidate && hasAlternateCandidates && openCandidatePickers?.has(item.parent_id);
+  const ownsPicker = pickerOpen && openCandidatePickers?.get(item.parent_id) === item.id;
   const firstSelectedSibling = siblingCandidates.find((sibling) => selectedIds?.has(sibling.id));
   const visibleCandidateId = firstSelectedSibling?.id || siblingCandidates[0]?.id;
   const hiddenAlternateCandidate = leafDownloadCandidate && !pickerOpen && visibleCandidateId && visibleCandidateId !== item.id;
-  const statusMeta = itemStatusMeta(item);
+  // What ticking THIS row means: the rows it draws, one candidate per track rather than every
+  // alternate. Unticking drops the whole subtree, hidden alternates included, so nothing
+  // invisible can stay selected.
+  const branchIds = leafDownloadCandidate ? [item.id] : visibleBranchIds(item, childrenById, selectedIds);
+  const selectedInBranch = branchIds.filter((id) => selectedIds?.has(id)).length;
+  const checked = selectedInBranch === branchIds.length;
+  const partiallyChecked = selectedInBranch > 0 && !checked;
   // file_move / delete leaves carry old_value (from) + new_value (to) — show the move.
   const isFileMoveLeaf = (item.kind === "file_move" || item.kind === "delete") && children.length === 0 && Boolean(item.new_value);
   const hasDownloadCandidateChildren = children.some((child) => {
     const grandchildren = childrenById.get(child.id) || [];
     return child.kind === "download" && grandchildren.length === 0 && (child.new_value || child.old_value);
   });
-  const downloadProgress = item.kind === "download" && hasDownloadCandidateChildren ? downloadStatusProgressForItem(item) : null;
+  // A real bar for anything actually moving, at whatever the server says it has done. ⚠️ Reuse the
+  // podcast episode bar (`.podcast-progress`) — the standing rule is to reuse an existing style
+  // rather than invent one, and the old indeterminate `InlineProgress` was a spinner in disguise:
+  // it animated without ever saying how far along the work was.
+  const downloadProgress = QUEUE_WORKING_STAGES.has(item.stage) ? item.progress : null;
   if (hiddenAlternateCandidate) return null;
 
-  function updateChecked(checked) {
-    // Selection is local UI state (a global id set), so toggling just adds/removes ids — no
-    // per-batch grouping or backend call. Checking a candidate leaf picks only that file.
-    if (leafDownloadCandidate && checked) {
+  function updateChecked(nextChecked) {
+    // Selection is local UI state (one id set per tab), so toggling just adds/removes ids — no
+    // backend call. Checking a candidate leaf picks only that file.
+    if (leafDownloadCandidate && nextChecked) {
       onSelectOnly?.(siblingIds, item.id);
     } else {
-      onToggle?.(descendantIds, checked);
+      onToggle?.(nextChecked ? branchIds : descendantIds, nextChecked);
     }
   }
 
   return (
     <>
       <div className={`proposal-row status-${item.status}`} style={{ "--depth": depth }}>
+        {/* ⚠️ Never disabled. Every row has to be selectable — including one stuck "finding
+            candidates" and one already executing — or the only way to clear it is row by row. */}
         <input
           type="checkbox"
-          checked={selectedIds?.has(item.id) || false}
-          disabled={item.status === "executing"}
+          checked={checked}
+          ref={(node) => { if (node) node.indeterminate = partiallyChecked; }}
           onChange={(event) => updateChecked(event.target.checked)}
         />
         <button
@@ -5384,30 +6373,49 @@ function ApprovalNode({
         <span className="proposal-title-cell">
           <span className="proposal-title">{item.title}</span>
           {downloadProgress && (
-            <InlineProgress value={downloadProgress.value} label={downloadProgress.label} indeterminate={downloadProgress.indeterminate} compact />
+            <span className="queue-download-progress">
+              <span className="status-pill status-pill-waiting">{item.status_label}</span>
+              {downloadProgress.label && downloadProgress.label !== item.status_label && (
+                <small>{downloadProgress.label}</small>
+              )}
+              <div className="podcast-progress"><div className="podcast-progress-fill" style={{ width: `${Math.max(0, Math.min(100, downloadProgress.value || 0))}%` }} /></div>
+            </span>
           )}
         </span>
         <small title={isFileMoveLeaf ? `${item.old_value || "?"} → ${item.new_value || "?"}` : undefined}>
           {isFileMoveLeaf
             ? `${shortPath(item.old_value)} → ${shortPath(item.new_value)}`
-            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : statusMeta}
+            : metadataChanges.length > 0 ? `${metadataChanges.length} changes` : leafDownloadCandidate ? candidateMeta(item) : downloadProgress ? "" : item.status_label}
         </small>
-        {leafDownloadCandidate && hasAlternateCandidates && (
+        {leafDownloadCandidate && hasAlternateCandidates && (!pickerOpen || ownsPicker) && (
           <button
             className="row-icon-button"
-            onClick={() => toggleSet(setOpenCandidatePickers, item.parent_id)}
-            title={pickerOpen ? "Hide candidates" : "Choose candidate"}
+            onClick={() => toggleCandidatePicker(setOpenCandidatePickers, item.parent_id, item.id)}
+            title={ownsPicker ? "Hide candidates" : "Choose candidate"}
           >
-            <Pencil size={14} />
+            {ownsPicker ? <ChevronUp size={14} /> : <Pencil size={14} />}
           </button>
         )}
-        {allowBranchDelete && !leafDownloadCandidate && (
-          <button className="row-icon-button danger" onClick={() => onReject?.([item])} title="Delete branch and files">
-            <Trash2 size={14} />
+        {/* Cancel — stop this now, the request survives (not destructive). Retry — two of the
+            server's three modes, matching what the iOS context menu offers: the next ranked
+            candidate, or discard everything and search again. */}
+        {onCancel && item.can_cancel && (
+          <button className="row-icon-button" onClick={() => onCancel([item])} title="Cancel — the request stays and searches again">
+            <Ban size={14} />
           </button>
         )}
-        {onRemove && item.status !== "executing" && (
-          <button className="row-icon-button" onClick={() => onRemove(item)} title="Remove from queue">
+        {onRetry && item.can_retry && (
+          <>
+            <button className="row-icon-button" onClick={() => onRetry([item], "next_candidate")} title="Retry with the next candidate">
+              <RefreshCw size={14} />
+            </button>
+            <button className="row-icon-button" onClick={() => onRetry([item], "research")} title="Discard candidates and search again">
+              <Search size={14} />
+            </button>
+          </>
+        )}
+        {onRemove && (
+          <button className="row-icon-button" onClick={() => onRemove([item])} title="Cancel if running, then remove from the queue">
             <X size={14} />
           </button>
         )}
@@ -5431,14 +6439,13 @@ function ApprovalNode({
             selectedIds={selectedIds}
             onToggle={onToggle}
             onSelectOnly={onSelectOnly}
-            onReject={onReject}
             onRemove={onRemove}
-            allowBranchDelete={allowBranchDelete}
+            onCancel={onCancel}
+            onRetry={onRetry}
             openCandidatePickers={openCandidatePickers}
             setOpenCandidatePickers={setOpenCandidatePickers}
             depth={depth + 1}
-            itemById={itemById}
-            key={child.id}
+              key={child.id}
           />
         ))}
     </>
@@ -5889,14 +6896,17 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, approvals, onSearch, onFetchTracks, onQueue, apiKey,
-  onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
+  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onQueue, apiKey,
+  onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
+  onApproveQueue, onRejectQueue,
 }) {
-  const [tab, setTab] = useState("discover");
   const ownCount = useMemo(
     () => wishlist.filter((item) => item.user_id === user.id).length,
     [wishlist, user.id],
   );
+  // Gate 1 review is for a wishlist:approve_all holder or an admin only — everyone else never
+  // sees the tab exists (the user, 2026-09-23).
+  const canReviewQueue = hasPermission(user, "wishlist:approve_all");
 
   return (
     <div className="workspace-split">
@@ -5906,7 +6916,7 @@ function WishlistWorkspace({
           role="tab"
           aria-selected={tab === "discover"}
           className={tab === "discover" ? "active" : ""}
-          onClick={() => setTab("discover")}
+          onClick={() => onTabChange("discover")}
         >
           <Compass size={15} /> Discover
         </button>
@@ -5915,10 +6925,21 @@ function WishlistWorkspace({
           role="tab"
           aria-selected={tab === "requests"}
           className={tab === "requests" ? "active" : ""}
-          onClick={() => setTab("requests")}
+          onClick={() => onTabChange("requests")}
         >
           <Sparkles size={15} /> My requests{ownCount ? ` (${ownCount})` : ""}
         </button>
+        {canReviewQueue && (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === "queue"}
+            className={tab === "queue" ? "active" : ""}
+            onClick={() => onTabChange("queue")}
+          >
+            <ListChecks size={15} /> Queue{wishlistQueue.length ? ` (${wishlistQueue.length})` : ""}
+          </button>
+        )}
       </div>
       <div className="workspace-tabpanel" hidden={tab !== "discover"}>
         <DiscoverView
@@ -5933,33 +6954,35 @@ function WishlistWorkspace({
       <div className="workspace-tabpanel" hidden={tab !== "requests"}>
         <WishlistView
           wishlist={wishlist}
-          approvals={approvals}
           user={user}
           onAdd={onAdd}
           onRemove={onRemove}
           onRemoveMany={onRemoveMany}
-          onSubmit={onSubmit}
+          onCancel={onCancel}
+          onRequestAgain={onRequestAgain}
           onSearchAlbums={onSearchAlbums}
           onLookupAlbum={onLookupAlbum}
           onInspectorActionsChange={onInspectorActionsChange}
         />
       </div>
+      {canReviewQueue && (
+        <div className="workspace-tabpanel" hidden={tab !== "queue"}>
+          <WishlistQueueView items={wishlistQueue} onApprove={onApproveQueue} onReject={onRejectQueue} />
+        </div>
+      )}
     </div>
   );
 }
 
 // Personal wishlist only — always scoped to the viewer's own items, regardless of permission.
-// Other users' requests live entirely on the separate Approvals page (WishlistApprovalsView
-// below), never mixed in here, even for a wishlist:approve_all holder viewing their own list.
-function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany, onSubmit, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
+// Other users' requests live in the Task Queue's Review bucket instead (for an approver) — there
+// is no separate Approvals page any more (superseded 2026-09, see CLAUDE-wip-requests-rework.md).
+function WishlistView({ wishlist, user, onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange }) {
   const [albumSearchOpen, setAlbumSearchOpen] = useState(false);
   const [openArtists, setOpenArtists] = useState(() => new Set());
   const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const [selectedItems, setSelectedItems] = useState(() => new Set());
-  const canApproveAll = hasPermission(user, "wishlist:approve_all");
   const ownWishlist = useMemo(() => wishlist.filter((item) => item.user_id === user.id), [wishlist, user.id]);
   const tree = useMemo(() => buildWishlistTree(ownWishlist), [ownWishlist]);
-  const wantedItems = useMemo(() => ownWishlist.filter((item) => item.status === "wanted"), [ownWishlist]);
   const treeKey = useMemo(
     () => tree.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|"),
     [tree],
@@ -5968,8 +6991,7 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
   useEffect(() => {
     setOpenArtists(new Set(tree.map((artist) => artist.name)));
     setOpenAlbums(new Set(tree.flatMap((artist) => artist.albums.map((album) => `${artist.name}/${album.name}`))));
-    setSelectedItems(new Set(wantedItems.map((item) => item.id)));
-  }, [treeKey, wantedItems.length]);
+  }, [treeKey]);
 
   async function addAlbumToWishlist(album) {
     if (album.tracks?.length) {
@@ -5984,13 +7006,10 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
 
   useEffect(() => {
     onInspectorActionsChange?.({
-      selectedCount: selectedItems.size,
-      canApproveAll,
       onToggleAlbumSearch: () => setAlbumSearchOpen((value) => !value),
-      onSubmitSelected: canApproveAll ? () => onSubmit([...selectedItems], { denyUnselected: true }) : null,
     });
     return () => onInspectorActionsChange?.(null);
-  }, [selectedItems.size, canApproveAll]);
+  }, [onInspectorActionsChange]);
 
   return (
     <div className="wishlist-view">
@@ -6010,97 +7029,15 @@ function WishlistView({ wishlist, approvals, user, onAdd, onRemove, onRemoveMany
               setOpenAlbums(new Set());
             }}
           />
-          {tree.map((artist) => renderWishlistArtist(artist, 0, "", openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany))}
+          {tree.map((artist) => renderWishlistArtist(artist, 0, openArtists, setOpenArtists, openAlbums, setOpenAlbums, onRemove, onRemoveMany, onCancel, onRequestAgain))}
         </div>
       )}
     </div>
   );
 }
 
-// Other users' wishlist requests, for a wishlist:approve_all holder to review and queue for
-// download. The viewer's own items never appear here — they're on the Wishlist page instead.
-function WishlistApprovalsView({ wishlist, user, onRemove, onRemoveMany, onSubmit, onInspectorActionsChange }) {
-  const [openOwners, setOpenOwners] = useState(() => new Set());
-  const [openArtists, setOpenArtists] = useState(() => new Set());
-  const [openAlbums, setOpenAlbums] = useState(() => new Set());
-  const [selectedItems, setSelectedItems] = useState(() => new Set());
-  const othersWishlist = useMemo(() => wishlist.filter((item) => item.user_id !== user.id), [wishlist, user.id]);
-  const ownerTree = useMemo(() => buildWishlistOwnerTree(othersWishlist), [othersWishlist]);
-  const wantedItems = useMemo(() => othersWishlist.filter((item) => item.status === "wanted"), [othersWishlist]);
-  const treeKey = useMemo(
-    () => ownerTree.map((owner) => `${owner.name}:${owner.artists.map((artist) => `${artist.name}:${artist.albums.map((album) => album.name).join(",")}`).join("|")}`).join("|"),
-    [ownerTree],
-  );
-
-  useEffect(() => {
-    setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
-    setOpenArtists(new Set(ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`))));
-    setOpenAlbums(
-      new Set(
-        ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))).flatMap(
-          ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId}:${artist.name}/${album.name}`),
-        ),
-      ),
-    );
-    setSelectedItems(new Set(wantedItems.map((item) => item.id)));
-  }, [treeKey, wantedItems.length]);
-
-  useEffect(() => {
-    onInspectorActionsChange?.({
-      selectedCount: selectedItems.size,
-      onSubmitSelected: () => onSubmit([...selectedItems], { denyUnselected: true }),
-    });
-    return () => onInspectorActionsChange?.(null);
-  }, [selectedItems.size]);
-
-  return (
-    <div className="wishlist-view">
-      {othersWishlist.length === 0 ? (
-        <EmptyState title="No requests waiting" body="Other users' requests will appear here for approval." />
-      ) : (
-        <div className="tree">
-          <TreeToolbar
-            expanded={openArtists.size > 0 || openAlbums.size > 0}
-            onExpand={() => {
-              setOpenOwners(new Set(ownerTree.map((owner) => owner.id)));
-              setOpenArtists(new Set(ownerTree.flatMap((owner) => owner.artists.map((artist) => `${owner.id}:${artist.name}`))));
-              setOpenAlbums(
-                new Set(
-                  ownerTree.flatMap((owner) => owner.artists.map((artist) => ({ ownerId: owner.id, artist }))).flatMap(
-                    ({ ownerId, artist }) => artist.albums.map((album) => `${ownerId}:${artist.name}/${album.name}`),
-                  ),
-                ),
-              );
-            }}
-            onCollapse={() => {
-              setOpenOwners(new Set());
-              setOpenArtists(new Set());
-              setOpenAlbums(new Set());
-            }}
-          />
-          {ownerTree.map((owner) => (
-            <div key={owner.id}>
-              <TreeRow
-                icon={Users}
-                open={openOwners.has(owner.id)}
-                title={owner.name}
-                meta={`${owner.itemCount} items`}
-                onToggle={() => toggleSet(setOpenOwners, owner.id)}
-              />
-              {openOwners.has(owner.id) &&
-                owner.artists.map((artist) =>
-                  renderWishlistArtist(artist, 1, owner.id, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany),
-                )}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists, openAlbums, setOpenAlbums, selectedItems, setSelectedItems, onRemove, onRemoveMany) {
-  const artistId = `${prefix ? `${prefix}:` : ""}${artist.name}`;
+function renderWishlistArtist(artist, depth, openArtists, setOpenArtists, openAlbums, setOpenAlbums, onRemove, onRemoveMany, onCancel, onRequestAgain) {
+  const artistId = artist.name;
   return (
     <div key={`${depth}:${artistId}`}>
       <div className="tree-action-row library-row-actions">
@@ -6137,42 +7074,204 @@ function renderWishlistArtist(artist, depth, prefix, openArtists, setOpenArtists
               {openAlbums.has(albumId) &&
                 (album.tracks.length > 0 ? (
                   album.tracks.map((track) => (
-                    <div className={`tree-action-row library-row-actions wishlist-row${track.status === "removed" ? " removed" : ""}`} key={track.id}>
-                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistStatusLabel(track.status)} />
-                      <DownloadBranchToggle
-                        checked={selectedItems.has(track.id)}
-                        disabled={track.status !== "wanted"}
-                        onChange={(checked) => toggleWishlistItem(setSelectedItems, track.id, checked)}
-                        title="Select wishlist track"
-                      />
-                      {track.status !== "removed" && (
-                        <button className="row-icon-button" onClick={() => onRemove(track.id)} title="Remove track">
-                          <X size={15} />
-                        </button>
-                      )}
+                    <div className="tree-action-row library-row-actions wishlist-row" key={track.id}>
+                      <TreeRow depth={depth + 2} icon={FileAudio} title={track.track || "Track"} meta={wishlistItemStatusLabel(track)} />
+                      <WishlistRowActions item={track} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />
                     </div>
                   ))
                 ) : (
-                  <div className={`tree-action-row library-row-actions wishlist-row${album.request?.status === "removed" ? " removed" : ""}`}>
-                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={wishlistStatusLabel(album.request?.status || "wanted")} />
-                    {album.request && (
-                      <DownloadBranchToggle
-                        checked={selectedItems.has(album.request.id)}
-                        disabled={album.request.status !== "wanted"}
-                        onChange={(checked) => toggleWishlistItem(setSelectedItems, album.request.id, checked)}
-                        title="Select wishlist request"
-                      />
-                    )}
-                    {album.request && album.request.status !== "removed" && (
-                      <button className="row-icon-button" onClick={() => onRemove(album.request.id)} title="Remove request">
-                        <X size={15} />
-                      </button>
-                    )}
+                  <div className="tree-action-row library-row-actions wishlist-row">
+                    <TreeRow depth={depth + 2} icon={FileAudio} title={album.request?.album || "Full album"} meta={album.request ? wishlistItemStatusLabel(album.request) : ""} />
+                    {album.request && <WishlistRowActions item={album.request} onRemove={onRemove} onCancel={onCancel} onRequestAgain={onRequestAgain} />}
                   </div>
                 ))}
             </div>
           );
         })}
+    </div>
+  );
+}
+
+// Cancel (while the request is actively searching/downloading), Request again (once declined or
+// failed), Remove — never more than the two that make sense for the row's current stage.
+function WishlistRowActions({ item, onRemove, onCancel, onRequestAgain }) {
+  const active = isWishlistItemActive(item);
+  const needsRequestAgain = ["rejected", "failed"].includes(item.stage);
+  return (
+    <>
+      {active && (item.batch_id || item.stage === "searching") && (
+        <button
+          className="row-icon-button"
+          onClick={() => onCancel(item.stage === "searching"
+            ? [{ wishlist_item_id: item.id }]
+            : [{ id: item.item_id || item.id, batch_id: item.batch_id }])}
+          title={item.stage === "searching" ? "Cancel — stop searching and wait for approval again" : "Cancel — stop downloading and wait for approval again"}
+        >
+          <Ban size={15} />
+        </button>
+      )}
+      {needsRequestAgain && (
+        <button className="row-icon-button" onClick={() => onRequestAgain(item)} title="Request again">
+          <RefreshCw size={15} />
+        </button>
+      )}
+      <button className="row-icon-button" onClick={() => onRemove(item.id)} title="Remove">
+        <X size={15} />
+      </button>
+    </>
+  );
+}
+
+// Gate 1: every user's `requested` rows, grouped by who asked. One `wishlist:approve_all`
+// holder or admin reviews everyone's requests here before anything searches. Deliberately built
+// from the SAME tree pieces the Task Queue draws with (buildItemTree/ApprovalNode/TreeToolbar) —
+// reusing an existing visual style rather than inventing a second tree (the user, 2026-09-23) —
+// by shaping each `WishlistOut` row into the item shape ApprovalNode already knows how to draw:
+// a synthetic artist node, a synthetic album node under it, and the real row (kind
+// "wishlist_queue_item", so none of ApprovalNode's download-candidate/file-move branches fire)
+// as the leaf, carrying its own real id straight through for Approve/Reject.
+function groupWishlistQueueByUser(items) {
+  const byUser = new Map();
+  for (const item of items) {
+    if (!byUser.has(item.user_id)) {
+      byUser.set(item.user_id, { userId: item.user_id, ownerName: item.owner_name || "Unknown user", items: [] });
+    }
+    byUser.get(item.user_id).items.push(item);
+  }
+  return [...byUser.values()].sort((a, b) => a.ownerName.localeCompare(b.ownerName));
+}
+
+function buildWishlistQueueTree(items) {
+  const artists = new Map();
+  for (const item of items) {
+    const artistName = item.artist || "Unknown Artist";
+    const albumName = item.album || "Singles";
+    const artistId = `wq-artist:${artistName}`;
+    const albumId = `wq-album:${artistName}:${albumName}`;
+    if (!artists.has(artistId)) artists.set(artistId, { title: artistName, albums: new Map() });
+    const artist = artists.get(artistId);
+    if (!artist.albums.has(albumId)) artist.albums.set(albumId, { title: albumName, items: [] });
+    artist.albums.get(albumId).items.push(item);
+  }
+  const nodes = [];
+  for (const [artistId, artist] of artists) {
+    const albums = [...artist.albums.values()];
+    const artistCount = albums.reduce((total, album) => total + album.items.length, 0);
+    nodes.push({
+      id: artistId, parent_id: null, kind: "wishlist_group", status: "pending",
+      title: artist.title, status_label: `${artistCount} request${artistCount === 1 ? "" : "s"}`,
+    });
+    for (const [albumId, album] of artist.albums) {
+      nodes.push({
+        id: albumId, parent_id: artistId, kind: "wishlist_group", status: "pending",
+        title: album.title, status_label: `${album.items.length} request${album.items.length === 1 ? "" : "s"}`,
+      });
+      for (const item of album.items) {
+        nodes.push({ ...item, parent_id: albumId, kind: "wishlist_queue_item", status: "pending", title: item.track || "Full album" });
+      }
+    }
+  }
+  return nodes;
+}
+
+function WishlistQueueView({ items, onApprove, onReject }) {
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [openItems, setOpenItems] = useState(() => new Set());
+  const groups = useMemo(() => groupWishlistQueueByUser(items), [items]);
+  const trees = useMemo(
+    () => groups.map((group) => ({ ...group, tree: buildItemTree(buildWishlistQueueTree(group.items)) })),
+    [groups],
+  );
+  const allNodeIds = useMemo(() => trees.flatMap((group) => [...group.tree.childrenById.keys()]), [trees]);
+  const treeKey = useMemo(() => allNodeIds.slice().sort().join(","), [allNodeIds]);
+  // Default expanded, same as a fresh Task Queue batch.
+  useEffect(() => { setOpenItems(new Set(allNodeIds)); }, [treeKey]);
+
+  const realIds = useMemo(() => new Set(items.map((item) => item.id)), [items]);
+  const selectedRealIds = useMemo(() => [...selectedIds].filter((id) => realIds.has(id)), [selectedIds, realIds]);
+
+  function onToggle(ids, checked) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      ids.forEach((id) => (checked ? next.add(id) : next.delete(id)));
+      return next;
+    });
+  }
+
+  async function handleApprove() {
+    if (selectedRealIds.length === 0) return;
+    await onApprove(selectedRealIds);
+    setSelectedIds(new Set());
+  }
+
+  async function handleReject() {
+    if (selectedRealIds.length === 0) return;
+    await onReject(selectedRealIds);
+    setSelectedIds(new Set());
+  }
+
+  if (items.length === 0) {
+    return <EmptyState title="Nothing waiting" body="Requests from everyone but you land here first, before anything searches." />;
+  }
+
+  return (
+    <div className="approval-tree">
+      {/* Same bulk bar the Task Queue uses (.batch-header.queue-actions) — Approve/Reject act
+          immediately here too, no pop-up. */}
+      <div className="batch-header queue-actions">
+        <div className="approval-actions">
+          <p>{selectedRealIds.length} selected</p>
+        </div>
+        <div className="approval-actions">
+          <button className="secondary" onClick={handleReject} disabled={selectedRealIds.length === 0}>
+            <X size={16} /> Reject
+          </button>
+          <button className="primary" onClick={handleApprove} disabled={selectedRealIds.length === 0}>
+            <Check size={16} /> Approve
+          </button>
+        </div>
+      </div>
+      {trees.map((group) => {
+        const groupIds = group.items.map((item) => item.id);
+        const groupSelectedCount = groupIds.filter((id) => selectedIds.has(id)).length;
+        const allSelected = groupIds.length > 0 && groupSelectedCount === groupIds.length;
+        const groupNodeIds = [...group.tree.childrenById.keys()];
+        const groupExpanded = groupNodeIds.some((id) => openItems.has(id));
+        return (
+          <section className="batch" key={group.userId}>
+            <div className="batch-header">
+              <h2>{group.ownerName}</h2>
+            </div>
+            <div className="bulk-row">
+              <label>
+                <input type="checkbox" checked={allSelected} onChange={(event) => onToggle(groupIds, event.target.checked)} />
+                Select all
+              </label>
+              <span>{groupSelectedCount} selected</span>
+              <TreeToolbar
+                expanded={groupExpanded}
+                onExpand={() => setOpenItems((prev) => new Set([...prev, ...groupNodeIds]))}
+                onCollapse={() => setOpenItems((prev) => {
+                  const next = new Set(prev);
+                  groupNodeIds.forEach((id) => next.delete(id));
+                  return next;
+                })}
+              />
+            </div>
+            {group.tree.roots.map((root) => (
+              <ApprovalNode
+                item={root}
+                childrenById={group.tree.childrenById}
+                openItems={openItems}
+                setOpenItems={setOpenItems}
+                selectedIds={selectedIds}
+                onToggle={onToggle}
+                key={root.id}
+              />
+            ))}
+          </section>
+        );
+      })}
     </div>
   );
 }
@@ -7604,8 +8703,9 @@ function canViewPage(user, page) {
   if (page === "Library") return hasPermission(user, "library:view") || hasPermission(user, "library:edit");
   if (page === "Import/Add") return hasPermission(user, "import:run");
   if (page === "Wishlist") return hasPermission(user, "discover") || hasPermission(user, "wishlist:approve_all");
-  if (page === "Approvals") return hasPermission(user, "wishlist:approve_all");
-  if (page === "Task Queue") return hasPermission(user, "approvals:manage");
+  // wishlist:approve_all admits the Task Queue too, since Review (music requests awaiting
+  // approval) is where those requests live now -- there's no separate Approvals page any more.
+  if (page === "Task Queue") return hasPermission(user, "approvals:manage") || hasPermission(user, "wishlist:approve_all");
   if (page === "Playlists") return hasPermission(user, "playlists:manage");
   if (page === "Podcasts") return hasPermission(user, "podcasts:manage");
   if (page === "Activity") return hasPermission(user, "activity:read");
@@ -7851,7 +8951,16 @@ function TasksView({ tasks, playback, onCancel }) {
 }
 
 function ActiveWorkBar({ tasks }) {
-  const activeTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
+  // One row per kind of work: several "Processing task queue" rows said the same thing over and
+  // over. The one furthest along (running, with progress) speaks for the rest.
+  const byName = new Map();
+  for (const task of tasks.filter((current) => ["queued", "running"].includes(current.status))) {
+    const name = taskDisplayName(task);
+    const rank = (task.status === "running" ? 1 : 0) + (taskProgress(task) ? 2 : 0);
+    const existing = byName.get(name);
+    if (!existing || rank > existing.rank) byName.set(name, { task, rank });
+  }
+  const activeTasks = [...byName.values()].map((entry) => entry.task);
   if (activeTasks.length === 0) return null;
   return (
     <div className="active-work-bar">
@@ -7922,6 +9031,7 @@ function ToolsView({ tasks, appLogs, user, backups, onRun, onFix, api, notify })
   const [restoreBackupPath, setRestoreBackupPath] = useState("");
   const tools = [
     ["Scan Jellyfin", "Request Jellyfin re-scans filles.", "jellyfin-scan", "tools:manage"],
+    ["Rescan Soulseek shares", "Ask slskd to reindex its shared folders so newly imported tracks become downloadable by others.", "rescan-slskd-shares", "tools:manage"],
     ["Remap tracks", "Match Nudibranch tracks to Jellyfin item IDs if playlists are not working.", "remap-tracks", "tools:manage"],
     ["Find missing album tracks", "Compare known albums against library records and prepare download approvals.", "check-missing-tracks", "tools:manage"],
     ["Check files against database", "Find library files missing from the database and records with missing files.", "check-files", "tools:manage"],
@@ -8024,6 +9134,7 @@ function parseCronToSimple(cron) {
 
 const TOOL_OPTIONS = [
   ["Scan Jellyfin", "jellyfin-scan"],
+  ["Rescan Soulseek shares", "rescan-slskd-shares"],
   ["Remap tracks", "remap-tracks"],
   ["Find missing album tracks", "check-missing-tracks"],
   ["Check files", "check-files"],
@@ -9579,6 +10690,10 @@ function SettingsPanel({
   setDark,
   crossfadeDuration,
   setCrossfadeDuration,
+  remotePlaybackEnabled,
+  setRemotePlaybackEnabled,
+  claimTimeoutMinutes,
+  setClaimTimeoutMinutes,
   equalizer,
   setEqualizer,
   onSaveSearchThreshold,
@@ -9673,6 +10788,42 @@ function SettingsPanel({
           />
         </label>
       </section>
+      <section className="settings-section">
+        <h2>Playback</h2>
+        <label className="setting-row">
+          <span>
+            Cross-device playback
+            <small>Let this account's players hand playback between them, and show what is playing elsewhere.</small>
+          </span>
+          <button className="secondary compact" onClick={() => setRemotePlaybackEnabled((value) => !value)}>
+            {remotePlaybackEnabled ? "On" : "Off"}
+          </button>
+        </label>
+        <label className="setting-row">
+          <span>
+            Session timeout
+            <small>
+              {claimTimeoutMinutes === 0
+                ? "A paused player keeps the session until something else claims it."
+                : `A paused player keeps the session for ${claimTimeoutMinutes} minute${claimTimeoutMinutes === 1 ? "" : "s"}, then another device can take it.`}
+              {" "}Zero means never.
+            </small>
+          </span>
+          <input
+            type="number"
+            min="0"
+            max="1440"
+            step="1"
+            value={claimTimeoutMinutes}
+            disabled={!remotePlaybackEnabled}
+            onChange={(event) => {
+              const minutes = Math.round(Number(event.target.value));
+              if (!Number.isFinite(minutes)) return;
+              setClaimTimeoutMinutes(Math.max(0, Math.min(1440, minutes)));
+            }}
+          />
+        </label>
+      </section>
       <EqualizerSettings equalizer={equalizer} setEqualizer={setEqualizer} />
       {canManageSettings(user) && (
         <section className="settings-section">
@@ -9748,6 +10899,28 @@ function SettingsPanel({
         </section>
       )}
       {canManageSettings(user) && (
+        <section className="settings-section">
+          <h2>Server addresses</h2>
+          {[
+            ["server_primary_address", "Primary address"],
+            ["server_secondary_address", "Secondary address"],
+          ].map(([key, label]) => (
+            <label className="setting-row integration-row" key={key}>
+              <span>{label}</span>
+              <input
+                type="url"
+                placeholder="https://"
+                value={integrationDraft[key] || ""}
+                onChange={(event) => setIntegrationDraft((current) => ({ ...current, [key]: event.target.value }))}
+              />
+            </label>
+          ))}
+          <button className="primary compact-button" onClick={() => onSaveIntegrations(integrationDraft)}>
+            Save addresses
+          </button>
+        </section>
+      )}
+      {canManageSettings(user) && (
         <MatchTuningSettings
           api={api}
           notify={notify}
@@ -9756,10 +10929,11 @@ function SettingsPanel({
           onSaveIntegrations={onSaveIntegrations}
         />
       )}
+      {canManageSettings(user) && <SlskdReachabilitySettings api={api} notify={notify} />}
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
-        Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
+        Nudibranch {WEB_VERSION} | Made by Poplel | <a href="https://poplel.xyz" target="_blank" rel="noreferrer">poplel.xyz</a>
         {" | "}<button type="button" onClick={() => setShowAttributions(true)}>Attributions</button>
       </footer>
     </div>
@@ -9936,6 +11110,90 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
       </div>
       </>
       )}
+    </section>
+  );
+}
+
+// Soulseek listen-port reachability self-probe (Settings -> Download settings). Backend:
+// GET/POST /settings/slskd/port-check (services/slskd_reachability.py). The check runs on the
+// worker -- its identity step can take up to ~90s -- so "Check now" enqueues it and this polls
+// GET until `checking` goes false, same shape as the podcast "Check for new" button.
+function SlskdReachabilitySettings({ api, notify }) {
+  const [state, setState] = useState(null);
+  const pollRef = useRef(null);
+
+  const load = useCallback(
+    () => api("/settings/slskd/port-check").then((data) => { if (data) setState(data); return data; }).catch(() => null),
+    [api]
+  );
+
+  useEffect(() => {
+    load();
+    return () => clearInterval(pollRef.current);
+  }, [load]);
+
+  useEffect(() => {
+    if (state?.checking && !pollRef.current) {
+      pollRef.current = setInterval(() => {
+        load().then((data) => {
+          if (data && !data.checking) {
+            clearInterval(pollRef.current);
+            pollRef.current = null;
+          }
+        });
+      }, 3000);
+    }
+  }, [state?.checking, load]);
+
+  async function checkNow() {
+    try {
+      const data = await api("/settings/slskd/port-check", { method: "POST" });
+      if (data) setState(data);
+    } catch (error) {
+      notify?.("Reachability check failed", error?.message || "Could not start the Soulseek reachability check", "ui_error");
+    }
+  }
+
+  const statusLabel = { ok: "Reachable", warning: "Reachable, unconfirmed", failed: "Not reachable" }[state?.status] || "Not checked yet";
+  const statusColor = state?.status === "ok" ? "#37c871" : state?.status === "failed" ? "#ff5a5a" : "var(--muted)";
+  const checking = !!state?.checking;
+
+  return (
+    <section className="settings-section">
+      <h2>Soulseek reachability</h2>
+      <label className="setting-row">
+        <span>
+          Listen port check
+          <small>
+            {state?.public_address && state?.port ? `${state.public_address}:${state.port} — ` : ""}
+            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Confirms slskd's own port forward is reachable, end to end."}
+          </small>
+        </span>
+        <button className="secondary compact" onClick={checkNow} disabled={checking}>
+          <RefreshCw size={14} className={checking ? "spin-icon" : ""} /> {checking ? "Checking…" : "Check now"}
+        </button>
+      </label>
+      {state?.status && (
+        <label className="setting-row">
+          <span>Status</span>
+          <strong style={{ color: statusColor }}>{statusLabel}</strong>
+        </label>
+      )}
+      {(state?.steps || []).map((step) => (
+        <label className="setting-row" key={step.key}>
+          <span>
+            {step.label}
+            <small>{step.detail}</small>
+          </span>
+          {step.ok === true ? (
+            <Check size={16} style={{ color: "#37c871" }} />
+          ) : step.ok === false ? (
+            <X size={16} style={{ color: "#ff5a5a" }} />
+          ) : (
+            <Info size={16} style={{ color: "var(--muted)" }} />
+          )}
+        </label>
+      ))}
     </section>
   );
 }
@@ -10978,15 +12236,14 @@ function Inspector({
   importFiles,
   importDownloadRequests,
   approvals,
+  requests,
   wishlist,
   playlists,
-  queueItemCount,
   queueSelectionCount,
   tasks,
   downloadProgress,
   importActions,
   wishlistActions,
-  approvalsActions,
   playlistActions,
   podcastActions,
   mappingSyncStats,
@@ -11002,10 +12259,10 @@ function Inspector({
     importFiles,
     importDownloadRequests,
     approvals,
+    requests,
     wishlist,
     user,
     playlists,
-    queueItemCount,
     queueSelectionCount,
     tasks,
     mappingSyncStats,
@@ -11157,20 +12414,6 @@ function Inspector({
             <Plus size={16} />
             Add album
           </button>
-          {wishlistActions.canApproveAll && (
-            <button className="primary" onClick={wishlistActions.onSubmitSelected} disabled={wishlistActions.selectedCount === 0}>
-              <ListChecks size={16} />
-              Add selected to task queue
-            </button>
-          )}
-        </div>
-      )}
-      {page === "Approvals" && approvalsActions && (
-        <div className="inspector-actions">
-          <button className="primary" onClick={approvalsActions.onSubmitSelected} disabled={approvalsActions.selectedCount === 0}>
-            <ListChecks size={16} />
-            Add selected to task queue
-          </button>
         </div>
       )}
       {page === "Import/Add" && playlistImportActions && (
@@ -11247,7 +12490,7 @@ function Inspector({
         </div>
       )}
       <ActiveWorkBar tasks={tasks} />
-      {stats.rows.length > 0 && (
+      {(stats.rows.length > 0 || stats.summary) && (
         <div className="metadata-grid inspector-stats">
           {stats.summary && (
             <>
@@ -11273,10 +12516,10 @@ function inspectorStats({
   importFiles = [],
   importDownloadRequests = [],
   approvals = [],
+  requests = [],
   wishlist = [],
   user = null,
   playlists = [],
-  queueItemCount = 0,
   queueSelectionCount = 0,
   tasks = [],
   mappingSyncStats = null,
@@ -11291,19 +12534,17 @@ function inspectorStats({
     return { summary: `${selected} selected · ${ready} ready`, rows: musicStatRows(stats) };
   }
   if (page === "Task Queue") {
-    const stats = countApprovalMusic(approvals.filter((batch) => batch.status !== "executing"));
+    // ⚠️ Selection only. The old "N ready" (and the artist/album/track rollup beside it) counted
+    // whatever happened to be in the queue and read as a number of things to review — the count
+    // the user had removed from the tabs for being wrong (2026-09-22).
     return {
-      summary: `${queueSelectionCount} selected · ${queueItemCount} ready`,
-      rows: musicStatRows(stats),
+      summary: `${queueSelectionCount} selected`,
+      rows: [],
     };
   }
   if (page === "Wishlist") {
     const own = user ? wishlist.filter((item) => item.user_id === user.id) : wishlist;
     return { summary: "", rows: musicStatRows(countWishlistMusic(own)) };
-  }
-  if (page === "Approvals") {
-    const others = user ? wishlist.filter((item) => item.user_id !== user.id) : wishlist;
-    return { summary: "", rows: musicStatRows(countWishlistMusic(others)) };
   }
   if (page === "Playlists") {
     const stats = countPlaylistMusic(playlists);
@@ -11359,20 +12600,9 @@ function countImportMusic(files = [], requests = []) {
   return countMusicRefs(refs);
 }
 
-function countApprovalMusic(batches = [], downloadsOnly = false) {
-  const items = downloadsOnly ? visibleDownloadItems(batches) : batches.flatMap((batch) => batch.items || []);
-  const leaves = lowestLevelItems(items);
-  const actionLeaves = leaves.filter((item) => !["artist", "album"].includes(item.kind));
-  const selected = actionLeaves.filter((item) => item.selected).length;
-  const ready = actionLeaves.filter((item) => item.selected && isReadyApprovalItem(item)).length;
-  return { ...countMusicRefs(actionLeaves.map(itemMusicRef)), selected, ready };
-}
-
 function countWishlistMusic(items = []) {
   return countMusicRefs(
-    items
-      .filter((item) => item.status !== "removed")
-      .map((item) => ({ artist: item.artist, album: item.album, track: item.track || item.title })),
+    items.map((item) => ({ artist: item.artist, album: item.album, track: item.track || item.title })),
   );
 }
 
@@ -11396,36 +12626,18 @@ function countMusicRefs(refs = []) {
   return { artists: artists.size, albums: albums.size, tracks };
 }
 
-function itemMusicRef(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const request = payload.request || payload;
-  return {
-    artist: request.artist || payload.artist,
-    album: request.album || payload.album,
-    track: request.track || request.title || payload.track || payload.title || item.title,
-  };
-}
-
-function isReadyApprovalItem(item) {
-  const status = String(itemStatusMeta(item) || item.status || "").toLowerCase();
-  return ["pending", "approved"].includes(item.status) || /candidate ready|pending|approved|ready/.test(status);
-}
-
-function isExecutableApprovalItem(item) {
-  if (["executing", "completed", "rejected"].includes(item.status)) return false;
-  const payload = parseJsonObject(item.payload_json);
-  if (item.kind === "import_files") return Boolean(item.old_value && item.new_value);
-  if (item.kind === "metadata") return Boolean(payload.target_type);
-  if (["delete", "file_move", "playlist", "download", "lyrics"].includes(item.kind)) return Boolean(payload.action);
-  return false;
-}
-
-function isCandidateSearchItem(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const status = String(payload.status || item.status || "").toLowerCase();
-  if (!status) return false;
-  if (/candidate ready|review ready|ready|approved|completed|done|failed|needs attention|rejected/.test(status)) return false;
-  return /searching|preparing/.test(status) && /candidate|download|slskd|track/.test(status);
+// What "Approve selected" may send. Two server-computed flags decide it now: `actionable` (a real
+// change, not an artist/album/track grouping row) and `can_approve` (this row is at a stage where
+// approving means something — including a `staged` library_review item waiting to be added).
+//
+// `isFullApprover=false` means the caller only has wishlist:approve_all, not approvals:manage --
+// that permission's own approve route (`POST /requests/{id}/approve`) is scoped server-side to
+// download_review batches, so an item whose bucket isn't "review" must not be offered here even
+// though the flag says yes. See CLAUDE-wip-requests-rework.md "server gap".
+function isExecutableApprovalItem(item, isFullApprover = true) {
+  if (!item.actionable || !item.can_approve) return false;
+  if (!isFullApprover && item.bucket !== "review") return false;
+  return true;
 }
 
 function Toast({ title, body, onClose }) {
@@ -11693,6 +12905,8 @@ function AudioPlayer({
   onRemoteCommand,
   onRemoteMode,
   onRemoteQueueJump,
+  onRemoteQueueRemove,
+  onRemoteQueuePlayNext,
   onRemoteLive,
 }) {
   // Double-buffer: two audio elements. One is "active" (audible); the other
@@ -12632,15 +13846,23 @@ function AudioPlayer({
   }
 
   function queueList() {
-    // A remote queue is listed AND jumpable (via the "jump" command, `queue_index` into the far
-    // end's own queue) — but never reordered/removed from here: those actions (move/remove) would
-    // still appear to work locally and be contradicted by the next poll, which a plain jump is not
-    // (the far end reports its new current track, which is exactly what this view then reflects).
+    // The remote queue is the account's SHARED queue, and it is editable from any device (§A1b):
+    // jump, remove and "play next" (a move) go to the owner as commands, or to the server's copy
+    // when nobody holds it. `_remoteIndex` is each row's position in that shared queue. The owner
+    // applies the edit and republishes, so the list here is corrected by the next read.
     if (isRemote) {
       return remoteQueue
         .filter((track) => !track._remoteCurrent)
         .map((track, index) => (
-          <div className="queue-entry" key={`${track.id}:${index}`}>
+          <div
+            className="queue-entry"
+            key={`${track.id}:${index}`}
+            onContextMenu={(event) => openQueueMenu(event, [
+              onRemoteQueueJump && { label: "Play", action: () => onRemoteQueueJump(track._remoteIndex) },
+              onRemoteQueuePlayNext && { label: "Play next", action: () => onRemoteQueuePlayNext(track._remoteIndex) },
+              onRemoteQueueRemove && { label: "Remove from queue", danger: true, action: () => onRemoteQueueRemove(track._remoteIndex) },
+            ].filter(Boolean))}
+          >
             {onRemoteQueueJump ? (
               <button className="queue-play-btn" onClick={() => onRemoteQueueJump(track._remoteIndex)}>
                 <strong>{track.title}</strong>
@@ -12651,6 +13873,11 @@ function AudioPlayer({
                 <strong>{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </span>
+            )}
+            {onRemoteQueueRemove && (
+              <button className="queue-remove-btn" onClick={(e) => { e.stopPropagation(); onRemoteQueueRemove(track._remoteIndex); }} title="Remove from queue">
+                <X size={12} />
+              </button>
             )}
           </div>
         ));
@@ -13097,14 +14324,14 @@ function groupApprovalBatches(batches) {
 
     // Prune empty grouping branches for the DOWNLOAD group only: an album whose
     // candidates have all been consumed would otherwise leave its grouping rows
-    // lingering here empty. Keep only download items that are actionable themselves (have a
-    // payload action or are failed) or are ancestors of such items. Other kinds (metadata,
-    // import_files, lyrics, artwork) carry no "action" and must NOT be pruned.
+    // lingering here empty. Keep only download items the server marks `actionable` (real work,
+    // not an artist/album/track container) or failed, plus their ancestors. Other kinds
+    // (metadata, import_files, lyrics, artwork) must NOT be pruned.
     if (group.id === "type:download") {
       const byId = new Map(group.items.map((i) => [i.id, i]));
       const actionableIds = new Set(
         group.items
-          .filter((i) => Boolean(parseJsonObject(i.payload_json).action) || i.status === "failed")
+          .filter((i) => i.actionable || i.status === "failed")
           .map((i) => i.id)
       );
       const keepIds = new Set();
@@ -13137,6 +14364,60 @@ function siblingItems(item, childrenById) {
   return [item];
 }
 
+// Which rows the Task Queue actually DRAWS for these groups: every item except the alternate
+// download candidates ApprovalNode collapses behind the candidate picker. "Select all" ticks
+// exactly this, so approving a selection can never queue five copies of the same track.
+// ⚠️ The chosen sibling must be picked the same way ApprovalNode picks it (a locally selected
+// sibling first, then the first one) or Select all ticks a different row than the one on screen.
+function visibleQueueItems(groups, selectedIds) {
+  return groups.flatMap((group) => {
+    const tree = buildItemTree(group.items);
+    const hidden = new Set();
+    for (const siblings of tree.childrenById.values()) {
+      const candidates = siblings.filter(
+        (item) => item.kind === "download"
+          && (tree.childrenById.get(item.id) || []).length === 0
+          && (item.old_value || item.new_value),
+      );
+      if (candidates.length < 2) continue;
+      const chosen = candidates.find((item) => selectedIds?.has(item.id)) || candidates[0];
+      for (const candidate of candidates) if (candidate.id !== chosen.id) hidden.add(candidate.id);
+    }
+    return group.items.filter((item) => !hidden.has(item.id));
+  });
+}
+
+// The same rule for one branch: this row plus every descendant that is drawn under it.
+function visibleBranchIds(item, childrenById, selectedIds) {
+  const children = childrenById.get(item.id) || [];
+  const candidates = children.filter(
+    (child) => child.kind === "download"
+      && (childrenById.get(child.id) || []).length === 0
+      && (child.old_value || child.new_value),
+  );
+  const chosenId = candidates.length > 1
+    ? (candidates.find((child) => selectedIds?.has(child.id)) || candidates[0]).id
+    : null;
+  const ids = [item.id];
+  for (const child of children) {
+    if (chosenId && candidates.includes(child)) {
+      if (child.id === chosenId) ids.push(child.id);
+    } else {
+      ids.push(...visibleBranchIds(child, childrenById, selectedIds));
+    }
+  }
+  return ids;
+}
+
+function toggleCandidatePicker(setOpenCandidatePickers, parentId, itemId) {
+  setOpenCandidatePickers((prev) => {
+    const next = new Map(prev);
+    if (next.has(parentId)) next.delete(parentId);
+    else next.set(parentId, itemId);
+    return next;
+  });
+}
+
 function visibleDownloadItems(batches) {
   return batches.flatMap((batch) => {
     const tree = buildItemTree(batch.items);
@@ -13154,12 +14435,6 @@ function visibleDownloadItems(batches) {
   });
 }
 
-function isDownloadActionItem(item) {
-  if (item.kind !== "download") return false;
-  const payload = parseJsonObject(item.payload_json);
-  return ["queue_download", "queue_ytdlp_download", "wishlist_request"].includes(payload.action);
-}
-
 function lowestLevelItems(items) {
   const parentIds = new Set(items.map((item) => item.parent_id).filter(Boolean));
   return items.filter((item) => !parentIds.has(item.id));
@@ -13173,26 +14448,30 @@ function shortPath(value) {
   return parts.slice(-2).join("/") || String(value);
 }
 
+// Candidate subtitle. Size and duration come straight off the typed `candidate` object now —
+// they always existed server-side and were dropped before reaching the UI, which is exactly the
+// information a human needs to sanity-check a match the ranker got wrong.
 function candidateMeta(item) {
-  const status = itemStatusMeta(item);
+  const c = item.candidate;
   const source = item.new_value ? ` · ${item.new_value}` : "";
-  if (["working", "done", "needs attention", "pending"].includes(status)) return `candidate${source}`;
-  return `${status}${source}`;
+  if (!c) return `${item.status_label}${source}`;
+  const parts = [];
+  if (c.confidence != null) parts.push(`${c.confidence}% match`);
+  if (c.same_album_folder) parts.push("same album folder");
+  if (c.format) parts.push(c.format);
+  if (c.size_bytes) parts.push(formatBytes(c.size_bytes));
+  // NOTE: the existing formatDuration takes MILLISECONDS, and the candidate carries seconds.
+  if (c.duration_seconds) parts.push(formatDuration(c.duration_seconds * 1000));
+  if (c.username) parts.push(c.username);
+  return parts.join(" · ");
 }
 
-function itemStatusMeta(item) {
-  const payload = parseJsonObject(item.payload_json);
-  if (payload.status) return payload.status;
-  if (item.status === "executing") return "working";
-  if (item.status === "completed") return "done";
-  if (item.status === "failed") return "needs attention";
-  if (item.status === "rejected") return "rejected";
-  return item.kind;
-}
-
+// The inspector's Downloads card: one bar across everything the download gate has approved and is
+// now working through. Every branch reads the server's `stage` — a client must never pattern-match
+// a status string again (that is how four status vocabularies grew; see queue_state.py).
 function downloadProgressSummary(approvals) {
-  const batches = approvals.filter((batch) => batch.kind === "download" && batch.tree_path === "/downloads");
-  const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && isDownloadActionItem(item));
+  const batches = approvals.filter((batch) => batch.flow === "download_review" && batch.status !== "pending");
+  const leaves = lowestLevelItems(visibleDownloadItems(batches)).filter((item) => item.selected && item.actionable);
   if (leaves.length === 0) return null;
   let downloading = 0;
   let retried = 0;
@@ -13206,43 +14485,35 @@ function downloadProgressSummary(approvals) {
   let verified = 0;
   let partial = 0;
   for (const item of leaves) {
-    const status = itemStatusMeta(item);
-    const lower = String(status || "").toLowerCase();
-    const payload = parseJsonObject(item.payload_json);
-    const structuredProgress = downloadStatusProgressForItem(item);
-    const hasRetried = /retry|retried|replacement|stalled/.test(lower) || (payload.failed_candidates || []).length > 0;
-    if (hasRetried) retried += 1;
-    if (item.status === "failed" || /need attention|failed|mismatch|could not be verified/.test(lower)) {
+    const stage = item.stage;
+    if (stage === "retrying" || (item.failure?.tried_candidates || 0) > 0) retried += 1;
+    if (stage === "failed" || stage === "canceled") {
       failed += 1;
-      continue;
-    }
-    if (item.status === "completed" || /verified|importing/.test(lower)) {
+    } else if (stage === "completed" || stage === "importing") {
       finished += 1;
       verified += 1;
       partial += 100;
-      continue;
-    }
-    if (/downloaded|staged|verifying/.test(lower)) {
+    } else if (stage === "staged") {
       finished += 1;
-      if (/verifying/.test(lower)) verifying += 1;
       partial += 100;
-      continue;
-    }
-    if (/candidate ready|candidate|pending/.test(lower) || item.status === "pending" || item.status === "approved") {
+    } else if (stage === "verifying") {
+      finished += 1;
+      verifying += 1;
+      partial += 100;
+    } else if (stage === "staging") {
+      staging += 1;
+      partial += item.progress.indeterminate ? 0 : item.progress.value;
+    } else if (stage === "downloading") {
+      downloading += 1;
+      partial += item.progress.indeterminate ? 0 : item.progress.value;
+    } else if (stage === "queued" || stage === "retrying") {
+      queued += 1;
+    } else if (stage === "searching") {
+      waiting += 1;
+    } else {
+      // waiting / awaiting_approval / approved: chosen, nothing started.
       selected += 1;
-      continue;
     }
-    const progress = structuredProgress || downloadStatusProgress(status);
-    if (progress) {
-      if (progress.stage === "downloading" || /downloading\s+\d+(?:\.\d+)?%/.test(lower)) downloading += 1;
-      else if (["staging", "transferring", "importing"].includes(progress.stage)) staging += 1;
-      else if (progress.stage === "verifying") verifying += 1;
-      else if (progress.stage === "queued") queued += 1;
-      else waiting += 1;
-      partial += progress.indeterminate ? 0 : progress.value;
-      continue;
-    }
-    selected += 1;
   }
   const total = leaves.length;
   if (verified === total && failed === 0) return null;
@@ -13268,42 +14539,6 @@ function downloadProgressSummary(approvals) {
     indeterminate: !notStarted && downloading > 0 && partial === 0,
     label,
     detail: `${queued} queued · ${downloading} downloading · ${staging} staging · ${retried} retried · ${finished} finished · ${failed} failed`,
-  };
-}
-
-function downloadStatusProgress(status) {
-  if (!status) return null;
-  const text = String(status);
-  const match = text.match(/downloading\s+(\d+(?:\.\d+)?)%/i);
-  if (match) {
-    return { value: Number(match[1]), label: text, indeterminate: false };
-  }
-  if (/verifying with musicbrainz/i.test(text)) {
-    return { value: 0, label: text, indeterminate: true };
-  }
-  if (/downloaded|staged|verified|importing/i.test(text)) {
-    return { value: 100, label: text, indeterminate: false };
-  }
-  const ratio = text.match(/(?:downloading|verifying)\s+(\d+(?:\.\d+)?)%/i);
-  if (ratio) {
-    return { value: Number(ratio[1]), label: text, indeterminate: false };
-  }
-  if (/download initialized|download queued|moving completed file|checking slskd|searching for slskd|slskd .*queued|slskd .*remote|reports complete/i.test(text)) {
-    return { value: 0, label: text, indeterminate: false };
-  }
-  return null;
-}
-
-function downloadStatusProgressForItem(item) {
-  const payload = parseJsonObject(item.payload_json);
-  const progress = payload.download_progress;
-  if (!progress || typeof progress !== "object") return downloadStatusProgress(payload.status);
-  const value = Number(progress.value ?? progress.progress ?? 0);
-  return {
-    value: Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 0,
-    label: progress.label || payload.status || itemStatusMeta(item),
-    indeterminate: Boolean(progress.indeterminate),
-    stage: progress.stage || "queued",
   };
 }
 
@@ -13833,7 +15068,6 @@ function groupRequestedAlbums(albums) {
 function buildWishlistTree(items) {
   const artistMap = new Map();
   items.forEach((item) => {
-    if (item.status === "removed") return;
     const artistName = item.artist || "Unknown Artist";
     const albumName = item.album || "Singles";
     if (!artistMap.has(artistName)) {
@@ -13868,40 +15102,29 @@ function buildWishlistTree(items) {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function buildWishlistOwnerTree(items) {
-  const ownerMap = new Map();
-  items.forEach((item) => {
-    if (item.status === "removed") return;
-    const ownerId = item.user_id || "unknown";
-    if (!ownerMap.has(ownerId)) {
-      ownerMap.set(ownerId, { id: ownerId, name: item.owner_name || "Unknown User", items: [] });
-    }
-    ownerMap.get(ownerId).items.push(item);
-  });
-  return [...ownerMap.values()]
-    .map((owner) => ({
-      ...owner,
-      itemCount: owner.items.length,
-      artists: buildWishlistTree(owner.items),
-    }))
-    .filter((owner) => owner.itemCount > 0)
-    .sort((a, b) => a.name.localeCompare(b.name));
+// `WishlistOut.status_label` is the only status vocabulary. The old local map (six strings that
+// disagreed with the server's own) is gone with the legacy `status` field — read `stage` when you
+// need to branch, and render `status_label` when you need words.
+function wishlistItemStatusLabel(item) {
+  return item.status_label;
 }
 
-function wishlistStatusLabel(status) {
-  if (status === "downloading") return "Downloading…";
-  if (status === "approved") return "Awaiting Download";
-  if (status === "completed") return "Completed";
-  if (status === "rejected") return "Rejected";
-  if (status === "review" || status === "wanted") return "Awaiting Approval";
-  if (status === "removed") return "Removed";
-  return status || "Awaiting Approval";
+// Stages where the linked download batch is doing something a Cancel would actually stop —
+// exactly the server's cancelable set (2026-09-23 contract). Gate 1 ("requested"), a gate
+// waiting on a human ("awaiting_approval"/"staged"), staging/verifying, declined, failed,
+// completed and removed rows all have nothing a Cancel would do, so they're deliberately absent.
+const ACTIVE_WISHLIST_STAGES = new Set([
+  "searching", "approved", "queued", "downloading", "retrying",
+]);
+
+function isWishlistItemActive(item) {
+  return ACTIVE_WISHLIST_STAGES.has(item.stage);
 }
 
 function wishlistAlbumMeta(album) {
   const count = album.tracks.length || (album.request ? 1 : 0);
   const statuses = new Set(
-    [...album.tracks.map((track) => track.status), album.request?.status].filter(Boolean).map(wishlistStatusLabel),
+    [...album.tracks, album.request].filter(Boolean).map(wishlistItemStatusLabel),
   );
   const label = count === 1 ? "request" : "requests";
   return `${count} ${label}${statuses.size ? ` · ${[...statuses].join(", ")}` : ""}`;
@@ -13912,15 +15135,6 @@ function toggleSet(setter, value) {
     const next = new Set(current);
     if (next.has(value)) next.delete(value);
     else next.add(value);
-    return next;
-  });
-}
-
-function toggleWishlistItem(setter, id, checked) {
-  setter((current) => {
-    const next = new Set(current);
-    if (checked) next.add(id);
-    else next.delete(id);
     return next;
   });
 }
