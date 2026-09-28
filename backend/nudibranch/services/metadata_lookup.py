@@ -184,7 +184,7 @@ def discover_music(query: str, type: str = "all") -> dict:
                     artist,
                     {
                         "id": track.get("album_id"),
-                        "title": track.get("album") or "Singles",
+                        "title": track.get("album") or track.get("title") or "Unknown Album",
                         "artist": track.get("artist") or artist.get("name"),
                         "artist_id": artist.get("id"),
                         "tracks": [track],

@@ -4342,8 +4342,8 @@ def _spotify_embed_fetch(playlist_id: str) -> dict | None:
     credentials are configured this is how we get the FULL track list — the rendered embed and the
     spotifyscraper library only expose ~20-30 of the tracks, while the embed's embedded JSON carries
     them all. The embed caps very large playlists at ~100 tracks and carries no album name (title +
-    artist only), which is fine here: 'songs' mode groups under Singles and 'albums' mode resolves
-    albums via MusicBrainz. Returns None on any failure so the caller can fall through.
+    artist only), which is fine here: 'songs' mode files each song as its own single and 'albums'
+    mode resolves albums via MusicBrainz. Returns None on any failure so the caller can fall through.
     """
     import json as _json
     import re as _re

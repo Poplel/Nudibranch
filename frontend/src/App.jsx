@@ -1879,13 +1879,7 @@ function App() {
       }
 
       if (mode === "songs") {
-        const incoming = tracks.map((t) => {
-          // When Spotify returns the track's own name as the album (single release),
-          // strip the album so it groups under "Singles" instead of creating a
-          // redundant artist → "Track Name" album → "Track Name" track hierarchy.
-          const album = t.album && normalizeName(t.album) !== normalizeName(t.title) ? t.album : "";
-          return { artist: t.artist, album, track: t.title, playlist_name: playlistName };
-        });
+        const incoming = tracks.map((t) => ({ artist: t.artist, album: t.album || t.title, track: t.title, playlist_name: playlistName }));
         addToTree(incoming);
         setPendingPlaylistName(playlistName);
         setPendingPlaylistOriginalTracks(originalTracks);
@@ -7145,7 +7139,7 @@ function buildWishlistQueueTree(items) {
   const artists = new Map();
   for (const item of items) {
     const artistName = item.artist || "Unknown Artist";
-    const albumName = item.album || "Singles";
+    const albumName = item.album || item.track || "Unknown Album";
     const artistId = `wq-artist:${artistName}`;
     const albumId = `wq-album:${artistName}:${albumName}`;
     if (!artists.has(artistId)) artists.set(artistId, { title: artistName, albums: new Map() });
@@ -8842,7 +8836,7 @@ function manualAlbumsFromDownloadRequests(requests = []) {
   const albumMap = new Map();
   requests.forEach((request, index) => {
     const artist = request.artist || "Unknown Artist";
-    const album = request.album || "Singles";
+    const album = request.album || request.track || request.title || "Unknown Album";
     const key = albumRecordKey(artist, album);
     if (!albumMap.has(key)) {
       albumMap.set(key, { id: `seed:${key}`, artist, name: album, tracks: [], playlistName: request.playlist_name || null });
@@ -8887,7 +8881,7 @@ function selectedSlotIdsForRequests(grouped, requests = []) {
         if (slot.file) return;
         const match = requests.some((request) => {
           const sameArtist = normalizeName(request.artist || "Unknown Artist") === normalizeName(artist.name);
-          const sameAlbum = normalizeName(request.album || "Singles") === normalizeName(album.name);
+          const sameAlbum = normalizeName(request.album || request.track || request.title || "Unknown Album") === normalizeName(album.name);
           const sameNumber = request.track_number && Number(request.track_number) === Number(slot.track_number) && Number(request.disc_number || 1) === Number(slot.disc_number || 1);
           const sameTitle = normalizeName(request.track || request.title || "") === normalizeName(slot.title);
           return sameArtist && sameAlbum && (sameNumber || sameTitle);
@@ -14793,7 +14787,7 @@ function findLibraryAlbum(library, artistName, albumName) {
 }
 
 // Album-agnostic: does the artist already own a track with this title under ANY album?
-// Used for Singles/playlist imports whose library copy lives under a different album name.
+// Used for single/playlist imports whose library copy lives under a different album name.
 function libraryHasArtistTitle(library, artistName, title) {
   const normalizedArtist = normalizeName(artistName);
   const normalizedTitle = normalizeName(title);
@@ -15069,7 +15063,7 @@ function buildWishlistTree(items) {
   const artistMap = new Map();
   items.forEach((item) => {
     const artistName = item.artist || "Unknown Artist";
-    const albumName = item.album || "Singles";
+    const albumName = item.album || item.track || "Unknown Album";
     if (!artistMap.has(artistName)) {
       artistMap.set(artistName, { name: artistName, albumMap: new Map(), itemIds: [] });
     }

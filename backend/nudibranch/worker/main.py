@@ -403,15 +403,14 @@ def add_download_candidate_review_items(
     grouped: dict[tuple[str, str], list[tuple[dict, ProposalItem]]] = {}
     for request in download_requests:
         artist = request.get("artist") or "Unknown Artist"
-        album = request.get("album") or "Unknown Album"
+        album = request_album(request)
         title = request.get("track") or request.get("title") or "Unknown Track"
         existing = find_library_track(session, artist, album, title)
-        # A request with no specific album (playlist track / Singles / unknown) just wants the
+        # A request with no real album (playlist track / single / unknown) just wants the
         # SONG, so skip the download if it already exists under ANY album (matched on
         # artist+title). It still gets added to a playlist from the library copy via the
         # pending-playlist resolver. (Real album downloads keep the album-strict check above.)
-        req_album = (request.get("album") or "").strip().lower()
-        if not existing and (request.get("playlist_name") or req_album in {"", "singles", "unknown album"}):
+        if not existing and (request.get("playlist_name") or is_single(album, title)):
             existing = library_track_by_artist_title(session, artist, title)
         if existing:
             append_task_log(session, task, f"{title}: already in library ({artist} / {album}); skipping download", "info")
@@ -467,10 +466,10 @@ def add_download_candidate_review_items(
     for (artist, album), track_items in grouped.items():
         requests = [request for request, _track_item_id, _track_title in track_items]
         folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
-        # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
-        # matches arbitrary same-artist folders for the wrong songs) and search per-track directly.
-        if is_singles_pseudo_album(album):
-            append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+        # A single isn't a real album folder — skip the album-folder search (it only matches
+        # arbitrary same-artist folders for the wrong songs) and search per-track directly.
+        if all(is_single(album, track_title) for _request, _track_item_id, track_title in track_items):
+            append_task_log(session, task, f"{artist} / {album}: single — searching per-track candidates directly")
             pools = []
         else:
             append_task_log(session, task, f"{artist} / {album}: searching album-level candidates for task queue review")
@@ -615,11 +614,11 @@ def add_track_search_candidate_items(
     return added
 
 
-def is_singles_pseudo_album(album: str) -> bool:
-    """A 'Singles'/empty/unknown album isn't a real album folder. Searching slskd for an album
-    folder named that matches arbitrary same-artist folders (wrong songs), so these go straight to
-    per-track search."""
-    return fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
+def is_single(album: str, title: str) -> bool:
+    """A single is an album with one track: its album equals its own track title, or it has no
+    real album at all (empty/unknown, or a stored pseudo-value from before this was the rule).
+    Either way there is no real album folder to search — these go straight to per-track search."""
+    return fuzzy_text(album) == fuzzy_text(title) or fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}
 
 
 def has_live_descendants(item: ProposalItem) -> bool:
@@ -1636,7 +1635,7 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
     for request in requests:
         key = (
             str(request.get("artist") or "Unknown Artist").casefold(),
-            str(request.get("album") or "Unknown Album").casefold(),
+            request_album(request).casefold(),
             str(request.get("track") or request.get("title") or "Unknown Track").casefold(),
         )
         if key in seen:
@@ -4557,10 +4556,13 @@ def metadata_matches_request(metadata: dict, request: dict) -> bool:
     return bool((request_track and metadata_track) or (request_artist and metadata_artist))
 
 
-def _request_album(request: dict) -> str | None:
+def request_album(request: dict) -> str:
+    """The request's own album when it names a real one; otherwise a single is named after its own
+    track (a single release is named after its song), falling back to "Unknown Album" only when
+    neither is known."""
     album = request.get("album")
     if fuzzy_text(album) in {"", "singles", "unknown album", "unknown"}:
-        return None
+        return request.get("track") or request.get("title") or "Unknown Album"
     return album
 
 
@@ -4570,14 +4572,14 @@ def verified_download_metadata(metadata: dict, request: dict) -> dict:
         **metadata,
         "artist": artist,
         "albumartist": artist,
-        "album": _request_album(request) or metadata.get("album"),
+        "album": request_album(request),
         "title": request.get("track") or request.get("title") or metadata.get("title"),
     }
 
 
 def normalize_download_metadata(metadata: dict, request: dict) -> dict:
     artist = request.get("artist") or metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
-    album = _request_album(request) or metadata.get("album") or "Unknown Album"
+    album = request_album(request)
     title = request.get("track") or request.get("title") or metadata.get("title") or "Unknown Title"
     normalized = {
         **metadata,
@@ -4704,7 +4706,7 @@ def process_wishlist_request_items(session: Session, requests: list[dict], task:
     wishlist_item_ids = []
     for payload in requests:
         artist = payload.get("artist") or "Unknown Artist"
-        album = payload.get("album") or "Singles"
+        album = request_album(payload)
         workflow = payload.get("workflow") or "wishlist"
         if payload.get("wishlist_item_id"):
             wishlist_item_ids.append(payload["wishlist_item_id"])
@@ -4889,12 +4891,12 @@ def create_album_download_candidate_batch(
     retry_tracks = 0
     diagnostic_lines = []
     folder_try_limit = slskd_album_folder_try_limit(integration_settings(session))
-    # A "Singles"/empty/unknown album isn't a real folder — skip the album-folder search (it only
-    # matches arbitrary same-artist folders for the wrong songs) and go straight to per-track search.
-    skip_album_folder_search = is_singles_pseudo_album(album)
+    # A single isn't a real album folder — skip the album-folder search (it only matches arbitrary
+    # same-artist folders for the wrong songs) and go straight to per-track search.
+    skip_album_folder_search = all(is_single(album, track_title) for _request, _track_item_id, track_title in track_items)
     search_progress = {"done": 0}
     if skip_album_folder_search:
-        append_task_log(session, task, f"{artist} / {album}: Singles request — searching per-track candidates directly")
+        append_task_log(session, task, f"{artist} / {album}: single — searching per-track candidates directly")
         album_queries: list[str] = []
         total_tracks = max(1, len(track_items))
         folder_pools = []
@@ -6299,7 +6301,7 @@ def is_rate_limit_error(error: Exception) -> bool:
 
 def add_download_tree_parents(session: Session, batch: ProposalBatch, request: dict, query: str) -> ProposalItem:
     artist = request.get("artist") or "Unknown Artist"
-    album = request.get("album") or "Singles"
+    album = request_album(request)
     track = request.get("track") or request.get("title") or query
     # The ancestor chain carries the owner too, so a requester-scoped read can keep the containers
     # that give their track somewhere to hang instead of returning an orphaned leaf.
@@ -10450,7 +10452,7 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
                 create_album_download_candidate_batch(
                     session,
                     request.get("artist") or "Unknown Artist",
-                    _request_album(request) or "Singles",
+                    request_album(request),
                     [request],
                     task,
                     existing_batch=item.batch,
