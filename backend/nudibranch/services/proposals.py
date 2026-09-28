@@ -106,6 +106,11 @@ def approve_batch(
     call `/selection` first, and picking an alternate candidate wins its sibling picker here rather
     than being silently skipped for not being the pre-selected one. Naming a container means its
     whole subtree; naming leaves means exactly those leaves.
+
+    ⚠️ A failed download in the selection is RETRIED, not re-approved (the user's call,
+    2026-09-28). Re-approving re-queued the candidate that had just failed, never moved on to an
+    untried one, and -- because naming an id selects it -- could hand a track a second live row
+    beside one still downloading. `retry_items` owns all of that, including one download per track.
     """
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
@@ -118,6 +123,17 @@ def approve_batch(
             raise ValueError("None of those items are in this batch")
         preferred_ids &= known_ids
     approved_ids = item_ids_with_descendants(batch.items, preferred_ids) if item_ids is not None else None
+    failed_download_ids = {
+        item.id
+        for item in batch.items
+        if (approved_ids is None or item.id in approved_ids)
+        and item.status is ProposalStatus.failed
+        and json.loads(item.payload_json or "{}").get("action") in {"queue_download", "queue_ytdlp_download"}
+    }
+    retried, retry_tasks = _retry_items(session, batch_id, sorted(failed_download_ids)) if failed_download_ids else ([], [])
+    preferred_ids -= failed_download_ids
+    if approved_ids is not None:
+        approved_ids -= failed_download_ids
     if approved_ids is not None:
         # An explicitly named leaf is being asked for, so make it the selection rather than
         # requiring the caller to have set it beforehand. Containers are left alone: selecting a
@@ -128,7 +144,7 @@ def approve_batch(
     normalize_download_candidate_selection(batch.items, preferred_ids)
     approved = 0
     for item in batch.items:
-        if approved_ids is not None and item.id not in approved_ids:
+        if (approved_ids is not None and item.id not in approved_ids) or item.id in failed_download_ids:
             continue
         # ⚠️ `canceled` is deliberately NOT in this set. Approving a batch must not resurrect a
         # track the user explicitly stopped -- that is what makes a cancel stick.
@@ -144,6 +160,10 @@ def approve_batch(
                     wishlist_item.stage = ItemStage.approved.value
                     wishlist_item.status_changed_at = datetime.now(timezone.utc)
     if not approved:
+        if retried:
+            # `_retry_items` has already committed its own work; nothing else here changed.
+            session.commit()
+            return retry_tasks[-1]
         session.rollback()
         raise NothingToApprove("Nothing in this selection can be approved")
     batch.status = ProposalStatus.approved
@@ -842,6 +862,13 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     of deleting, and there is nothing here to put back in flight. Re-entering the download from
     gate (a) is an ordinary Approve, not a retry.
     """
+    return _retry_items(session, batch_id, item_ids, mode)[0]
+
+
+def _retry_items(
+    session: Session, batch_id: str, item_ids: list[str] | None, mode: str = "next_candidate"
+) -> tuple[list[str], list[Task]]:
+    """`retry_items`, also returning the worker tasks it enqueued (Approve answers with one)."""
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
@@ -849,6 +876,7 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         raise ValueError(f"Unknown retry mode: {mode}")
     targets = _leaf_download_items(batch, item_ids)
     retried: list[str] = []
+    tasks: list[Task] = []
     # Round 4 #2: Retry must always do something. `next_candidate` used to silently no-op when
     # every sibling candidate had already been tried -- tracked per item here so a batch that mixes
     # "switch candidate" and "search again" items still enqueues the right worker task for each.
@@ -946,7 +974,7 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         for item_id in retried:
             by_mode.setdefault(retried_mode.get(item_id, mode), []).append(item_id)
         for effective_mode, ids in by_mode.items():
-            enqueue_task(session, "retry_download_item", {"item_ids": ids, "mode": effective_mode})
+            tasks.append(enqueue_task(session, "retry_download_item", {"item_ids": ids, "mode": effective_mode}))
     else:
         session.commit()
-    return retried
+    return retried, tasks
