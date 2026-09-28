@@ -816,6 +816,19 @@ def _next_untried_candidate(item: ProposalItem) -> ProposalItem | None:
     return min(untried, key=_candidate_rank)
 
 
+def _track_download_siblings(item: ProposalItem) -> list[ProposalItem]:
+    """The other candidate rows for the same track as `item`."""
+    if not item.parent:
+        return []
+    return [
+        sibling
+        for sibling in item.parent.children
+        if sibling.id != item.id
+        and sibling.kind == ProposalKind.download
+        and json.loads(sibling.payload_json or "{}").get("action") in {"queue_download", "queue_ytdlp_download"}
+    ]
+
+
 def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mode: str = "next_candidate") -> list[str]:
     """Put failed downloads back in flight. Returns the ids actually retried.
 
@@ -840,9 +853,21 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     # every sibling candidate had already been tried -- tracked per item here so a batch that mixes
     # "switch candidate" and "search again" items still enqueues the right worker task for each.
     retried_mode: dict[str, str] = {}
+    retried_tracks: set[str] = set()
     for item in targets:
         if item.status is not ProposalStatus.failed:
             continue
+        # ⚠️ One download per track. Every tried candidate is left `failed` under the track, and
+        # clients send them all when Retry is pressed on a track, album or batch. Each one used to
+        # start its own alternate, next to the track's live row, which was still working through
+        # its own automatic retries. That put two or three transfers on one track at once and
+        # staged every copy that landed. So a track is retried once per call, and not at all while
+        # another of its rows is downloading or has already downloaded.
+        track_key = item.parent_id or item.id
+        siblings = _track_download_siblings(item)
+        if track_key in retried_tracks or any(sibling.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.completed} for sibling in siblings):
+            continue
+        retried_tracks.add(track_key)
         # `next_candidate` means switch to a different, never-tried sibling candidate -- it must
         # NOT just reset this same failed item and hope. Before this, both modes did exactly the
         # same thing: reset the failed item and let the worker re-queue its own already-failing
@@ -874,6 +899,10 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
         # human picks from the new ones. It must NOT auto-approve.
         target.status = ProposalStatus.pending if effective_mode == "research" else ProposalStatus.approved
         target.stage = "awaiting_approval" if effective_mode == "research" else "retrying"
+        # The retried row becomes the track's only selected row, so the track reads as this
+        # attempt rather than the worst of the failed ones beside it.
+        for sibling in siblings:
+            sibling.selected = False
         target.selected = True
         retried.append(target.id)
         retried_mode[target.id] = effective_mode

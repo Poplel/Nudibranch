@@ -1581,17 +1581,32 @@ def existing_retry_candidate_items(session: Session, item: ProposalItem, failed_
     if not item.parent_id:
         return []
     ignored = {candidate_identity(candidate) for candidate in failed_candidates if isinstance(candidate, dict)}
+    siblings = [
+        sibling
+        for sibling in session.scalars(
+            select(ProposalItem)
+            .where(ProposalItem.batch_id == item.batch_id)
+            .where(ProposalItem.parent_id == item.parent_id)
+            .where(ProposalItem.kind == ProposalKind.download)
+        )
+        if sibling.id != item.id and json.loads(sibling.payload_json or "{}").get("action") == "queue_download"
+    ]
+    # ⚠️ Only a sibling still at `pending` has never been tried, so only its file is safe to swap
+    # in. This used to accept any sibling, so the live row re-downloaded a file another row was
+    # already transferring or had already staged: one track staged two or three times ("12 -
+    # Love.m4a", "12 - Love (1).m4a"), and a track whose file had already landed ran on into
+    # exhaustion and read "needs attention". A pending row repeating a file some other row already
+    # used is skipped too, because one search can list the same file more than once.
+    ignored |= {
+        candidate_identity(json.loads(sibling.payload_json or "{}").get("candidate") or {})
+        for sibling in siblings
+        if sibling.status is not ProposalStatus.pending
+    }
     candidates = []
-    for candidate_item in session.scalars(
-        select(ProposalItem)
-        .where(ProposalItem.batch_id == item.batch_id)
-        .where(ProposalItem.parent_id == item.parent_id)
-        .where(ProposalItem.kind == ProposalKind.download)
-    ):
-        payload = json.loads(candidate_item.payload_json or "{}")
-        if payload.get("action") != "queue_download":
+    for candidate_item in siblings:
+        if candidate_item.status is not ProposalStatus.pending:
             continue
-        candidate = payload.get("candidate") or {}
+        candidate = json.loads(candidate_item.payload_json or "{}").get("candidate") or {}
         if candidate_identity(candidate) in ignored:
             continue
         candidates.append(candidate_item)
