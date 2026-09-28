@@ -3,7 +3,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from nudibranch.db.models import NotificationStatus, ProposalKind, ProposalStatus, TaskStatus
+from nudibranch.db.models import (
+    ItemStage,
+    NotificationStatus,
+    ProposalFlow,
+    ProposalKind,
+    ProposalStatus,
+    QueueBucket,
+    TaskStatus,
+)
 
 
 class LoginRequest(BaseModel):
@@ -11,8 +19,9 @@ class LoginRequest(BaseModel):
     password: str = Field(min_length=4, max_length=128)
     device_label: str | None = None
     # "ios" | "mac" | "web". Recorded on the session so a device that has never played still shows
-    # with the right identity in a device picker.
-    client: str | None = None
+    # with the right identity in a device picker. Required: every client sends it, and a session
+    # with no client shape is one the device picker cannot draw.
+    client: Literal["ios", "mac", "web"]
 
 
 class LoginResponse(BaseModel):
@@ -35,6 +44,9 @@ class UserOut(BaseModel):
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
     remote_playback_enabled: bool = True
+    #: Minutes a playback claim survives without playing; 0 = never expires (§31), and is the
+    #: default (2026-09-23 -- "Never" is the default for Hand Off After).
+    playback_claim_timeout_minutes: int = 0
     search_min_confidence: float = 0.4
     library_page_size: int = 100
     jellyfin_user_id: str | None = None
@@ -62,6 +74,9 @@ class UserUpdate(BaseModel):
     username: str | None = None
     is_admin: bool | None = None
     permissions: list[str] | None = None
+    #: Minutes a playback claim survives without playing; 0 = never. None means leave alone, the
+    #: rule every field on this admin-side patch follows.
+    playback_claim_timeout_minutes: int | None = Field(default=None, ge=0, le=1440)
 
 
 class UserPinUpdate(BaseModel):
@@ -129,11 +144,15 @@ class UserAppearanceUpdate(BaseModel):
     accent_color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     background_tint: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
     crossfade_duration: float = Field(default=0.5, ge=0.0, le=15.0)
-    #: ⚠ Optional, and None means LEAVE ALONE — not "restore the default". The web app sends this
-    #: body without the field (it predates the setting), so a non-optional default of True would
-    #: silently switch cross-device playback back on for anyone who turned it off on another client
-    #: and then changed their theme in a browser. Same rule `UserUpdate` follows for its fields.
-    remote_playback_enabled: bool | None = None
+    #: Required. Every client now sends the whole appearance record, so there is no "leave alone"
+    #: case left to model — and an optional field here was a trap: a client that omitted it wrote
+    #: nothing, while a future default would have switched cross-device playback back on for
+    #: someone who turned it off elsewhere.
+    remote_playback_enabled: bool
+    #: How long this account's playback claim survives without playing, in MINUTES. 0 = never
+    #: expires, and is the default (2026-09-23) -- replaces the old fixed 5-minute
+    #: CLAIM_IDLE_TIMEOUT per user (§31).
+    playback_claim_timeout_minutes: int = Field(default=0, ge=0, le=1440)
 
 
 class JellyfinUserLinkUpdate(BaseModel):
@@ -161,9 +180,9 @@ class PlayerStateUpdate(BaseModel):
     @classmethod
     def _known_client(cls, value: str | None) -> str | None:
         return value if value in {"ios", "mac", "web"} else None
-    # What the caller's queue currently hashes to. The server answers `queue_stale` when its
-    # stored copy disagrees, which is the client's cue to publish the queue itself.
-    queue_hash: str | None = None
+    # The account-session claim this device believes it holds (§A1b). Present only on a client that
+    # plays the shared session; a report without it keeps the per-device behaviour of old clients.
+    claim_id: str | None = None
 
 
 class LibraryTreeTrack(BaseModel):
@@ -210,6 +229,15 @@ class LibraryTreeArtist(BaseModel):
     albums: list[LibraryTreeAlbum] = Field(default_factory=list)
 
 
+class ProgressOut(BaseModel):
+    """Truthful progress for any item of any kind. `value` is 0-100."""
+
+    value: float = 0.0
+    label: str = ""
+    indeterminate: bool = False
+    stage: ItemStage = ItemStage.waiting
+
+
 class WishlistCreate(BaseModel):
     kind: str = Field(pattern="^(artist|album|track)$")
     artist: str
@@ -222,14 +250,65 @@ class WishlistOut(WishlistCreate):
     id: str
     user_id: str
     owner_name: str | None = None
-    status: str
+    # The typed state, and the first-class link to the work serving this request. The free-string
+    # `status` this replaces (a second vocabulary: "wanted"/"review"/"approved") is gone from the
+    # wire; the stored column keeps it, and `wishlist_stage()` is the one place it is read.
+    stage: ItemStage = ItemStage.waiting
+    status_code: str = ItemStage.waiting.value
+    status_label: str = ""
+    batch_id: str | None = None
+    item_id: str | None = None
+    progress: ProgressOut = Field(default_factory=ProgressOut)
     created_at: datetime
     status_changed_at: datetime
 
 
-class WishlistApprovalRequest(BaseModel):
-    item_ids: list[str] | None = None
-    deny_unselected: bool = False
+class CandidateOut(BaseModel):
+    """One download candidate, typed.
+
+    Every field here was already computed by the matcher and stored on the item -- size, duration,
+    queue_length, free_upload_slots and upload_speed were simply dropped before reaching any UI,
+    which is exactly what a human needs to sanity-check a match the ranker got wrong.
+    """
+
+    #: Stable dedupe key: "<filename>::<username>", or "youtube::<artist>::<album>::<track>" for a
+    #: yt-dlp fallback. Both clients hand-rolled this off the raw payload; computed once here now.
+    identity: str | None = None
+    username: str | None = None
+    filename: str | None = None
+    folder: str | None = None
+    size_bytes: int | None = None
+    duration_seconds: float | None = None
+    bitrate: int | None = None
+    format: str | None = None          # "FLAC", "MP3 320"
+    quality: str | None = None         # "lossless" | "lossy" | "unknown"
+    confidence: int | None = None      # 0-100
+    same_album_folder: bool = False
+    album_folder_rank: int | None = None
+    free_upload_slots: bool | None = None
+    queue_length: int | None = None
+    upload_speed: float | None = None
+
+
+class FailureOut(BaseModel):
+    """Why something failed, so a client never has to send the user to the task log."""
+
+    reason: str | None = None
+    retry_count: int = 0
+    auto_retry_exhausted: bool = False
+    retryable: bool = True
+    tried_candidates: int = 0
+
+
+class RequestRefOut(BaseModel):
+    """Who asked for this, and for what."""
+
+    artist: str | None = None
+    album: str | None = None
+    track: str | None = None
+    wishlist_item_id: str | None = None
+    requester_id: str | None = None
+    requester_name: str | None = None
 
 
 class ProposalItemOut(BaseModel):
@@ -242,7 +321,23 @@ class ProposalItemOut(BaseModel):
     selected: bool
     old_value: str | None = None
     new_value: str | None = None
-    payload_json: str = "{}"
+    # Typed state. `status_code` is `stage.value`; clients branch on it and render `status_label`,
+    # and must never pattern-match a status string again.
+    stage: ItemStage = ItemStage.waiting
+    status_code: str = ItemStage.waiting.value
+    status_label: str = ""
+    bucket: QueueBucket = QueueBucket.changes
+    action: str | None = None
+    # Whether this row is a real change the batch would apply, as opposed to an artist/album/track
+    # grouping container. Both clients used to re-derive this by parsing `payload_json`.
+    actionable: bool = False
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+    candidate: CandidateOut | None = None
+    failure: FailureOut | None = None
+    request: RequestRefOut | None = None
+    can_approve: bool = False
+    can_retry: bool = False
+    can_cancel: bool = False
 
 
 class ProposalBatchOut(BaseModel):
@@ -250,10 +345,41 @@ class ProposalBatchOut(BaseModel):
     title: str
     kind: ProposalKind
     status: ProposalStatus
-    tree_path: str
+    # Which approval gate this is, and therefore which bucket it renders in.
+    flow: ProposalFlow = ProposalFlow.library_change
+    stage: ItemStage = ItemStage.waiting
+    bucket: QueueBucket = QueueBucket.changes
+    progress: ProgressOut = Field(default_factory=ProgressOut)
+    # Distinct requesters across the batch's items, so an approver can see whose request this is
+    # without parsing anything -- and so a client can refuse to merge rows spanning two people.
+    requesters: list[RequestRefOut] = Field(default_factory=list)
+    counts: dict[str, int] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
     items: list[ProposalItemOut]
+    # Populated only by the retry routes (Round 4 #2), so a client can tell exactly which item ids
+    # changed -- `next_candidate` can retarget a different sibling id than the one it was asked to
+    # retry, and a `research` fallback replaces the item's candidates entirely, so the caller cannot
+    # assume the id(s) it sent are still the ones to watch.
+    retried_item_ids: list[str] = Field(default_factory=list)
+
+
+class RetryRequest(BaseModel):
+    item_ids: list[str] | None = None
+    # next_candidate: try the next ranked source. same_candidate: the same one again (a transient
+    # network failure). research: discard the candidates and search afresh -- this re-enters the
+    # approval gate rather than auto-starting, so a retry can never become a silent download.
+    mode: str = "next_candidate"
+
+
+class CancelRequest(BaseModel):
+    item_ids: list[str] | None = None
+
+
+class WishlistQueueActionRequest(BaseModel):
+    """Body for `/wishlist/queue/approve` and `/wishlist/queue/reject` -- gate 1."""
+
+    item_ids: list[str]
 
 
 class ProposalSelectionUpdate(BaseModel):
@@ -267,6 +393,27 @@ class ProposalApproveRequest(BaseModel):
 
 class ProposalRejectRequest(BaseModel):
     item_ids: list[str] | None = None
+
+
+class QueueItemsRequest(BaseModel):
+    """An arbitrary set of item ids, from any batches, for the bulk Cancel/Remove actions."""
+
+    item_ids: list[str] = Field(min_length=1, max_length=2000)
+
+
+class QueueBulkResult(BaseModel):
+    """What a bulk action actually did.
+
+    Counts rather than a bare 200 because these are deliberately idempotent: ids that were already
+    settled, or that no longer exist, are skipped rather than refused, and the client needs to be
+    able to say "nothing happened" without guessing.
+    """
+
+    canceled: int = 0
+    removed: int = 0
+    #: The affected batches, re-serialized, so a client can refresh without a second round trip.
+    #: A batch emptied by the action is absent -- it has been deleted.
+    batches: list["ProposalBatchOut"] = Field(default_factory=list)
 
 
 class TaskCreate(BaseModel):
@@ -300,6 +447,9 @@ class NotificationOut(BaseModel):
     body: str
     event_type: str
     target_url: str | None
+    # Rows sharing a group_key are one workflow: the server upserts on it, and a client uses it to
+    # collapse a batch's lifetime into a single tray row instead of stacking one per stage.
+    group_key: str | None = None
     status: NotificationStatus
     deliver_web: bool
     deliver_apns: bool
@@ -342,6 +492,41 @@ class IntegrationSettings(BaseModel):
     acoustid_api_key: str = ""
     allow_m4a_downloads: str = "true"
     allow_ytdlp_fallback: str = "false"
+    server_primary_address: str = ""
+    server_secondary_address: str = ""
+
+
+class NotificationReadRequest(BaseModel):
+    ids: list[str] | None = Field(default=None, max_length=500)
+
+
+class ServerAddressesOut(BaseModel):
+    """The addresses an admin configured for this server. Either may be null. Clients adopt the
+    one they did not sign in with as their fallback address."""
+
+    primary: str | None = None
+    secondary: str | None = None
+
+
+class SlskdPortCheckStep(BaseModel):
+    key: str
+    label: str
+    ok: bool | None = None
+    detail: str
+
+
+class SlskdPortCheckOut(BaseModel):
+    """The Soulseek listen-port reachability self-probe. `status`/`checked_at` are None until the
+    check has run at least once. `checking` is true while a triggered run is still in flight
+    (the identity step's browse can take up to ~90s), and the client should keep polling GET."""
+
+    checking: bool = False
+    ok: bool | None = None
+    status: str | None = None
+    checked_at: datetime | None = None
+    public_address: str | None = None
+    port: int | None = None
+    steps: list[SlskdPortCheckStep] = Field(default_factory=list)
 
 
 class PlaylistTrackOut(BaseModel):
@@ -549,6 +734,8 @@ class LibraryArtistRow(BaseModel):
     cover_path: str | None = None
     cover_locked: bool = False
     album_count: int = 0
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class LibraryAlbumRow(BaseModel):
@@ -560,6 +747,8 @@ class LibraryAlbumRow(BaseModel):
     cover_path: str | None = None
     cover_locked: bool = False
     track_count: int = 0
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class LibraryTrackRow(BaseModel):
@@ -575,6 +764,8 @@ class LibraryTrackRow(BaseModel):
     format: str | None = None
     is_lossless: bool = False
     replaygain_track_gain: float | None = None
+    #: Exactly as `/library/changes` sends it, so a seeded mirror reproduces `/library/checksum`.
+    updated_at: str | None = None
 
 
 class PaginatedArtists(BaseModel):
@@ -641,27 +832,6 @@ class PlaybackSnapshot(BaseModel):
     repeat: str = "off"
 
 
-class PlaybackQueueUpload(BaseModel):
-    """A session publishing its own queue so a THIRD device can move it somewhere.
-
-    The client remains the authority on its queue and never plays from this copy; it exists only so
-    playback can be moved between two sessions without waking the source.
-    """
-
-    hash: str
-    snapshot: PlaybackSnapshot
-
-
-class PlaybackTransferRequest(BaseModel):
-    to_session_id: str
-    autoplay: bool = True
-    # Omit to move the CALLER's own queue. Naming another session moves that session's stored queue
-    # instead, which is what lets any device move playback between two others.
-    from_session_id: str | None = None
-    # Omit when moving another session's queue — the server uses the copy that session published.
-    snapshot: PlaybackSnapshot | None = None
-
-
 class PlaybackEnqueueRequest(BaseModel):
     to_session_id: str
     # "next" inserts after whatever is playing there; "end" appends.
@@ -686,7 +856,6 @@ class PlaybackHandoffOut(BaseModel):
     created_at: datetime
     expires_at: datetime
     from_device_label: str | None = None
-    autoplay_effective: bool | None = None
     snapshot: PlaybackSnapshot | None = None
 
 
@@ -953,3 +1122,85 @@ class MarkEpisodesPlayedIn(BaseModel):
     # before the caller's currently-oldest played episode (a backlog catch-up action) and is a
     # no-op when nothing is played yet.
     scope: Literal["all", "before_oldest_played"] = "all"
+
+
+class AccountSessionOwner(BaseModel):
+    session_id: str
+    device_label: str | None = None
+    client: str | None = None
+
+
+class AccountSessionOut(BaseModel):
+    """The account's one shared playback session, as the caller may honestly see it.
+
+    ⚠ With no VALID claim, `owner` is null and `status` is projected as "paused" (a stopped session
+    with nothing queued stays "stopped"): an orphaned session is shown where it was left, and Play on
+    any device claims it. `position_at` is when `position_seconds` was true; only a session that is
+    owned AND playing should be interpolated forward from it.
+    """
+
+    status: str
+    owner: AccountSessionOwner | None = None
+    claim_valid: bool = False
+    you_own: bool = False
+    #: The most recent claim, VALID OR LAPSED, is the caller's. A device still holding a claim id
+    #: must let go when this is false: someone else has claimed since, and a lapsed owner is never
+    #: sent the `stop` a valid one gets.
+    claim_is_yours: bool = False
+    #: Returned only to the caller that just claimed — it must send it on every report after.
+    claim_id: str | None = None
+    queue_version: int = 0
+    queue_length: int = 0
+    current_index: int = 0
+    position_seconds: float = 0.0
+    position_at: datetime | None = None
+    shuffle: bool = False
+    repeat: str = "off"
+    track_id: str | None = None
+    episode_id: str | None = None
+    podcast_id: str | None = None
+    album_id: str | None = None
+    title: str | None = None
+    artist: str | None = None
+    album: str | None = None
+    duration_seconds: int | None = None
+    updated_at: datetime | None = None
+    #: Only with `?queue=1` (and always on a claim).
+    items: list[PlaybackSnapshotItem] | None = None
+
+
+class SessionClaimRequest(BaseModel):
+    # Omit to take the stored queue where it was left (Play on an orphan, "Play here"). Send one for a
+    # fresh play, which replaces the queue.
+    snapshot: PlaybackSnapshot | None = None
+
+
+class SessionTransferRequest(BaseModel):
+    to_session_id: str
+    # Omit to send the stored session; send one to have the target play THIS instead.
+    snapshot: PlaybackSnapshot | None = None
+
+
+class SessionReleaseRequest(BaseModel):
+    claim_id: str
+    position_seconds: float | None = None
+    current_index: int | None = None
+
+
+class SessionQueuePublish(BaseModel):
+    claim_id: str
+    snapshot: PlaybackSnapshot
+
+
+class SessionEditRequest(BaseModel):
+    # insert_next | insert_end | remove | move | jump | seek | state | clear
+    op: str
+    items: list[PlaybackSnapshotItem] | None = None
+    index: int | None = None
+    to_index: int | None = None
+    position_seconds: float | None = None
+    shuffle: bool | None = None
+    repeat: str | None = None
+    # When set, the edit is refused with 409 if the queue has changed since the caller read it, so an
+    # index can never land on the wrong item.
+    base_version: int | None = None

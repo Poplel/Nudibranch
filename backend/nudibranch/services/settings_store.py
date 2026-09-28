@@ -17,6 +17,8 @@ INTEGRATION_KEYS = {
     "acoustid_api_key",
     "allow_m4a_downloads",
     "allow_ytdlp_fallback",
+    "server_primary_address",
+    "server_secondary_address",
 }
 
 
@@ -35,6 +37,10 @@ def integration_settings(session: Session) -> dict[str, str]:
         "acoustid_api_key": settings.acoustid_api_key,
         "allow_m4a_downloads": "true",
         "allow_ytdlp_fallback": "false",
+        # The two addresses the apps are handed after signing in (GET /server/addresses), so a
+        # client configured through either one learns the other without anyone typing it.
+        "server_primary_address": "",
+        "server_secondary_address": "",
     }
     for setting in session.query(AppSetting).filter(AppSetting.key.in_(INTEGRATION_KEYS)):
         values[setting.key] = setting.value

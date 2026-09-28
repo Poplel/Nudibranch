@@ -28,7 +28,7 @@ _TAGS_METADATA = [
     {"name": "notifications", "description": "In-app and APNS push notifications. Register devices, mark notifications read, dismiss all."},
     {"name": "automations", "description": "Trigger → Action → Notify automations: run a maintenance tool or play music on a schedule (cron/interval), an inbound webhook (IFTTT-style; the token is the credential), or an in-app event."},
     {"name": "podcasts", "description": "Podcast subscriptions: subscribe by directory search or direct RSS feed, scan feeds for new episodes, record per-user listening progress, and set per-podcast new-episode notification preferences. Episode audio is never stored here — clients play the publisher's enclosure_url directly, and the stream route relays it for browsers, which cannot use a cross-origin URL in the web player's audio graph."},
-    {"name": "system", "description": "Health-check endpoint."},
+    {"name": "system", "description": "Health-check and reachability endpoints."},
 ]
 
 app = FastAPI(
@@ -41,7 +41,7 @@ app = FastAPI(
         "automations, push notifications, and remote playback control. Jellyfin integration is "
         "supported but optional; playlists and favourites fall back to a native database backend "
         "when no Jellyfin server is configured.\n\n"
-        "**Authentication.** Every endpoint except `GET /healthz`, `POST /api/v1/auth/login`, and "
+        "**Authentication.** Every endpoint except `GET /healthz`, `GET /api/v1/ping`, `POST /api/v1/auth/login`, and "
         "the public automation webhook requires a bearer credential, sent as "
         "`Authorization: Bearer <token>`. The token may be a session token obtained from "
         "`POST /api/v1/auth/login`, or a static API key created through `/api/v1/me/api-keys`. "

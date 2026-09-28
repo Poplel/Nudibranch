@@ -61,6 +61,68 @@ class ProposalStatus(str, enum.Enum):
     executing = "executing"
     completed = "completed"
     failed = "failed"
+    # Distinct from `rejected` on purpose: "the user stopped this" is not "an approver declined
+    # it".  `rejected` deletes the subtree, deletes downloaded files, and fires a requester-facing
+    # "request denied" notification -- none of which is right for a cancel.  Adding the member
+    # needs no DDL: SQLAlchemy 2.x `Enum()` defaults to create_constraint=False, so the SQLite
+    # column is a bare VARCHAR with no CHECK (verified 2026-09-18).
+    canceled = "canceled"
+
+
+class ProposalFlow(str, enum.Enum):
+    """Which approval gate a batch belongs to -- replaces `tree_path`'s de-facto stage duty.
+
+    Stored, and fixed for a batch's whole life.  Contrast `ItemStage` (changes constantly) and
+    `QueueBucket` (derived, never stored).
+
+    NOTE: member name == member value for every member, and that is load-bearing -- `db/init.py`
+    backfills this column with raw SQL, and an `Enum()` column persists the member NAME, not the
+    value (see CLAUDE-server-notes.md section 49).  Keep them identical.
+    """
+
+    download_review = "download_review"   # gate (a): candidates -> approve to download
+    library_review = "library_review"     # gate (b): staged files -> approve to add to library
+    library_change = "library_change"     # metadata/artwork/lyrics/moves/deletes/playlists/imports
+
+
+class ItemStage(str, enum.Enum):
+    """The truthful fine-grained state of one proposal item.
+
+    Written to the denormalized `ProposalItem.stage` / `WishlistItem.stage` cache columns (plain
+    String, not Enum, so the name/value trap above cannot bite) and resolved for the wire by
+    `services/queue_state.resolve_stage`.  Name == value here too, for the same reason.
+    """
+
+    waiting = "waiting"                      # created, nothing started
+    requested = "requested"                  # wishlist request waiting at gate 1 (human must approve the search)
+    searching = "searching"                  # slskd candidate search in flight
+    awaiting_approval = "awaiting_approval"  # a human must act (gate a or b)
+    approved = "approved"                    # approved, worker has not picked it up
+    queued = "queued"                        # accepted by slskd / queued for yt-dlp, no bytes yet
+    downloading = "downloading"
+    retrying = "retrying"
+    staging = "staging"                      # transfer done, file moving into staging
+    verifying = "verifying"                  # content verification running
+    staged = "staged"                        # verified + staged, awaiting gate (b)
+    importing = "importing"                  # applying: import, tag write, move, delete, playlist
+    completed = "completed"
+    failed = "failed"
+    canceled = "canceled"
+    rejected = "rejected"
+
+
+class QueueBucket(str, enum.Enum):
+    """Which Task Queue tab an item shows in.  DERIVED, never stored.
+
+    `issues` is a pure function of live status and flips on every failure, retry and cancel --
+    storing it would mean a write on every transition in the hot download loop and guaranteed
+    drift the first time a code path forgot.  `ProposalFlow` is stored precisely because it does
+    not change.  The single derivation lives in `services/queue_state.bucket_for`.
+    """
+
+    review = "review"
+    changes = "changes"
+    issues = "issues"
 
 
 class TaskStatus(str, enum.Enum):
@@ -84,7 +146,9 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(120), nullable=False)
     username: Mapped[str | None] = mapped_column(String(120), unique=True, index=True)
     pin_hash: Mapped[str] = mapped_column(String(255), nullable=False)
-    api_key_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # NOTE: the old `api_key_hash` column is gone. Static keys live in `static_api_keys` only, and
+    # the env full-access key is migrated into one there (db/init.py). A second, per-user secret
+    # that nothing could list or revoke was an authentication path with no management surface.
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     theme: Mapped[str] = mapped_column(String(16), default="light", nullable=False)
     accent_color: Mapped[str] = mapped_column(String(16), default="#356df3", nullable=False)
@@ -96,6 +160,12 @@ class User(Base):
     #: device through the same route (§3/§24), and silently stopping those would be a second,
     #: unasked-for change.
     remote_playback_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: How long this account's playback claim survives without playing, in MINUTES; 0 = never
+    #: expires. Per-user because "how long should my phone keep the session after I pause?" is a
+    #: taste question, not a protocol constant. ⚠ It governs the IDLE clock only: a claim whose
+    #: owner says it is PLAYING is still checked against LIVE_WINDOW (45s), so a force-quit app
+    #: releases the session immediately whatever this says (§31's two clocks).
+    playback_claim_timeout_minutes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     search_min_confidence: Mapped[float] = mapped_column(default=0.4, nullable=False)
     library_page_size: Mapped[int] = mapped_column(default=100, nullable=False)
     jellyfin_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -193,22 +263,6 @@ class SessionPlayerState(Base):
     repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     # Indexed because reads pick a user's newest report and sort on this column.
     reported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
-    #: When this session last STARTED playing (transitioned into it), not when it last reported.
-    #: ⚠ This is what breaks the tie when two sessions both believe they are playing. It cannot be
-    #: "most recent report", because a device that has gone offline stops reporting while genuinely
-    #: still playing — and it is exactly that device which must keep the session if nothing else has
-    #: started since. Whoever started last owns playback.
-    playback_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    # The session's queue, so playback can be moved from ANY online session to any other without the
-    # source having to be woken to hand it over.
-    #
-    # ⚠ The client stays the authority on its own queue — it never reads this back to play from. The
-    # copy exists only so a THIRD device can move that queue somewhere. `queue_hash` is what keeps
-    # that cheap: status reports carry the client's hash, and the server only asks for a fresh upload
-    # when the two disagree, so an unchanged queue is never re-sent however long it plays.
-    queue_json: Mapped[str | None] = mapped_column(Text)
-    queue_hash: Mapped[str | None] = mapped_column(String(64))
-    queue_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # "ios" | "mac" | "web" — which client shape reported, for labelling a session in a device list.
     client: Mapped[str | None] = mapped_column(String(16))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
@@ -372,6 +426,12 @@ class WishlistItem(Base):
     album: Mapped[str | None] = mapped_column(String(255))
     track: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="wanted", nullable=False)
+    # Direct link to the proposal batch/item serving this request.  NULL for rows created before
+    # this existed -- those fall through to the legacy JSON-scan path for one release.
+    batch_id: Mapped[str | None] = mapped_column(String, index=True)
+    item_id: Mapped[str | None] = mapped_column(String)
+    # Same denormalized-cache rule as ProposalItem.stage above: plain String on purpose.
+    stage: Mapped[str | None] = mapped_column(String(24))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
@@ -517,7 +577,13 @@ class ProposalBatch(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     kind: Mapped[ProposalKind] = mapped_column(Enum(ProposalKind), nullable=False)
     status: Mapped[ProposalStatus] = mapped_column(Enum(ProposalStatus), default=ProposalStatus.pending, nullable=False)
-    tree_path: Mapped[str] = mapped_column(Text, default="/", nullable=False)
+    # Which approval gate this batch belongs to, and therefore which Task Queue bucket it renders
+    # in.  Replaced `tree_path`, an untyped free string that did double duty as a UI grouping key
+    # AND a de-facto workflow-stage marker ("/wishlist", "/task-queue", "/downloads"); that column
+    # is dropped (db/init.py) and nothing may reintroduce a string marker beside this.
+    flow: Mapped[ProposalFlow] = mapped_column(
+        Enum(ProposalFlow), default=ProposalFlow.library_change, nullable=False, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
@@ -537,6 +603,17 @@ class ProposalItem(Base):
     old_value: Mapped[str | None] = mapped_column(Text)
     new_value: Mapped[str | None] = mapped_column(Text)
     payload_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    # First-class linkage back to who asked for this and which wishlist row it serves.  Both were
+    # previously only discoverable by string-matching nested JSON inside `payload_json`, which made
+    # "what am I waiting on" an O(batches x items) json.loads scan on every GET /wishlist -- and
+    # which silently failed for candidate items, whose user id sits at payload["request"]["user_id"]
+    # rather than the top level.  Write these at EVERY creation site.
+    requester_id: Mapped[str | None] = mapped_column(String, index=True)
+    wishlist_item_id: Mapped[str | None] = mapped_column(String, index=True)
+    # Denormalized cache of `services.queue_state.resolve_stage`, written by the worker so the API
+    # can filter buckets in SQL instead of in Python.  Deliberately a plain String, NOT Enum(...):
+    # it is a cache parsed at the boundary, and String sidesteps the member-name persistence trap.
+    stage: Mapped[str | None] = mapped_column(String(24), index=True)
     # Vestigial: rejection-suppression was removed from every client and from the API.  Nothing
     # has written this since, so it is always NULL.  Kept only because dropping a column needs a
     # migration that buys nothing; do not reintroduce reads of it.
@@ -665,13 +742,59 @@ class PlaybackHandoff(Base):
     command_id: Mapped[str | None] = mapped_column(String(64))
     payload_json: Mapped[str | None] = mapped_column(Text)
     item_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    autoplay: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     # pending | adopted | expired | rejected
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(String(64))
+
+
+class AccountPlaybackSession(Base):
+    """The account's ONE shared playback session: a queue and a position that outlive every device.
+
+    One row per user, created on first use and never deleted. What comes and goes is the CLAIM — the
+    right of one device session to play it. A claim is valid while its owner keeps reporting and is
+    not idle; see `_claim_valid` in routes.py. ⚠ Validity is derived at read time and never written:
+    a lapsed claim keeps `claim_id`/`owner_session_id` so the holder, returning from a stretch
+    offline, wins the session back — unless another device claimed it meanwhile, which replaces
+    `claim_id`. Only a new claim or an explicit release (the app's dying gasp) changes the owner.
+
+    Per-device `session_player_states` rows still exist and still answer the two-clock questions
+    (§31); this row answers "what is the account listening to, and who may play it".
+    """
+
+    __tablename__ = "account_playback_sessions"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    # A PlaybackSnapshot of ids only, the whole queue (capped far above the transfer cap).
+    queue_json: Mapped[str | None] = mapped_column(Text)
+    #: Bumped on every change to the queue's CONTENTS, so a viewer refetches only when it moved.
+    queue_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    queue_length: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    position_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    #: When `position_seconds` was true. A viewer of a PLAYING session interpolates from here.
+    position_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="stopped", nullable=False)
+    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
+    track_id: Mapped[str | None] = mapped_column(ForeignKey("tracks.id", ondelete="SET NULL"))
+    episode_id: Mapped[str | None] = mapped_column(ForeignKey("episodes.id", ondelete="SET NULL"))
+    title: Mapped[str | None] = mapped_column(String(255))
+    artist: Mapped[str | None] = mapped_column(String(255))
+    album: Mapped[str | None] = mapped_column(String(255))
+    duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    claim_id: Mapped[str | None] = mapped_column(String(64))
+    owner_session_id: Mapped[str | None] = mapped_column(String(64))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    owner_reported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When the session last stopped PLAYING; NULL while it plays. Drives the idle lapse.
+    paused_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+    track: Mapped["Track | None"] = relationship(foreign_keys=[track_id])
+    episode: Mapped["Episode | None"] = relationship(foreign_keys=[episode_id])
 
 
 class Automation(Base):

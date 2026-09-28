@@ -121,6 +121,11 @@ def signing_public_key_pem(session: Session) -> str:
     ).decode()
 
 
+def instance_id(session: Session) -> str:
+    """This server's stable identity, shared by push pairing and the apps' address race."""
+    return _get_or_create_instance_id(session)
+
+
 def push_identity(session: Session) -> dict:
     """Identity the iOS app needs to authorise this server with the proxy."""
     settings = get_settings()
@@ -162,23 +167,33 @@ def _canonical_push_message(
 # Broadcast notifications route to the people who own the menu/flow the notification
 # is about (decided by its target_url's first path segment), plus admins. A notification
 # with no/unknown target goes to admins only.
-_NOTIFICATION_AUDIENCE: dict[str, Permission] = {
-    "activity": Permission.activity_read,
-    "task-queue": Permission.approvals_manage,
-    "downloads": Permission.approvals_manage,
-    "tools": Permission.tools_manage,
-    "library": Permission.library_view,
-    "automations": Permission.automations_manage,
-    "wishlist": Permission.discover,
-    "podcasts": Permission.podcasts_manage,
+# A segment maps to a SET of permissions, any one of which admits the reader.  It was a single
+# Permission until 2026-09-18, which meant a "/task-queue" broadcast reached only
+# `approvals_manage` holders -- so someone whose whole job is approving other people's music
+# requests (`wishlist:approve_all`) never got told there was anything to approve.
+_NOTIFICATION_AUDIENCE: dict[str, set[Permission]] = {
+    "activity": {Permission.activity_read},
+    "task-queue": {Permission.approvals_manage, Permission.wishlist_approve_all},
+    # Legacy target kept only so historical rows still route; nothing new aims here.  The
+    # requester-facing destination is "/requests" below.
+    "downloads": {Permission.approvals_manage},
+    "tools": {Permission.tools_manage},
+    "library": {Permission.library_view},
+    "automations": {Permission.automations_manage},
+    "wishlist": {Permission.discover},
+    # Where a requester watches their own request.  Anyone who can ask for music can read it.
+    "requests": {Permission.discover},
+    "podcasts": {Permission.podcasts_manage},
+    "settings": {Permission.settings_manage},
 }
 
 
-def _audience_permission(target_url: str | None) -> Permission | None:
+def _audience_permissions(target_url: str | None) -> set[Permission]:
+    """Permissions that admit a reader to this target. Empty means admins only."""
     if not target_url:
-        return None
+        return set()
     segment = target_url.split("?", 1)[0].strip("/").split("/", 1)[0]
-    return _NOTIFICATION_AUDIENCE.get(segment)
+    return _NOTIFICATION_AUDIENCE.get(segment, set())
 
 
 def create_notification(
@@ -194,13 +209,13 @@ def create_notification(
     group_key: str | None = None,
 ) -> Notification:
     if user_id is None:
-        audience = _audience_permission(target_url)
+        audience = _audience_permissions(target_url)
         users = list(session.scalars(select(User)))
         target_user_ids = [
             user.id
             for user in users
             if user.is_admin
-            or (audience is not None and any(permission.permission == audience for permission in user.permissions))
+            or (audience and any(permission.permission in audience for permission in user.permissions))
         ]
         if target_user_ids:
             created: Notification | None = None

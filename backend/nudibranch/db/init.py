@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -125,7 +125,6 @@ def _init_schema(session: Session) -> None:
         display_name="Admin",
         username="admin",
         pin_hash=hash_password(settings.first_admin_pin),
-        api_key_hash=hash_secret(settings.full_access_api_key),
         is_admin=True,
     )
     session.add(admin)
@@ -134,7 +133,36 @@ def _init_schema(session: Session) -> None:
     for permission in Permission:
         session.add(UserPermission(user_id=admin.id, permission=permission))
 
+    # The env full-access key is an ordinary static API key now, so it can be listed and revoked
+    # like any other instead of living in a per-user column nothing could manage.
+    _ensure_env_full_access_key(session, admin)
     session.commit()
+
+
+def _ensure_env_full_access_key(session: Session, admin: User) -> None:
+    """Make `NUDIBRANCH_FULL_ACCESS_API_KEY` a `StaticApiKey` row owned by the admin.
+
+    Idempotent, and hashed exactly the way `deps.get_current_user` hashes a bearer token
+    (`hash_token` == this module's old `hash_secret`: both are sha256 hex), so a key already in a
+    deploy's `.env` keeps working now that the `users.api_key_hash` lookup is gone.
+    """
+    from nudibranch.db.models import StaticApiKey
+
+    raw = (get_settings().full_access_api_key or "").strip()
+    if not raw:
+        return
+    key_hash = hash_secret(raw)
+    if session.scalar(select(StaticApiKey).where(StaticApiKey.key_hash == key_hash)):
+        return
+    session.add(
+        StaticApiKey(
+            user_id=admin.id,
+            name="Full-access key (from the environment)",
+            key_hash=key_hash,
+            prefix=raw[:8],
+        )
+    )
+    session.flush()
 
 
 def ensure_lightweight_migrations(session: Session) -> None:
@@ -244,20 +272,10 @@ def ensure_lightweight_migrations(session: Session) -> None:
         # Set at login so a device that has never played still shows correctly in a device picker.
         session.execute(text("ALTER TABLE auth_sessions ADD COLUMN client VARCHAR(16) NULL"))
         session.commit()
-    sps_cols = {row[1] for row in session.execute(text("PRAGMA table_info(session_player_states)"))}
-    if sps_cols and "queue_json" not in sps_cols:
-        # The session's queue, so playback can be moved between any two online sessions without
-        # waking the source. See SessionPlayerState for why the hash matters.
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_json TEXT NULL"))
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_hash VARCHAR(64) NULL"))
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN queue_updated_at DATETIME NULL"))
-        session.commit()
-    if sps_cols and "playback_started_at" not in sps_cols:
-        # When this session last STARTED playing, which is what decides who wins when two sessions
-        # both believe they are playing — an offline device cannot be told to stop, so the tie is
-        # broken by who started most recently rather than by who reported most recently.
-        session.execute(text("ALTER TABLE session_player_states ADD COLUMN playback_started_at DATETIME NULL"))
-        session.commit()
+    # The per-device queue copy and start-time tiebreak were replaced by the account playback session
+    # (`account_playback_sessions`); the handoff autoplay flag went with the old transfer route.
+    _drop_columns(session, "session_player_states", ["queue_json", "queue_hash", "queue_updated_at", "playback_started_at"])
+    _drop_columns(session, "playback_handoffs", ["autoplay"])
     cmd_cols = {row[1] for row in session.execute(text("PRAGMA table_info(playback_commands)"))}
     if cmd_cols:
         if "position_seconds" not in cmd_cols:
@@ -297,13 +315,425 @@ def ensure_lightweight_migrations(session: Session) -> None:
         # Per-pairing APNS proxy grant token (App Attest model); NULL = direct/legacy device.
         session.execute(text("ALTER TABLE mobile_devices ADD COLUMN proxy_grant TEXT"))
         session.commit()
+    if "playback_claim_timeout_minutes" not in user_cols:
+        # Minutes a playback claim survives without playing; 0 = never, and never is now the
+        # default (2026-09-23 -- "Never" is the default for Hand Off After).
+        session.execute(
+            text(
+                "ALTER TABLE users ADD COLUMN playback_claim_timeout_minutes "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+        session.commit()
+    _migrate_queue_state_columns(session)
+    # ⚠️ ORDER: everything that still reads `tree_path` must run BEFORE it is dropped.
+    # `_migrate_queue_state_columns` backfills `flow` from it, and `_retire_intent_batches`
+    # identifies the old "/wishlist" batches by it.
+    _retire_intent_batches(session)
+    _drop_columns(session, "proposal_batches", ["tree_path"])
+    _migrate_static_api_keys(session)
     _backfill_usernames(session)
     _migrate_password_hashes(session)
     _migrate_playlists_per_user(session)
     _migrate_library_timestamps(session)
     _migrate_permissions(session)
     _scrub_invalid_mbids(session)
+    _drop_empty_rejected_batches(session)
+    _drop_canceled_leftovers(session)
+    _fail_completed_batches_with_failed_items(session)
+    _delete_empty_proposal_batches(session)
+    _heal_searching_parent_items(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _drop_columns(session: Session, table: str, columns: list[str]) -> None:
+    """Drop columns an older install still has. SQLite >= 3.35 supports DROP COLUMN."""
+    existing = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
+    for column in columns:
+        if column in existing:
+            session.execute(text(f"ALTER TABLE {table} DROP COLUMN {column}"))
+    session.commit()
+
+
+def _retire_intent_batches(session: Session) -> None:
+    """Delete the "Request: X" intent batches, and heal the wishlist rows they stranded.
+
+    Until 2026-09-22 a wishlist search committed a *visible* pending batch of `wishlist_request`
+    rows into Review before the search ran, and retired it only on the happy path. A worker killed
+    mid-search (sandalphon recreates its containers on every nightly push) therefore left a batch of
+    rows reading "finding candidates" in Review forever, with nothing able to finish or clear them —
+    and removing them one at a time emptied the batch without ever retiring it. Searching no longer
+    creates a batch at all, so these are pure debris.
+
+    Idempotent and self-limiting: after `tree_path` is dropped there is nothing left to match, and
+    the rows this deletes never existed on a database created after the change.
+    """
+    batch_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_batches)"))}
+    if "tree_path" not in batch_cols:
+        return
+    stale_ids = [
+        row[0]
+        for row in session.execute(
+            text("SELECT id FROM proposal_batches WHERE tree_path = '/wishlist'")
+        )
+    ]
+    if not stale_ids:
+        return
+    # The wishlist rows these batches were serving: re-point them at reality. One that already has
+    # real candidates elsewhere is awaiting approval; one with nothing is searching again, and the
+    # worker's recovery sweep re-queues it on its next tick.
+    wishlist_ids = [
+        row[0]
+        for row in session.execute(
+            text(
+                "SELECT DISTINCT wishlist_item_id FROM proposal_items "
+                "WHERE wishlist_item_id IS NOT NULL AND batch_id IN :ids"
+            ).bindparams(bindparam("ids", value=stale_ids, expanding=True))
+        )
+    ]
+    session.execute(
+        text("DELETE FROM proposal_items WHERE batch_id IN :ids").bindparams(
+            bindparam("ids", value=stale_ids, expanding=True)
+        )
+    )
+    session.execute(
+        text("DELETE FROM proposal_batches WHERE id IN :ids").bindparams(
+            bindparam("ids", value=stale_ids, expanding=True)
+        )
+    )
+    for wishlist_id in wishlist_ids:
+        has_live_work = session.execute(
+            text(
+                "SELECT 1 FROM proposal_items WHERE wishlist_item_id = :id "
+                "AND status IN ('pending', 'approved', 'executing') LIMIT 1"
+            ),
+            {"id": wishlist_id},
+        ).first()
+        session.execute(
+            text(
+                "UPDATE wishlist_items SET status = :status, stage = :stage "
+                "WHERE id = :id AND status NOT IN "
+                "('completed', 'rejected', 'removed', 'canceled', 'failed')"
+            ),
+            {
+                "id": wishlist_id,
+                "status": "review" if has_live_work else "searching",
+                "stage": "awaiting_approval" if has_live_work else "searching",
+            },
+        )
+    # A wishlist row that is settled (the user declined or removed it) must not keep work of its
+    # own: it was the "removing a request left its rows behind" bug, and this clears what it left.
+    session.execute(
+        text(
+            "DELETE FROM proposal_items WHERE wishlist_item_id IN "
+            "(SELECT id FROM wishlist_items WHERE status IN ('rejected', 'removed')) "
+            "AND status IN ('pending', 'approved')"
+        )
+    )
+    session.commit()
+    write_app_log(
+        f"Retired {len(stale_ids)} stale wishlist intent batch(es) and healed "
+        f"{len(wishlist_ids)} request row(s)",
+        "warning",
+    )
+
+
+def _delete_empty_proposal_batches(session: Session) -> None:
+    """Delete batches with no items left.
+
+    A batch is only ever a container for its rows, and an empty one is unactionable debris — but
+    nothing deleted them unless a *rejection* emptied them, so removing rows one by one left a husk
+    in the Task Queue that no UI could clear. Download batches younger than 10 minutes are spared:
+    a candidate search commits its batch before attaching the first candidate.
+
+    Childless artist/album/track containers go first, for the same reason and in the same shape as
+    `proposals.cleanup_empty_container_items`: a batch holding nothing but grouping rows renders as
+    an empty tree rather than as nothing at all. Three passes covers artist > album > track.
+    """
+    for _ in range(3):
+        session.execute(
+            text(
+                "DELETE FROM proposal_items WHERE instr(coalesce(payload_json, ''), '\"action\"') = 0 "
+                "AND NOT EXISTS (SELECT 1 FROM proposal_items child WHERE child.parent_id = proposal_items.id) "
+                "AND (old_value IS NULL OR new_value IS NULL)"
+            )
+        )
+    session.commit()
+    session.execute(
+        text(
+            "DELETE FROM proposal_batches WHERE NOT EXISTS "
+            "(SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id) "
+            "AND (kind != 'download' OR created_at < datetime('now', '-10 minutes'))"
+        )
+    )
+    session.commit()
+
+
+def _heal_searching_parent_items(session: Session) -> None:
+    """Un-stick track rows cached as `searching` that already have candidates under them.
+
+    The stage cache was written when the row was created and not re-stamped when its search ended,
+    so a track with five ready candidates still reported "finding candidates" -- `can_approve=false`
+    on a row a client then (rightly) refuses to approve around. The write-time fix is in the worker;
+    this repairs the rows that already exist. Idempotent.
+    """
+    session.execute(text(
+        "UPDATE proposal_items SET stage = 'awaiting_approval' "
+        "WHERE stage = 'searching' AND status = 'pending' AND EXISTS ("
+        "SELECT 1 FROM proposal_items child WHERE child.parent_id = proposal_items.id "
+        "AND child.status IN ('pending', 'approved', 'executing'))"
+    ))
+    session.commit()
+
+
+def _migrate_static_api_keys(session: Session) -> None:
+    """Move `users.api_key_hash` into `static_api_keys`, then drop the column.
+
+    Same stored form on both sides (sha256 of the token), so every key that worked before still
+    works — as a row that can be listed and revoked, which the column never could be.
+    """
+    user_cols = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
+    if "api_key_hash" in user_cols:
+        rows = list(
+            session.execute(
+                text(
+                    "SELECT id, api_key_hash FROM users "
+                    "WHERE api_key_hash IS NOT NULL AND api_key_hash != ''"
+                )
+            )
+        )
+        for user_id, key_hash in rows:
+            existing = session.execute(
+                text("SELECT 1 FROM static_api_keys WHERE key_hash = :hash"), {"hash": key_hash}
+            ).first()
+            if existing:
+                continue
+            session.execute(
+                text(
+                    "INSERT INTO static_api_keys (id, user_id, name, key_hash, prefix, created_at, revoked) "
+                    "VALUES (:id, :user_id, :name, :hash, :prefix, :created_at, 0)"
+                ),
+                {
+                    "id": str(uuid.uuid4()),
+                    "user_id": user_id,
+                    "name": "Full-access key (migrated)",
+                    "hash": key_hash,
+                    "prefix": str(key_hash)[:8],
+                    "created_at": datetime.now(timezone.utc).isoformat(sep=" "),
+                },
+            )
+        session.commit()
+        _drop_columns(session, "users", ["api_key_hash"])
+        if rows:
+            write_app_log(f"Migrated {len(rows)} legacy API key(s) to static_api_keys", "warning")
+    # A deploy whose `.env` key was only ever in that column (or in no column at all) still needs a
+    # row to authenticate against.
+    admin = session.scalar(select(User).where(User.is_admin.is_(True)).order_by(User.created_at.asc()))
+    if admin is not None:
+        _ensure_env_full_access_key(session, admin)
+        session.commit()
+
+
+def _drop_empty_rejected_batches(session: Session) -> None:
+    """Delete fully rejected batches left behind before rejection started removing them.
+
+    Rejecting deletes a batch's items, and since 2026-09-21 the reject route deletes the emptied
+    batch as well. Rows written before that remain as empty `rejected` husks in the Task Queue
+    history. Idempotent: once they are gone this matches nothing.
+    """
+    session.execute(text(
+        "DELETE FROM proposal_batches WHERE status = 'rejected' "
+        "AND NOT EXISTS (SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id)"
+    ))
+    session.commit()
+
+
+def _fail_completed_batches_with_failed_items(session: Session) -> None:
+    """Re-mark batches that were stored `completed` although a selected item failed.
+
+    Before 2026-09-22 the worker wrote `completed` once every item result had settled, failures
+    included. Reads already project those as failed, but list filters work on the stored status, so
+    the failure never showed in Issues. Idempotent: once fixed, nothing matches.
+    """
+    session.execute(text(
+        "UPDATE proposal_batches SET status = 'failed' WHERE status = 'completed' AND EXISTS ("
+        "SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id "
+        "AND proposal_items.selected = 1 AND proposal_items.status = 'failed')"
+    ))
+    session.commit()
+
+
+def _drop_canceled_leftovers(session: Session) -> None:
+    """One-time cleanup for the pre-2026-09-21 cancel behaviour.
+
+    Before that date, `cancel_items` left cancelled items sitting in the DB forever (instead of
+    deleting them once the worker had stopped their transfers) and marked a batch `rejected` -- not
+    `canceled` -- once everything in it had been cancelled, overloading "rejected" to mean two
+    different things. This deletes the leftover `canceled` item rows outright (their files are not
+    touched here -- a *live* cancel already removed those on disk; this migration only fixes rows a
+    completed cancel would already have cleaned up), then removes every `canceled` batch and every
+    `rejected` one, items and all. Idempotent: once nothing matches, both statements are no-ops.
+    """
+    # A `rejected` batch that still has items can only be one of those mislabeled cancels -- a real
+    # rejection deletes every item first -- so it goes whole, like a `canceled` one. Items are deleted
+    # explicitly because raw SQL here does not rely on SQLite enforcing the ON DELETE CASCADE.
+    session.execute(text(
+        "DELETE FROM proposal_items WHERE status = 'canceled' "
+        "OR batch_id IN (SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected'))"
+    ))
+    session.execute(text("DELETE FROM proposal_batches WHERE status IN ('canceled', 'rejected')"))
+    session.commit()
+
+
+def _migrate_queue_state_columns(session: Session) -> None:
+    """Add the Review/Issues/Changes state columns and backfill them from what already exists.
+
+    Idempotent, PRAGMA-guarded, and safe to re-run: each backfill only runs in the same branch
+    that just created its column, so a second pass is a no-op rather than a re-write.
+
+    NOTE on the raw-SQL backfills below: an `Enum()` column persists the enum MEMBER NAME, not its
+    value.  `ProposalFlow`'s names and values are deliberately identical, which is what makes
+    writing the literal strings here correct.  Do not add a member where they differ.
+    """
+
+    batch_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_batches)"))}
+    if batch_cols and "flow" not in batch_cols:
+        session.execute(
+            text(
+                "ALTER TABLE proposal_batches ADD COLUMN flow VARCHAR(32) "
+                "NOT NULL DEFAULT 'library_change'"
+            )
+        )
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_batches_flow ON proposal_batches(flow)")
+        )
+        # Gate (a): every download batch, whichever stage marker it happened to carry.
+        session.execute(
+            text(
+                "UPDATE proposal_batches SET flow = 'download_review' "
+                "WHERE kind = 'download' "
+                "AND tree_path IN ('/wishlist', '/task-queue', '/downloads')"
+            )
+        )
+        # Gate (b): the "add the staged files to the library" review, distinguished from an
+        # ordinary disk import only by its title -- there was never a typed marker for it.
+        session.execute(
+            text(
+                "UPDATE proposal_batches SET flow = 'library_review' "
+                "WHERE kind = 'import_files' AND tree_path = '/task-queue' "
+                "AND (title LIKE 'Add downloaded music to library%' "
+                "     OR title LIKE 'Add to library:%')"
+            )
+        )
+        session.commit()
+
+    item_cols = {row[1] for row in session.execute(text("PRAGMA table_info(proposal_items)"))}
+    if item_cols and "requester_id" not in item_cols:
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN requester_id VARCHAR NULL"))
+        session.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_proposal_items_requester_id "
+                "ON proposal_items(requester_id)"
+            )
+        )
+        session.commit()
+        _backfill_item_json_column(session, "requester_id", ("user_id",), ("request", "user_id"))
+    if item_cols and "wishlist_item_id" not in item_cols:
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN wishlist_item_id VARCHAR NULL"))
+        session.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_proposal_items_wishlist_item_id "
+                "ON proposal_items(wishlist_item_id)"
+            )
+        )
+        session.commit()
+        _backfill_item_json_column(
+            session, "wishlist_item_id", ("wishlist_item_id",), ("request", "wishlist_item_id")
+        )
+    if item_cols and "stage" not in item_cols:
+        # Denormalized cache of resolve_stage(); left NULL so the resolver's status/payload
+        # fallback answers for every pre-existing row until the worker next touches it.
+        session.execute(text("ALTER TABLE proposal_items ADD COLUMN stage VARCHAR(24) NULL"))
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_items_stage ON proposal_items(stage)")
+        )
+        session.commit()
+
+    wishlist_cols = {row[1] for row in session.execute(text("PRAGMA table_info(wishlist_items)"))}
+    if wishlist_cols and "batch_id" not in wishlist_cols:
+        # No backfill is possible -- this linkage never existed, and reconstructing it from the
+        # payload JSON would be guesswork.  NULL means "legacy row"; the read path falls back to
+        # the old scan for exactly those, for one release.
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN batch_id VARCHAR NULL"))
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_wishlist_items_batch_id ON wishlist_items(batch_id)")
+        )
+        session.commit()
+    if wishlist_cols and "item_id" not in wishlist_cols:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN item_id VARCHAR NULL"))
+        session.commit()
+    if wishlist_cols and "stage" not in wishlist_cols:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN stage VARCHAR(24) NULL"))
+        session.commit()
+
+
+def _backfill_item_json_column(
+    session: Session,
+    column: str,
+    top_key: tuple[str, ...],
+    nested_key: tuple[str, ...],
+) -> None:
+    """Lift a value out of proposal_items.payload_json into a real column.
+
+    Tries SQLite's json_extract first (one statement, no round trip).  JSON1 has been compiled in
+    by default since SQLite 3.38, but the deployed build is not something this code can assume, so
+    a plain Python loop is the fallback rather than a note in a plan.  The loop is bounded by the
+    number of live proposal items, which prune_settled_batches keeps small.
+    """
+
+    top = "$." + ".".join(top_key)
+    nested = "$." + ".".join(nested_key)
+    try:
+        session.execute(
+            text(
+                f"UPDATE proposal_items SET {column} = COALESCE("
+                f"  json_extract(payload_json, :top), json_extract(payload_json, :nested)) "
+                f"WHERE {column} IS NULL AND payload_json LIKE :needle"
+            ),
+            {"top": top, "nested": nested, "needle": f"%{top_key[-1]}%"},
+        )
+        session.commit()
+        return
+    except OperationalError:
+        session.rollback()
+
+    rows = session.execute(
+        text(
+            f"SELECT id, payload_json FROM proposal_items "
+            f"WHERE {column} IS NULL AND payload_json LIKE :needle"
+        ),
+        {"needle": f"%{top_key[-1]}%"},
+    ).fetchall()
+    for item_id, payload_json in rows:
+        try:
+            payload = json.loads(payload_json or "{}")
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        value = payload.get(top_key[-1])
+        if value is None:
+            nested_obj = payload.get(nested_key[0])
+            if isinstance(nested_obj, dict):
+                value = nested_obj.get(nested_key[-1])
+        if value is None:
+            continue
+        session.execute(
+            text(f"UPDATE proposal_items SET {column} = :value WHERE id = :id"),
+            {"value": str(value), "id": item_id},
+        )
+    session.commit()
+
 
 
 # Columns carried over from the old per-user player_states table, paired with what to substitute
