@@ -6287,21 +6287,18 @@ def prune_settled_batches(
             # failed and kept in the list, because it belongs in Issues. This used to write
             # `completed` and drop it, which is how every exhausted request vanished from Issues.
             any_failed = any(item.selected and item.status is ProposalStatus.failed for item in batch.items)
-            if actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
+            # ⚠️ Never while a row waits on a human (`queue_state.open_decision_rows`) -- that hid
+            # rows at a gate for good: a track whose selected candidate was removed, say.
+            has_open_decision = bool(queue_state.open_decision_rows(batch.items))
+            if has_open_decision:
+                pass
+            elif actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
                 if any_failed:
                     batch.status = ProposalStatus.failed
                 else:
                     batch.status = ProposalStatus.completed
                     settled.add(batch.id)
-            # ⚠️ Nothing selected is not nothing to do: a batch whose every candidate was
-            # deselected still holds rows at a gate, and settling it hid them for good.
-            elif (
-                not actionable_items
-                and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items)
-                and not any(
-                    item.status is ProposalStatus.pending and queue_state.is_actionable(item) for item in batch.items
-                )
-            ):
+            elif not actionable_items and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
                 if any_failed:
                     batch.status = ProposalStatus.failed
                 else:

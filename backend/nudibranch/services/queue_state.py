@@ -523,6 +523,31 @@ def request_out(item: ProposalItem, payload: dict, requester_name: str | None = 
     }
 
 
+def open_decision_rows(items: Iterable[ProposalItem]) -> list[ProposalItem]:
+    """Actionable rows still waiting on a human at a gate -- work a batch must never hide.
+
+    ⚠️ The user's rule (2026-09-29): no state in which an entry cannot be seen and addressed. A
+    `pending` actionable row is an open decision when it is **selected** (the choice, waiting for
+    Approve), or when **nothing under its parent is selected** (its track has no choice yet -- the
+    selected candidate was removed, say -- so every alternate is still an option). An unselected
+    alternate beside a selected sibling is only an option for a track that has its answer.
+
+    Every "is this batch finished?" check uses this: finalizing a download batch, settling one for
+    the list, marking one canceled after a removal, and reopening a settled one.
+    """
+    materialized = list(items)
+    chosen_parents = {
+        item.parent_id for item in materialized if item.selected and item.parent_id and is_actionable(item)
+    }
+    return [
+        item
+        for item in materialized
+        if item.status is ProposalStatus.pending
+        and is_actionable(item)
+        and (item.selected or item.parent_id is None or item.parent_id not in chosen_parents)
+    ]
+
+
 def rollup_items(items: Iterable[ProposalItem]) -> list[ProposalItem]:
     """The items that actually represent work, for rollup purposes.
 

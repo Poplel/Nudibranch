@@ -635,11 +635,38 @@ def _drop_canceled_leftovers(session: Session) -> None:
     # A `rejected` batch that still has items can only be one of those mislabeled cancels -- a real
     # rejection deletes every item first -- so it goes whole, like a `canceled` one. Items are deleted
     # explicitly because raw SQL here does not rely on SQLite enforcing the ON DELETE CASCADE.
-    session.execute(text(
-        "DELETE FROM proposal_items WHERE status = 'canceled' "
-        "OR batch_id IN (SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected'))"
-    ))
-    session.execute(text("DELETE FROM proposal_batches WHERE status IN ('canceled', 'rejected')"))
+    #
+    # ⚠️ Except what a Remove is still in the middle of (2026-09-29). This runs on EVERY boot, and a
+    # Remove marks rows `canceled` and leaves them for the worker's queued `cancel_download_item`,
+    # which finds the transfer and the partial file through them. Deleting them here -- on a deploy
+    # that lands mid-Remove -- left the transfer running with nothing pointing at it. Rows that task
+    # names, and their batches, are left for it.
+    pending_removals: set[str] = set()
+    for (payload_json,) in session.execute(text(
+        "SELECT payload_json FROM tasks WHERE type = 'cancel_download_item' AND status IN ('queued', 'running')"
+    )):
+        try:
+            pending_removals.update(str(item_id) for item_id in (json.loads(payload_json or "{}").get("item_ids") or []))
+        except (ValueError, TypeError):
+            continue
+    protected_batches = {
+        row[0]
+        for item_id in pending_removals
+        for row in session.execute(text("SELECT batch_id FROM proposal_items WHERE id = :id"), {"id": item_id})
+    }
+    for item_id, status, batch_id, batch_status in session.execute(text(
+        "SELECT i.id, i.status, i.batch_id, b.status FROM proposal_items i "
+        "LEFT JOIN proposal_batches b ON b.id = i.batch_id "
+        "WHERE i.status = 'canceled' OR b.status IN ('canceled', 'rejected')"
+    )).all():
+        if item_id in pending_removals or batch_id in protected_batches:
+            continue
+        session.execute(text("DELETE FROM proposal_items WHERE id = :id"), {"id": item_id})
+    for (batch_id,) in session.execute(text(
+        "SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected')"
+    )).all():
+        if batch_id not in protected_batches:
+            session.execute(text("DELETE FROM proposal_batches WHERE id = :id"), {"id": batch_id})
     session.commit()
 
 

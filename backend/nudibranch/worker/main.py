@@ -3913,7 +3913,8 @@ class LibraryReviewBuilder:
 
 
 def download_rows_awaiting_approval(batch: ProposalBatch) -> list[ProposalItem]:
-    """Selected candidate rows sitting at Download approval (`pending`) -- work the batch still owes.
+    """Download rows still at Download approval -- `queue_state.open_decision_rows`: the selected
+    candidate, or any candidate of a track that has none selected. Work the batch still owes.
 
     ⚠️ Nothing about them is in the download manifest: a Cancel puts a track back here and removes
     its entry, and a partial Approve never gives the rest one. So every manifest-driven "has this
@@ -3923,14 +3924,7 @@ def download_rows_awaiting_approval(batch: ProposalBatch) -> list[ProposalItem]:
     were Daft Punk "Nightvision" and Fleetwood Mac "Dreams"). A batch holding any of these is never
     finalized; it stays in Review with them at Download approval.
     """
-    return [
-        item
-        for item in batch.items
-        if item.selected
-        and item.kind == ProposalKind.download
-        and item.status is ProposalStatus.pending
-        and queue_state.payload_of(item).get("action") in {"queue_download", "queue_ytdlp_download"}
-    ]
+    return [item for item in queue_state.open_decision_rows(batch.items) if item.kind == ProposalKind.download]
 
 
 def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
@@ -10170,37 +10164,37 @@ def reopen_batches_with_open_work(session: Session) -> int:
     The Task Queue lists batches by their STORED status, so a `completed`/`canceled`/`rejected`
     batch is hidden however live its rows are -- which is exactly how a batch Cancel lost ten
     tracks at Download approval (`download_rows_awaiting_approval`). This is the net under every
-    such path, known or not: a settled batch with a selected, actionable row still pending,
-    approved, executing or failed is reopened -- `pending` if a row waits on a human, `executing`
-    if one is in flight, else `failed` (Issues). Runs at startup and on the recovery tick.
+    such path, known or not: a settled batch with an open decision (`queue_state.open_decision_rows`)
+    is reopened `pending`; else one with a selected row in flight goes to `executing`, and one with
+    a selected failed row to `failed` (Issues). Runs at startup and on the recovery tick.
     """
-    items = list(
+    batch_ids = set(
         session.scalars(
-            select(ProposalItem)
+            select(ProposalItem.batch_id)
             .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
             .where(ProposalBatch.status.in_(_SETTLED_BATCH_STATUSES))
-            .where(ProposalItem.selected.is_(True))
             .where(ProposalItem.status.in_(_OPEN_ITEM_STATUSES))
         )
     )
-    statuses: dict[str, set[ProposalStatus]] = {}
-    for item in items:
-        if queue_state.is_actionable(item):
-            statuses.setdefault(item.batch_id, set()).add(item.status)
-    for batch_id, open_statuses in statuses.items():
+    reopened = 0
+    for batch_id in batch_ids:
         batch = session.get(ProposalBatch, batch_id)
         if batch is None:
             continue
-        if ProposalStatus.pending in open_statuses:
+        selected = [item for item in batch.items if item.selected and queue_state.is_actionable(item)]
+        if queue_state.open_decision_rows(batch.items):
             batch.status = ProposalStatus.pending
-        elif open_statuses & {ProposalStatus.approved, ProposalStatus.executing}:
+        elif any(item.status in {ProposalStatus.approved, ProposalStatus.executing} for item in selected):
             batch.status = ProposalStatus.executing
-        else:
+        elif any(item.status is ProposalStatus.failed for item in selected):
             batch.status = ProposalStatus.failed
+        else:
+            continue
+        reopened += 1
         write_app_log(f"Reopened settled batch {batch.title!r}: it still had work to see", "warning", batch_id=batch.id)
-    if statuses:
+    if reopened:
         session.commit()
-    return len(statuses)
+    return reopened
 
 
 def recover_stuck_wishlist_searches(session: Session) -> int:
