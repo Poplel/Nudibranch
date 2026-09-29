@@ -10507,6 +10507,11 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
                     task,
                     existing_batch=item.batch,
                 )
+                # The request moves with its candidates: `retry_items` put it at "searching", and
+                # nothing else would take it off until the recovery tick noticed (seen live
+                # 2026-09-29: Pink Floyd "Dogs" read Searching beside its new candidates).
+                if item.wishlist_item_id:
+                    advance_wishlist_rows_to_review(session, [item.wishlist_item_id], item.batch)
                 # The search has attached fresh candidates. The old leaf was only kept as a
                 # "finding candidates" placeholder; it is itself a stale candidate that already
                 # failed, and leaving it selected meant approval downloaded it AND the new pick
@@ -10523,6 +10528,8 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
                 append_task_log(session, task, f"{item.title}: re-search failed: {error}", "error")
                 set_download_item_status(item, "needs attention", stage="failed")
                 item.status = ProposalStatus.failed
+                # ...and so does the request, off the "searching" `retry_items` gave it.
+                fail_linked_wishlist_item(session, item)
             continue
         set_download_item_status(item, "retrying", stage="queued")
         retried += 1
