@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 
 from nudibranch.db.models import WishlistItem
-from nudibranch.services.metadata_lookup import lookup_album_tracks
+from nudibranch.services.metadata_lookup import lookup_album_tracks, lookup_recording_length
 
 
 def normalized_music_name(value: str | None) -> str:
@@ -34,6 +34,16 @@ def _album_tracks(artist: str, album: str, cache: dict[tuple[str, str], dict | N
     if key not in cache:
         try:
             cache[key] = lookup_album_tracks(artist, album)
+        except Exception:  # noqa: BLE001 - a lookup miss must never block the request
+            cache[key] = None
+    return cache.get(key)
+
+
+def _recording_length(artist: str, title: str, cache: dict) -> int | None:
+    key = ("recording", artist, title)
+    if key not in cache:
+        try:
+            cache[key] = lookup_recording_length(artist, title)
         except Exception:  # noqa: BLE001 - a lookup miss must never block the request
             cache[key] = None
     return cache.get(key)
@@ -99,6 +109,10 @@ def build_request_payloads(
                     }
                 )
                 break
+        # ⚠️ No album, or one MusicBrainz does not know by that name, used to leave the request with
+        # no length -- and the matcher then ranks every candidate as if its length fitted.
+        if item.track and not payload.get("duration_ms"):
+            payload["duration_ms"] = _recording_length(item.artist, item.track, cache)
         payloads.append(payload)
 
     return [payload | base_owner for payload in payloads]

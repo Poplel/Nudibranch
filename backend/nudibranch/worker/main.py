@@ -211,6 +211,8 @@ _allow_m4a_downloads: bool = True
 # the auto-executing exhausted-retries fallback) is allowed; when off they're all skipped.
 # Refreshed alongside _match_tuning at each search entry point.
 _allow_ytdlp_fallback: bool = False
+# A different recording or cut of the song. "remaster(ed)" is deliberately absent: a remaster is
+# the same recording, and "Dreams (2004 Remaster)" is a right answer, not a wrong version.
 DOWNLOAD_VERSION_WORDS = {
     "acapella",
     "acoustic",
@@ -220,8 +222,6 @@ DOWNLOAD_VERSION_WORDS = {
     "instrumental",
     "karaoke",
     "live",
-    "remaster",
-    "remastered",
     "remix",
     "sped",
     "slowed",
@@ -6063,7 +6063,14 @@ def best_segment_score(expected: str, segments: list[str]) -> float:
 
 
 def version_words_for_text(value: object) -> set[str]:
-    return set(fuzzy_text(value).split()) & DOWNLOAD_VERSION_WORDS
+    """Version markers in a name, INCLUDING bracketed ones.
+
+    ⚠️ Not via `fuzzy_text`, which drops "(...)"/"[...]" -- exactly where a version is written, so
+    "John Cage - 4'33 (Speedcore remix)" read as no version at all and escaped the wrong-version
+    demotion entirely.
+    """
+    text = strip_accents(str(value or "").casefold())
+    return set(re.findall(r"[a-z0-9]+", text)) & DOWNLOAD_VERSION_WORDS
 
 
 def fuzzy_similarity(left: str, right: str) -> float:
