@@ -54,7 +54,6 @@ class ProposalKind(str, enum.Enum):
 
 
 class ProposalStatus(str, enum.Enum):
-    draft = "draft"
     pending = "pending"
     approved = "approved"
     rejected = "rejected"
@@ -425,9 +424,12 @@ class WishlistItem(Base):
     artist: Mapped[str] = mapped_column(String(255), nullable=False)
     album: Mapped[str | None] = mapped_column(String(255))
     track: Mapped[str | None] = mapped_column(String(255))
+    #: Where the request was made ("discover", "siri", …), as the client said when creating it.
+    source: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="wanted", nullable=False)
-    # Direct link to the proposal batch/item serving this request.  NULL for rows created before
-    # this existed -- those fall through to the legacy JSON-scan path for one release.
+    # Direct link to the proposal batch/item serving this request. Kept pointing at wherever the
+    # request's work lives now (the download batch, then "Add to library"); a pointer whose batch
+    # or item is gone is dropped on the way out (`serialize_wishlist_items`).
     batch_id: Mapped[str | None] = mapped_column(String, index=True)
     item_id: Mapped[str | None] = mapped_column(String)
     # Same denormalized-cache rule as ProposalItem.stage above: plain String on purpose.

@@ -329,14 +329,17 @@ def status_label(
     """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
+    # ⚠️ A row waiting on a human names the gate it waits at, never the worker's free text (§0: "a
+    # waiting status must say what is being approved"). A candidate used to read "100% match · same
+    # album folder · FLAC" here; clients draw those details from `candidate` themselves.
+    if stage is ItemStage.awaiting_approval and flow is not None:
+        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+        return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
     # ⚠️ In-flight stages always use their own word. The worker's free text for them is transfer
     # plumbing ("download queued in slskd: Initializing (5s)", "needs attention; could not be
     # downloaded automatically") -- jargon in a row (§0), and the pill must say one thing.
     if stage not in _FIXED_WORD_STAGES and isinstance(existing, str) and existing.strip():
         return existing.strip()
-    if stage is ItemStage.awaiting_approval and flow is not None:
-        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
-        return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
     return _STAGE_DEFAULT_LABEL.get(stage, stage.value)
 
 

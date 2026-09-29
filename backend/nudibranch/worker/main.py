@@ -28,7 +28,7 @@ from nudibranch.services.replaygain import measure_track_gain, write_replaygain_
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
-from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, remove_rejected_download_files
+from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, prune_empty_download_dirs, remove_rejected_download_files
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -1838,86 +1838,119 @@ def entry_download_label(entry: dict) -> str:
 
 
 def import_completed_downloads(session: Session, minimum_age_seconds: int = 5) -> dict:
-    settings = get_settings()
-    root = settings.downloads_path
-    if not root.exists():
+    """One scan tick of the download pipeline: move every batch's transfers along, then -- once no
+    download is in flight -- surface files nothing owns (`surface_unclaimed_audio_files`).
+
+    ⚠️ Nothing here imports into the library. That happens only when Import approval (gate b) is
+    approved; this tick used to import loose files in `downloads/` directly.
+    """
+    if not get_settings().downloads_path.exists():
         return {"imported": 0, "errors": []}
-    errors: list[str] = []
-    manifest_result = import_manifest_download_batches(session, minimum_age_seconds)
-    manifest_imported = manifest_result["imported"]
-    errors.extend(manifest_result["errors"])
-    manifest_waiting = manifest_result.get("waiting", 0)
-    manifest_ready = manifest_result.get("ready", 0)
-    manifest_failed = manifest_result.get("failed", 0)
-    if manifest_imported:
-        session.flush()
-        create_notification(
-            session,
-            title="Downloaded album imported",
-            body=f"{manifest_imported} tracks were added to the library.",
-            event_type="tool_completed",
-            target_url="/library",
-        )
-        if jellyfin_configured(session):
-            append_task_log(session, None, f"Downloaded album import completed for {manifest_imported} track(s); queueing Jellyfin scan")
-            enqueue_task(session, "jellyfin_scan", {})
-        flush_import_enrichment(session)
-        return {"imported": manifest_imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
-    if manifest_waiting or manifest_ready or manifest_failed:
-        return {"imported": 0, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
-    imported = 0
+    result = import_manifest_download_batches(session, minimum_age_seconds)
+    if not (result.get("waiting") or result.get("ready") or result.get("failed")):
+        surface_unclaimed_audio_files(session)
+    return {**result, "imported": 0}
+
+
+UNCLAIMED_FILE_MIN_AGE_SECONDS = 600
+UNCLAIMED_FILE_SWEEP_SECONDS = 60
+_last_unclaimed_sweep = 0.0
+
+
+def surface_unclaimed_audio_files(session: Session, force: bool = False) -> int:
+    """Put every audio file nothing owns into "Add to library", where a human can see and decide it.
+
+    ⚠️ **No file here may be invisible, and none may reach the library unapproved** (the user,
+    2026-09-29: "there should be no state in which we cannot see an entry and address it"). A file
+    under `downloads/` or `staging/downloads/` with no manifest entry, no proposal row and no library
+    track is surfaced as a staged import row (gate b), so Approve adds it and Remove deletes it.
+    Before this, such a file had one of two fates, both wrong:
+    - in `downloads/`, it was imported straight into the library, skipping Import approval, with a
+      "1 files were added" broadcast to every user. That is how a track cancelled mid-transfer
+      ("Wildlife Analysis", sandalphon) landed in the library anyway;
+    - in `staging/downloads/`, it sat forever: 22 files on sandalphon, left by the duplicate-download
+      bug, belonged to a batch that no longer existed.
+
+    A file from `downloads/` is moved into `staging/downloads/unclaimed/` first, so staging owns it
+    like any other file awaiting gate (b). Files younger than ten minutes are left alone -- a file
+    the download loop is about to claim must not be taken from under it -- and the sweep runs at
+    most once a minute, because it lists the library's paths.
+    """
+    global _last_unclaimed_sweep
+    if not force and time.time() - _last_unclaimed_sweep < UNCLAIMED_FILE_SWEEP_SECONDS:
+        return 0
+    _last_unclaimed_sweep = time.time()
+    settings = get_settings()
+    downloads_root = settings.downloads_path
+    staging_root = download_staging_root()
     now = time.time()
-    known_paths = existing_library_and_proposal_paths(session)
-    for file_path in sorted(root.rglob("*")):
-        if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+    candidates: list[tuple[Path, Path]] = []
+    for root in (downloads_root, staging_root):
+        if not root.exists():
             continue
-        if str(file_path) in known_paths:
+        for file_path in sorted(root.rglob("*")):
+            if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+                continue
+            try:
+                if now - file_path.stat().st_mtime < UNCLAIMED_FILE_MIN_AGE_SECONDS:
+                    continue
+            except OSError:
+                continue
+            candidates.append((root, file_path))
+    if not candidates:
+        return 0
+    known = existing_library_and_proposal_paths(session)
+    live_paths = {
+        str(entry.get("path"))
+        for entry in load_download_manifest()
+        if entry.get("path") and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES
+    }
+    review: LibraryReviewBuilder | None = None
+    surfaced = 0
+    for root, file_path in candidates:
+        if str(file_path) in known or str(file_path) in live_paths:
             continue
-        stat = file_path.stat()
-        if now - stat.st_mtime < minimum_age_seconds:
-            continue
-        metadata = read_audio_metadata(file_path)
-        manifest_entry = find_download_manifest_entry(file_path)
-        if manifest_entry:
-            if manifest_entry.get("status") == "rejected":
+        entry = find_download_manifest_entry(file_path)
+        if entry:
+            # A transfer the download loop still owns -- or one already rejected, whose file goes.
+            if entry.get("status") == "rejected" and root == downloads_root:
                 try:
                     file_path.unlink()
-                    update_download_manifest_entry(manifest_entry, "rejected_removed")
+                    update_download_manifest_entry(entry, "rejected_removed")
                 except OSError as error:
-                    errors.append(f"{file_path.name}: failed to remove rejected download: {error}")
+                    append_task_log(session, None, f"{file_path.name}: failed to remove rejected download: {error}", "warning")
             continue
-        payload = {
-            "path": str(file_path),
-            "relative_path": str(file_path.relative_to(root)),
-            "extension": file_path.suffix.lower(),
-            "size_bytes": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
-            "metadata": metadata,
-            "suggested_library_path": str(suggest_library_path(metadata, file_path)),
-        }
-        target_path = Path(payload["suggested_library_path"])
-        if str(target_path) in known_paths or target_path.exists():
-            continue
+        if root == downloads_root:
+            destination = unique_destination(download_staging_root("unclaimed") / file_path.name)
+            try:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(file_path), str(destination))
+            except OSError as error:
+                append_task_log(session, None, f"{file_path.name}: could not move an unclaimed download into staging: {error}", "warning")
+                continue
+            prune_empty_download_dirs(file_path.parent, downloads_root)
+            file_path = destination
+        if review is None:
+            review = LibraryReviewBuilder(session)
         try:
-            import_file_to_library(session, file_path, target_path, payload)
-            mark_matching_wishlist_completed(session, metadata)
-            imported += 1
-        except Exception as error:  # noqa: BLE001 - keep sweeping independent finished downloads.
-            errors.append(f"{file_path.name}: {error}")
-    if imported:
+            review.add(file_path, {}, label=file_path.name)
+        except Exception as error:  # noqa: BLE001 - one unreadable file must not hide the rest.
+            append_task_log(session, None, f"{file_path.name}: could not add an unclaimed file to review: {error}", "warning")
+            continue
+        surfaced += 1
+    if review is not None and surfaced:
+        review.refresh_title()
         session.flush()
-        create_notification(
+        append_task_log(session, None, f"Found {surfaced} downloaded file(s) with no request behind them; added to review")
+        notify_approvers(
             session,
-            title="Downloaded files imported",
-            body=f"{imported} files were added to the library.",
-            event_type="tool_completed",
-            target_url="/library",
+            review.batch,
+            title="Downloaded music ready to add",
+            body=f"{surfaced} file(s) with nothing waiting for them were found in downloads — approve to add them to your library, or remove them.",
+            bucket="changes",
         )
-        if jellyfin_configured(session):
-            append_task_log(session, None, f"Downloaded import completed for {imported} file(s); queueing Jellyfin scan")
-            enqueue_task(session, "jellyfin_scan", {})
-        flush_import_enrichment(session)
-    return {"imported": imported, "errors": errors, "waiting": manifest_waiting, "ready": manifest_ready, "failed": manifest_failed}
+        session.commit()
+    return surfaced
 
 
 def import_manifest_download_batches(session: Session, minimum_age_seconds: int) -> dict:
@@ -3628,11 +3661,10 @@ def handle_download_verification_issue(session: Session, batch: ProposalBatch, e
     session.commit()
 
 
-def import_verified_download_batch(session: Session, batch: ProposalBatch, verified_entries: list[tuple[dict, Path, dict]]) -> int:
-    return import_verified_download_entries(session, batch, verified_entries, finalize=True)
-
-
 def finalize_completed_download_batch(session: Session, batch: ProposalBatch) -> None:
+    # Never while a selected row is still at Download approval -- see `download_rows_awaiting_approval`.
+    if download_rows_awaiting_approval(batch):
+        return
     cleanup_download_staging_batch(batch.id)
     for item in batch.items:
         if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
@@ -3764,63 +3796,147 @@ def watchdog_stuck_download_items(session: Session) -> int:
     return stuck
 
 
-def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
-    """Turn a fully-downloaded, staged batch into a manual "add to library" review task.
+class LibraryReviewBuilder:
+    """Files into the ONE pending "Add to library" batch (gate b), under Artist > Album rows.
 
-    All completed download batches accumulate into a single pending import_files review batch
-    so the user approves everything at once rather than one card per album.
+    All staged music -- a finished download, or a file found with no request behind it -- lands in
+    the same pending `library_review` batch, so the user approves everything at once rather than one
+    card per album. Shared by `present_staged_downloads_for_library_review` and
+    `surface_unclaimed_audio_files`, so there is one way a file reaches gate (b).
     """
-    # Reuse an existing pending review batch so multiple completed download batches
-    # consolidate into one "Add to library" card instead of one per album.
-    review_batch: ProposalBatch | None = session.scalar(
-        select(ProposalBatch)
-        .options(selectinload(ProposalBatch.items))
-        .where(ProposalBatch.kind == ProposalKind.import_files)
-        .where(ProposalBatch.flow == ProposalFlow.library_review)
-        .where(ProposalBatch.status == ProposalStatus.pending)
-        .order_by(ProposalBatch.created_at.desc())
-        .limit(1)
-    )
 
-    # Rebuild artist/album node maps from whatever's already in the batch.
-    artist_items: dict[str, ProposalItem] = {}
-    album_items: dict[tuple[str, str], ProposalItem] = {}
-    if review_batch is not None:
-        for existing_item in review_batch.items:
-            try:
-                payload = json.loads(existing_item.payload_json or "{}")
-            except (ValueError, TypeError):
-                payload = {}
+    def __init__(self, session: Session) -> None:
+        self.session = session
+        self.batch: ProposalBatch | None = session.scalar(
+            select(ProposalBatch)
+            .options(selectinload(ProposalBatch.items))
+            .where(ProposalBatch.kind == ProposalKind.import_files)
+            .where(ProposalBatch.flow == ProposalFlow.library_review)
+            .where(ProposalBatch.status == ProposalStatus.pending)
+            .order_by(ProposalBatch.created_at.desc())
+            .limit(1)
+        )
+        # Rebuild artist/album node maps from whatever's already in the batch.
+        self.artist_items: dict[str, ProposalItem] = {}
+        self.album_items: dict[tuple[str, str], ProposalItem] = {}
+        for existing_item in self.batch.items if self.batch is not None else []:
+            payload = queue_state.payload_of(existing_item)
             artist = payload.get("artist")
             album = payload.get("album")
             if not artist:
                 continue
             if existing_item.parent_id is None:
-                artist_items[artist] = existing_item
+                self.artist_items[artist] = existing_item
             elif album and existing_item.old_value is None:
-                album_items[(artist, album)] = existing_item
+                self.album_items[(artist, album)] = existing_item
 
-    created = 0
-
-    def ensure_review_tree(artist: str, album: str) -> str:
-        nonlocal review_batch
-        if review_batch is None:
-            review_batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, flow=ProposalFlow.library_review)
-            session.add(review_batch)
+    def _album_row(self, artist: str, album: str) -> str:
+        session = self.session
+        if self.batch is None:
+            self.batch = ProposalBatch(title="Add downloaded music to library", kind=ProposalKind.import_files, flow=ProposalFlow.library_review)
+            session.add(self.batch)
             session.flush()
-        if artist not in artist_items:
-            artist_item = ProposalItem(batch_id=review_batch.id, title=artist, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist}))
+        if artist not in self.artist_items:
+            artist_item = ProposalItem(batch_id=self.batch.id, title=artist, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist}))
             session.add(artist_item)
             session.flush()
-            artist_items[artist] = artist_item
+            self.artist_items[artist] = artist_item
         album_key = (artist, album)
-        if album_key not in album_items:
-            album_item = ProposalItem(batch_id=review_batch.id, parent_id=artist_items[artist].id, title=album, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist, "album": album}))
+        if album_key not in self.album_items:
+            album_item = ProposalItem(batch_id=self.batch.id, parent_id=self.artist_items[artist].id, title=album, kind=ProposalKind.import_files, payload_json=json.dumps({"artist": artist, "album": album}))
             session.add(album_item)
             session.flush()
-            album_items[album_key] = album_item
-        return album_items[album_key].id
+            self.album_items[album_key] = album_item
+        return self.album_items[album_key].id
 
+    def add(
+        self,
+        staged_path: Path,
+        request: dict,
+        source_item: ProposalItem | None = None,
+        source_batch_id: str | None = None,
+        label: str | None = None,
+    ) -> ProposalItem:
+        """One file as a staged import row. `request` drives the tags when there is one; a file
+        with no request behind it keeps its own tags, untouched."""
+        session = self.session
+        metadata = read_audio_metadata(staged_path)
+        if request:
+            metadata = normalize_download_metadata(metadata, request)
+            try:
+                write_audio_metadata(staged_path, metadata)
+            except Exception as error:  # noqa: BLE001 - tagging is best-effort; import still works.
+                append_task_log(session, None, f"{label or staged_path.name}: could not write tags before review: {error}", "warning")
+        replace_track_id = request.get("replace_track_id")
+        replace_track = session.get(Track, replace_track_id) if replace_track_id else None
+        target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
+        artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
+        album = metadata.get("album") or "Unknown Album"
+        album_item_id = self._album_row(artist, album)
+        # ⚠️ Carry the owner across to gate (b). These review items previously recorded only
+        # `source_download_*`, with no requester or wishlist link at all — so the requester lost
+        # sight of their request exactly when it was closest to done, and `reject_items` could
+        # not revert the wishlist row when a staged import was declined.
+        review_item = ProposalItem(
+            batch_id=self.batch.id,
+            parent_id=album_item_id,
+            title=metadata.get("title") or staged_path.stem,
+            kind=ProposalKind.import_files,
+            old_value=str(staged_path),
+            new_value=str(target_path),
+            requester_id=source_item.requester_id if source_item else None,
+            wishlist_item_id=source_item.wishlist_item_id if source_item else None,
+            stage=ItemStage.staged.value,
+            payload_json=json.dumps(
+                {
+                    "action": "replace_library_track" if replace_track else "import_download",
+                    "source_download_batch_id": source_batch_id,
+                    "source_download_item_id": source_item.id if source_item else None,
+                    "replace_track_id": replace_track.id if replace_track else None,
+                    "wishlist_item_id": source_item.wishlist_item_id if source_item else None,
+                    "user_id": source_item.requester_id if source_item else None,
+                    "metadata": metadata,
+                }
+            ),
+        )
+        session.add(review_item)
+        session.flush()
+        return review_item
+
+    def refresh_title(self) -> str:
+        """Retitle the batch from its artists; returns the artist label."""
+        all_artists = sorted({a for a in self.artist_items if a != "Unknown Artist"} or {"Unknown Artist"})
+        artist_label = ", ".join(all_artists[:3]) + (" & more" if len(all_artists) > 3 else "")
+        if self.batch is not None:
+            self.batch.title = f"Add to library: {artist_label}"
+        return artist_label
+
+
+def download_rows_awaiting_approval(batch: ProposalBatch) -> list[ProposalItem]:
+    """Selected candidate rows sitting at Download approval (`pending`) -- work the batch still owes.
+
+    ⚠️ Nothing about them is in the download manifest: a Cancel puts a track back here and removes
+    its entry, and a partial Approve never gives the rest one. So every manifest-driven "has this
+    batch settled?" check reads such a batch as done, and finalizing it marked these rows
+    `completed` -- the batch with them -- so the tracks vanished from every list with nothing
+    downloaded (reproduced 2026-09-29: a batch Cancel lost 10 of an 18-track album; earlier victims
+    were Daft Punk "Nightvision" and Fleetwood Mac "Dreams"). A batch holding any of these is never
+    finalized; it stays in Review with them at Download approval.
+    """
+    return [
+        item
+        for item in batch.items
+        if item.selected
+        and item.kind == ProposalKind.download
+        and item.status is ProposalStatus.pending
+        and queue_state.payload_of(item).get("action") in {"queue_download", "queue_ytdlp_download"}
+    ]
+
+
+def present_staged_downloads_for_library_review(session: Session, batch: ProposalBatch, staged_entries: list[tuple[dict, Path]], finalize: bool) -> None:
+    """Turn a batch's staged downloads into rows of the manual "add to library" review task."""
+    review = LibraryReviewBuilder(session)
+    created = 0
     for entry, staged_path in staged_entries:
         # Per-item idempotency: never add the same downloaded track to a review twice (handles a
         # track that fails, retries, and succeeds after the album was already presented).
@@ -3831,87 +3947,55 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             .where(ProposalItem.payload_json.like(f'%"source_download_item_id": "{item_id}"%'))
             .limit(1)
         )
+        source_item = session.get(ProposalItem, item_id) if item_id else None
+        review_item = None
         if not already_in_review:
-            request = entry.get("request") or {}
-            metadata = normalize_download_metadata(read_audio_metadata(staged_path), request)
-            try:
-                write_audio_metadata(staged_path, metadata)
-            except Exception as error:  # noqa: BLE001 - tagging is best-effort; import still works.
-                append_task_log(session, None, f"{entry_download_label(entry)}: could not write tags before review: {error}", "warning")
-            replace_track_id = request.get("replace_track_id")
-            replace_track = session.get(Track, replace_track_id) if replace_track_id else None
-            target_path = replacement_target_path(replace_track, metadata, staged_path) if replace_track else unique_destination(suggest_library_path(metadata, staged_path))
-            artist = metadata.get("albumartist") or metadata.get("artist") or "Unknown Artist"
-            album = metadata.get("album") or "Unknown Album"
-            album_item_id = ensure_review_tree(artist, album)
-            # ⚠️ Carry the owner across to gate (b). These review items previously recorded only
-            # `source_download_*`, with no requester or wishlist link at all — so the requester lost
-            # sight of their request exactly when it was closest to done, and `reject_items` could
-            # not revert the wishlist row when a staged import was declined.
-            source_item = session.get(ProposalItem, item_id) if item_id else None
-            session.add(
-                ProposalItem(
-                    batch_id=review_batch.id,
-                    parent_id=album_item_id,
-                    title=metadata.get("title") or staged_path.stem,
-                    kind=ProposalKind.import_files,
-                    old_value=str(staged_path),
-                    new_value=str(target_path),
-                    requester_id=source_item.requester_id if source_item else None,
-                    wishlist_item_id=source_item.wishlist_item_id if source_item else None,
-                    stage=ItemStage.staged.value,
-                    payload_json=json.dumps(
-                        {
-                            "action": "replace_library_track" if replace_track else "import_download",
-                            "source_download_batch_id": batch.id,
-                            "source_download_item_id": item_id,
-                            "replace_track_id": replace_track.id if replace_track else None,
-                            "wishlist_item_id": source_item.wishlist_item_id if source_item else None,
-                            "user_id": source_item.requester_id if source_item else None,
-                            "metadata": metadata,
-                        }
-                    ),
-                )
+            review_item = review.add(
+                staged_path, entry.get("request") or {}, source_item, batch.id, label=entry_download_label(entry)
             )
             created += 1
         # The download is done; the review task now owns the staged file.
         update_download_manifest_entry(entry, "completed", path=str(staged_path))
-        download_item = session.get(ProposalItem, entry.get("item_id"))
-        if download_item and download_item.wishlist_item_id:
+        if source_item and source_item.wishlist_item_id:
             # Downloaded and verified, but NOT in the library until gate (b) is approved. Calling
             # this "completed" here is precisely the bug where a rejected import still read as done.
-            staged_wishlist = session.get(WishlistItem, download_item.wishlist_item_id)
+            staged_wishlist = session.get(WishlistItem, source_item.wishlist_item_id)
             if staged_wishlist and staged_wishlist.status not in {"completed", "removed"}:
                 staged_wishlist.status = "staged"
                 staged_wishlist.stage = ItemStage.staged.value
                 staged_wishlist.status_changed_at = datetime.now(timezone.utc)
-        if download_item:
-            download_item.status = ProposalStatus.completed
-            set_download_item_status(download_item, "downloaded; review to add to library", stage="staging", progress=100)
-    if review_batch is not None:
-        # Title: list distinct artists in the batch.
-        all_artists = sorted({a for a in artist_items if a != "Unknown Artist"} or {"Unknown Artist"})
-        artist_label = ", ".join(all_artists[:3]) + (" & more" if len(all_artists) > 3 else "")
-        review_batch.title = f"Add to library: {artist_label}"
+                # The request now lives in "Add to library" -- point it there, not at the download
+                # batch it left (which is finalized and later gone).
+                if review_item is not None:
+                    staged_wishlist.batch_id = review_item.batch_id
+                    staged_wishlist.item_id = review_item.id
+        if source_item:
+            source_item.status = ProposalStatus.completed
+            set_download_item_status(source_item, "downloaded; review to add to library", stage="staging", progress=100)
+    if review.batch is not None:
+        artist_label = review.refresh_title()
         session.flush()
         if created:
             append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
             # Requester first, approver second: they are frequently the same person and share a
             # group_key, so the actionable row has to be the one that survives.
+            # ⚠️ The requester's text names THEIR request (`batch_subject` of the download batch),
+            # never the shared review batch's title -- that lists every artist anyone has waiting
+            # ("Daft Punk, Fleetwood Mac, Imagine Dragons & more"), other people's music included.
             notify_requesters(
                 session,
                 batch,
                 title="Your request finished downloading",
-                body=f"{artist_label}: waiting for approval to add it to the library.",
+                body=f"{batch_subject(batch)}: waiting for approval to add it to the library.",
             )
             notify_approvers(
                 session,
-                review_batch,
+                review.batch,
                 title="Downloaded music ready to add",
                 body=f"{created} track(s) downloaded for {artist_label} — approve to add them to your library.",
                 bucket="changes",
             )
-    if finalize:
+    if finalize and not download_rows_awaiting_approval(batch):
         # Mark the download batch complete WITHOUT cleaning staging — the review task still needs
         # the staged files; they leave staging when it is approved and imported.
         for item in batch.items:
@@ -3919,71 +4003,6 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
                 item.status = ProposalStatus.completed
         batch.status = ProposalStatus.completed
     session.flush()
-
-
-def import_verified_download_entries(
-    session: Session,
-    batch: ProposalBatch,
-    verified_entries: list[tuple[dict, Path, dict]],
-    finalize: bool = True,
-) -> int:
-    known_paths = existing_library_and_proposal_paths(session)
-    imported = 0
-    imported_albums: set[tuple[str, str]] = set()
-    for entry, file_path, metadata in sorted(verified_entries, key=lambda item: ((item[2].get("disc_number") or 0), (item[2].get("track_number") or 9999), item[2].get("title") or "")):
-        request = entry.get("request") or {}
-        normalized_metadata = normalize_download_metadata(metadata, request)
-        normalized_metadata["musicbrainz_verified"] = True
-        append_task_log(session, None, f"{entry_download_label(entry)}: writing normalized metadata before library import")
-        write_audio_metadata(file_path, normalized_metadata)
-        replacement_track = session.get(Track, request.get("replace_track_id")) if request.get("replace_track_id") else None
-        target_path = replacement_target_path(replacement_track, normalized_metadata, file_path)
-        if not replacement_track and str(target_path) in known_paths:
-            if file_path.exists() and file_path.resolve() != target_path.resolve():
-                file_path.unlink()
-                append_task_log(session, None, f"{entry_download_label(entry)}: removed duplicate staged file because {target_path.name} already exists")
-            update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
-            duplicate_item = session.get(ProposalItem, entry.get("item_id"))
-            if duplicate_item:
-                duplicate_item.status = ProposalStatus.completed
-            continue
-        payload = {
-            "path": str(file_path),
-            "relative_path": relative_media_path(file_path),
-            "extension": file_path.suffix.lower(),
-            "size_bytes": file_path.stat().st_size,
-            "mtime_ns": file_path.stat().st_mtime_ns,
-            "metadata": normalized_metadata,
-            "suggested_library_path": str(target_path),
-        }
-        if replacement_track:
-            replace_library_track_file(session, replacement_track, file_path, target_path, payload)
-            append_task_log(session, None, f"{entry_download_label(entry)}: replaced library file at {target_path}")
-        else:
-            import_file_to_library(session, file_path, target_path, payload)
-            append_task_log(session, None, f"{entry_download_label(entry)}: moved staged file into library at {target_path}")
-        mark_matching_wishlist_completed(session, normalized_metadata)
-        update_download_manifest_entry(entry, "completed", path=str(target_path), metadata=normalized_metadata)
-        imported_item = session.get(ProposalItem, entry.get("item_id"))
-        if imported_item:
-            imported_item.status = ProposalStatus.completed
-        imported += 1
-        known_paths.add(str(target_path))
-        imported_albums.add(
-            (
-                str(normalized_metadata.get("albumartist") or normalized_metadata.get("artist") or "Unknown Artist"),
-                str(normalized_metadata.get("album") or "Unknown Album"),
-            )
-        )
-    for artist_name, album_title in sorted(imported_albums):
-        ensure_album_cover_for_import(session, artist_name, album_title)
-    if finalize:
-        finalize_completed_download_batch(session, batch)
-        append_task_log(session, None, f"{batch.title}: library import finished for {imported} track(s)")
-    else:
-        session.flush()
-        append_task_log(session, None, f"{batch.title}: imported {imported} verified track(s); other tracks still in progress")
-    return imported
 
 
 def relative_media_path(file_path: Path) -> str:
@@ -4321,27 +4340,6 @@ def ensure_artist_cover(session: Session, artist: Artist) -> None:
             append_task_log(session, None, f"{artist.name}: using album cover as artist art {cover_path}")
     if cover_path:
         artist.cover_path = cover_path
-
-
-def ensure_album_cover_for_import(session: Session, artist_name: str, album_title: str) -> None:
-    album = session.scalar(
-        select(Album)
-        .join(Artist, Album.artist_id == Artist.id)
-        .where(func.lower(Artist.name) == artist_name.lower(), func.lower(Album.title) == album_title.lower())
-    )
-    if not album or album.cover_path:
-        return
-    try:
-        results = search_album_releases(artist_name, album_title)
-    except Exception as error:  # noqa: BLE001 - cover art should not block completed imports.
-        append_task_log(session, None, f"{artist_name} / {album_title}: album art lookup failed: {error}", "warning")
-        return
-    cover_path = download_album_cover_to_library(session, album, album_cover_candidate_urls(artist_name, album_title, results))
-    if not cover_path:
-        append_task_log(session, None, f"{artist_name} / {album_title}: no album art found", "warning")
-        return
-    album.cover_path = cover_path
-    append_task_log(session, None, f"{artist_name} / {album_title}: album art set")
 
 
 def cleanup_download_staging_batch(batch_id: str) -> None:
@@ -10162,6 +10160,49 @@ def fail_wishlist_item(session: Session, wishlist_item: WishlistItem, reason: st
 MAX_WISHLIST_SEARCH_ATTEMPTS = 3
 
 
+_SETTLED_BATCH_STATUSES = (ProposalStatus.completed, ProposalStatus.canceled, ProposalStatus.rejected)
+_OPEN_ITEM_STATUSES = (ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed)
+
+
+def reopen_batches_with_open_work(session: Session) -> int:
+    """A settled batch must never hold work a human still has to see (the user, 2026-09-29).
+
+    The Task Queue lists batches by their STORED status, so a `completed`/`canceled`/`rejected`
+    batch is hidden however live its rows are -- which is exactly how a batch Cancel lost ten
+    tracks at Download approval (`download_rows_awaiting_approval`). This is the net under every
+    such path, known or not: a settled batch with a selected, actionable row still pending,
+    approved, executing or failed is reopened -- `pending` if a row waits on a human, `executing`
+    if one is in flight, else `failed` (Issues). Runs at startup and on the recovery tick.
+    """
+    items = list(
+        session.scalars(
+            select(ProposalItem)
+            .join(ProposalBatch, ProposalBatch.id == ProposalItem.batch_id)
+            .where(ProposalBatch.status.in_(_SETTLED_BATCH_STATUSES))
+            .where(ProposalItem.selected.is_(True))
+            .where(ProposalItem.status.in_(_OPEN_ITEM_STATUSES))
+        )
+    )
+    statuses: dict[str, set[ProposalStatus]] = {}
+    for item in items:
+        if queue_state.is_actionable(item):
+            statuses.setdefault(item.batch_id, set()).add(item.status)
+    for batch_id, open_statuses in statuses.items():
+        batch = session.get(ProposalBatch, batch_id)
+        if batch is None:
+            continue
+        if ProposalStatus.pending in open_statuses:
+            batch.status = ProposalStatus.pending
+        elif open_statuses & {ProposalStatus.approved, ProposalStatus.executing}:
+            batch.status = ProposalStatus.executing
+        else:
+            batch.status = ProposalStatus.failed
+        write_app_log(f"Reopened settled batch {batch.title!r}: it still had work to see", "warning", batch_id=batch.id)
+    if statuses:
+        session.commit()
+    return len(statuses)
+
+
 def recover_stuck_wishlist_searches(session: Session) -> int:
     """Heal requests sitting in `searching` with nothing searching for them.
 
@@ -10816,6 +10857,11 @@ async def worker_loop() -> None:
         except Exception as error:  # noqa: BLE001 - recovery must never stop the worker booting.
             session.rollback()
             write_app_log(f"Wishlist search recovery failed: {error}", "warning")
+        try:
+            reopen_batches_with_open_work(session)
+        except Exception as error:  # noqa: BLE001 - recovery must never stop the worker booting.
+            session.rollback()
+            write_app_log(f"Reopening settled batches failed: {error}", "warning")
         recovered = recover_orphaned_tasks(session)
         if recovered:
             create_notification(
@@ -10929,6 +10975,11 @@ async def worker_loop() -> None:
                     except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
                         session.rollback()
                         write_app_log(f"Wishlist search recovery failed: {error}", "warning")
+                    try:
+                        reopen_batches_with_open_work(session)
+                    except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
+                        session.rollback()
+                        write_app_log(f"Reopening settled batches failed: {error}", "warning")
                     last_wishlist_recovery_tick = time.time()
                 if time.time() - last_deletion_prune_tick > DELETION_PRUNE_TICK_SECONDS:
                     try:

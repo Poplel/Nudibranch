@@ -4587,7 +4587,7 @@ def list_wishlist(
     expire_old_terminal_wishlist_items(session, items)
     items = [item for item in items if item.status != "removed" and not terminal_wishlist_expired(item)]
     downloading_ids = downloading_wishlist_ids(session)
-    return [serialize_wishlist_item(item, downloading_ids) for item in items]
+    return serialize_wishlist_items(session, items, downloading_ids)
 
 
 @router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"], summary="Add to wishlist")
@@ -4626,7 +4626,7 @@ def create_wishlist_item(
             album=payload.album,
             track=payload.track,
         )
-        return serialize_wishlist_item(existing)
+        return serialize_wishlist_items(session, [existing])[0]
     # Requesting something again replaces its declined (or failed) row rather than listing it twice.
     for declined in session.scalars(
         select(WishlistItem)
@@ -4638,7 +4638,7 @@ def create_wishlist_item(
         .where(WishlistItem.status.in_(["rejected", "failed"]))
     ):
         session.delete(declined)
-    item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
+    item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}), source=(payload.source or None) and payload.source[:64])
     item.status_changed_at = datetime.now(timezone.utc)
     # Gate 1 (2026-09-23): an approver's own request skips straight to searching, exactly as
     # before. Everyone else's request waits at `requested` until a `wishlist:approve_all` holder
@@ -4668,7 +4668,7 @@ def create_wishlist_item(
         album=item.album,
         track=item.track,
     )
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"], summary="Remove from wishlist")
@@ -4690,7 +4690,7 @@ def remove_wishlist_item(
     # whose own row already read Declined, with nothing in any UI able to clear them.
     purge_wishlist_work(session, item, actor_id=user.id)
     session.refresh(item)
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.post("/wishlist/{item_id}/cancel", response_model=WishlistOut, tags=["wishlist"], summary="Stop a request's candidate search")
@@ -4709,7 +4709,7 @@ def cancel_wishlist_search(
     if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     if wishlist_stage(item) is not ItemStage.searching:
-        return serialize_wishlist_item(item)
+        return serialize_wishlist_items(session, [item])[0]
     stop_wishlist_search_tasks(session, {item.id})
     # Candidates the search already committed go too. `purge_wishlist_work` declines the row on the
     # way (it is shared with Remove), so the gate-1 state is written after it, not before.
@@ -4721,7 +4721,7 @@ def cancel_wishlist_search(
     item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(item)
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.get("/wishlist/queue", response_model=list[WishlistOut], tags=["wishlist"], summary="List requests waiting at gate 1")
@@ -4743,7 +4743,7 @@ def list_wishlist_queue(
             .order_by(WishlistItem.created_at.asc())
         )
     )
-    return [serialize_wishlist_item(item) for item in items]
+    return serialize_wishlist_items(session, items)
 
 
 @router.post("/wishlist/queue/approve", response_model=list[WishlistOut], tags=["wishlist"], summary="Approve requests at gate 1")
@@ -4784,7 +4784,7 @@ def approve_wishlist_queue(
             requester_id=item.user_id,
         )
     session.commit()
-    return [serialize_wishlist_item(item) for item in approved]
+    return serialize_wishlist_items(session, approved)
 
 
 @router.post("/wishlist/queue/reject", response_model=list[WishlistOut], tags=["wishlist"], summary="Decline requests at gate 1")
@@ -4820,7 +4820,7 @@ def reject_wishlist_queue(
             item_id=item.id,
             requester_id=item.user_id,
         )
-    return [serialize_wishlist_item(item) for item in rejected]
+    return serialize_wishlist_items(session, rejected)
 
 
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
@@ -6263,8 +6263,18 @@ _UI_SETTLED_ITEM_STATUSES = {
 }
 
 
-def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> list[ProposalBatch]:
+def prune_settled_batches(
+    session: Session, batches: list[ProposalBatch], keep_settled: bool = False
+) -> list[ProposalBatch]:
+    """Settle batches whose work is done, and drop them from the list unless `keep_settled`.
+
+    ⚠️ `keep_settled` is what `include_settled=true` asks for. It used to be ignored here, so a
+    batch that settled in this very call was dropped even when the caller asked to see settled
+    ones -- a finished download batch never appeared in the settled view at all. Deleted (empty)
+    batches are always dropped: there is nothing left to show.
+    """
     settled: set[str] = set()
+    deleted: set[str] = set()
     for batch in batches:
         if batch.items:
             actionable_items = [
@@ -6283,7 +6293,15 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
                 else:
                     batch.status = ProposalStatus.completed
                     settled.add(batch.id)
-            elif not actionable_items and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
+            # ⚠️ Nothing selected is not nothing to do: a batch whose every candidate was
+            # deselected still holds rows at a gate, and settling it hid them for good.
+            elif (
+                not actionable_items
+                and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items)
+                and not any(
+                    item.status is ProposalStatus.pending and queue_state.is_actionable(item) for item in batch.items
+                )
+            ):
                 if any_failed:
                     batch.status = ProposalStatus.failed
                 else:
@@ -6295,15 +6313,18 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
             # time used to leave one behind every single time.
             session.delete(batch)
             settled.add(batch.id)
+            deleted.add(batch.id)
         elif batch.created_at and as_utc(batch.created_at) < datetime.now(timezone.utc) - timedelta(minutes=10):
             # An empty DOWNLOAD batch is left alone while fresh — a candidate search commits its
             # batch before attaching items and must not be finalized mid-search — but one older
             # than any plausible in-flight search is dead leftover and goes the same way.
             session.delete(batch)
             settled.add(batch.id)
+            deleted.add(batch.id)
     if session.dirty or session.deleted:
         session.commit()
-    return [batch for batch in batches if batch.id not in settled]
+    hidden = deleted if keep_settled else settled
+    return [batch for batch in batches if batch.id not in hidden]
 
 
 def resolve_requester_names(session: Session, batches: list[ProposalBatch]) -> dict[str, str]:
@@ -6369,7 +6390,7 @@ def list_approvals(
             ProposalBatch.items.any(ProposalItem.requester_id == requester)
         )
     batches = list(session.scalars(query.order_by(ProposalBatch.created_at.desc())))
-    batches = prune_settled_batches(session, batches)
+    batches = prune_settled_batches(session, batches, keep_settled=include_settled)
     batches = filter_batches_for_bucket(batches, bucket)
     batches = batches[offset : offset + limit] if limit else batches[offset:]
     names = resolve_requester_names(session, batches)
@@ -6644,7 +6665,7 @@ def reject(
     # ⚠️ Removal CANCELS first (the user's rule, 2026-09-22). `remove_items` stops any live
     # transfer and deletes its partial file before the row goes, so nothing can be removed from the
     # Task Queue while it is still running.
-    remove_items(session, item_ids, actor_id=user.id)
+    remove_items(session, item_ids, actor_id=user.id, notify_declined=True)
     session.commit()
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
@@ -6714,7 +6735,10 @@ def remove_selected_items(
         if batch:
             _assert_may_remove(batch, user)
     canceled, removed, batch_ids = remove_items(
-        session, [item_id for ids in grouped.values() for item_id in sorted(ids)], actor_id=user.id
+        session,
+        [item_id for ids in grouped.values() for item_id in sorted(ids)],
+        actor_id=user.id,
+        notify_declined=True,
     )
     session.commit()
     return QueueBulkResult(
@@ -7565,7 +7589,38 @@ def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) 
     }.get(status, ItemStage.waiting)
 
 
-def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
+def serialize_wishlist_items(
+    session: Session, items: list[WishlistItem], downloading_ids: set[str] | None = None
+) -> list[WishlistOut]:
+    """Serialize requests, dropping any `batch_id`/`item_id` whose row no longer exists.
+
+    ⚠️ A request's pointers outlive what they point at: a download batch is finalized and later
+    deleted, a Remove deletes rows, a research retry replaces them. Handing a client a batch id that
+    resolves to nothing sends it to a Task Queue entry that is not there. Checked here, once per
+    response in two queries, rather than at every one of the many places a row can go.
+    """
+    batch_ids = {item.batch_id for item in items if item.batch_id}
+    item_ids = {item.item_id for item in items if item.item_id}
+    live_batches = set(session.scalars(select(ProposalBatch.id).where(ProposalBatch.id.in_(batch_ids)))) if batch_ids else set()
+    live_items = set(session.scalars(select(ProposalItem.id).where(ProposalItem.id.in_(item_ids)))) if item_ids else set()
+    return [
+        serialize_wishlist_item(
+            item,
+            downloading_ids,
+            batch_id=item.batch_id if item.batch_id in live_batches else None,
+            item_id=item.item_id if item.item_id in live_items else None,
+        )
+        for item in items
+    ]
+
+
+def serialize_wishlist_item(
+    item: WishlistItem,
+    downloading_ids: set[str] | None = None,
+    *,
+    batch_id: str | None,
+    item_id: str | None,
+) -> WishlistOut:
     stage = wishlist_stage(item, downloading_ids)
     label = _WISHLIST_STAGE_LABELS.get(stage, stage.value)
     return WishlistOut(
@@ -7576,11 +7631,12 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
         artist=item.artist,
         album=item.album,
         track=item.track,
+        source=item.source,
         stage=stage,
         status_code=stage.value,
         status_label=label,
-        batch_id=item.batch_id,
-        item_id=item.item_id,
+        batch_id=batch_id,
+        item_id=item_id,
         progress=ProgressOut(
             value=100.0 if stage is ItemStage.completed else 0.0,
             label=label,

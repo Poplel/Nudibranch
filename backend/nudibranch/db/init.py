@@ -171,6 +171,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE wishlist_items ADD COLUMN status_changed_at DATETIME"))
         session.execute(text("UPDATE wishlist_items SET status_changed_at = created_at WHERE status_changed_at IS NULL"))
         session.commit()
+    if "source" not in wishlist_columns:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN source VARCHAR(64) NULL"))
+        session.commit()
     artist_columns = {row[1] for row in session.execute(text("PRAGMA table_info(artists)"))}
     if "cover_path" not in artist_columns:
         session.execute(text("ALTER TABLE artists ADD COLUMN cover_path TEXT"))
@@ -343,6 +346,7 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _fail_completed_batches_with_failed_items(session)
     _delete_empty_proposal_batches(session)
     _heal_searching_parent_items(session)
+    _reopen_downloads_finalized_unfetched(session)
     move_task_result_logs_to_app_log(session)
 
 
@@ -545,6 +549,60 @@ def _drop_empty_rejected_batches(session: Session) -> None:
         "DELETE FROM proposal_batches WHERE status = 'rejected' "
         "AND NOT EXISTS (SELECT 1 FROM proposal_items WHERE proposal_items.batch_id = proposal_batches.id)"
     ))
+    session.commit()
+
+
+def _reopen_downloads_finalized_unfetched(session: Session) -> None:
+    """Give back the tracks a finalize marked `completed` although they never downloaded.
+
+    Until 2026-09-29 a download batch was finalized as soon as its manifest had nothing in flight,
+    and finalizing marked every `pending` row `completed` -- including a selected track a Cancel had
+    just put back at Download approval, or one a partial Approve had never reached. The track and
+    its batch vanished from every list (sandalphon: Boards of Canada x10, Daft Punk "Nightvision",
+    Fleetwood Mac "Dreams"). Such a row is recognisable: a selected slskd candidate, `completed`,
+    whose cached stage never got past waiting (a real completion is re-stamped `staging` when its
+    file lands) and which no "Add to library" row came from. It goes back to Download approval with
+    its unused siblings and its ancestors, and its batch is reopened. Idempotent.
+    """
+    rows = session.execute(text(
+        "SELECT i.id, i.parent_id, i.batch_id FROM proposal_items i "
+        "WHERE i.status = 'completed' AND i.kind = 'download' AND i.selected = 1 "
+        "AND i.stage IN ('awaiting_approval', 'queued', 'approved') "
+        "AND i.payload_json LIKE '%\"action\": \"queue_download\"%' "
+        "AND NOT EXISTS (SELECT 1 FROM proposal_items r WHERE r.kind = 'import_files' "
+        "AND r.payload_json LIKE '%\"source_download_item_id\": \"' || i.id || '\"%')"
+    )).all()
+    if not rows:
+        return
+    parents = {row.parent_id for row in rows if row.parent_id}
+    for row in rows:
+        session.execute(
+            text("UPDATE proposal_items SET status = 'pending', stage = 'awaiting_approval' WHERE id = :id"),
+            {"id": row.id},
+        )
+    for parent_id in parents:
+        # The track's alternates were swept to `completed` by the same finalize.
+        session.execute(
+            text(
+                "UPDATE proposal_items SET status = 'pending' WHERE parent_id = :parent AND selected = 0 "
+                "AND status = 'completed' AND stage = 'awaiting_approval'"
+            ),
+            {"parent": parent_id},
+        )
+        # Ancestors (track, album, artist rows) settle with their children; unsettle them.
+        current = parent_id
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            session.execute(
+                text("UPDATE proposal_items SET status = 'pending' WHERE id = :id AND status = 'completed'"),
+                {"id": current},
+            )
+            current = session.execute(
+                text("SELECT parent_id FROM proposal_items WHERE id = :id"), {"id": current}
+            ).scalar()
+    for batch_id in {row.batch_id for row in rows}:
+        session.execute(text("UPDATE proposal_batches SET status = 'pending' WHERE id = :id"), {"id": batch_id})
     session.commit()
 
 
