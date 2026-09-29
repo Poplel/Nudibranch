@@ -618,19 +618,31 @@ def _reset_stale_container_stages(session: Session) -> None:
     executing beneath it is stale -- the rows `_reopen_downloads_finalized_unfetched` gave back read
     "waiting to download" and "verifying 0% · 0 of 1 verified" above candidates at Download approval.
     Such a row goes to `awaiting_approval`, its free text and progress dropped. Idempotent.
+
+    The claim can be the cached `stage`, or -- with no `stage` at all -- the row's leftover
+    `download_progress`/`status` text, which `resolve_stage` falls back to (the Fleetwood Mac rows).
+    Only rows above a candidate that really waits at the gate: a row whose search is still running
+    has no candidates yet and is left alone.
     """
+    in_flight = ", ".join(f"'{s}'" for s in _IN_FLIGHT_STAGES)
     rows = session.execute(text(
-        "SELECT id, payload_json FROM proposal_items WHERE status = 'pending' "
-        "AND payload_json NOT LIKE '%\"action\"%' AND stage IN (" + ", ".join(f"'{s}'" for s in _IN_FLIGHT_STAGES) + ")"
+        "SELECT id, payload_json FROM proposal_items WHERE status = 'pending' AND kind = 'download' "
+        "AND payload_json NOT LIKE '%\"action\"%' AND (stage IN (" + in_flight + ") OR (stage IS NULL "
+        "AND (payload_json LIKE '%\"download_progress\"%' OR payload_json LIKE '%\"status\"%')))"
     )).all()
+    beneath = (
+        "WITH RECURSIVE sub(id) AS (SELECT id FROM proposal_items WHERE parent_id = :id "
+        "UNION SELECT p.id FROM proposal_items p JOIN sub ON p.parent_id = sub.id) "
+        "SELECT 1 FROM proposal_items WHERE id IN (SELECT id FROM sub) AND "
+    )
     for row in rows:
-        live = session.execute(text(
-            "WITH RECURSIVE sub(id) AS (SELECT id FROM proposal_items WHERE parent_id = :id "
-            "UNION SELECT p.id FROM proposal_items p JOIN sub ON p.parent_id = sub.id) "
-            "SELECT 1 FROM proposal_items WHERE id IN (SELECT id FROM sub) "
-            "AND status IN ('approved', 'executing') LIMIT 1"
-        ), {"id": row.id}).first()
-        if live:
+        live = session.execute(
+            text(beneath + "status IN ('approved', 'executing') LIMIT 1"), {"id": row.id}
+        ).first()
+        waiting = session.execute(
+            text(beneath + "status = 'pending' AND payload_json LIKE '%\"action\"%' LIMIT 1"), {"id": row.id}
+        ).first()
+        if live or not waiting:
             continue
         try:
             payload = json.loads(row.payload_json or "{}")
