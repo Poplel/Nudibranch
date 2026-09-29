@@ -271,7 +271,10 @@ def _decline_requests_left_empty(
     whole request -- the requester was told "Request declined" and the row read Declined while four
     good candidates sat beside the removed one. A request is declined only when nothing of it is
     left: no row outside `leaving_ids` (rows this same removal is taking) that is not already
-    rejected or canceled. A completed row counts as left -- part of the request is in the library.
+    rejected or canceled. A completed IMPORT row counts as left -- that part is in the library. A
+    completed DOWNLOAD row does not: its file was handed to an "Add to library" row, and removing
+    that one is what leaves the request with nothing (seen live: requests kept reading "staged"
+    after their staged files were removed).
     """
     now = datetime.now(timezone.utc)
     declined: set[str] = set()
@@ -285,6 +288,7 @@ def _decline_requests_left_empty(
             .where(ProposalItem.wishlist_item_id == wishlist_item_id)
             .where(ProposalItem.id.not_in(leaving_ids) if leaving_ids else True)
             .where(ProposalItem.status.not_in([ProposalStatus.rejected, ProposalStatus.canceled]))
+            .where(~((ProposalItem.kind == ProposalKind.download) & (ProposalItem.status == ProposalStatus.completed)))
             .limit(1)
         )
         if remaining:

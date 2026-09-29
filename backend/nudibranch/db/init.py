@@ -347,6 +347,7 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _delete_empty_proposal_batches(session)
     _heal_searching_parent_items(session)
     _reopen_downloads_finalized_unfetched(session)
+    _reset_stale_container_stages(session)
     move_task_result_logs_to_app_log(session)
 
 
@@ -603,6 +604,44 @@ def _reopen_downloads_finalized_unfetched(session: Session) -> None:
             ).scalar()
     for batch_id in {row.batch_id for row in rows}:
         session.execute(text("UPDATE proposal_batches SET status = 'pending' WHERE id = :id"), {"id": batch_id})
+    session.commit()
+
+
+_IN_FLIGHT_STAGES = ("approved", "queued", "downloading", "retrying", "staging", "verifying", "staged", "importing")
+
+
+def _reset_stale_container_stages(session: Session) -> None:
+    """A waiting grouping row (artist/album/track) must not claim work that is not happening.
+
+    Grouping rows cache a `stage` and free text like any row, refreshed only while downloads run.
+    A `pending` one whose cache still says queued/verifying/staging… with nothing approved or
+    executing beneath it is stale -- the rows `_reopen_downloads_finalized_unfetched` gave back read
+    "waiting to download" and "verifying 0% · 0 of 1 verified" above candidates at Download approval.
+    Such a row goes to `awaiting_approval`, its free text and progress dropped. Idempotent.
+    """
+    rows = session.execute(text(
+        "SELECT id, payload_json FROM proposal_items WHERE status = 'pending' "
+        "AND payload_json NOT LIKE '%\"action\"%' AND stage IN (" + ", ".join(f"'{s}'" for s in _IN_FLIGHT_STAGES) + ")"
+    )).all()
+    for row in rows:
+        live = session.execute(text(
+            "WITH RECURSIVE sub(id) AS (SELECT id FROM proposal_items WHERE parent_id = :id "
+            "UNION SELECT p.id FROM proposal_items p JOIN sub ON p.parent_id = sub.id) "
+            "SELECT 1 FROM proposal_items WHERE id IN (SELECT id FROM sub) "
+            "AND status IN ('approved', 'executing') LIMIT 1"
+        ), {"id": row.id}).first()
+        if live:
+            continue
+        try:
+            payload = json.loads(row.payload_json or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        payload.pop("status", None)
+        payload.pop("download_progress", None)
+        session.execute(
+            text("UPDATE proposal_items SET stage = 'awaiting_approval', payload_json = :p WHERE id = :id"),
+            {"id": row.id, "p": json.dumps(payload)},
+        )
     session.commit()
 
 
