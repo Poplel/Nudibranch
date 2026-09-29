@@ -7862,6 +7862,7 @@ def serialize_proposal_item(
     flow: ProposalFlow,
     requester_names: dict[str, str] | None = None,
     approvable_ids: set[str] | None = None,
+    superseded_ids: set[str] | None = None,
 ) -> ProposalItemOut:
     """One item, with its stage/bucket/progress/candidate resolved server-side.
 
@@ -7909,7 +7910,7 @@ def serialize_proposal_item(
             if approvable_ids is not None
             else (actionable and queue_state.can_approve(stage, flow))
         ),
-        can_retry=queue_state.can_retry(stage, flow),
+        can_retry=queue_state.can_retry(stage, flow) and item.id not in (superseded_ids or set()),
         can_cancel=queue_state.can_cancel(stage),
     )
 
@@ -7934,6 +7935,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
     # Computed once over the whole batch: a container is approvable only because of what is under
     # it, so this cannot be decided row by row.
     approvable = queue_state.approvable_item_ids(items, flow)
+    superseded = queue_state.superseded_download_rows(items)
     return ProposalBatchOut(
         id=batch.id,
         title=title,
@@ -7948,7 +7950,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         items=[
-            serialize_proposal_item(item, flow, requester_names, approvable)
+            serialize_proposal_item(item, flow, requester_names, approvable, superseded)
             for item in items
         ],
     )

@@ -671,6 +671,30 @@ def can_approve(stage: ItemStage, flow: ProposalFlow | str | None = None) -> boo
     return stage in allowed
 
 
+def superseded_download_rows(items: Iterable[ProposalItem]) -> set[str]:
+    """Failed candidates whose track already has another candidate in flight or done.
+
+    One download per track (`retry_items`, `approve_batch`): Retry skips such a track and Approve on
+    such a row answers 409, so offering either button on it is a button that does nothing. Seen
+    live 2026-09-29: four failed alternates of a finished "Cloudbusting" all read Approve + Retry.
+    """
+    materialized = list(items)
+    taken = {
+        item.parent_id
+        for item in materialized
+        if item.parent_id
+        and item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.completed}
+        and payload_of(item).get("action") in _DOWNLOAD_ACTIONS
+    }
+    return {
+        item.id
+        for item in materialized
+        if item.status is ProposalStatus.failed
+        and item.parent_id in taken
+        and payload_of(item).get("action") in _DOWNLOAD_ACTIONS
+    }
+
+
 def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str | None) -> set[str]:
     """Every id a human could approve, containers resolved from their descendants.
 
@@ -686,6 +710,7 @@ def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str 
         if item.parent_id:
             children.setdefault(item.parent_id, []).append(item)
     approvable: set[str] = set()
+    superseded = superseded_download_rows(materialized)
 
     def visit(item: ProposalItem, seen: frozenset[str]) -> bool:
         if item.id in seen:
@@ -699,7 +724,11 @@ def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str 
             if visit(kid, seen | {item.id}):
                 under = True
         payload = payload_of(item)
-        mine = is_actionable(item, payload) and can_approve(resolve_stage(item, payload), flow)
+        mine = (
+            item.id not in superseded
+            and is_actionable(item, payload)
+            and can_approve(resolve_stage(item, payload), flow)
+        )
         if under or mine:
             approvable.add(item.id)
         return under or mine
