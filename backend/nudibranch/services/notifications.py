@@ -174,9 +174,6 @@ def _canonical_push_message(
 _NOTIFICATION_AUDIENCE: dict[str, set[Permission]] = {
     "activity": {Permission.activity_read},
     "task-queue": {Permission.approvals_manage, Permission.wishlist_approve_all},
-    # Legacy target kept only so historical rows still route; nothing new aims here.  The
-    # requester-facing destination is "/requests" below.
-    "downloads": {Permission.approvals_manage},
     "tools": {Permission.tools_manage},
     "library": {Permission.library_view},
     "automations": {Permission.automations_manage},

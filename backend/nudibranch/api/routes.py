@@ -3393,7 +3393,7 @@ def verify_track_audio(
         title="Audio check complete",
         body=f"{track_label}: {result['message']}",
         event_type="library_audio_check",
-        target_url="/library",
+        target_url=f"/library/albums/{track.album_id}" if track.album_id else "/library",
         user_id=current_user.id,
     )
     session.commit()

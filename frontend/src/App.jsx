@@ -139,6 +139,10 @@ const DEFAULT_CLAIM_TIMEOUT_MINUTES = 0;
 // "Approvals" is gone: other users' wishlist requests now surface inside the Task Queue's
 // Review bucket alongside the candidates they produce, instead of a third, differently-named
 // queue (matches the iOS rebuild -- see CLAUDE-wip-requests-rework.md).
+// Writes the app makes on its own — playback reporting, the command channel, marking the tray
+// read — which must not flash "Working…" at someone who did not ask for anything.
+const BACKGROUND_WRITE_PATHS = ["/player/", "/me/plays", "/notifications/read", "/podcasts/episodes/"];
+
 const navItems = [
   ["Home", House],
   ["Library", Music],
@@ -483,6 +487,7 @@ function App() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [pendingWrites, setPendingWrites] = useState(0);
   const [error, setError] = useState("");
   const syncToastTaskIds = useRef(new Set());
   const checkFileTaskIds = useRef(new Set());
@@ -756,21 +761,32 @@ function App() {
     return () => { cancelled = true; if (intervalId !== null) clearInterval(intervalId); };
   }, [token, user?.id]);
 
+  // ⚠️ Every action shows "Working…" from the click until the server has answered. It is counted
+  // here, in the one function every request goes through, so no handler can forget it: a slow
+  // server used to make a click look ignored wherever a handler had no busy state of its own.
+  // Reads never count, and neither do the writes the app makes by itself (`BACKGROUND_WRITE_PATHS`).
   const api = useCallback(async (path, options = {}) => {
     const isFormData = options.body instanceof FormData;
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers: {
-        ...(isFormData ? {} : { "Content-Type": "application/json" }),
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
-      },
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || `${response.status} ${response.statusText}`);
+    const method = (options.method || "GET").toUpperCase();
+    const showsWork = method !== "GET" && !BACKGROUND_WRITE_PATHS.some((prefix) => path.startsWith(prefix));
+    if (showsWork) setPendingWrites((count) => count + 1);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers: {
+          ...(isFormData ? {} : { "Content-Type": "application/json" }),
+          Authorization: `Bearer ${token}`,
+          ...(options.headers || {}),
+        },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `${response.status} ${response.statusText}`);
+      }
+      return await response.json();
+    } finally {
+      if (showsWork) setPendingWrites((count) => count - 1);
     }
-    return response.json();
   }, [token]);
 
   async function login(username, password) {
@@ -1221,6 +1237,84 @@ function App() {
       });
     } catch (favoriteError) {
       notify("Favorite failed", favoriteError.message, "ui_error");
+    }
+  }
+
+  // Where clicking a notification goes: the page its `target_url` names, never just "the app".
+  // ⚠️ The same vocabulary the iOS app reads (`AppNavigation.deepLink`), so the server writes one
+  // target and both clients land in the same place:
+  //   /task-queue?bucket=&batch=   /requests?batch=   /library/albums/<id>   /podcasts/<id>
+  //   /playlists[/<id>|/shares]    /activity   /tools   /automations   /settings?section=
+  // A full http(s) URL (a broadcast's link) opens in a new tab. Anything this user cannot open,
+  // or that has no page here (/player, /notifications), leaves the tray as it is.
+  async function openNotification(notification) {
+    const target = (notification.target_url || "").trim();
+    if (/^https?:\/\//i.test(target)) {
+      window.open(target, "_blank", "noopener");
+      return;
+    }
+    const [path, queryString = ""] = target.split("?");
+    const segments = path.split("/").filter(Boolean);
+    const query = new URLSearchParams(queryString);
+    const go = (label) => {
+      if (!canViewPage(user, label)) return false;
+      setAlbumDetail(null);
+      setArtistDetail(null);
+      setPage(label);
+      setTrayOpen(false);
+      return true;
+    };
+    switch (segments[0]) {
+      case "task-queue": {
+        if (!go("Task Queue")) { go("Wishlist"); break; }
+        const bucket = query.get("bucket");
+        if (["review", "issues", "changes"].includes(bucket)) setQueueBucket(bucket);
+        break;
+      }
+      case "requests":
+      case "wishlist":
+        go("Wishlist");
+        break;
+      case "library": {
+        if (!go("Library")) break;
+        if (segments[1] !== "albums" || !segments[2]) break;
+        try {
+          const data = await api(`/library/tracks?album_id=${encodeURIComponent(segments[2])}&page_size=1`);
+          const track = data?.items?.[0];
+          if (track) openAlbumDetail({ id: segments[2], title: track.album_title, artist_name: track.artist_name }, "Library");
+        } catch {
+          // The Library page is already showing; the album just could not be opened.
+        }
+        break;
+      }
+      case "podcasts":
+        if (segments[1] && canViewPage(user, "Podcasts")) {
+          openPodcastDetail({ id: segments[1] });
+          setTrayOpen(false);
+        } else {
+          go("Podcasts");
+        }
+        break;
+      case "playlists":
+        go("Playlists");
+        break;
+      case "activity":
+        go("Activity");
+        break;
+      case "tools":
+        go("Tools");
+        break;
+      case "automations":
+        go("Automations");
+        break;
+      case "settings":
+        go("Settings");
+        break;
+      case "import":
+        go("Import/Add");
+        break;
+      default:
+        break;
     }
   }
 
@@ -3978,6 +4072,7 @@ function App() {
             <NotificationTray
               notifications={notifications}
               onClear={clearNotifications}
+              onOpen={openNotification}
               style={{ position: "fixed", top: trayAnchor.top, right: trayAnchor.right }}
             />,
             appRootRef.current
@@ -4102,7 +4197,7 @@ function App() {
           {!(playerOpen || displayedRemote) && (
             <div className="topbar-side topbar-side-right">{topbarUtilityActions}</div>
           )}
-          {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
+          {(loading || pendingWrites > 0) && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
         <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
@@ -4363,6 +4458,7 @@ function App() {
             playlists={playlists}
             queueSelectionCount={queueSelection[queueBucket].size}
             tasks={tasks}
+            onCancelTask={cancelTask}
             downloadProgress={downloadProgressSummary(approvals)}
             importActions={{
               onScan: scanImportFolder,
@@ -4501,7 +4597,7 @@ function LoginScreen({ loading, error, onLogin }) {
   );
 }
 
-function NotificationTray({ notifications, onClear, style }) {
+function NotificationTray({ notifications, onClear, onOpen, style }) {
   return (
     <div className="notification-tray" style={style}>
       <div className="notification-header">
@@ -4520,6 +4616,7 @@ function NotificationTray({ notifications, onClear, style }) {
               tone={notificationSeverity(notification)}
               title={notification.title}
               body={notification.body}
+              onClick={() => onOpen(notification)}
             />
           ))
         )}
@@ -4528,9 +4625,9 @@ function NotificationTray({ notifications, onClear, style }) {
   );
 }
 
-function TrayItem({ title, body, tone = "normal" }) {
+function TrayItem({ title, body, tone = "normal", onClick }) {
   return (
-    <button className={`tray-item ${tone}`}>
+    <button className={`tray-item ${tone}`} onClick={onClick}>
       <span>{title}</span>
       <small>{body}</small>
     </button>
@@ -8927,7 +9024,7 @@ function TasksView({ tasks, playback, onCancel }) {
                 <small>{taskSummary(task)}</small>
                 <TaskProgress task={task} />
               </button>
-              {["queued", "running"].includes(task.status) && (
+              {taskCancelable(task) && (
                 <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
                   <X size={14} />
                   Cancel
@@ -8944,7 +9041,7 @@ function TasksView({ tasks, playback, onCancel }) {
   );
 }
 
-function ActiveWorkBar({ tasks }) {
+function ActiveWorkBar({ tasks, onCancel }) {
   // One row per kind of work: several "Processing task queue" rows said the same thing over and
   // over. The one furthest along (running, with progress) speaks for the rest.
   const byName = new Map();
@@ -8965,9 +9062,15 @@ function ActiveWorkBar({ tasks }) {
             <strong>{taskDisplayName(task)}</strong>
             <InlineProgress
               value={progress?.percent || 0}
-              label={progress?.message || task.status}
+              label={progress ? progressLabel(progress) : task.status}
               indeterminate={!progress}
             />
+            {onCancel && task.status === "running" && progress?.cancelable && (
+              <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
+                <X size={14} />
+                Cancel
+              </button>
+            )}
           </div>
         );
       })}
@@ -8978,7 +9081,7 @@ function ActiveWorkBar({ tasks }) {
 function TaskProgress({ task }) {
   const progress = taskProgress(task);
   if (!progress) return null;
-  return <InlineProgress value={progress.percent} label={progress.message} />;
+  return <InlineProgress value={progress.percent} label={progressLabel(progress)} />;
 }
 
 function taskDisplayName(task) {
@@ -12235,6 +12338,7 @@ function Inspector({
   playlists,
   queueSelectionCount,
   tasks,
+  onCancelTask,
   downloadProgress,
   importActions,
   wishlistActions,
@@ -12483,7 +12587,7 @@ function Inspector({
           <small>{downloadProgress.detail}</small>
         </div>
       )}
-      <ActiveWorkBar tasks={tasks} />
+      <ActiveWorkBar tasks={tasks} onCancel={onCancelTask} />
       {(stats.rows.length > 0 || stats.summary) && (
         <div className="metadata-grid inspector-stats">
           {stats.summary && (
@@ -14985,7 +15089,34 @@ function taskProgress(task) {
     total,
     percent: Number(progress.percent ?? (total ? (current / total) * 100 : 0)),
     message: progress.message || taskSummary({ ...task, result: null }),
+    eta: task.status === "running" ? etaLabel(progress.eta_seconds) : "",
+    cancelable: !!progress.cancelable,
   };
+}
+
+// The worker's time-left estimate for a long scan (`ScanProgress`), in words. Rounded hard on
+// purpose: it is an estimate from the pace so far, and "11 min 42 s" would claim more than that.
+function etaLabel(seconds) {
+  const value = Number(seconds);
+  if (seconds == null || !Number.isFinite(value) || value < 0) return "";
+  if (value < 60) return "less than a minute left";
+  const minutes = Math.round(value / 60);
+  if (minutes < 60) return `about ${minutes} min left`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `about ${hours} h ${rest} min left` : `about ${hours} h left`;
+}
+
+function progressLabel(progress) {
+  return [progress.message, progress.eta].filter(Boolean).join(" · ");
+}
+
+// A queued task is always cancelable: the worker simply never claims it. A running one only
+// stops if its handler checks for the cancel, so the button is offered only where it works.
+function taskCancelable(task) {
+  if (task.status === "queued") return true;
+  if (task.status !== "running") return false;
+  return task.type === "execute_proposal_batch" || !!task.result?.progress?.cancelable;
 }
 
 function proposalTaskSummary(result) {

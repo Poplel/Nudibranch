@@ -610,6 +610,10 @@ nav button:hover {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.active-work-item .task-cancel {
+  grid-column: 1 / -1;
+}
+
 .inspector-progress-card {
   display: grid;
   gap: 8px;

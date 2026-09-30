@@ -1,5 +1,6 @@
 import json
 import socket
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy import and_, or_, select, update
@@ -103,6 +104,67 @@ def update_task_progress(session: Session, task: Task, current: int, total: int,
     task.result_json = json.dumps(payload)
     task.lease_until = Task.lease_expiry(300)
     session.commit()
+
+
+class ScanProgress:
+    """Progress, a time-left estimate and cooperative cancel for a long library scan.
+
+    Call `step()` at the top of every iteration and stop the loop when it returns False. The scan
+    then finishes normally with whatever it has found so far: a cancel stops the scanning, it
+    does not throw away findings.
+
+    Writes are throttled, because each one takes SQLite's single write lock. The cancel check
+    rides on the same throttle, so a cancel lands within about a second of work.
+    `progress.cancelable` tells clients this task will actually honour Cancel while running.
+    """
+
+    MIN_WRITE_INTERVAL = 1.0
+    # An estimate from the first couple of items is noise, so none is given until both pass.
+    ETA_MIN_ITEMS = 3
+    ETA_MIN_SECONDS = 5.0
+
+    def __init__(self, session: Session, task: Task | None, total: int) -> None:
+        self.session = session
+        self.task = task
+        self.total = max(1, total)
+        self.done = 0
+        self.canceled = False
+        self._started = time.monotonic()
+        self._last_write: float | None = None
+
+    def step(self, message: str) -> bool:
+        """Report that the next item is starting. False once the task has been cancelled."""
+        if self.canceled:
+            return False
+        done = self.done
+        self.done += 1
+        if self.task is None:
+            return True
+        now = time.monotonic()
+        if self._last_write is not None and now - self._last_write < self.MIN_WRITE_INTERVAL:
+            return True
+        self._last_write = now
+        status = self.session.scalar(select(Task.status).where(Task.id == self.task.id))
+        if status == TaskStatus.canceled:
+            self.canceled = True
+            return False
+        elapsed = now - self._started
+        eta_seconds = None
+        if done >= self.ETA_MIN_ITEMS and elapsed >= self.ETA_MIN_SECONDS:
+            eta_seconds = round(elapsed / done * (self.total - done))
+        update_task_progress(
+            self.session, self.task, min(done, self.total), self.total, message,
+            eta_seconds=eta_seconds, cancelable=True,
+        )
+        return True
+
+    def log_if_canceled(self, label: str) -> None:
+        if self.canceled:
+            append_task_log(
+                self.session, self.task,
+                f"{label} cancelled after {self.done - 1} of {self.total}; keeping what was found so far",
+                "warning",
+            )
 
 
 def fail_task(session: Session, task: Task, error: str) -> None:
