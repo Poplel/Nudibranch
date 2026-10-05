@@ -20,7 +20,7 @@ from nudibranch.db.models import (
     WishlistItem,
 )
 from nudibranch.services import queue_state
-from nudibranch.services.notifications import create_notification
+from nudibranch.services.notifications import create_notification, retire_queue_notifications
 from nudibranch.services.tasks import enqueue_task
 
 
@@ -170,6 +170,8 @@ def approve_batch(
         session.rollback()
         raise NothingToApprove("Nothing in this selection can be approved")
     batch.status = ProposalStatus.approved
+    # The ask is answered; the "needs approval" row must not sit unread (or still be pushed).
+    retire_queue_notifications(session, batch_id)
     session.commit()
     return enqueue_task(session, "execute_proposal_batch", {"batch_id": batch_id})
 
@@ -249,6 +251,10 @@ def reject_items(
         session.expire(batch, ["items"])
         if not batch.items:
             batch.status = ProposalStatus.rejected
+        # Only once nothing here still waits on a decision: rejecting part of a batch leaves the
+        # rest of the ask standing, and its row must stay unread.
+        if not any(item.status == ProposalStatus.pending for item in batch.items):
+            retire_queue_notifications(session, batch_id)
     session.commit()
     if removed_download_files:
         create_notification(
@@ -798,6 +804,8 @@ def _mark_items_canceled_for_removal(
         for item in _leaf_download_items(batch, None, include_staged=True)
     ):
         batch.status = ProposalStatus.canceled
+    if cancelled:
+        retire_queue_notifications(session, batch_id)
     session.commit()
     if cancelled:
         enqueue_task(session, "cancel_download_item", {"item_ids": cancelled, "delete_rows": True})
@@ -863,6 +871,7 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
             wishlist_item.status = "review"
             wishlist_item.stage = ItemStage.awaiting_approval.value
             wishlist_item.status_changed_at = now
+    retire_queue_notifications(session, batch_id)
     session.commit()
     # The slow half: stop the real slskd/yt-dlp transfer and delete the partial file. This needs
     # the row to still exist -- it looks up the manifest/transfer entry by item id -- which is

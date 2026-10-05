@@ -277,6 +277,37 @@ def create_notification(
     raise RuntimeError("Notification could not be created")
 
 
+def queue_group_key(batch_id: str) -> str:
+    return f"queue:{batch_id}"
+
+
+def retire_queue_notifications(session: Session, batch_id: str) -> int:
+    """Mark a batch's "needs you" rows read for everyone once the need is gone.
+
+    Covers both group keys a batch writes under (`queue:` for approvals, `download:` for download
+    progress and failures), but only the actionable event types -- a finished/"added to your
+    library" row is a result, not a to-do, and stays unread.  `apns_delivered_at` is stamped so a
+    push still waiting to go out for a resolved row never fires.  Does not commit: callers run it
+    inside their own transaction.  A later `notify_approvers` for a new gate rewrites the row and
+    makes it unread again, so calling this before one is safe.
+    """
+    now = datetime.now(timezone.utc)
+    rows = list(
+        session.scalars(
+            select(Notification).where(
+                Notification.group_key.in_([queue_group_key(batch_id), f"download:{batch_id}"]),
+                Notification.event_type.in_(["approval_needed", "task_failed"]),
+            )
+        )
+    )
+    for row in rows:
+        if row.status == NotificationStatus.unread:
+            row.status = NotificationStatus.read
+        if row.apns_delivered_at is None:
+            row.apns_delivered_at = now
+    return len(rows)
+
+
 async def deliver_apns_notifications(session: Session) -> int:
     settings = get_settings()
     if not settings.apns_enabled:

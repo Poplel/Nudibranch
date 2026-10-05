@@ -192,7 +192,7 @@ from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
-from nudibranch.services.notifications import create_notification, instance_id, push_identity
+from nudibranch.services.notifications import create_notification, instance_id, push_identity, retire_queue_notifications
 from nudibranch.services.proposals import (
     ApprovalNotPermitted,
     NothingToApprove,
@@ -876,7 +876,7 @@ def update_own_jellyfin_user(
     # which is what establishes the mirror. Unlinking needs no counterpart: the native rows stay
     # put and simply stop being mirrored.
     if not previously_linked and user.jellyfin_user_id:
-        enqueue_task(session, "migrate_native_playlists_to_jellyfin", {"user_id": user.id})
+        enqueue_task(session, "migrate_native_playlists_to_jellyfin", {"user_id": user.id, "requested_by": user.id})
     return serialize_user(user)
 
 
@@ -5959,89 +5959,89 @@ def propose_playlist_position(
 @router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"], summary="Trigger Jellyfin library scan")
 def tool_jellyfin_scan(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
+    return serialize_task(enqueue_task(session, "jellyfin_scan", {"requested_by": user.id}))
 
 
 @router.post("/tools/rescan-slskd-shares", response_model=TaskOut, tags=["tools"], summary="Rescan Soulseek shares")
 def tool_rescan_slskd_shares(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {}))
+    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {"requested_by": user.id}))
 
 
 @router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
 def tool_remap_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"], summary="Check library files for issues")
 def tool_check_files(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_files", {}))
+    return serialize_task(enqueue_task(session, "check_files", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"], summary="Check for duplicate files")
 def tool_check_duplicates(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_duplicates", {}))
+    return serialize_task(enqueue_task(session, "check_duplicates", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"], summary="Check for missing lyrics")
 def tool_check_lyrics(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_lyrics", {}))
+    return serialize_task(enqueue_task(session, "check_lyrics", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-musicbrainz-ids", response_model=TaskOut, tags=["tools"], summary="Fill missing MusicBrainz IDs")
 def tool_check_musicbrainz_ids(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {}))
+    return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-audio-content", response_model=TaskOut, tags=["tools"], summary="Verify audio matches metadata")
 def tool_check_audio_content(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_audio_content", {}))
+    return serialize_task(enqueue_task(session, "check_audio_content", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")
 def tool_check_album_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_album_covers", {}))
+    return serialize_task(enqueue_task(session, "check_album_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-artist-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing artist art")
 def tool_check_artist_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_artist_covers", {}))
+    return serialize_task(enqueue_task(session, "check_artist_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/refresh-covers", response_model=TaskOut, tags=["tools"], summary="Re-fetch low-resolution album covers")
 def tool_refresh_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "refresh_covers", {}))
+    return serialize_task(enqueue_task(session, "refresh_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"], summary="Apply file check fix")
@@ -6146,49 +6146,49 @@ def propose_check_file_fix(
 @router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"], summary="Check for missing tracks")
 def tool_check_missing_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
+    return serialize_task(enqueue_task(session, "check_missing_tracks", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"], summary="Check for non-lossless files")
 def tool_check_non_lossless(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_non_lossless", {}))
+    return serialize_task(enqueue_task(session, "check_non_lossless", {"requested_by": user.id}))
 
 
 @router.post("/tools/apply-replaygain", response_model=TaskOut, tags=["tools"], summary="Measure + apply ReplayGain (review-gated)")
 def tool_apply_replaygain(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "apply_replaygain", {}))
+    return serialize_task(enqueue_task(session, "apply_replaygain", {"requested_by": user.id}))
 
 
 @router.post("/tools/consolidate-folders", response_model=TaskOut, tags=["tools"], summary="Consolidate album folders")
 def tool_consolidate_folders(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "consolidate_folders", {}))
+    return serialize_task(enqueue_task(session, "consolidate_folders", {"requested_by": user.id}))
 
 
 @router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"], summary="Clear completed downloads")
 def tool_clear_downloads(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "clear_downloads", {}))
+    return serialize_task(enqueue_task(session, "clear_downloads", {"requested_by": user.id}))
 
 
 @router.post("/tools/backup", response_model=TaskOut, tags=["tools"], summary="Create library backup")
 def tool_backup(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "backup_now", {}))
+    return serialize_task(enqueue_task(session, "backup_now", {"requested_by": user.id}))
 
 
 @router.get("/tools/backups", tags=["tools"], summary="List available backups", response_model=dict)
@@ -6204,9 +6204,9 @@ def list_backups(
 @router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"], summary="Restore from latest backup")
 def tool_restore_default(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "restore_default", {}))
+    return serialize_task(enqueue_task(session, "restore_default", {"requested_by": user.id}))
 
 
 @router.post("/tools/restore-backup", response_model=TaskOut, tags=["tools"], summary="Restore from specific backup")
@@ -6318,6 +6318,8 @@ def prune_settled_batches(
             session.delete(batch)
             settled.add(batch.id)
             deleted.add(batch.id)
+    for settled_id in settled:
+        retire_queue_notifications(session, settled_id)
     if session.dirty or session.deleted:
         session.commit()
     hidden = deleted if keep_settled else settled

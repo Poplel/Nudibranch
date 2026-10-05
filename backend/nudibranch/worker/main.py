@@ -26,7 +26,7 @@ from nudibranch.db.session import SessionLocal
 from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_import_files, read_audio_metadata, safe_path_part, suggest_library_path, write_audio_metadata
 from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
-from nudibranch.services.notifications import create_notification, deliver_apns_notifications
+from nudibranch.services.notifications import create_notification, deliver_apns_notifications, queue_group_key, retire_queue_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, prune_empty_download_dirs, remove_rejected_download_files
 from nudibranch.services.app_log import write_app_log
@@ -83,6 +83,10 @@ DELETION_PRUNE_TICK_SECONDS = 86400
 # them. Cheap (one indexed read of wishlist rows in that stage, usually zero) and deliberately
 # frequent: this is the sweep that makes "a request stuck in Review" unable to persist.
 WISHLIST_RECOVERY_TICK_SECONDS = 120
+DISK_CHECK_TICK_SECONDS = 600
+DISK_LOW_FLOOR_BYTES = 5 * 1024**3
+DISK_LOW_FRACTION = 0.05
+DISK_RECOVERY_FACTOR = 1.5
 AUTOMATION_EVENT_SESSION_KEY = "nudibranch:automation-events"
 # Debounce for the post-import Soulseek share rescan (see maybe_queue_slskd_rescan): a batch
 # approval can import dozens of tracks through import_file_to_library in one task, and each one
@@ -170,6 +174,55 @@ def maybe_queue_slskd_rescan(session: Session) -> None:
             return
     _upsert_setting(session, "slskd_rescan_last_queued_at", now.isoformat())
     enqueue_task(session, "rescan_slskd_shares", {})
+
+
+def _format_disk_size(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1000 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit in ("B", "KB") or size >= 100 else f"{size:.1f} {unit}"
+        size /= 1000
+    return f"{size:.1f} TB"
+
+
+def check_disk_space(session: Session) -> None:
+    """Tell admins once when a data folder's disk runs low, and again only after it has recovered.
+
+    ⚠️ The alerted state is stored (`disk_alert:{name}`), not held in memory: a restart must not
+    re-announce a disk that is still full, and re-alerting needs headroom above 1.5x the
+    threshold so a disk hovering at the line does not flap.  Folders on one device are checked
+    once, under the first name.
+    """
+    settings = get_settings()
+    roots = [("Library", settings.library_path), ("Downloads", settings.downloads_path), ("Config", settings.config_path)]
+    seen_devices: set[int] = set()
+    for name, root in roots:
+        try:
+            device = root.stat().st_dev
+            if device in seen_devices:
+                continue
+            seen_devices.add(device)
+            usage = shutil.disk_usage(root)
+        except OSError:
+            continue
+        threshold = max(DISK_LOW_FLOOR_BYTES, usage.total * DISK_LOW_FRACTION)
+        key = f"disk_alert:{name.lower()}"
+        state = session.get(AppSetting, key)
+        alerted = bool(state and state.value == "1")
+        if not alerted and usage.free < threshold:
+            _upsert_setting(session, key, "1")
+            write_app_log(f"{name} disk space low: {_format_disk_size(usage.free)} free of {_format_disk_size(usage.total)}", level="warning", event_type="server_alert")
+            create_notification(
+                session,
+                title="Server disk space low",
+                body=f"{name} has {_format_disk_size(usage.free)} free of {_format_disk_size(usage.total)}.",
+                event_type="server_alert",
+                target_url="/activity",
+                group_key=f"system:disk:{name.lower()}",
+            )
+        elif alerted and usage.free > threshold * DISK_RECOVERY_FACTOR:
+            _upsert_setting(session, key, "0")
+            write_app_log(f"{name} disk space recovered: {_format_disk_size(usage.free)} free of {_format_disk_size(usage.total)}", level="info", event_type="server_alert")
+    session.commit()
 
 
 def _upsert_setting(session: Session, key: str, value: str) -> None:
@@ -658,6 +711,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     imported = 0
     skipped = 0
     errors: list[str] = []
+    filed_paths: list[str] = []  # where the finished notification should point
     executable_items = [
         item
         for item in selected_items
@@ -763,6 +817,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
                 item.status = ProposalStatus.completed
                 imported += 1
                 album_imported += 1
+                filed_paths.append(str(item.new_value))
             except Exception as error:  # noqa: BLE001 - keep importing the rest of the album.
                 item.status = ProposalStatus.failed
                 errors.append(f"{item.title}: {error}")
@@ -995,6 +1050,9 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         )
     else:
         batch.status = ProposalStatus.pending
+    if batch.status in {ProposalStatus.completed, ProposalStatus.failed, ProposalStatus.rejected, ProposalStatus.canceled}:
+        # Settled: earlier "needs you" rows are stale.  A failure below writes a fresh one.
+        retire_queue_notifications(session, batch.id)
     session.commit()
 
     summary_body = task_queue_notification_body(
@@ -1047,7 +1105,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             event_type="task_completed" if batch.status != ProposalStatus.failed or is_download_batch else "task_failed",
             # Running downloads are still in the queue, under Review. A finished batch has left
             # it, so the record of what it did is in Activity.
-            target_url=queue_target("review", batch) if open_downloads else "/activity",
+            target_url=queue_target("review", batch) if open_downloads else filed_batch_target(session, filed_paths),
             deliver_apns=not open_downloads,
             group_key=f"download:{batch.id}" if batch.kind == ProposalKind.download or download_items else None,
         )
@@ -2254,7 +2312,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 title="Request needs attention",
                 body=f"The downloads for {batch_subject(batch)} couldn't be prepared for review. Open Activity for details.",
                 event_type="task_failed",
-                target_url="/activity",
+                target_url=queue_target("issues", batch),
                 group_key=f"download:{batch.id}",
             )
         session.commit()
@@ -3248,10 +3306,6 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
 # Conflating them is why the old wishlist_approved push sent requesters to an approvers-only screen.
 
 
-def queue_group_key(batch_id: str) -> str:
-    return f"queue:{batch_id}"
-
-
 def batch_requester_ids(session: Session, batch: ProposalBatch) -> list[str]:
     """Distinct requesters with items in this batch, newest-first-stable."""
     seen: list[str] = []
@@ -3305,6 +3359,25 @@ def library_target(session: Session, path: str | Path | None) -> str:
     return "/library"
 
 
+def filed_batch_target(session: Session, paths: list[str]) -> str:
+    """Where a finished batch's notification opens: the one album it filed, the one artist when it
+    filed several albums of them, otherwise Activity (several artists, or nothing filed)."""
+    if not paths:
+        return "/activity"
+    rows = session.execute(
+        select(Track.album_id, Album.artist_id)
+        .join(Album, Album.id == Track.album_id)
+        .where(Track.path.in_(paths))
+    ).all()
+    album_ids = {album_id for album_id, _ in rows if album_id}
+    artist_ids = {artist_id for _, artist_id in rows if artist_id}
+    if len(album_ids) == 1:
+        return f"/library/albums/{next(iter(album_ids))}"
+    if len(album_ids) > 1 and len(artist_ids) == 1:
+        return f"/library/artists/{next(iter(artist_ids))}"
+    return "/activity"
+
+
 def notify_requesters(
     session: Session,
     batch: ProposalBatch,
@@ -3349,6 +3422,27 @@ def notify_approvers(
         target_url=queue_target(bucket, batch),
         group_key=queue_group_key(batch.id),
     )
+
+
+def notify_tool_result(
+    session: Session,
+    payload: dict,
+    title: str,
+    body: str,
+    target_url: str = "/tools",
+    event_type: str = "tool_completed",
+) -> None:
+    """A routine tool result: tell the person who ran it by hand, otherwise just log it.
+
+    ⚠️ `requested_by` is set only by the `/tools/*` routes.  A scheduled automation (or any
+    internal enqueue) leaves it off, so "nothing found" never pings every admin each time a
+    timer fires.  Findings that queued a review keep their own `approval_needed` broadcast.
+    """
+    requested_by = payload.get("requested_by")
+    if requested_by:
+        create_notification(session, title=title, body=body, event_type=event_type, target_url=target_url, user_id=str(requested_by))
+    else:
+        write_app_log(f"{title}: {body}", level="info", event_type="tool_completed")
 
 
 def manifest_failed_candidates(entry: dict) -> list[dict]:
@@ -3694,6 +3788,7 @@ def finalize_completed_download_batch(session: Session, batch: ProposalBatch) ->
         if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
             item.status = ProposalStatus.completed
     batch.status = ProposalStatus.completed
+    retire_queue_notifications(session, batch.id)
     session.flush()
 
 
@@ -7133,15 +7228,15 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
         # The YouTube fallback was the last resort (see exhaust_download_retries) -- nothing else
         # will retry this track, so the linked wishlist row must follow it to failure now.
         fail_linked_wishlist_item(session, item)
+        failed_batch = session.get(ProposalBatch, item.batch_id)
         create_notification(
             session,
             title="Request needs attention",
             body=f"'{query}' couldn't be downloaded from YouTube. Open Activity for details.",
             event_type="task_failed",
-            target_url="/activity",
+            target_url=queue_target("issues", failed_batch),
             group_key=f"download:{item.batch_id}",
         )
-        failed_batch = session.get(ProposalBatch, item.batch_id)
         if failed_batch:
             failed_batch.status = ProposalStatus.completed
         session.commit()
@@ -7477,14 +7572,7 @@ def run_migrate_native_playlists_to_jellyfin(session: Session, payload: dict) ->
         # Jellyfin scan followed by any edit to the playlist mirrors them across.
         body += f" {skipped_total} track(s) aren't in Jellyfin yet, so they aren't mirrored — they're still in the playlist here. Run a Jellyfin scan to pick them up."
     append_task_log(session, None, f"Playlist sync for {user.username}: {body}")
-    create_notification(
-        session,
-        title="Playlists synced to Jellyfin",
-        body=body,
-        event_type="tool_completed",
-        target_url="/playlists",
-        user_id=user.id,
-    )
+    notify_tool_result(session, payload, title="Playlists synced to Jellyfin", body=body, target_url="/playlists")
     return {
         "migrated_playlists": migrated_playlists,
         "migrated_favorite_tracks": migrated_favorite_tracks,
@@ -7760,7 +7848,11 @@ def _try_create_pending_playlists(session: Session) -> None:
                     data["jellyfin_playlist_id"] = playlist_id
                     write_app_log(f"Created Jellyfin playlist '{playlist_name}' with {len(new_ids)} track(s)")
                     if stored_user_id:
-                        create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done", target_url="/playlists")
+                        # Open the playlist itself when a Nudibranch row mirrors it; the list otherwise.
+                        mirrored_id = session.scalar(
+                            select(Playlist.id).where(Playlist.user_id == stored_user_id, Playlist.jellyfin_playlist_id == playlist_id)
+                        ) if playlist_id else None
+                        create_notification(session, user_id=stored_user_id, title="Playlist created", body=f"'{playlist_name}' was added to your Jellyfin library; remaining tracks are added as they finish downloading.", event_type="playlist_import_done", target_url=f"/playlists/{mirrored_id}" if mirrored_id else "/playlists")
                 # Credit only what ACTUALLY landed. Jellyfin silently rejects stale item ids, so the old
                 # `added_ids |= jf_ids` counted ids that never made it — the record then reached
                 # total_titled and deleted itself while the playlist was short, with no retry.
@@ -8053,7 +8145,7 @@ def check_slskd_after_download_failure(session: Session) -> None:
     )
 
 
-def run_check_files(session: Session, _payload: dict) -> dict:
+def run_check_files(session: Session, payload: dict) -> dict:
     discard_pending_batches(session, "Create records for library files", ProposalKind.import_files)
     settings = get_settings()
     library_root = settings.library_path.resolve()
@@ -8108,14 +8200,18 @@ def run_check_files(session: Session, _payload: dict) -> dict:
     ]
     queued_missing_files = queue_missing_file_downloads(session, missing_files)
     queued_missing_records = queue_missing_record_imports(session, missing_records)
-    create_notification(
-        session,
-        title="File check complete",
-        body=f"Relinked {relinked} moved file(s). {len(missing_files)} records still missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue.",
-        event_type="tool_completed",
-        # Missing files are re-downloaded (Review); files with no record are imported (Changes).
-        target_url=queue_target("review" if queued_missing_files else "changes") if queued_missing_files + queued_missing_records else "/tools",
-    )
+    file_check_body = f"Relinked {relinked} moved file(s). {len(missing_files)} records still missing files. {len(missing_records)} files missing records. {queued_missing_files + queued_missing_records} fixes added to the task queue."
+    if queued_missing_files + queued_missing_records:
+        create_notification(
+            session,
+            title="File check complete",
+            body=file_check_body,
+            event_type="tool_completed",
+            # Missing files are re-downloaded (Review); files with no record are imported (Changes).
+            target_url=queue_target("review" if queued_missing_files else "changes"),
+        )
+    else:
+        notify_tool_result(session, payload, title="File check complete", body=file_check_body)
     return {
         "relinked": relinked,
         "missing_files": missing_files,
@@ -8305,7 +8401,7 @@ def queue_missing_file_downloads(session: Session, missing_files: list[dict]) ->
     return len(rows)
 
 
-def run_check_duplicates(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_duplicates(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Find tracks with the same artist + album + title appearing in multiple files and queue a
     review batch to delete the duplicate copies (keeping the best copy of each song)."""
     discard_pending_batches(session, "Remove duplicate library files", ProposalKind.delete)
@@ -8328,12 +8424,11 @@ def run_check_duplicates(session: Session, _payload: dict, task: Task | None = N
         groups.setdefault(key, []).append(track)
     duplicate_groups = {key: items for key, items in groups.items() if len(items) > 1}
     if not duplicate_groups:
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Duplicate check complete",
             body="No duplicate tracks were found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"songs_with_duplicates": 0, "files_queued": 0}
 
@@ -8483,7 +8578,7 @@ def file_info_for_existing_library_file(file_path: Path) -> dict:
     }
 
 
-def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_lyrics(session: Session, payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Download missing lyrics", ProposalKind.lyrics)
     tracks = list(
         session.scalars(
@@ -8513,12 +8608,11 @@ def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None)
     if not missing:
         if progress.canceled:
             return {"checked": progress.done - 1, "existing": existing, "missing": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Lyrics check complete",
             body=f"{existing} tracks already have lyrics. No missing lyrics found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"checked": len(tracks), "existing": existing, "missing": 0, "batch_id": None}
 
@@ -8583,7 +8677,7 @@ def run_check_lyrics(session: Session, _payload: dict, task: Task | None = None)
     return {"checked": len(tracks), "existing": existing, "missing": len(missing), "batch_id": batch.id}
 
 
-def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_musicbrainz_ids(session: Session, payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Fill MusicBrainz info", ProposalKind.metadata)
     artists = list(
         session.scalars(
@@ -8785,12 +8879,11 @@ def run_check_musicbrainz_ids(session: Session, _payload: dict, task: Task | Non
         session.delete(batch)
         if progress.canceled:
             return {"checked": n_albums_scanned, "proposed": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="MusicBrainz check complete",
             body="All MusicBrainz IDs are already filled in or no matches were found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"checked": n_albums_scanned, "proposed": 0, "batch_id": None}
 
@@ -8897,7 +8990,7 @@ def run_enrich_imports(session: Session, payload: dict, task: Task | None = None
     return {"tracks": total, "lyrics_found": lyrics_found, "lyrics_missing": len(missing)}
 
 
-def run_check_album_covers(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_album_covers(session: Session, payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Download missing album covers", ProposalKind.artwork)
     albums = list(
         session.scalars(
@@ -8952,12 +9045,11 @@ def run_check_album_covers(session: Session, _payload: dict, task: Task | None =
         session.delete(batch)
         if progress.canceled:
             return {"albums_checked": progress.done - 1, "cover_changes": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Album cover check complete",
             body=f"{len(albums)} albums checked. No missing covers were found online.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"albums_checked": len(albums), "cover_changes": 0, "batch_id": None}
     create_notification(
@@ -8970,7 +9062,7 @@ def run_check_album_covers(session: Session, _payload: dict, task: Task | None =
     return {"albums_checked": len(albums), "cover_changes": found, "batch_id": batch.id}
 
 
-def run_refresh_covers(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_refresh_covers(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Maintenance: re-fetch low-resolution album covers at the higher (1200 px) lookup size.
 
     Overwrites the existing local cover file in place so its ETag changes and installed clients
@@ -9014,17 +9106,16 @@ def run_refresh_covers(session: Session, _payload: dict, task: Task | None = Non
             refreshed += 1
     progress.log_if_canceled("Cover refresh")
     scanned = progress.done - 1 if progress.canceled else total
-    create_notification(
+    notify_tool_result(
         session,
+        payload,
         title="Cover refresh stopped" if progress.canceled else "Cover refresh complete",
         body=f"{refreshed} of {checked} low-resolution album covers were upgraded ({scanned} of {total} albums scanned).",
-        event_type="tool_completed",
-        target_url="/tools",
     )
     return {"albums_scanned": total, "low_res_checked": checked, "covers_refreshed": refreshed}
 
 
-def run_check_artist_covers(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_artist_covers(session: Session, payload: dict, task: Task | None = None) -> dict:
     discard_pending_batches(session, "Download missing artist covers", ProposalKind.artwork)
     artists = list(
         session.scalars(
@@ -9080,12 +9171,11 @@ def run_check_artist_covers(session: Session, _payload: dict, task: Task | None 
         session.delete(batch)
         if progress.canceled:
             return {"artists_checked": progress.done - 1, "cover_changes": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Artist cover check complete",
             body=f"{len(artists)} artists checked. No missing covers were found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"artists_checked": len(artists), "cover_changes": 0, "batch_id": None}
     create_notification(
@@ -9098,7 +9188,7 @@ def run_check_artist_covers(session: Session, _payload: dict, task: Task | None 
     return {"artists_checked": len(artists), "cover_changes": found, "batch_id": batch.id}
 
 
-def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_missing_tracks(session: Session, payload: dict, task: Task | None = None) -> dict:
     albums = list(
         session.scalars(
             select(Album).options(selectinload(Album.artist), selectinload(Album.tracks)).order_by(Album.title.asc())
@@ -9157,19 +9247,18 @@ def run_check_missing_tracks(session: Session, _payload: dict, task: Task | None
     if created == 0:
         if progress.canceled:
             return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Missing track check complete",
             body=f"{checked} albums checked. No missing tracks were found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"albums_checked": checked, "download_items_created": 0, "batch_id": None}
     enqueue_task(session, "search_candidates", {"requests": requests})
     return {"albums_checked": checked, "download_items_created": created}
 
 
-def run_check_non_lossless(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_non_lossless(session: Session, payload: dict, task: Task | None = None) -> dict:
     tracks = list(session.scalars(select(Track).options(selectinload(Track.album).selectinload(Album.artist)).order_by(Track.title.asc())))
     requests: list[dict] = []
     created = 0
@@ -9212,12 +9301,11 @@ def run_check_non_lossless(session: Session, _payload: dict, task: Task | None =
     if created == 0:
         if progress.canceled:
             return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Lossless check complete",
             body=f"{checked} tracks checked. No lossy or suspicious files were found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"tracks_checked": checked, "download_items_created": 0, "batch_id": None}
     enqueue_task(session, "search_candidates", {"requests": requests})
@@ -9280,7 +9368,7 @@ def run_requeue_replacement(session: Session, payload: dict, task: Task | None =
     return {"download_items_created": created}
 
 
-def run_check_audio_content(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_check_audio_content(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Find tracks whose audio is NOT what the library says it is, and queue replacements.
 
     Two layers per track, cheapest first (see services/content_verify.py):
@@ -9445,12 +9533,11 @@ def run_check_audio_content(session: Session, _payload: dict, task: Task | None 
     if created == 0:
         if progress.canceled:
             return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": 0, "batch_id": None}
-        create_notification(
+        notify_tool_result(
             session,
+            payload,
             title="Audio content check complete",
             body=f"{summary} No incorrect or dead-air tracks found.",
-            event_type="tool_completed",
-            target_url="/tools",
         )
         return {"tracks_checked": tracks_checked, "suspicious": suspicious, "dead_air": dead_air, "foreign": foreign, "undetermined": undetermined, "unverifiable": unverifiable, "replacements_created": 0, "batch_id": None}
     enqueue_task(session, "search_candidates", {"requests": requests})
@@ -9571,7 +9658,7 @@ def download_request_payload(
     }
 
 
-def run_backup_now(session: Session, _payload: dict) -> dict:
+def run_backup_now(session: Session, payload: dict) -> dict:
     settings = get_settings()
     settings.backups_path.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -9582,7 +9669,7 @@ def run_backup_now(session: Session, _payload: dict) -> dict:
         sidecar = Path(f"{settings.db_path}{suffix}")
         if sidecar.exists():
             shutil.copy2(sidecar, settings.backups_path / f"{backup_path.name}{suffix}")
-    create_notification(session, title="Backup complete", body=f"The library database was saved as {backup_path.name}.", event_type="tool_completed", target_url="/tools")
+    notify_tool_result(session, payload, title="Backup complete", body=f"The library database was saved as {backup_path.name}.")
     return {"backup_path": str(backup_path)}
 
 
@@ -9616,7 +9703,7 @@ def run_restore_backup(session: Session, payload: dict) -> dict:
     return {"restored_from": str(backup_path), "pre_restore_backup": pre_restore.get("backup_path")}
 
 
-def run_clear_downloads(session: Session, _payload: dict, task: Task | None = None) -> dict:
+def run_clear_downloads(session: Session, payload: dict, task: Task | None = None) -> dict:
     root = get_settings().downloads_path
     append_task_log(session, task, f"Clear downloads started for {root}")
     if task is not None:
@@ -9694,13 +9781,11 @@ def run_clear_downloads(session: Session, _payload: dict, task: Task | None = No
         f"Clear downloads finished: scanned {scanned}, removed {removed_files} file(s), removed {removed_dirs} folder(s), skipped {skipped}, errors {len(errors)}",
         "warning" if errors else "info",
     )
-    create_notification(
-        session,
-        title="Downloads cleanup completed",
-        body=f"{removed_files + removed_dirs} passed, {len(errors)} failed. {removed_files} files and {removed_dirs} folders removed; {skipped} skipped.",
-        event_type="task_completed",
-        target_url="/activity" if errors else "/tools",
-    )
+    cleanup_body = f"{removed_files + removed_dirs} passed, {len(errors)} failed. {removed_files} files and {removed_dirs} folders removed; {skipped} skipped."
+    if errors:
+        create_notification(session, title="Downloads cleanup completed", body=cleanup_body, event_type="task_completed", target_url="/activity")
+    else:
+        notify_tool_result(session, payload, title="Downloads cleanup completed", body=cleanup_body, event_type="task_completed")
     return {
         "removed_files": removed_files,
         "removed_dirs": removed_dirs,
@@ -10739,7 +10824,7 @@ def notify_podcast_subscribers(session: Session, podcast: Podcast, episode: Epis
                 title=podcast.title,
                 body=f"New episode: {episode.title}",
                 event_type="podcast_episode_added",
-                target_url=f"/podcasts/{podcast.id}",
+                target_url=f"/podcasts/{podcast.id}/episodes/{episode.id}",
                 user_id=user_id,
                 deliver_web=True,
                 deliver_apns=True,
@@ -10749,7 +10834,7 @@ def notify_podcast_subscribers(session: Session, podcast: Podcast, episode: Epis
             write_app_log(f"Podcast notification failed for user {user_id}: {podcast.title}", "warning")
 
 
-def wake_devices_for_new_episode(session: Session, podcast: Podcast) -> None:
+def wake_devices_for_new_episode(session: Session, podcast: Podcast, episode: Episode) -> None:
     """Silent content-available push so devices download the episode without the app being opened.
 
     Deliberately separate from `notify_podcast_subscribers`. That one is **opt-in per user per
@@ -10767,7 +10852,7 @@ def wake_devices_for_new_episode(session: Session, podcast: Podcast) -> None:
             title="",
             body="",
             event_type="podcast_episode_available",
-            target_url=f"/podcasts/{podcast.id}",
+            target_url=f"/podcasts/{podcast.id}/episodes/{episode.id}",
             user_id=None,
             deliver_web=False,
             deliver_apns=True,
@@ -10826,9 +10911,9 @@ def run_podcast_scan(session: Session, payload: dict, task: Task | None = None) 
         queue_automation_event(session, "podcast_episode_added")
         for episode in new_episodes:
             notify_podcast_subscribers(session, podcast, episode)
-        # One silent wake per podcast rather than per episode: it carries no episode id, and each
+        # One silent wake per podcast rather than per episode (it points at the newest), and each
         # device reconciles its whole download window when it lands.
-        wake_devices_for_new_episode(session, podcast)
+        wake_devices_for_new_episode(session, podcast, new_episodes[0])
     return {"scanned": scanned, "added": added}
 
 
@@ -10936,19 +11021,14 @@ async def worker_loop() -> None:
             write_app_log(f"Reopening settled batches failed: {error}", "warning")
         recovered = recover_orphaned_tasks(session)
         if recovered:
-            create_notification(
-                session,
-                title="Resumed interrupted work",
-                body=f"{recovered} task(s) interrupted by a restart were requeued to continue.",
-                event_type="task_started",
-                target_url="/activity",
-            )
-            session.commit()
+            # Log only: a restart is routine, and nobody can act on "your tasks were requeued".
+            write_app_log(f"Resumed interrupted work: {recovered} task(s) interrupted by a restart were requeued to continue.", event_type="task_started")
 
     last_download_scan = 0.0
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
     last_automation_tick = 0.0
+    last_disk_check_tick = 0.0
     last_pending_playlist_tick = 0.0
     last_playlist_mirror_tick = 0.0
     last_podcast_scan_tick = 0.0
@@ -10998,6 +11078,13 @@ async def worker_loop() -> None:
                             group_key="system:download-scan",
                         )
                     last_download_scan = time.time()
+                if time.time() - last_disk_check_tick > DISK_CHECK_TICK_SECONDS:
+                    try:
+                        check_disk_space(session)
+                    except Exception as error:  # noqa: BLE001 - a disk check must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Disk space check failed: {error}", "warning")
+                    last_disk_check_tick = time.time()
                 if time.time() - last_automation_tick > AUTOMATION_TICK_SECONDS:
                     try:
                         from nudibranch.services.automations import run_due_automations

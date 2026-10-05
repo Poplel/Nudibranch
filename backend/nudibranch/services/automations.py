@@ -212,7 +212,23 @@ def run_automation(session: Session, automation: Automation, trigger_source: str
     except Exception:
         pass
 
-    if automation.notify_mode in ("notification", "both"):
+    if status == "error":
+        # A failure is always worth knowing, whatever notify_mode says -- a silent automation
+        # that stopped working is invisible otherwise.  Owner only; admins if it has none.
+        try:
+            create_notification(
+                session,
+                title=f"Automation failed: {automation.name}",
+                body="Its last run failed. Check its settings.",
+                event_type="automation_failed",
+                target_url="/automations",
+                user_id=automation.owner_id,
+                deliver_apns=True,
+                group_key=f"automation:{automation.id}",
+            )
+        except Exception:
+            pass
+    elif automation.notify_mode in ("notification", "both"):
         try:
             create_notification(
                 session,
