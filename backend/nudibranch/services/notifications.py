@@ -25,11 +25,11 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy import select
+from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
-from nudibranch.db.models import AppSetting, MobileDevice, Notification, NotificationStatus, Permission, User
+from nudibranch.db.models import AppSetting, MobileDevice, Notification, NotificationStatus, Permission, ProposalBatch, User
 
 logger = logging.getLogger("nudibranch.notifications")
 
@@ -295,8 +295,8 @@ def retire_queue_notifications(session: Session, batch_id: str) -> int:
     rows = list(
         session.scalars(
             select(Notification).where(
-                Notification.group_key.in_([queue_group_key(batch_id), f"download:{batch_id}"]),
-                Notification.event_type.in_(["approval_needed", "task_failed"]),
+                Notification.group_key.in_(_batch_group_keys(batch_id)),
+                Notification.event_type.in_(_RETIRED_EVENT_TYPES),
             )
         )
     )
@@ -306,6 +306,43 @@ def retire_queue_notifications(session: Session, batch_id: str) -> int:
         if row.apns_delivered_at is None:
             row.apns_delivered_at = now
     return len(rows)
+
+
+_RETIRED_EVENT_TYPES = ("approval_needed", "task_failed")
+
+
+def _batch_group_keys(batch_id: str) -> list[str]:
+    return [queue_group_key(batch_id), f"download:{batch_id}"]
+
+
+@event.listens_for(ProposalBatch, "after_delete")
+def _retire_on_batch_delete(_mapper, connection, target: ProposalBatch) -> None:
+    """A deleted batch has nothing left to ask about, wherever it was deleted from.
+
+    ⚠️ Batches are deleted in some twenty places (reject/remove emptying one, a tool re-run
+    discarding its last pending batch, pruning, a check that found nothing) and a per-site call is
+    one the next site forgets -- the reject route was the first to slip through. So this rides on
+    the delete itself, in the same transaction, as plain UPDATEs on the flush's connection.
+    """
+    keys = _batch_group_keys(target.id)
+    connection.execute(
+        update(Notification)
+        .where(
+            Notification.group_key.in_(keys),
+            Notification.event_type.in_(_RETIRED_EVENT_TYPES),
+            Notification.status == NotificationStatus.unread,
+        )
+        .values(status=NotificationStatus.read)
+    )
+    connection.execute(
+        update(Notification)
+        .where(
+            Notification.group_key.in_(keys),
+            Notification.event_type.in_(_RETIRED_EVENT_TYPES),
+            Notification.apns_delivered_at.is_(None),
+        )
+        .values(apns_delivered_at=datetime.now(timezone.utc))
+    )
 
 
 async def deliver_apns_notifications(session: Session) -> int:
