@@ -25,7 +25,7 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy import event, select, update
+from sqlalchemy import event, or_, select, update
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
@@ -284,8 +284,7 @@ def queue_group_key(batch_id: str) -> str:
 def retire_queue_notifications(session: Session, batch_id: str) -> int:
     """Mark a batch's "needs you" rows read for everyone once the need is gone.
 
-    Covers both group keys a batch writes under (`queue:` for approvals, `download:` for download
-    progress and failures), but only the actionable event types -- a finished/"added to your
+    Covers every row about the batch (`_about_batch`), but only the actionable event types -- a finished/"added to your
     library" row is a result, not a to-do, and stays unread.  `apns_delivered_at` is stamped so a
     push still waiting to go out for a resolved row never fires.  Does not commit: callers run it
     inside their own transaction.  A later `notify_approvers` for a new gate rewrites the row and
@@ -295,7 +294,7 @@ def retire_queue_notifications(session: Session, batch_id: str) -> int:
     rows = list(
         session.scalars(
             select(Notification).where(
-                Notification.group_key.in_(_batch_group_keys(batch_id)),
+                _about_batch(batch_id),
                 Notification.event_type.in_(_RETIRED_EVENT_TYPES),
             )
         )
@@ -311,8 +310,17 @@ def retire_queue_notifications(session: Session, batch_id: str) -> int:
 _RETIRED_EVENT_TYPES = ("approval_needed", "task_failed")
 
 
-def _batch_group_keys(batch_id: str) -> list[str]:
-    return [queue_group_key(batch_id), f"download:{batch_id}"]
+def _about_batch(batch_id: str):
+    """Rows about this batch: either group key it writes under, or a `target_url` naming it.
+
+    ⚠ The target is the part every such row has -- `queue_target` puts `batch=<id>` in each
+    "review in the Task Queue" link -- while the tools' "… review ready" rows carry no group key at
+    all. Matching on the key alone missed every one of them.
+    """
+    return or_(
+        Notification.group_key.in_([queue_group_key(batch_id), f"download:{batch_id}"]),
+        Notification.target_url.like(f"%batch={batch_id}%"),
+    )
 
 
 @event.listens_for(ProposalBatch, "after_delete")
@@ -324,11 +332,10 @@ def _retire_on_batch_delete(_mapper, connection, target: ProposalBatch) -> None:
     one the next site forgets -- the reject route was the first to slip through. So this rides on
     the delete itself, in the same transaction, as plain UPDATEs on the flush's connection.
     """
-    keys = _batch_group_keys(target.id)
     connection.execute(
         update(Notification)
         .where(
-            Notification.group_key.in_(keys),
+            _about_batch(target.id),
             Notification.event_type.in_(_RETIRED_EVENT_TYPES),
             Notification.status == NotificationStatus.unread,
         )
@@ -337,7 +344,7 @@ def _retire_on_batch_delete(_mapper, connection, target: ProposalBatch) -> None:
     connection.execute(
         update(Notification)
         .where(
-            Notification.group_key.in_(keys),
+            _about_batch(target.id),
             Notification.event_type.in_(_RETIRED_EVENT_TYPES),
             Notification.apns_delivered_at.is_(None),
         )
