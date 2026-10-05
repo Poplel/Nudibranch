@@ -5020,6 +5020,7 @@ nav button:hover {
 .podcast-detail .album-detail-tracks { gap: 0; }
 .podcast-episode-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .podcast-episode-row:hover { background: var(--panel-strong); }
+.podcast-episode-row.flash { background: color-mix(in srgb, var(--accent) 22%, transparent); transition: background 0.4s; }
 .podcast-episode-main { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .podcast-episode-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .podcast-episode-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -1243,7 +1243,8 @@ function App() {
   // Where clicking a notification goes: the page its `target_url` names, never just "the app".
   // ⚠️ The same vocabulary the iOS app reads (`AppNavigation.deepLink`), so the server writes one
   // target and both clients land in the same place:
-  //   /task-queue?bucket=&batch=   /requests?batch=   /library/albums/<id>   /podcasts/<id>
+  //   /task-queue?bucket=&batch=   /requests?batch=   /library/albums/<id>   /library/artists/<id>
+  //   /podcasts/<id>   /podcasts/<id>/episodes/<eid>
   //   /playlists[/<id>|/shares]    /activity   /tools   /automations   /settings?section=
   // A full http(s) URL (a broadcast's link) opens in a new tab. Anything this user cannot open,
   // or that has no page here (/player, /notifications), leaves the tray as it is.
@@ -1277,6 +1278,15 @@ function App() {
         break;
       case "library": {
         if (!go("Library")) break;
+        if (segments[1] === "artists" && segments[2]) {
+          try {
+            const data = await api(`/library/albums?artist_id=${encodeURIComponent(segments[2])}&page_size=1`);
+            openArtistDetail({ id: segments[2], name: data?.items?.[0]?.artist_name || "Artist" }, "Library");
+          } catch {
+            // The Library page is already showing; the artist just could not be opened.
+          }
+          break;
+        }
         if (segments[1] !== "albums" || !segments[2]) break;
         try {
           const data = await api(`/library/tracks?album_id=${encodeURIComponent(segments[2])}&page_size=1`);
@@ -1289,7 +1299,7 @@ function App() {
       }
       case "podcasts":
         if (segments[1] && canViewPage(user, "Podcasts")) {
-          openPodcastDetail({ id: segments[1] });
+          openPodcastDetail({ id: segments[1], episodeId: segments[2] === "episodes" ? segments[3] : null });
           setTrayOpen(false);
         } else {
           go("Podcasts");
@@ -1824,7 +1834,7 @@ function App() {
   }
 
   function openPodcastDetail(podcast) {
-    setPodcastOpenRequest({ id: podcast.id, nonce: Date.now() });
+    setPodcastOpenRequest({ id: podcast.id, episodeId: podcast.episodeId || null, nonce: Date.now() });
     setPage("Podcasts");
   }
 
@@ -4242,7 +4252,7 @@ function App() {
             <>
             <PanelHeader page={page} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} />
+              <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} canSearchLibrary={canViewPage(user, "Library")} canSearchPlaylists={canViewPage(user, "Playlists")} canSearchPodcasts={canViewPage(user, "Podcasts")} searchThreshold={user?.search_min_confidence ?? 0.4} onOpenPlaylists={() => setPage("Playlists")} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -4647,7 +4657,7 @@ function PanelHeader({ page, displayName }) {
     <div className="panel-header">
       <div>
         <h1>{heading}</h1>
-        <p>{description ?? "Manage this section of Nudibranch."}</p>
+        {description && <p>{description}</p>}
       </div>
     </div>
   );
@@ -4720,6 +4730,7 @@ function formatDurationMs(ms) {
 function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refreshVersion, onInspectorActionsChange, pinnedPodcastIds, onTogglePinPodcast, initialPodcastRequest, onInitialPodcastConsumed }) {
   const [podcasts, setPodcasts] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
+  const [focusEpisodeId, setFocusEpisodeId] = useState(null);
   const [addOpen, setAddOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const selected = (podcasts || []).find((podcast) => podcast.id === selectedId) || null;
@@ -4734,6 +4745,7 @@ function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refres
   useEffect(() => {
     if (!initialPodcastRequest?.id) return;
     setSelectedId(initialPodcastRequest.id);
+    setFocusEpisodeId(initialPodcastRequest.episodeId || null);
     onInitialPodcastConsumed?.();
   }, [initialPodcastRequest?.nonce]);
 
@@ -4829,11 +4841,12 @@ function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refres
           notify={notify}
           onPlay={onPlay}
           onQueue={onQueue}
-          onBack={() => setSelectedId(null)}
+          onBack={() => { setSelectedId(null); setFocusEpisodeId(null); }}
           onChanged={loadPodcasts}
           onInspectorActionsChange={onInspectorActionsChange}
           pinned={pinnedPodcastIds?.has(selected.id)}
           onTogglePin={onTogglePinPodcast}
+          focusEpisodeId={focusEpisodeId}
         />
         {addOpen && <AddPodcastDialog api={api} submitting={submitting} onClose={() => !submitting && setAddOpen(false)} onSubscribe={subscribe} />}
       </>
@@ -5003,8 +5016,10 @@ function AddPodcastDialog({ api, submitting, onClose, onSubscribe }) {
   return host ? createPortal(dialog, host) : null;
 }
 
-function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, onQueue, onBack, onChanged, onInspectorActionsChange, pinned, onTogglePin }) {
+function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, onQueue, onBack, onChanged, onInspectorActionsChange, pinned, onTogglePin, focusEpisodeId }) {
   const [episodes, setEpisodes] = useState(null);
+  const [flashEpisodeId, setFlashEpisodeId] = useState(null);
+  const focusedRef = useRef(null);
   const [busyId, setBusyId] = useState(null);
   const [openMenu, menuElement] = useMenuHost();
 
@@ -5018,6 +5033,17 @@ function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, o
   }, [api, podcast.id]);
 
   useEffect(() => { loadEpisodes(); }, [loadEpisodes]);
+
+  // Opened from a notification or search on one episode: scroll to it and highlight it briefly.
+  useEffect(() => {
+    if (!focusEpisodeId || !episodes || focusedRef.current === focusEpisodeId) return;
+    if (!episodes.some((e) => e.id === focusEpisodeId)) return;
+    focusedRef.current = focusEpisodeId;
+    setFlashEpisodeId(focusEpisodeId);
+    requestAnimationFrame(() => document.getElementById(`podcast-episode-${focusEpisodeId}`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+    const t = setTimeout(() => setFlashEpisodeId(null), 2500);
+    return () => clearTimeout(t);
+  }, [focusEpisodeId, episodes]);
 
   const playable = useMemo(
     () => (episodes || []).map((e) => episodeToPlayable(e, podcast, apiKey)),
@@ -5157,7 +5183,7 @@ function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, o
             const progress = episode.progress;
             const pct = progress && progress.duration_ms ? Math.min(100, Math.round((progress.position_ms / progress.duration_ms) * 100)) : 0;
             return (
-              <div key={episode.id} className="podcast-episode-row" onContextMenu={(event) => openMenu(event, episodeMenuItems(episode))}>
+              <div key={episode.id} id={`podcast-episode-${episode.id}`} className={`podcast-episode-row${flashEpisodeId === episode.id ? " flash" : ""}`} onContextMenu={(event) => openMenu(event, episodeMenuItems(episode))}>
                 <div className="podcast-episode-main">
                   <div className="podcast-episode-title">
                     {progress?.played && <CheckCircle size={14} className="podcast-played" />}
@@ -10279,7 +10305,7 @@ function Placeholder({ page }) {
     <div className="placeholder">
       <Shield size={28} />
       <h2>{page}</h2>
-      <p>{pageDescriptions[page] ?? "Manage this section of Nudibranch."}</p>
+      {pageDescriptions[page] && <p>{pageDescriptions[page]}</p>}
     </div>
   );
 }
@@ -10667,7 +10693,6 @@ function EqualizerSettings({ equalizer, setEqualizer }) {
           <label className="setting-row">
             <span>
               Enable equalizer
-              <small>Ten-band EQ applied to playback on this device.</small>
             </span>
             <input
               type="checkbox"
@@ -10830,7 +10855,6 @@ function SettingsPanel({
         <label className="setting-row">
           <span>
             Theme
-            <small>Switch between light and dark interface colors.</small>
           </span>
           <button className="secondary compact" onClick={() => setDark((value) => !value)}>
             {dark ? <Sun size={15} /> : <Moon size={15} />}
@@ -10840,21 +10864,19 @@ function SettingsPanel({
         <label className="setting-row">
           <span>
             Accent color
-            <small>Interactive highlights and hover states.</small>
           </span>
           <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value)} />
         </label>
         <label className="setting-row">
           <span>
             Background tint
-            <small>Mixed into the grey interface in light and dark mode.</small>
           </span>
           <input type="color" value={backgroundTint} onChange={(event) => setBackgroundTint(event.target.value)} />
         </label>
         <label className="setting-row crossfade-row">
           <span>
             Crossfade
-            <small>Fade between tracks. {crossfadeDuration === 0 ? "Off" : `${crossfadeDuration.toFixed(1)}s`}</small>
+            <small>{crossfadeDuration === 0 ? "Off" : `${crossfadeDuration.toFixed(1)}s`}</small>
           </span>
           <input
             className="crossfade-slider"
@@ -10870,7 +10892,7 @@ function SettingsPanel({
         <label className="setting-row crossfade-row">
           <span>
             Min match
-            <small>Library search confidence threshold. {Math.round(searchThreshold * 100)}%</small>
+            <small>Library search only. Lower finds looser matches; higher only close ones. {Math.round(searchThreshold * 100)}%</small>
           </span>
           <input
             className="crossfade-slider"
@@ -11177,8 +11199,7 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
       {advancedOpen && (
         <>
           <p className="settings-hint">
-            How Soulseek results are scored and ranked. Higher recall surfaces more candidates for review; everything still goes through the
-            approval queue before downloading. Leave at defaults unless you know what you're tuning.
+            How Soulseek results are scored and ranked. Leave at defaults unless you know what you're doing.
           </p>
           {schema.map((field) => (
             <label className="setting-row integration-row" key={field.name} title={field.help}>
@@ -11263,7 +11284,7 @@ function SlskdReachabilitySettings({ api, notify }) {
           Listen port check
           <small>
             {state?.public_address && state?.port ? `${state.public_address}:${state.port} — ` : ""}
-            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Confirms slskd's own port forward is reachable, end to end."}
+            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Checks slskd's port forward is reachable."}
           </small>
         </span>
         <button className="secondary compact" onClick={checkNow} disabled={checking}>
@@ -11904,7 +11925,7 @@ function resolveHomeOrder(stored) {
   return [...saved, ...HOME_ROW_IDS.filter((id) => !seen.has(id))];
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onPlayArtistNext, onOpenArtist, onQueueArtist, onPlayTracks, onPlayNextTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, pinnedPodcastIds, onTogglePinPodcast, onOpenPodcast, homeVersion, onUnpinPlaylist, onPlayAll, onShuffleAll, homeLayout, onSaveHomeLayout, playlists, onAddToPlaylist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onPlayArtistNext, onOpenArtist, onQueueArtist, onPlayTracks, onPlayNextTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, pinnedPodcastIds, onTogglePinPodcast, onOpenPodcast, homeVersion, onUnpinPlaylist, onPlayAll, onShuffleAll, homeLayout, onSaveHomeLayout, playlists, onAddToPlaylist, canSearchLibrary, canSearchPlaylists, canSearchPodcasts, searchThreshold, onOpenPlaylists }) {
   // On demand only — a Home row of pinned albums must not fetch a track list per card.
   const albumTrackRows = useCallback(async (album) => {
     const data = await api(`/library/tracks?album_id=${encodeURIComponent(album.id)}&page_size=500`);
@@ -11922,6 +11943,49 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   const [home, setHome] = useState(null);
   const [openMenu, menuElement] = useMenuHost();
   const [order, setOrder] = useState(() => resolveHomeOrder(homeLayout));
+
+  // Global search. Library kinds come from /library/search (one query per kind so a busy kind
+  // cannot crowd out another), playlists match by name over the list the app already holds, and
+  // podcasts/episodes over an index fetched once, the first time search is used.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHits, setSearchHits] = useState(null); // null = not searching, or still waiting
+  const [podcastIndex, setPodcastIndex] = useState(null);
+  const podcastIndexRequested = useRef(false);
+  const searchTerm = searchQuery.trim();
+  useEffect(() => {
+    if (!searchTerm) { setSearchHits(null); return; }
+    let active = true;
+    const t = setTimeout(async () => {
+      const kinds = canSearchLibrary ? ["artist", "album", "track"] : [];
+      const lists = await Promise.all(kinds.map(async (kind) => {
+        try {
+          const data = await api(`/library/search?q=${encodeURIComponent(searchTerm)}&types=${kind}&min_confidence=${searchThreshold}&limit=8`);
+          return data?.results || [];
+        } catch { return []; }
+      }));
+      if (active) setSearchHits({ term: searchTerm, library: lists.flat() });
+    }, 250);
+    return () => { active = false; clearTimeout(t); };
+  }, [searchTerm, api, canSearchLibrary, searchThreshold]);
+  useEffect(() => {
+    if (!searchTerm || !canSearchPodcasts || podcastIndexRequested.current) return;
+    podcastIndexRequested.current = true;
+    (async () => {
+      try {
+        const shows = await api("/podcasts");
+        const perShow = await Promise.all((shows || []).map(async (show) => {
+          try {
+            const data = await api(`/podcasts/${encodeURIComponent(show.id)}/episodes?page=1&page_size=200`);
+            return (data?.items || []).map((episode) => ({ episode, podcast: show }));
+          } catch { return []; }
+        }));
+        setPodcastIndex({ shows: shows || [], episodes: perShow.flat() });
+      } catch {
+        setPodcastIndex({ shows: [], episodes: [] });
+      }
+    })();
+  }, [searchTerm, canSearchPodcasts, api]);
+
   const [dragId, setDragId] = useState(null);
   const [dropId, setDropId] = useState(null);
   // Re-resolve when the saved layout arrives (Home can render before /me settles) or changes.
@@ -11959,6 +12023,67 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   if (!home) return <div className="home-view"><p className="muted">Loading…</p></div>;
 
   const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString() : "");
+
+  const searchBar = (
+    <form className="discover-search library-search-bar" onSubmit={(e) => e.preventDefault()}>
+      <Search size={17} />
+      <input
+        type="text"
+        placeholder="Search your library…"
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+      />
+      {searchQuery ? (
+        <button type="button" className="secondary compact" onClick={() => setSearchQuery("")} title="Clear search">
+          ✕
+        </button>
+      ) : (
+        <span />
+      )}
+    </form>
+  );
+
+  function renderSearchResults() {
+    const needle = searchTerm.toLowerCase();
+    const hits = searchHits && searchHits.term === searchTerm ? searchHits.library : null;
+    const matches = (text) => (text || "").toLowerCase().includes(needle);
+    const playlistHits = canSearchPlaylists
+      ? [
+          ...(matches("favorites") ? [{ id: "favorites", name: "Favorites" }] : []),
+          ...(playlists || []).filter((pl) => pl.id !== "favorites" && matches(pl.name)),
+        ].slice(0, 8)
+      : [];
+    const showHits = podcastIndex ? podcastIndex.shows.filter((show) => matches(show.title)).slice(0, 8) : [];
+    const episodeHits = podcastIndex ? podcastIndex.episodes.filter(({ episode }) => matches(episode.title)).slice(0, 8) : [];
+    const groups = [
+      { label: "Artists", rows: (hits || []).filter((x) => x.kind === "artist").map((x) => ({ key: `artist:${x.id}`, name: x.name, open: () => onOpenArtist?.({ id: x.id, name: x.name }) })) },
+      { label: "Albums", rows: (hits || []).filter((x) => x.kind === "album").map((x) => ({ key: `album:${x.id}`, name: x.name, open: () => onOpenAlbum?.({ id: x.id, title: x.name }) })) },
+      { label: "Songs", rows: (hits || []).filter((x) => x.kind === "track").map((x) => ({ key: `track:${x.id}`, name: x.name, open: () => onPlayTracks?.([{ id: x.id, title: x.name }]) })) },
+      { label: "Playlists", rows: playlistHits.map((pl) => ({ key: `playlist:${pl.id}`, name: pl.name, open: () => (onOpenPlaylists ? onOpenPlaylists() : onPlayPlaylist(pl.id)) })) },
+      { label: "Podcasts", rows: showHits.map((show) => ({ key: `podcast:${show.id}`, name: show.title, open: () => onOpenPodcast?.(show) })) },
+      { label: "Episodes", rows: episodeHits.map(({ episode, podcast }) => ({ key: `episode:${episode.id}`, name: episode.title, sub: podcast.title, open: () => onOpenPodcast?.({ id: podcast.id, episodeId: episode.id }) })) },
+    ].filter((group) => group.rows.length > 0);
+    const waiting = hits === null || (canSearchPodcasts && !podcastIndex);
+    return (
+      <div className="tree library-search-results">
+        {groups.length === 0 ? (
+          waiting ? null : <div className="tree-empty-message">No matches</div>
+        ) : (
+          groups.map((group) => (
+            <div key={group.label} className="library-search-group">
+              <div className="library-search-group-label">{group.label}</div>
+              {group.rows.map((row) => (
+                <button key={row.key} type="button" className="library-search-result-row" onClick={row.open}>
+                  <span className="library-search-result-name">{row.name}</span>
+                  {row.sub && <small className="library-search-result-confidence muted">{row.sub}</small>}
+                </button>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    );
+  }
 
   async function playPinnedPodcast(podcast) {
     const data = await api(`/podcasts/${encodeURIComponent(podcast.id)}/episodes?page=1&page_size=500`);
@@ -12146,7 +12271,8 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   return (
     <div className="home-view">
       {menuElement}
-      {order.map((id) => {
+      {searchBar}
+      {searchTerm ? renderSearchResults() : order.map((id) => {
         const content = renderRow(id);
         if (content === null) return null;
         return (
