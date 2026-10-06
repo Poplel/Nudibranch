@@ -132,6 +132,10 @@ class _Resolver:
         if self.lookups >= MAX_LOOKUPS or time.monotonic() - self.started > LOOKUP_BUDGET_SECONDS:
             return None
         self.lookups += 1
+        # ⚠️ Never hold a transaction across an iTunes call. SQLite has one write lock for the whole
+        # server: a cache row flushed before the next lookup kept it for every remaining call, and
+        # every other write (session bumps, player heartbeats) — and so the page itself — waited.
+        self.session.commit()
         artist_id: str | None = None
         albums: list[dict] = []
         try:
@@ -148,6 +152,8 @@ class _Resolver:
         row.itunes_artist_id = artist_id
         row.albums = json.dumps(albums)
         row.fetched_at = now
+        # Its own short write, committed at once (see above).
+        self.session.commit()
         return albums
 
 
