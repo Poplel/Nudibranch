@@ -826,6 +826,9 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
                 item.status = ProposalStatus.failed
                 errors.append(f"{item.title}: {error}")
             progress_current += 1
+            # Commit per track so the write lock taken by this track's flushes is released before
+            # the next track's cross-volume file move.
+            session.commit()
         if task is not None:
             update_task_progress(session, task, min(progress_current, progress_total), progress_total, f"Imported {album_imported}/{len(album_items)} track(s) from {album_label}")
         else:
@@ -2168,6 +2171,10 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         if not blocking_items and not ytdlp_executing:
             finalize_completed_download_batch(session, batch)
         return {"imported": 0, "errors": []}
+    # ⚠️ Lock discipline for this sweep: every helper that flushes is followed by a commit, and
+    # each slow step (slskd HTTP, file moves, ffmpeg/fpcalc/AcoustID) is preceded by one, so the
+    # SQLite write lock is never held across them.
+    session.commit()
     entries = reconcile_manifest_entries_to_selected_items(session, batch, entries, expected_item_ids)
     # Entries whose item is no longer approved (rejected/deselected/never-approved) get their
     # slskd transfer cancelled and manifest entry/partial file removed, instead of silently
@@ -2189,6 +2196,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     # of the entries we already have, so a finished download still reaches the library while its
     # siblings are still waiting for a slot.
     for item_id in sorted(expected_item_ids - manifest_item_ids):
+        session.commit()
         item = session.get(ProposalItem, item_id)
         if download_item_retry_exhausted(item):
             set_download_item_status(item, "needs attention; could not be downloaded automatically", stage="failed")
@@ -2207,12 +2215,15 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         set_download_item_status(item, "searching for slskd queue record")
         waiting_count += 1
 
+    session.commit()
     transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
     if transfer_error_message:
         append_task_log(session, None, f"slskd transfer lookup: {transfer_error_message}", "warning")
         for entry in entries:
             set_download_item_status(session.get(ProposalItem, entry.get("item_id")), "searching transfer state")
     for entry in entries:
+        # Release the lock before this entry's slow work (staging move, verification, retry HTTP).
+        session.commit()
         item = session.get(ProposalItem, entry.get("item_id"))
         if download_item_retry_exhausted(item):
             set_download_item_status(item, "needs attention; could not be downloaded automatically", stage="failed")
@@ -2286,7 +2297,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
         continue
 
     update_download_container_statuses(batch)
-    session.flush()
+    session.commit()
 
     # Whole-album imports (wishlist / plain album downloads) wait until the entire batch has settled
     # before presenting, so an album isn't reviewed piecemeal. Per-track imports (lossless replacement
@@ -2364,7 +2375,7 @@ def reconcile_manifest_entries_to_selected_items(session: Session, batch: Propos
         reconciled.append(patched)
         changed = True
     if changed:
-        session.flush()
+        session.commit()
     return reconciled
 
 
@@ -2375,8 +2386,10 @@ def cancel_unapproved_download_entries(session: Session, dropped_entries: list[d
     orphaned in /app/downloads. Completed downloads are left untouched."""
     if not dropped_entries:
         return
+    session.commit()
     transfer_lookup, transfer_error = slskd_transfer_lookup(session, dropped_entries)
     for entry in dropped_entries:
+        session.commit()
         item = session.get(ProposalItem, entry.get("item_id"))
         if item is not None and item.status == ProposalStatus.completed:
             continue
@@ -2390,6 +2403,7 @@ def cancel_unapproved_download_entries(session: Session, dropped_entries: list[d
 
 def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, entries: list[dict]) -> list[dict]:
     limit = slskd_concurrent_download_limit(session)
+    session.commit()
     transfer_lookup, transfer_error_message = slskd_transfer_lookup(session, entries)
     if transfer_error_message:
         return entries
@@ -2414,6 +2428,7 @@ def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, e
     for entry, transfer in waiting_pairs[remaining_capacity:]:
         item = session.get(ProposalItem, entry.get("item_id"))
         reason = f"download slot limit {limit} reached"
+        session.commit()
         if not item or not cancel_existing_slskd_transfer(session, transfer, item, reason):
             continue
         remove_download_manifest_entry(entry)
@@ -2422,7 +2437,7 @@ def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, e
         deferred.add(id(entry))
     if deferred:
         batch.status = ProposalStatus.executing
-        session.flush()
+        session.commit()
     return [entry for entry in entries if id(entry) not in deferred or id(entry) in keep_ids]
 
 
@@ -3793,7 +3808,7 @@ def finalize_completed_download_batch(session: Session, batch: ProposalBatch) ->
             item.status = ProposalStatus.completed
     batch.status = ProposalStatus.completed
     retire_queue_notifications(session, batch.id)
-    session.flush()
+    session.commit()
 
 
 def cleanup_orphaned_download_batches(session: Session) -> int:
@@ -4055,6 +4070,8 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
     review = LibraryReviewBuilder(session)
     created = 0
     for entry, staged_path in staged_entries:
+        # Release the lock before review.add reads the staged file's tags / does lookups.
+        session.commit()
         # Per-item idempotency: never add the same downloaded track to a review twice (handles a
         # track that fails, retries, and succeeds after the album was already presented).
         item_id = str(entry.get("item_id") or "")
@@ -4091,7 +4108,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             set_download_item_status(source_item, "downloaded; review to add to library", stage="staging", progress=100)
     if review.batch is not None:
         artist_label = review.refresh_title()
-        session.flush()
+        session.commit()
         if created:
             append_task_log(session, None, f"{batch.title}: {created} downloaded track(s) staged; review to add them to the library")
             # Requester first, approver second: they are frequently the same person and share a
@@ -4119,7 +4136,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             if item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.pending}:
                 item.status = ProposalStatus.completed
         batch.status = ProposalStatus.completed
-    session.flush()
+    session.commit()
 
 
 def relative_media_path(file_path: Path) -> str:
@@ -6928,13 +6945,13 @@ def apply_artist_changes(session: Session, artist: Artist, changes: dict) -> Non
                 # a direct FK set leaves the stale collection and deleting the album
                 # in cleanup_empty_album_artist would null album_id (NOT NULL fail).
                 track.album = matching_album
-            session.flush()
+            session.commit()  # release the write lock before the same-volume file moves
             session.refresh(matching_album)
             sync_album_folder(session, matching_album)
             cleanup_empty_album_artist(session, album)
         else:
             album.artist = matching_artist
-            session.flush()
+            session.commit()  # release the write lock before the same-volume file moves
             session.refresh(album)
             sync_album_folder(session, album)
 
@@ -6993,7 +7010,7 @@ def apply_album_changes(session: Session, album: Album, changes: dict) -> None:
         # cleanup_empty_album_artist cascades album_id=NULL onto these tracks and
         # trips the NOT NULL constraint.
         track.album = matching_album
-    session.flush()
+    session.commit()  # release the write lock before the same-volume file moves
     session.refresh(matching_album)
     sync_album_folder(session, matching_album)
     cleanup_empty_album_artist(session, album)
@@ -9426,6 +9443,7 @@ def run_check_audio_content(session: Session, payload: dict, task: Task | None =
         # file that actually holds another track of THIS album is NOT treated as wrong audio).
         expected_tracks: list[dict] = []
         if album.musicbrainz_release_id:
+            session.commit()  # don't hold the write lock across the MusicBrainz lookup + sleep
             try:
                 record = lookup_album_tracks(artist_name, album.title, album.musicbrainz_release_id)
                 expected_tracks = record.get("tracks") or []
@@ -9471,6 +9489,7 @@ def run_check_audio_content(session: Session, payload: dict, task: Task | None =
                     duration_note = f"duration OFF MB slot by {round(delta/1000)}s"
 
             # --- AcoustID content confirmation on EVERY track (+ dead-air inside) ---
+            session.commit()  # ffmpeg/fpcalc/AcoustID follow: release the write lock first
             verdict = verify_audio_content(
                 Path(track.path),
                 claimed_title=track.title,

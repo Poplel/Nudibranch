@@ -241,7 +241,9 @@ def suggest_albums(
                 options.setdefault(base, album)
             if options:
                 used_artists.add(key)
-                picked.append(rng.choice(list(options.values())))
+                chosen = rng.choice(list(options.values()))
+                # Cache rows written before `apple_music_url` existed lack it; read as null.
+                picked.append({**chosen, "apple_music_url": chosen.get("apple_music_url")})
         session.commit()
     except Exception:  # noqa: BLE001 - never fail the page; return what we have
         session.rollback()

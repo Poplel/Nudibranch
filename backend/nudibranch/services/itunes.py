@@ -65,6 +65,7 @@ def _normalize_album(r: dict) -> dict:
         "cover_art_urls": [_art_url(r.get("artworkUrl100"))] if r.get("artworkUrl100") else [],
         "tracks": [],
         "source": "itunes",
+        "apple_music_url": r.get("collectionViewUrl") or None,
     }
 
 
@@ -77,6 +78,7 @@ def _normalize_track(r: dict) -> dict:
         "length": r.get("trackTimeMillis"),
         "duration_ms": r.get("trackTimeMillis"),
         "musicbrainz_recording_id": None,
+        "preview_url": r.get("previewUrl") or None,
     }
 
 
@@ -124,6 +126,80 @@ def album_tracks(album_id: str) -> list[dict]:
     except Exception as error:
         write_app_log("iTunes album tracks fetch failed", level="warning", feature="discover", error=str(error))
         return []
+
+
+def album_with_tracks(album_id: str) -> dict | None:
+    """One iTunes lookup returning the album (Discover shape) with its tracks hydrated, or None."""
+    try:
+        resp = httpx.get(f"{ITUNES_BASE}/lookup", params={
+            "id": album_id, "entity": "song",
+        }, timeout=ITUNES_TIMEOUT)
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        collection = next((r for r in results if r.get("wrapperType") == "collection"), None)
+        if not collection:
+            return None
+        album = _normalize_album(collection)
+        album["tracks"] = sorted(
+            (_normalize_track(r) for r in results if r.get("wrapperType") == "track" and r.get("kind") == "song"),
+            key=lambda t: (t.get("disc_number") or 1, t.get("track_number") or 999),
+        )
+        return album
+    except Exception as error:
+        write_app_log("iTunes album lookup failed", level="warning", feature="discover", error=str(error))
+        return None
+
+
+def track_lookup(track_id: str) -> dict | None:
+    """The raw iTunes song row for a track id (carries `collectionId`), or None."""
+    try:
+        resp = httpx.get(f"{ITUNES_BASE}/lookup", params={"id": track_id}, timeout=ITUNES_TIMEOUT)
+        resp.raise_for_status()
+        return next(
+            (r for r in resp.json().get("results", []) if r.get("wrapperType") == "track" and r.get("kind") == "song"),
+            None,
+        )
+    except Exception as error:
+        write_app_log("iTunes track lookup failed", level="warning", feature="discover", error=str(error))
+        return None
+
+
+def _names_match(wanted: str, found: str) -> bool:
+    """Normalized equality, tolerating a credited-artist suffix ("X feat. Y") on either side."""
+    a, b = _norm(wanted), _norm(found)
+    return bool(a) and bool(b) and (a == b or a.startswith(b + " ") or b.startswith(a + " "))
+
+
+def lookup_track(itunes_track_id: str = "", artist: str = "", title: str = "") -> dict | None:
+    """Resolve a recognised song to its iTunes album: `{"album": <Discover album + tracks>,
+    "track_id": <id within it>}`, or None. An id is an exact lookup; otherwise a song search on
+    artist + title that only accepts a normalized match."""
+    track_id = ""
+    album_id = ""
+    if itunes_track_id.strip():
+        row = track_lookup(itunes_track_id.strip())
+        if not row or not row.get("collectionId"):
+            return None
+        track_id, album_id = str(row.get("trackId") or ""), str(row["collectionId"])
+    else:
+        if not title.strip():
+            return None
+        # Title alone is allowed: a song shared from Shazam as a bare link only yields its URL slug.
+        # Then the best-ranked exact title match wins, which is iTunes' own popularity order.
+        for hit in track_search(f"{artist} {title}".strip(), limit=10):
+            if hit.get("album_id") and _norm(hit.get("title", "")) == _norm(title) and (
+                not artist.strip() or _names_match(artist, hit.get("artist", ""))
+            ):
+                track_id, album_id = hit["id"], hit["album_id"]
+                break
+        if not album_id:
+            return None
+    album = album_with_tracks(album_id)
+    if not album:
+        return None
+    if not any(t["id"] == track_id for t in album["tracks"]):
+        return None
+    return {"album": album, "track_id": track_id}
 
 
 def album_search(query: str, limit: int = 20) -> list[dict]:
@@ -191,12 +267,23 @@ def track_search(query: str, limit: int = 20) -> list[dict]:
             track["artist"] = r.get("artistName", "")
             track["album_date"] = (r.get("releaseDate") or "")[:10]
             track["album_track_count"] = r.get("trackCount", 0)
+            track["album_apple_music_url"] = r.get("collectionViewUrl") or None
             track["cover_art_url"] = _art_url(r.get("artworkUrl100"))
             tracks.append(track)
         return tracks
     except Exception as error:
         write_app_log("iTunes track search failed", level="warning", feature="discover", error=str(error))
         return []
+
+
+def _artists_with_albums(query: str, limit: int) -> list[dict]:
+    """Artist search, then each artist's albums fetched in parallel."""
+    raw_artists = artist_search(query, limit=limit)
+    with ThreadPoolExecutor(max_workers=max(len(raw_artists), 1)) as pool:
+        futures = {pool.submit(artist_albums, a["id"]): a for a in raw_artists}
+        for future in as_completed(futures):
+            futures[future]["albums"] = future.result()
+    return raw_artists
 
 
 def discover_music(query: str, type: str = "all") -> dict:
@@ -208,26 +295,39 @@ def discover_music(query: str, type: str = "all") -> dict:
     write_app_log("Discover search started", feature="discover", query=query, type=type, source="itunes")
     artist_map: dict[str, dict] = {}
 
-    if type in ("all", "artist"):
-        limit = 5 if type == "artist" else 3
-        raw_artists = artist_search(query, limit=limit)
-        with ThreadPoolExecutor(max_workers=max(len(raw_artists), 1)) as pool:
-            futures = {pool.submit(artist_albums, a["id"]): a for a in raw_artists}
-            for future in as_completed(futures):
-                artist = futures[future]
-                artist["albums"] = future.result()
-                artist_map[artist["id"]] = artist
-        write_app_log("Discover artist search completed", feature="discover", query=query, artists=len(raw_artists))
+    # The artist, album and track searches are independent iTunes calls, so they run together
+    # rather than one after another (each can take up to ITUNES_TIMEOUT). Results are assembled in
+    # the same order as before, so ranking and shape are unchanged.
+    want_artists = type in ("all", "artist")
+    want_albums = type in ("all", "album")
+    want_tracks = type in ("all", "track")
+    artist_limit = 5 if type == "artist" else 3
+    album_limit = 20 if type == "album" else 5
+    track_limit = 20 if type == "track" else 8
 
-    if type in ("all", "album"):
-        limit = 20 if type == "album" else 5
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        artist_future = pool.submit(_artists_with_albums, query, artist_limit) if want_artists else None
         # ⚠️ Search the conjunction variants too. iTunes matches title text literally, so "smoke and
         # mirrors" does not find *Smoke + Mirrors* — the album simply is not in the result set, and
         # no amount of ranking can rescue what was never fetched. One extra request, and only when
         # the query actually contains a conjunction.
-        found = list(album_search(query, limit=limit))
-        for variant in _conjunction_variants(query):
-            found.extend(album_search(variant, limit=limit))
+        album_futures = (
+            [pool.submit(album_search, q, album_limit) for q in [query, *_conjunction_variants(query)]]
+            if want_albums else []
+        )
+        track_future = pool.submit(track_search, query, track_limit) if want_tracks else None
+
+        if artist_future:
+            raw_artists = artist_future.result()
+            for artist in raw_artists:
+                artist_map[artist["id"]] = artist
+            write_app_log("Discover artist search completed", feature="discover", query=query, artists=len(raw_artists))
+        found: list[dict] = []
+        for future in album_futures:
+            found.extend(future.result())
+        found_tracks = track_future.result() if track_future else []
+
+    if want_albums:
         # iTunes returns results in its own relevance/popularity order, and that is the only
         # popularity signal available here. Keeping the position is what separates a dozen records
         # all genuinely titled "Smoke and Mirrors" — they score identically, so without it the
@@ -244,10 +344,9 @@ def discover_music(query: str, type: str = "all") -> dict:
             artist_map[aid]["albums"].append(album)
         write_app_log("Discover album search completed", feature="discover", query=query)
 
-    if type in ("all", "track"):
-        limit = 20 if type == "track" else 8
+    if want_tracks:
         album_map: dict[str, dict] = {}
-        for track_position, track in enumerate(track_search(query, limit=limit)):
+        for track_position, track in enumerate(found_tracks):
             aid = track.get("artist_id") or f"synth-{track.get('artist', '')}"
             alb_id = track.get("album_id") or f"synth-{aid}-{track.get('album', '')}"
             if aid not in artist_map:
@@ -264,11 +363,12 @@ def discover_music(query: str, type: str = "all") -> dict:
                     "cover_art_url": track.get("cover_art_url"),
                     "cover_art_urls": [track["cover_art_url"]] if track.get("cover_art_url") else [],
                     "tracks": [], "source": "itunes",
+                    "apple_music_url": track.get("album_apple_music_url"),
                     "_rank": track_position,
                 }
                 album_map[alb_id] = alb
                 artist_map[aid]["albums"].append(alb)
-            clean = {k: track[k] for k in ("id", "title", "track_number", "disc_number", "length", "duration_ms", "musicbrainz_recording_id") if k in track}
+            clean = {k: track[k] for k in ("id", "title", "track_number", "disc_number", "length", "duration_ms", "musicbrainz_recording_id", "preview_url") if k in track}
             album_map[alb_id]["tracks"].append(clean)
         write_app_log("Discover track search completed", feature="discover", query=query)
 

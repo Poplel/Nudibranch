@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 import secrets
+import time
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -196,6 +197,7 @@ from nudibranch.services import queue_state
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
+from nudibranch.services.itunes import lookup_track as itunes_lookup_track
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
 from nudibranch.services.notifications import create_notification, instance_id, push_identity, retire_queue_notifications
 from nudibranch.services.proposals import (
@@ -4707,6 +4709,24 @@ def discover_suggestions(
     return {"albums": suggest_albums(session, user, limit, skip)}
 
 
+@router.get("/discover/lookup", tags=["discover"], summary="Resolve a recognised song to its iTunes album")
+def discover_lookup(
+    itunes_track_id: str = Query("", max_length=40),
+    artist: str = Query("", max_length=180),
+    title: str = Query("", max_length=180),
+    _: User = Depends(require_permission(Permission.discover)),
+) -> dict:
+    """`{"album": <Discover album shape with tracks>, "track_id": "<iTunes track id within it>"}`.
+    An `itunes_track_id` is an exact lookup; otherwise `title` (with `artist` when known) is searched
+    and only a normalized match is accepted. 404 when nothing matches."""
+    if not itunes_track_id.strip() and not title.strip():
+        raise HTTPException(status_code=400, detail="Provide itunes_track_id or title")
+    found = itunes_lookup_track(itunes_track_id, artist, title)
+    if not found:
+        raise HTTPException(status_code=404, detail="No matching song found")
+    return found
+
+
 @router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)
 def discover_album_tracks(
     album_id: str,
@@ -5345,6 +5365,7 @@ def _reconcile_playlist(
     merged_local = [track_by_jf_id[jf_id] for jf_id in target if jf_id in track_by_jf_id] + invisible
     if _set_native_tracks(session, playlist, merged_local):
         changed = True
+        session.commit()    # the DELETE above took the write lock; don't hold it across the rename call
 
     # Name: same three-way rule. A rename made here has already been pushed synchronously, so a
     # difference means Jellyfin was renamed — unless the local name also moved off the base, in
@@ -5423,7 +5444,7 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             else:
                 playlist = Playlist(name=jf_name or jf_id, user_id=user.id, jellyfin_playlist_id=jf_id)
                 session.add(playlist)
-                session.flush()
+                session.commit()
             by_jf_id[jf_id] = playlist
             changed = True
         items = fetched.get(jf_id)
@@ -5432,6 +5453,10 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             changed = True
         if discovered and _jf_pull_cover(session, client, playlist):
             changed = True
+        if changed:
+            # Checkpoint after each playlist so the write lock is never held across the next
+            # playlist's Jellyfin calls.
+            session.commit()
 
     # A playlist we hold a Jellyfin id for that Jellyfin no longer lists was deleted over there.
     # (Tombstoned ids were removed from `jf_playlists` above, but no local row can point at one —
@@ -5446,6 +5471,8 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             removed.add(playlist.id)
             session.delete(playlist)
             changed = True
+    if changed:
+        session.commit()
 
     # Anything local that Jellyfin has never seen goes the other way.
     for playlist in native:
@@ -5458,6 +5485,8 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
     # _reconcile_playlist's add/remove-items calls — but it gets the same three-way merge, so
     # un-favoriting in either client sticks instead of being undone by the other.
     favorites = get_or_create_favorites(session, user.id)
+    if changed:
+        session.commit()
     fav_items = _jf_items(client, f"/Users/{jf_user_id}/Items", {
         "Filters": "IsFavorite", "IncludeItemTypes": "Audio", "Recursive": "true", "Limit": "500",
     })
@@ -5501,12 +5530,22 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
     return changed
 
 
+_JF_PULL_MIN_INTERVAL = 60.0
+_JF_PULL_LAST: dict[str, float] = {}
+
+
 def _sync_playlists(session: Session, user: User) -> None:
     """Run the inbound mirror for a user who has Jellyfin linked. No-op otherwise, which is what
     makes every read route below identical for both kinds of user."""
     client, jf_user_id = _jf_client(session, user)
     if not client:
         return
+    # Per-user throttle: the worker's mirror tick reconciles every 5 min regardless.
+    now = time.monotonic()
+    if now - _JF_PULL_LAST.get(user.id, -_JF_PULL_MIN_INTERVAL) < _JF_PULL_MIN_INTERVAL:
+        client.close()
+        return
+    _JF_PULL_LAST[user.id] = now
     with client:
         try:
             if _mirror_pull(session, user, client, jf_user_id):
@@ -5555,12 +5594,13 @@ def create_playlist(payload: PlaylistCreate, session: Session = Depends(get_sess
         raise HTTPException(status_code=409, detail="A playlist with that name already exists")
     playlist = Playlist(name=name, user_id=user.id, protected=False)
     session.add(playlist)
-    session.flush()
+    # Commit the local row before any Jellyfin call so the write lock is not held across HTTP.
+    session.commit()
     client, jf_user_id = _jf_client(session, user)
     if client:
         with client:
             _mirror_create(session, client, jf_user_id, playlist)
-    session.commit()
+        session.commit()
     return _native_playlist_out(session, playlist)
 
 
@@ -5576,11 +5616,11 @@ def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session 
     if conflict:
         raise HTTPException(status_code=409, detail="A playlist with that name already exists")
     playlist.name = name
+    session.commit()
     client, jf_user_id = _jf_client(session, user)
     if client and playlist.jellyfin_playlist_id:
         with client:
             _mirror_rename(client, jf_user_id, playlist.jellyfin_playlist_id, name)
-    session.commit()
     return _native_playlist_out(session, playlist)
 
 
@@ -5812,7 +5852,8 @@ def add_playlist_tracks(playlist_id: str, payload: PlaylistAddTracks, session: S
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     _add_tracks_to_native_playlist(session, playlist, payload.track_ids)
-    session.flush()
+    # Commit the local change before any Jellyfin call so the write lock is not held across HTTP.
+    session.commit()
     session.refresh(playlist)
     # A track that Jellyfin has never scanned is still added locally and simply isn't mirrored —
     # the old Jellyfin path rejected the whole request with "run a sync first", which made adding
@@ -5837,7 +5878,7 @@ def remove_playlist_track(playlist_id: str, track_id: str, session: Session = De
     for entry in list(playlist.tracks):
         if entry.track_id == track_id:
             session.delete(entry)
-    session.flush()
+    session.commit()
     session.refresh(playlist)
     client, jf_user_id = _jf_client(session, user)
     if client:
@@ -6003,15 +6044,16 @@ def accept_playlist_share(
 
     playlist = Playlist(name=name, user_id=user.id, protected=False)
     session.add(playlist)
-    session.flush()
+    session.commit()
     _add_tracks_to_native_playlist(session, playlist, track_ids)
-    session.flush()
+    session.commit()
     session.refresh(playlist)
 
     client, jf_user_id = _jf_client(session, user)
     if client:
         with client:
             _mirror_create(session, client, jf_user_id, playlist)
+        session.commit()
 
     # Carry the sender's cover over, so a shared playlist arrives looking like the one that was sent.
     source_cover = _playlist_local_cover_path(session, share.source_playlist_id)
@@ -6977,6 +7019,10 @@ def get_integrations(
     return _integration_settings_out(integration_settings(session))
 
 
+_CONNECTION_PROBE_TTL = 10.0
+_connection_probe_cache: "tuple[tuple, float, dict] | None" = None
+
+
 @router.get("/settings/connections", tags=["settings"], summary="Live connection status for slskd and Jellyfin")
 def get_connection_status(
     session: Session = Depends(get_session),
@@ -6997,9 +7043,23 @@ def get_connection_status(
     slskd_key = settings.get("slskd_api_key", "")
     jellyfin_url = settings.get("jellyfin_url", "")
     jellyfin_key = settings.get("jellyfin_api_key", "")
+    global _connection_probe_cache
+    cache_key = (slskd_url, slskd_key, jellyfin_url, jellyfin_key)
+    cached = _connection_probe_cache
+    if cached and cached[0] == cache_key and time.monotonic() - cached[1] < _CONNECTION_PROBE_TTL:
+        probes = cached[2]
+    else:
+        # Probe both servers at once so the slower one doesn't add to the other's wait.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slskd_future = pool.submit(probe, slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else None
+            jellyfin_future = pool.submit(probe, jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else None
+            probes = {
+                "slskd": slskd_future.result() if slskd_future else "disabled",
+                "jellyfin": jellyfin_future.result() if jellyfin_future else "disabled",
+            }
+        _connection_probe_cache = (cache_key, time.monotonic(), probes)
     return {
-        "slskd": probe(slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else "disabled",
-        "jellyfin": probe(jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else "disabled",
+        **probes,
         # Read-only: set with LISTENBRAINZ_ENABLED in the server's environment. Not probed.
         "listenbrainz": "enabled" if get_settings().listenbrainz_enabled else "disabled",
     }
@@ -7646,14 +7706,29 @@ def _serialize_command(cmd: PlaybackCommand) -> PlayerCommandOut:
     )
 
 
+_JF_NOW_PLAYING_TTL = 5.0
+_jf_now_playing_cache: tuple[float, list[dict]] | None = None
+
+
 def jellyfin_now_playing(session: Session) -> list[dict]:
+    """Jellyfin /Sessions, cached for 5 s so a polled `/users/playback` never blocks on it."""
+    global _jf_now_playing_cache
+    cached = _jf_now_playing_cache
+    if cached and time.monotonic() - cached[0] < _JF_NOW_PLAYING_TTL:
+        return [dict(item) for item in cached[1]]
+    sessions = _jellyfin_now_playing_fetch(session)
+    _jf_now_playing_cache = (time.monotonic(), sessions)
+    return [dict(item) for item in sessions]
+
+
+def _jellyfin_now_playing_fetch(session: Session) -> list[dict]:
     settings = integration_settings(session)
     jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
     api_key = settings.get("jellyfin_api_key", "")
     if not jellyfin_url or not api_key:
         return []
     try:
-        response = httpx.get(f"{jellyfin_url}/Sessions", headers={"X-Emby-Token": api_key}, timeout=8)
+        response = httpx.get(f"{jellyfin_url}/Sessions", headers={"X-Emby-Token": api_key}, timeout=3)
         response.raise_for_status()
     except httpx.HTTPError:
         return []
@@ -8328,6 +8403,8 @@ def subscribe_podcast(
     oldest = datetime.min.replace(tzinfo=timezone.utc)
     episodes.sort(key=lambda item: item["published_at"] or oldest, reverse=True)
     podcast_service.upsert_episodes(session, podcast, episodes[:_SUBSCRIBE_INLINE_EPISODES])
+    # Commit before the cover fetch (up to ~25 s of HTTP) so the write lock isn't held across it.
+    session.commit()
     _fetch_podcast_cover_now(podcast)
     session.commit()
     enqueue_task(session, "podcast_scan", {"podcast_id": podcast.id})

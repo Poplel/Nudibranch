@@ -851,40 +851,58 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, requestData, approvalData, playlistData, backupData] = await Promise.all([
-        api("/permissions"),
-        hasPermission(me, "library:view") ? api("/library/tree") : Promise.resolve([]),
-        hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
-        hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
-        api("/notifications"),
-        hasPermission(me, "discover") ? api("/wishlist") : Promise.resolve([]),
+      // Independent fetches: each sets its own state as it lands, so a slow or failing request
+      // (a big /library/tree, /logs, /playlists) never holds up or discards the others. Only
+      // /me, /library/tree and /notifications gate the first paint.
+      const slice = (condition, path, apply) =>
+        (condition ? api(path) : Promise.resolve(null)).then((data) => {
+          if (data !== null) apply(data);
+        });
+      const firstPaint = [
+        slice(hasPermission(me, "library:view"), "/library/tree", (libraryTree) => {
+          setLibrary(libraryTree);
+          lastLibraryPollRef.current = Date.now(); // count this fetch toward the 60s poll throttle
+        }),
+        slice(true, "/notifications", (notificationData) => {
+          setNotifications((current) => mergeTrayNotifications(notificationData, current));
+        }),
+      ];
+      const rest = [
+        slice(true, "/permissions", setPermissionCatalog),
+        slice(hasPermission(me, "activity:read"), "/tasks", (taskData) => {
+          setTasks(taskData);
+          handleCompletedTaskEffects(taskData, { emit: false });
+        }),
+        slice(hasPermission(me, "activity:read"), "/logs", setAppLogs),
+        slice(hasPermission(me, "discover"), "/wishlist", setWishlist),
         // /requests is the requester's own progress feed AND the Task Queue's data source for a
         // wishlist:approve_all holder who lacks approvals:manage (GET /approvals is admin-only).
-        hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all") ? api("/requests") : Promise.resolve([]),
-        hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
-        hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
-        hasPermission(me, "tools:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
-      ]);
-      setPermissionCatalog(permissionData);
-      setLibrary(libraryTree);
-      lastLibraryPollRef.current = Date.now(); // count this fetch toward the 60s poll throttle
-      setTasks(taskData);
-      setAppLogs(logData);
-      handleCompletedTaskEffects(taskData, { emit: false });
-      setNotifications((current) => mergeTrayNotifications(notificationData, current));
-      setWishlist(wishlistData);
-      setRequests(requestData);
-      setApprovals(approvalData);
-      setPlaylists(playlistData);
-      setBackups(backupData.backups || []);
-      setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
-      setHomeVersion((v) => v + 1);
-      setRefreshVersion((v) => v + 1);
+        slice(hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all"), "/requests", setRequests),
+        slice(hasPermission(me, "approvals:manage"), "/approvals", setApprovals),
+        slice(hasPermission(me, "playlists:manage"), "/playlists", (playlistData) => {
+          setPlaylists(playlistData);
+          setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
+        }),
+        slice(hasPermission(me, "tools:manage"), "/tools/backups", (backupData) => setBackups(backupData.backups || [])),
+      ];
+      const settled = Promise.allSettled([...firstPaint, ...rest]).then((results) => {
+        const authFailure = results.find(
+          (result) =>
+            result.status === "rejected" &&
+            /Invalid API key|Missing API key/.test(result.reason?.message || ""),
+        );
+        if (authFailure) logout();
+        setHomeVersion((v) => v + 1);
+        setRefreshVersion((v) => v + 1);
+      });
+      await Promise.allSettled(firstPaint);
+      setLoading(false);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
       if (canManageUsers(me)) refreshUsers();
       if (hasPermission(me, "activity:read")) refreshUserPlayback();
+      await settled;
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
         logout();
@@ -4472,6 +4490,7 @@ function App() {
                 onSuggestions={fetchDiscoverSuggestions}
                 onQueue={queueDiscoverDownloads}
                 apiKey={token}
+                playbackControl={playbackControlRef}
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onRemoveMany={removeWishlistItems}
@@ -6873,7 +6892,7 @@ function ArtistAvatar({ artist }) {
 
 const DISCOVER_ALBUMS_INITIAL = 5;
 
-function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist, onQueue, apiKey }) {
+function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist, onQueue, apiKey, playbackControl }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -6920,6 +6939,18 @@ function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist
   }, [onSuggestions, canWishlist]);
 
   useEffect(() => { loadSuggestions(); }, [loadSuggestions]);
+
+  // Track previews share the playlist suggestions' preview player: one at a time, pausing the main
+  // player and resuming it afterwards. Ids are prefixed so they can never collide with library ids.
+  const [previewId, setPreviewId] = useState(suggestionPreview.trackId);
+  useEffect(() => {
+    const listener = (id) => setPreviewId(id);
+    suggestionPreview.listeners.add(listener);
+    return () => {
+      suggestionPreview.listeners.delete(listener);
+      if (suggestionPreview.trackId?.startsWith("discover:")) suggestionPreview.stop();
+    };
+  }, []);
 
   function artUrl(src) {
     // Discover art comes straight from iTunes as an external URL — no auth needed.
@@ -7003,6 +7034,16 @@ function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist
               if (!openAlbums.has(album.id) && tracks.length === 0) loadAlbumTracks(album.id);
             }}
           />
+          {album.apple_music_url && (
+            <a
+              className="track-list-sub"
+              href={album.apple_music_url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Apple Music
+            </a>
+          )}
           <AlbumResultArt src={artUrl(album.cover_art_url)} />
           {canWishlist && (
             <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
@@ -7035,6 +7076,21 @@ function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist
             {tracks.map((track, index) => (
               <div className="tree-action-row discover-tree-row" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
                 <TreeRow depth={depth + 1} icon={FileAudio} title={`${trackNumberLabel(track)} ${track.title}`} meta={formatDuration(track.length || track.duration_ms)} />
+                {track.preview_url && (() => {
+                  const previewKey = `discover:${track.id || track.preview_url}`;
+                  const previewing = previewId === previewKey;
+                  return (
+                    <button
+                      type="button"
+                      className="row-icon-button"
+                      title={previewing ? "Stop preview" : "Preview"}
+                      aria-label={previewing ? "Stop preview" : "Preview"}
+                      onClick={() => (previewing ? suggestionPreview.stop() : suggestionPreview.startUrl(previewKey, track.preview_url, playbackControl?.current))}
+                    >
+                      {previewing ? <Pause size={15} /> : <Play size={15} />}
+                    </button>
+                  );
+                })()}
                 {canWishlist && (
                   <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
                     <Heart size={15} />
@@ -7154,7 +7210,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onSuggestions, onQueue, apiKey,
+  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onSuggestions, onQueue, apiKey, playbackControl,
   onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
   onApproveQueue, onRejectQueue,
 }) {
@@ -7208,6 +7264,7 @@ function WishlistWorkspace({
           onWishlist={onAdd}
           onQueue={onQueue}
           apiKey={apiKey}
+          playbackControl={playbackControl}
         />
       </div>
       <div className="workspace-tabpanel" hidden={tab !== "requests"}>
@@ -7781,6 +7838,10 @@ const suggestionPreview = {
   },
   start(trackId, apiKey, control) {
     if (!apiKey) return;
+    this.startUrl(trackId, `${API_BASE}/library/tracks/${encodeURIComponent(trackId)}/stream?api_key=${encodeURIComponent(apiKey)}`, control);
+  },
+  // `src` is any playable URL — a library stream above, or an iTunes 30 s clip on Discover.
+  startUrl(trackId, src, control) {
     if (!this.audio) {
       this.audio = new Audio();
       this.audio.addEventListener("ended", () => this.stop());
@@ -7791,7 +7852,7 @@ const suggestionPreview = {
       this.control.pause();
       this.resumeMain = true;
     }
-    this.audio.src = `${API_BASE}/library/tracks/${encodeURIComponent(trackId)}/stream?api_key=${encodeURIComponent(apiKey)}`;
+    this.audio.src = src;
     this.trackId = trackId;
     this.notify();
     this.audio.play().catch(() => this.stop());
