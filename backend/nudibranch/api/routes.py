@@ -215,6 +215,7 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
+from nudibranch.services.album_suggestions import suggest_albums
 from nudibranch.services.suggestions import plan_smart_shuffle, suggest
 from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
 
@@ -4691,6 +4692,19 @@ def discover_search(
     except httpx.RequestError as error:
         write_app_log("Discover API search failed: MusicBrainz unreachable", level="error", feature="discover", query=q, user_id=user.id, error=str(error))
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
+
+
+@router.get("/discover/suggestions", tags=["discover"], summary="Suggest albums the library does not have")
+def discover_suggestions(
+    limit: int = Query(5, ge=1, le=25),
+    exclude: str = Query("", description="Comma-separated iTunes album ids already shown"),
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> dict:
+    """Albums by similar artists not in the library, mixed with missing albums from artists the caller
+    already plays. `/discover/search` album shape; refresh by passing every shown id in `exclude`."""
+    skip = {part.strip() for part in exclude.split(",") if part.strip()}
+    return {"albums": suggest_albums(session, user, limit, skip)}
 
 
 @router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)

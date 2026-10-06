@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from statistics import median
 
 import numpy as np
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from nudibranch.db.models import Album, ArtistSimilarity, Artist, PlayEvent, PlaylistTrack, Track, TrackFeatures, User
@@ -150,8 +150,13 @@ def suggest(
     limit = max(0, limit)
     seed_ids = _sample_evenly(list(dict.fromkeys(seed_track_ids)), MAX_SEEDS)
     excluded = set(seed_track_ids) | set(exclude_track_ids or ())
-    if not seed_ids or limit == 0:
+    if limit == 0:
         return []
+    seeds_usable = bool(seed_ids) and session.scalar(
+        select(Track.id).where(Track.id.in_(seed_ids), Track.path.is_not(None)).limit(1)
+    )
+    if not seeds_usable:
+        return popular_tracks(session, user, excluded, limit, rng)
 
     # One bulk read of the whole candidate table, columns only (never a Track object per row).
     rows = session.execute(
@@ -272,6 +277,61 @@ def suggest(
 
     scored.sort(key=lambda row: row[1], reverse=True)
     chosen = _pick(scored, artist_of, limit, rng)
+    if not chosen:
+        return []
+    loaded = {
+        t.id: t
+        for t in session.scalars(
+            select(Track).where(Track.id.in_(chosen)).options(selectinload(Track.album).selectinload(Album.artist))
+        )
+    }
+    return [loaded[t] for t in chosen if t in loaded]
+
+
+POPULAR_POOL = 50
+
+
+def popular_tracks(
+    session: Session, user: User, excluded: set[str], limit: int, rng: random.Random | None = None
+) -> list[Track]:
+    """No usable seeds: `limit` random tracks from a popularity pool. The caller's 50 most-played
+    library tracks first, topped up from the server-wide most-played, then (only when nothing has
+    ever been played) random library tracks. Counted in SQL; never a row per play."""
+    rng = rng or random.Random()
+    chosen: list[str] = []
+
+    def top_ids(owner: User | None, skip: set[str]) -> list[str]:
+        plays = func.count(PlayEvent.id)
+        query = (
+            select(PlayEvent.track_id)
+            .join(Track, Track.id == PlayEvent.track_id)
+            .where(Track.path.is_not(None))
+            .group_by(PlayEvent.track_id)
+            .order_by(plays.desc(), PlayEvent.track_id)
+            .limit(POPULAR_POOL + len(skip))
+        )
+        if owner is not None:
+            query = query.where(PlayEvent.user_id == owner.id)
+        if skip:
+            query = query.where(PlayEvent.track_id.not_in(skip))
+        return list(session.scalars(query))
+
+    skip = set(excluded)
+    pool = top_ids(user, skip)[:POPULAR_POOL]
+    rng.shuffle(pool)
+    chosen.extend(pool[:limit])
+    if len(chosen) < limit:
+        skip |= set(chosen)
+        pool = top_ids(None, skip)[:POPULAR_POOL]
+        rng.shuffle(pool)
+        chosen.extend(pool[: limit - len(chosen)])
+    if not chosen:
+        # Nothing played (or every played track excluded): random library tracks, so it is never
+        # empty while the library has a candidate.
+        query = select(Track.id).where(Track.path.is_not(None))
+        if excluded:
+            query = query.where(Track.id.not_in(excluded))
+        chosen = list(session.scalars(query.order_by(func.random()).limit(limit)))
     if not chosen:
         return []
     loaded = {

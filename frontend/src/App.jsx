@@ -1560,6 +1560,12 @@ function App() {
     return api(`/discover/search?q=${encodeURIComponent(query)}`);
   }
 
+  // `exclude` = every suggested album id shown since the page opened.
+  const fetchDiscoverSuggestions = useCallback(
+    (exclude) => api(`/discover/suggestions?limit=5&exclude=${encodeURIComponent((exclude || []).join(","))}`),
+    [api],
+  );
+
   async function fetchDiscoverAlbumTracks(albumId) {
     return api(`/discover/album-tracks/${encodeURIComponent(albumId)}`);
   }
@@ -4463,6 +4469,7 @@ function App() {
                 onTabChange={setWishlistTab}
                 onSearch={searchDiscover}
                 onFetchTracks={fetchDiscoverAlbumTracks}
+                onSuggestions={fetchDiscoverSuggestions}
                 onQueue={queueDiscoverDownloads}
                 apiKey={token}
                 onAdd={createWishlistItem}
@@ -6866,7 +6873,7 @@ function ArtistAvatar({ artist }) {
 
 const DISCOVER_ALBUMS_INITIAL = 5;
 
-function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiKey }) {
+function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist, onQueue, apiKey }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -6877,6 +6884,42 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
   const [albumTracksLoading, setAlbumTracksLoading] = useState(() => new Set());
   const canWishlist = hasPermission(user, "discover");
   const canQueue = hasPermission(user, "discover");
+  // "Suggested Albums": albums the library does not have, shown while the search box is empty.
+  // Hidden offline or without `discover`; failures are silent (the section just stays hidden).
+  const [suggested, setSuggested] = useState([]);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  // Every album id shown since the page opened, so Refresh never repeats one.
+  const suggestedShownRef = useRef(new Set());
+
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  const loadSuggestions = useCallback(async () => {
+    if (!onSuggestions || !canWishlist) return;
+    setSuggestLoading(true);
+    try {
+      const data = await onSuggestions([...suggestedShownRef.current]);
+      const albums = data?.albums || [];
+      albums.forEach((album) => suggestedShownRef.current.add(album.id));
+      // An empty refresh keeps the current rows rather than blanking the section.
+      if (albums.length) setSuggested(albums);
+    } catch (_) {
+      /* silent */
+    } finally {
+      setSuggestLoading(false);
+    }
+  }, [onSuggestions, canWishlist]);
+
+  useEffect(() => { loadSuggestions(); }, [loadSuggestions]);
 
   function artUrl(src) {
     // Discover art comes straight from iTunes as an external URL — no auth needed.
@@ -6943,6 +6986,73 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
     await onWishlist({ kind: "track", artist: album.artist, album: album.title, track: track.title, source: "discover" });
   }
 
+  function renderAlbum(album, depth) {
+    const tracks = albumTracksCache.get(album.id) ?? album.tracks ?? [];
+    const tracksLoading = albumTracksLoading.has(album.id);
+    return (
+      <div key={album.id}>
+        <div className="tree-action-row discover-tree-row">
+          <TreeRow
+            depth={depth}
+            icon={Folder}
+            open={openAlbums.has(album.id)}
+            title={album.title}
+            meta={[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}
+            onToggle={() => {
+              toggleSet(setOpenAlbums, album.id);
+              if (!openAlbums.has(album.id) && tracks.length === 0) loadAlbumTracks(album.id);
+            }}
+          />
+          <AlbumResultArt src={artUrl(album.cover_art_url)} />
+          {canWishlist && (
+            <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
+              <Heart size={15} />
+            </button>
+          )}
+          {canQueue && (
+            <button className="row-icon-button" onClick={async () => {
+              // Always fetch the full track list from the API — search results may
+              // contain only a subset of tracks, so never rely on the display cache.
+              let freshTracks = tracks;
+              if (onFetchTracks) {
+                const data = await onFetchTracks(album.id);
+                freshTracks = data.tracks || [];
+                setAlbumTracksCache((prev) => new Map([...prev, [album.id, freshTracks]]));
+              }
+              onQueue(albumRequests({ ...album, tracks: freshTracks }));
+            }} disabled={tracksLoading} title="Queue album">
+              <ListChecks size={15} />
+            </button>
+          )}
+        </div>
+        {openAlbums.has(album.id) && (
+          <>
+            {tracksLoading && (
+              <div className="tree-action-row discover-tree-row">
+                <TreeRow depth={depth + 1} icon={FileAudio} title="Loading tracks…" />
+              </div>
+            )}
+            {tracks.map((track, index) => (
+              <div className="tree-action-row discover-tree-row" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
+                <TreeRow depth={depth + 1} icon={FileAudio} title={`${trackNumberLabel(track)} ${track.title}`} meta={formatDuration(track.length || track.duration_ms)} />
+                {canWishlist && (
+                  <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
+                    <Heart size={15} />
+                  </button>
+                )}
+                {canQueue && (
+                  <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks: [track] }))} title="Queue track">
+                    <ListChecks size={15} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="discover-view">
       <form className="discover-search" onSubmit={submit}>
@@ -6952,6 +7062,18 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
           {searching ? "Searching" : "Search"}
         </button>
       </form>
+      {online && canWishlist && !query.trim() && suggested.length > 0 && (
+        <div className="tree discover-tree discover-suggested">
+          <div className="tree-toolbar">
+            <strong>Suggested Albums</strong>
+            <button type="button" className="secondary compact" onClick={loadSuggestions} disabled={suggestLoading}>
+              <RefreshCw size={13} />
+              Refresh
+            </button>
+          </div>
+          {suggested.map((album) => renderAlbum(album, 0))}
+        </div>
+      )}
       {!results ? (
         <EmptyState title="Search MusicBrainz" body="Find an artist, album, or track, then add it to your wishlist or task queue." />
       ) : (results.artists || []).length === 0 ? (
@@ -7000,72 +7122,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                 const visibleAlbums = showAll ? allAlbums : allAlbums.slice(0, DISCOVER_ALBUMS_INITIAL);
                 return (
                   <>
-                    {visibleAlbums.map((album) => {
-                      const tracks = albumTracksCache.get(album.id) ?? album.tracks ?? [];
-                      const tracksLoading = albumTracksLoading.has(album.id);
-                      return (
-                        <div key={album.id}>
-                          <div className="tree-action-row discover-tree-row">
-                            <TreeRow
-                              depth={1}
-                              icon={Folder}
-                              open={openAlbums.has(album.id)}
-                              title={album.title}
-                              meta={[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}
-                              onToggle={() => {
-                                toggleSet(setOpenAlbums, album.id);
-                                if (!openAlbums.has(album.id) && tracks.length === 0) loadAlbumTracks(album.id);
-                              }}
-                            />
-                            <AlbumResultArt src={artUrl(album.cover_art_url)} />
-                            {canWishlist && (
-                              <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
-                                <Heart size={15} />
-                              </button>
-                            )}
-                            {canQueue && (
-                              <button className="row-icon-button" onClick={async () => {
-                                // Always fetch the full track list from the API — search results may
-                                // contain only a subset of tracks, so never rely on the display cache.
-                                let freshTracks = tracks;
-                                if (onFetchTracks) {
-                                  const data = await onFetchTracks(album.id);
-                                  freshTracks = data.tracks || [];
-                                  setAlbumTracksCache((prev) => new Map([...prev, [album.id, freshTracks]]));
-                                }
-                                onQueue(albumRequests({ ...album, tracks: freshTracks }));
-                              }} disabled={tracksLoading} title="Queue album">
-                                <ListChecks size={15} />
-                              </button>
-                            )}
-                          </div>
-                          {openAlbums.has(album.id) && (
-                            <>
-                              {tracksLoading && (
-                                <div className="tree-action-row discover-tree-row">
-                                  <TreeRow depth={2} icon={FileAudio} title="Loading tracks…" />
-                                </div>
-                              )}
-                              {tracks.map((track, index) => (
-                                <div className="tree-action-row discover-tree-row" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
-                                  <TreeRow depth={2} icon={FileAudio} title={`${trackNumberLabel(track)} ${track.title}`} meta={formatDuration(track.length || track.duration_ms)} />
-                                  {canWishlist && (
-                                    <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
-                                      <Heart size={15} />
-                                    </button>
-                                  )}
-                                  {canQueue && (
-                                    <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks: [track] }))} title="Queue track">
-                                      <ListChecks size={15} />
-                                    </button>
-                                  )}
-                                </div>
-                              ))}
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
+                    {visibleAlbums.map((album) => renderAlbum(album, 1))}
                     {!showAll && allAlbums.length > DISCOVER_ALBUMS_INITIAL && (
                       <div className="tree-action-row discover-tree-row">
                         <button
@@ -7097,7 +7154,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onQueue, apiKey,
+  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onSuggestions, onQueue, apiKey,
   onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
   onApproveQueue, onRejectQueue,
 }) {
@@ -7147,6 +7204,7 @@ function WishlistWorkspace({
           user={user}
           onSearch={onSearch}
           onFetchTracks={onFetchTracks}
+          onSuggestions={onSuggestions}
           onWishlist={onAdd}
           onQueue={onQueue}
           apiKey={apiKey}

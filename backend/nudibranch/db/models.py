@@ -375,6 +375,20 @@ class ArtistSimilarity(Base):
     error: Mapped[str | None] = mapped_column(Text)
 
 
+class DiscoverArtistCache(Base):
+    """iTunes artist resolution + album list for the Discover suggestions, keyed by normalized artist
+    name. An unresolved or failed lookup is stored with `itunes_artist_id` null and no albums (and a
+    shorter TTL), so it is not retried on every request."""
+
+    __tablename__ = "discover_artist_cache"
+
+    name_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    itunes_artist_id: Mapped[str | None] = mapped_column(String(64))
+    #: JSON list of iTunes album dicts (`itunes._normalize_album` shape).
+    albums: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+
+
 class LibraryDeletion(Base):
     """Tombstone for a removed library row, so `/library/changes` can report deletions.
 
