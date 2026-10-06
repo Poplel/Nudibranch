@@ -958,13 +958,14 @@ def smart_shuffle_plan(
     `inserts[].index` is a position in the SENT array, before which the track goes; the list is
     ascending and the client applies it from last to first. One song is inserted after every
     `smart_shuffle_every` consecutive non-smart tracks within 40 items of `current_index`; episodes
-    neither count nor break a run, and an already-spaced queue gets `[]`.
+    neither count nor break a run, and an already-spaced queue gets `[]`. With `repeat` off and fewer
+    than 2 tracks after the current one, 10 more are appended at `index == len(items)`.
     """
     if len(payload.items) > SESSION_MAX_ITEMS:
         raise HTTPException(status_code=413, detail=f"Queue exceeds {SESSION_MAX_ITEMS} items")
     items = [item.model_dump() for item in payload.items]
     every = max(1, min(20, int(getattr(user, "smart_shuffle_every", 4) or 4)))
-    plan = plan_smart_shuffle(session, user, items, payload.current_index, every)
+    plan = plan_smart_shuffle(session, user, items, payload.current_index, every, payload.repeat)
     return SmartShufflePlanResponse(
         inserts=[SmartShuffleInsert(index=index, track=_library_track_row(track)) for index, track in plan]
     )

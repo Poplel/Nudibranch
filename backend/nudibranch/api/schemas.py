@@ -797,6 +797,8 @@ class SmartShuffleItem(BaseModel):
 class SmartShufflePlanRequest(BaseModel):
     items: list[SmartShuffleItem] = Field(default_factory=list, max_length=5000)
     current_index: int = 0
+    #: The player's repeat mode. With "off", a queue about to run out is extended with suggestions.
+    repeat: Literal["off", "one", "all"]
 
 
 class SmartShuffleInsert(BaseModel):

@@ -556,7 +556,8 @@ function App() {
     return `${API_BASE}/library/tracks/${track.id}/lyrics?api_key=${encodeURIComponent(token)}`;
   }, [playerQueue, currentTrackIndex, token]);
 
-  // Smart shuffle: re-plan on every track change while the mode is on. Only a tab that is playing
+  // Smart shuffle: re-plan on every track change while the mode is on, and when repeat changes (with
+  // repeat off the server also extends a queue that is about to run out). Only a tab that is playing
   // here gets a currentTrack, so this is the owner by construction. Entering the mode plans
   // directly from setShuffleState; this covers every change after that (and a mode adopted from a
   // claimed session).
@@ -564,7 +565,7 @@ function App() {
     if (shuffle !== "smart" || !currentTrack) return;
     planSmartShuffle();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentTrack, shuffle]);
+  }, [currentTrack, shuffle, repeat]);
 
   // Podcast resume: when an episode with a saved position becomes current, seek to it once the
   // audio is seekable (retrying until controlRef.seek succeeds after metadata loads).
@@ -3981,6 +3982,7 @@ function App() {
         body: JSON.stringify({
           items: queue.map((track) => ({ type: track?._kind === "episode" ? "episode" : "track", id: queueItemId(track), smart: track?._smart ? true : undefined })),
           current_index: anchor,
+          repeat: sessionLiveRef.current.repeat || "off",
         }),
       });
       const inserts = (reply?.inserts || []).slice().sort((a, b) => a.index - b.index);

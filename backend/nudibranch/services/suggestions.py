@@ -382,6 +382,10 @@ def _pick(scored: list[tuple[str, float]], artist_of: dict[str, str], limit: int
 PLAN_HORIZON = 40
 #: Seeds are weighted toward this many items either side of the current one.
 PLAN_SEED_WINDOW = 20
+#: With repeat off, the queue is extended once fewer than this many tracks follow the current one…
+CONTINUE_WHEN_LEFT = 2
+#: …by this many suggestions appended at the end, so smart shuffle keeps playing like a radio.
+CONTINUE_BATCH = 10
 
 
 def plan_insert_indexes(items: list[dict], current_index: int, every: int) -> list[int]:
@@ -432,11 +436,16 @@ def plan_insert_indexes(items: list[dict], current_index: int, every: int) -> li
 
 
 def plan_seed_ids(items: list[dict], current_index: int) -> list[str]:
-    """Non-smart track ids, at most MAX_SEEDS, favouring those within PLAN_SEED_WINDOW of current."""
+    """Non-smart track ids, at most MAX_SEEDS, favouring those within PLAN_SEED_WINDOW of current.
+
+    A queue that is all suggestions by now (smart shuffle has been extending it for a while) seeds
+    from its suggestions instead, so it keeps drifting from what is playing rather than stopping.
+    """
     near: list[str] = []
     far: list[str] = []
+    only_smart = not any(e.get("type") == "track" and not e.get("smart") for e in items)
     for i, entry in enumerate(items):
-        if entry.get("type") != "track" or entry.get("smart"):
+        if entry.get("type") != "track" or (entry.get("smart") and not only_smart):
             continue
         (near if abs(i - current_index) <= PLAN_SEED_WINDOW else far).append(entry["id"])
     near = list(dict.fromkeys(near))
@@ -446,12 +455,27 @@ def plan_seed_ids(items: list[dict], current_index: int) -> list[str]:
     return near + _sample_evenly(far, MAX_SEEDS - len(near))
 
 
+def plan_continuation_count(items: list[dict], current_index: int, repeat: str) -> int:
+    """How many suggestions to append at the end: CONTINUE_BATCH when repeat is off and fewer than
+    CONTINUE_WHEN_LEFT tracks follow the current item, else 0. Repeat one/all never ends a queue."""
+    if repeat != "off" or not items:
+        return 0
+    current_index = max(0, min(current_index, len(items) - 1))
+    left = sum(1 for entry in items[current_index + 1:] if entry.get("type") == "track")
+    return CONTINUE_BATCH if left < CONTINUE_WHEN_LEFT else 0
+
+
 def plan_smart_shuffle(
     session: Session, user: User, items: list[dict], current_index: int, every: int,
-    rng: random.Random | None = None,
+    repeat: str = "off", rng: random.Random | None = None,
 ) -> list[tuple[int, Track]]:
-    """[(index, track)] ascending by index. Empty when nothing needs inserting or nothing can seed."""
+    """[(index, track)] ascending by index. Empty when nothing needs inserting or nothing can seed.
+
+    Besides the every-N inserts, a queue about to run out (repeat off) gets CONTINUE_BATCH
+    suggestions appended at `len(items)`.
+    """
     indexes = plan_insert_indexes(items, current_index, every)
+    indexes += [len(items)] * plan_continuation_count(items, current_index, repeat)
     if not indexes:
         return []
     seeds = plan_seed_ids(items, current_index)
