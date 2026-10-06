@@ -996,12 +996,16 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
         item for item in batch.items
         if item.selected and is_executable_proposal_item(item)
     ]
+    # The counts describe THIS run only.  A batch approved in parts runs once per approval, and
+    # counting every leaf the batch has ever finished reported "48 passed" for a run that imported 37.
+    run_item_ids = {item.id for item in selected_items}
+    run_items = [item for item in result_items if item.id in run_item_ids]
     passed_count = sum(
         item.status in {ProposalStatus.completed, ProposalStatus.executing}
-        for item in result_items
+        for item in run_items
     )
-    failed_count = sum(item.status == ProposalStatus.failed for item in result_items)
-    if errors and not result_items:
+    failed_count = sum(item.status == ProposalStatus.failed for item in run_items)
+    if errors and not run_items:
         # A malformed/no-op approval has no item row to count, but it is still one failed action.
         failed_count = max(1, len(errors))
 
@@ -1089,12 +1093,14 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
     # Names the batch: "Task queue item completed" said something finished without saying what.
     # A request is known by its music; a tool's batch by its own title ("Fill MusicBrainz info").
     subject = batch_subject(batch) if is_download_batch else batch.title
+    # Only a failed batch "couldn't finish".  A partial approval leaves the batch `pending` with
+    # the unapproved rows still waiting, and the part that was approved did finish.
     title = (
         f"Downloads started: {subject}"
         if open_downloads
-        else f"Finished: {subject}"
-        if batch.status == ProposalStatus.completed or is_download_batch
         else f"Couldn't finish: {subject}"
+        if batch.status == ProposalStatus.failed and not is_download_batch
+        else f"Finished: {subject}"
     )
     # Only surface meaningful outcomes as notifications; a no-op completion just goes to the log.
     important = bool(
