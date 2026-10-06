@@ -41,6 +41,11 @@ from nudibranch.api.schemas import (
     PlayEventOut,
     PlayRecordIn,
     SessionRenameRequest,
+    SmartShuffleInsert,
+    SmartShufflePlanRequest,
+    SmartShufflePlanResponse,
+    SuggestionsRequest,
+    SuggestionsResponse,
     DeviceRegistration,
     DiscoverTaskQueueRequest,
     FavoritesOut,
@@ -210,6 +215,7 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
+from nudibranch.services.suggestions import plan_smart_shuffle, suggest
 from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
 
 router = APIRouter(prefix="/api/v1")
@@ -932,9 +938,33 @@ def update_own_appearance(
     user.background_tint = payload.background_tint
     user.crossfade_duration = payload.crossfade_duration
     user.remote_playback_enabled = payload.remote_playback_enabled
+    user.smart_shuffle_every = payload.smart_shuffle_every
     user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     session.commit()
     return serialize_user(load_user(session, user.id))
+
+
+@router.post("/player/smart-shuffle/plan", response_model=SmartShufflePlanResponse, tags=["users"], summary="Plan smart shuffle insertions")
+def smart_shuffle_plan(
+    payload: SmartShufflePlanRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.library_view)),
+) -> SmartShufflePlanResponse:
+    """Where smart shuffle should insert a suggested track into the queue the client sent.
+
+    `inserts[].index` is a position in the SENT array, before which the track goes; the list is
+    ascending and the client applies it from last to first. One song is inserted after every
+    `smart_shuffle_every` consecutive non-smart tracks within 40 items of `current_index`; episodes
+    neither count nor break a run, and an already-spaced queue gets `[]`.
+    """
+    if len(payload.items) > SESSION_MAX_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Queue exceeds {SESSION_MAX_ITEMS} items")
+    items = [item.model_dump() for item in payload.items]
+    every = max(1, min(20, int(getattr(user, "smart_shuffle_every", 4) or 4)))
+    plan = plan_smart_shuffle(session, user, items, payload.current_index, every)
+    return SmartShufflePlanResponse(
+        inserts=[SmartShuffleInsert(index=index, track=_library_track_row(track)) for index, track in plan]
+    )
 
 
 @router.post("/player/status", tags=["users"], summary="Update player state", response_model=dict)
@@ -993,7 +1023,7 @@ def update_player_status(
     state.duration_seconds = (
         round(library_ms / 1000) if library_ms else payload.duration_seconds
     )
-    state.shuffle = bool(payload.shuffle)
+    state.shuffle = payload.shuffle
     state.repeat = payload.repeat if payload.repeat in {"off", "one", "all"} else "off"
     if payload.client:
         state.client = payload.client
@@ -1119,7 +1149,7 @@ def list_player_sessions(
                 current_index=state.current_index if state else 0,
                 position_seconds=state.position_seconds if state else None,
                 duration_seconds=state.duration_seconds if state else None,
-                shuffle=state.shuffle if state else False,
+                shuffle=state.shuffle if state else "off",
                 repeat=state.repeat if state else "off",
                 # ⚠ Normalised to aware UTC. SQLite hands these back naive, and a naive timestamp
                 # serialises without an offset — which a strict ISO8601 client decoder rejects,
@@ -1190,7 +1220,7 @@ def create_player_command(
         target_id=target_id,
         target_label=target_label,
         loop=payload.loop if payload.loop in {"off", "one", "all"} else "off",
-        shuffle=bool(payload.shuffle),
+        shuffle=payload.shuffle,
         position_seconds=payload.position_seconds if action == "seek" else None,
         queue_index=payload.queue_index if action in _QUEUE_ACTIONS else None,
         queue_to_index=payload.queue_to_index if action == "move" else None,
@@ -1321,7 +1351,7 @@ def enqueue_on_session(
         target_type="handoff",
         target_id=handoff.id,
         loop=(target_state.repeat if target_state else "off"),
-        shuffle=(target_state.shuffle if target_state else False),
+        shuffle=(target_state.shuffle if target_state else "off"),
         status="pending",
     )
     session.add(command)
@@ -1606,7 +1636,7 @@ def _store_session_queue(row: AccountPlaybackSession, items: list[PlaybackSnapsh
     Ids only: display titles are the viewer's to resolve (from its mirror, or `resolve=true`).
     """
     _validate_session_items(items)
-    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id) for i in items]
+    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id, smart=i.smart or None) for i in items]
     # exclude_none: every absent title/artist/album_id is ~50 bytes of nulls, which alone pushed a
     # full-size queue past the payload cap.
     encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json(exclude_none=True)
@@ -1716,7 +1746,7 @@ def _serialize_account_session(
         current_index=row.current_index or 0,
         position_seconds=float(row.position_seconds or 0.0),
         position_at=as_utc(row.position_at) if row.position_at else None,
-        shuffle=bool(row.shuffle),
+        shuffle=row.shuffle or "off",
         repeat=row.repeat or "off",
         track_id=row.track_id,
         episode_id=row.episode_id,
@@ -1865,7 +1895,7 @@ def claim_account_session(
         _store_session_queue(row, snap.items)
         row.current_index = snap.current_index if snap.items else 0
         row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
-        row.shuffle = bool(snap.shuffle)
+        row.shuffle = snap.shuffle
         row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
     elif previous_owner and row.status == "playing" and row.position_at:
         # Taking a session that is playing right now: resume where it IS, not where it last said.
@@ -1950,7 +1980,7 @@ def publish_account_session_queue(
     row.current_index = snap.current_index if snap.items else 0
     row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
     row.position_at = now
-    row.shuffle = bool(snap.shuffle)
+    row.shuffle = snap.shuffle
     row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
     row.owner_session_id = origin.id
     row.owner_reported_at = now
@@ -2033,7 +2063,7 @@ def edit_account_session(
         row.position_seconds = min(target, limit) if limit else target
     elif op == "state":
         if payload.shuffle is not None:
-            row.shuffle = bool(payload.shuffle)
+            row.shuffle = payload.shuffle
         if payload.repeat in {"off", "one", "all"}:
             row.repeat = payload.repeat
     else:
@@ -2525,6 +2555,100 @@ def unpin_podcast(
     return list_pinned_podcasts(session, user)
 
 
+def _library_artists_named(session: Session, name: str) -> list[Artist]:
+    """Library artists whose name matches `name` ignoring case and punctuation."""
+    target = normalized_music_name(name)
+    if not target:
+        return []
+    exact = list(session.scalars(select(Artist).where(func.lower(Artist.name) == name.strip().lower())))
+    if exact:
+        return exact
+    token = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip().split(" ")[0]
+    if not token:
+        return []
+    loose = session.scalars(select(Artist).where(func.lower(Artist.name).like(f"%{token}%")).limit(200))
+    return [a for a in loose if normalized_music_name(a.name) == target]
+
+
+def _recently_approved_albums(session: Session, user: User, limit: int = 12) -> list[dict]:
+    """Home's Recently Approved: the caller's `completed` wishlist rows, newest first, resolved to
+    the library album each landed in (deduped by album id).
+
+    The request pipeline records no link to the library rows it created, so resolution is by
+    normalized name: album rows by artist + album, track rows by artist + title (-> that track's
+    album), artist rows by that artist's albums created at/after the request. Unresolvable rows are
+    dropped.
+    """
+    rows = list(
+        session.scalars(
+            select(WishlistItem)
+            .where(WishlistItem.user_id == user.id, WishlistItem.status == "completed")
+            .order_by(WishlistItem.status_changed_at.desc())
+            .limit(60)
+        )
+    )
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(album: Album, row: WishlistItem) -> None:
+        if album.id in seen or len(out) >= limit:
+            return
+        seen.add(album.id)
+        approved = row.status_changed_at
+        out.append({
+            "id": album.id,
+            "title": album.title,
+            "artist": album.artist.name if album.artist else None,
+            "cover_path": album.cover_path,
+            "approved_at": as_utc(approved).isoformat() if approved else None,
+        })
+
+    for row in rows:
+        if len(out) >= limit:
+            break
+        artists = _library_artists_named(session, row.artist or "")
+        if not artists:
+            continue
+        artist_ids = [a.id for a in artists]
+        if row.kind == "album" and row.album and not row.track:
+            want = normalized_music_name(row.album)
+            for album in session.scalars(
+                select(Album).options(selectinload(Album.artist)).where(Album.artist_id.in_(artist_ids))
+            ):
+                if normalized_music_name(album.title) == want:
+                    add(album, row)
+                    break
+        elif row.track:
+            want = normalized_music_name(row.track)
+            want_album = normalized_music_name(row.album) if row.album else None
+            candidates = list(
+                session.scalars(
+                    select(Track)
+                    .join(Album, Track.album_id == Album.id)
+                    .options(selectinload(Track.album).selectinload(Album.artist))
+                    .where(Album.artist_id.in_(artist_ids), func.lower(Track.title).like(f"%{(row.track or '').strip().lower()[:40]}%"))
+                    .limit(50)
+                )
+            )
+            matches = [t for t in candidates if normalized_music_name(t.title) == want]
+            if want_album:
+                preferred = [t for t in matches if normalized_music_name(t.album.title) == want_album]
+                matches = preferred or matches
+            if matches:
+                add(matches[0].album, row)
+        else:
+            since = row.created_at
+            for album in session.scalars(
+                select(Album)
+                .options(selectinload(Album.artist))
+                .where(Album.artist_id.in_(artist_ids))
+                .order_by(Album.created_at.desc())
+            ):
+                if since is None or (album.created_at and as_utc(album.created_at) >= as_utc(since)):
+                    add(album, row)
+    return out
+
+
 @router.get("/me/home", tags=["users"], summary="Home dashboard aggregate", response_model=dict)
 def me_home(
     session: Session = Depends(get_session),
@@ -2560,20 +2684,8 @@ def me_home(
         for al in recent_albums
     ]
 
-    # Recently approved from my wishlist (completed items)
-    approved = list(
-        session.scalars(
-            select(WishlistItem)
-            .where(WishlistItem.user_id == user.id, WishlistItem.status == "completed")
-            .order_by(WishlistItem.status_changed_at.desc())
-            .limit(12)
-        )
-    )
-    recently_approved = [
-        {"id": w.id, "artist": w.artist, "album": w.album, "track": w.track,
-         "approved_at": w.status_changed_at.isoformat() if w.status_changed_at else None}
-        for w in approved
-    ]
+    # Recently approved: my completed wishlist requests, resolved to the library album each landed in.
+    recently_approved = _recently_approved_albums(session, user) if can_view_library else []
 
     # Recent plays — dedupe by track_id, keeping the most-recent occurrence, cap at 12.
     _raw_plays = list_my_plays(limit=100, days=None, session=session, user=user) if can_view_library else []
@@ -3021,6 +3133,19 @@ def library_albums(
     return PaginatedAlbums(items=items, total=total, page=page, page_size=page_size)
 
 
+def _library_track_row(t: Track) -> LibraryTrackRow:
+    return LibraryTrackRow(
+        id=t.id, title=t.title, album_id=t.album_id,
+        album_title=(t.album.title if t.album else ""),
+        artist_id=(t.album.artist_id if t.album else ""),
+        artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
+        track_number=t.track_number, disc_number=t.disc_number,
+        duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
+        replaygain_track_gain=t.replaygain_track_gain,
+        updated_at=_library_iso(t.updated_at),
+    )
+
+
 @router.get("/library/tracks", response_model=PaginatedTracks, tags=["library"], summary="Paginated tracks by bucket")
 def library_tracks(
     bucket: str = Query("all"),
@@ -3048,19 +3173,7 @@ def library_tracks(
     else:
         ordered = stmt.order_by(func.lower(Track.title))
     rows = session.scalars(ordered.offset((page - 1) * page_size).limit(page_size))
-    items = [
-        LibraryTrackRow(
-            id=t.id, title=t.title, album_id=t.album_id,
-            album_title=(t.album.title if t.album else ""),
-            artist_id=(t.album.artist_id if t.album else ""),
-            artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
-            track_number=t.track_number, disc_number=t.disc_number,
-            duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
-            replaygain_track_gain=t.replaygain_track_gain,
-            updated_at=_library_iso(t.updated_at),
-        )
-        for t in rows
-    ]
+    items = [_library_track_row(t) for t in rows]
     return PaginatedTracks(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -3106,6 +3219,33 @@ def library_search(
     )
     results = search_library(session, q, kinds=kinds, min_confidence=threshold, limit=limit)
     return SearchResponse(query=q, min_confidence=threshold, results=[SearchResultItem(**r) for r in results])
+
+
+@router.post("/library/suggestions", response_model=SuggestionsResponse, tags=["library"], summary="Suggest library tracks like a set of seeds")
+def library_suggestions(
+    payload: SuggestionsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.library_view)),
+) -> SuggestionsResponse:
+    """Library tracks that resemble the seeds (tags, genres, tempo, ListenBrainz where cached).
+
+    With `playlist_id` the seeds are that playlist's tracks and they are excluded as well; that needs
+    `playlists:manage` like every playlist route. To refresh, call again with the ids already shown
+    in `exclude_track_ids`. Every result is a playable library track, in the `/library/tracks` shape.
+    """
+    seeds = list(payload.seed_track_ids)
+    exclude = set(payload.exclude_track_ids)
+    if payload.playlist_id:
+        if not user_has_permission(user, Permission.playlists_manage):
+            raise HTTPException(status_code=403, detail=f"Requires {Permission.playlists_manage.value}")
+        playlist = _native_playlist_query(session, user.id, payload.playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        playlist_track_ids = [pt.track_id for pt in playlist.tracks]
+        seeds = playlist_track_ids + seeds
+        exclude |= set(playlist_track_ids)
+    tracks = suggest(session, user, seeds, exclude, payload.limit)
+    return SuggestionsResponse(tracks=[_library_track_row(t) for t in tracks])
 
 
 @router.post("/library/search/reindex", tags=["library"], summary="Rebuild the search index")
@@ -6846,6 +6986,8 @@ def get_connection_status(
     return {
         "slskd": probe(slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else "disabled",
         "jellyfin": probe(jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else "disabled",
+        # Read-only: set with LISTENBRAINZ_ENABLED in the server's environment. Not probed.
+        "listenbrainz": "enabled" if get_settings().listenbrainz_enabled else "disabled",
     }
 
 
@@ -7355,6 +7497,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         remote_playback_enabled=bool(getattr(user, "remote_playback_enabled", True)),
+        smart_shuffle_every=int(getattr(user, "smart_shuffle_every", 4) or 4),
         playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 0) or 0),
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,

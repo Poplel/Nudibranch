@@ -37,6 +37,7 @@ from nudibranch.services import content_verify
 from nudibranch.services.content_verify import verify_audio_content
 from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, rescan_slskd_shares, search_slskd_detailed, transfer_state_category
 from nudibranch.services.slskd_reachability import run_slskd_reachability_check, should_run_download_failure_check, store_slskd_check_result
+from nudibranch.worker.audio_analysis import enqueue_analysis_if_needed, run_analyze_audio
 from nudibranch.services.tasks import ScanProgress, append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
@@ -84,6 +85,9 @@ DELETION_PRUNE_TICK_SECONDS = 86400
 # frequent: this is the sweep that makes "a request stuck in Review" unable to persist.
 WISHLIST_RECOVERY_TICK_SECONDS = 120
 DISK_CHECK_TICK_SECONDS = 600
+# Queue an `analyze_audio` task whenever tracks (or artists) still lack features, so the initial sweep
+# and every later import are covered without hooking each import path.
+ANALYSIS_TICK_SECONDS = 30
 DISK_LOW_FLOOR_BYTES = 5 * 1024**3
 DISK_LOW_FRACTION = 0.05
 DISK_RECOVERY_FACTOR = 1.5
@@ -10927,6 +10931,7 @@ TASK_HANDLERS = {
     "jellyfin_scan": run_jellyfin_scan,
     "rescan_slskd_shares": run_rescan_slskd_shares,
     "slskd_port_check": run_slskd_port_check,
+    "analyze_audio": run_analyze_audio,
     "check_files": run_check_files,
     "check_duplicates": run_check_duplicates,
     "check_lyrics": run_check_lyrics,
@@ -11034,6 +11039,7 @@ async def worker_loop() -> None:
     last_podcast_scan_tick = 0.0
     last_deletion_prune_tick = 0.0
     last_wishlist_recovery_tick = 0.0
+    last_analysis_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -11140,6 +11146,12 @@ async def worker_loop() -> None:
                         session.rollback()
                         write_app_log(f"Reopening settled batches failed: {error}", "warning")
                     last_wishlist_recovery_tick = time.time()
+                if time.time() - last_analysis_tick > ANALYSIS_TICK_SECONDS:
+                    try:
+                        enqueue_analysis_if_needed(session)
+                    except Exception:  # noqa: BLE001 - never let the analysis tick stop the worker.
+                        session.rollback()
+                    last_analysis_tick = time.time()
                 if time.time() - last_deletion_prune_tick > DELETION_PRUNE_TICK_SECONDS:
                     try:
                         cutoff = datetime.now(timezone.utc) - LIBRARY_DELETION_RETENTION
@@ -11181,7 +11193,7 @@ async def worker_loop() -> None:
                 if not handler:
                     raise ValueError(f"No handler registered for task type {task.type}")
                 append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan"}:
+                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan", "analyze_audio"}:
                     result = handler(session, task_to_payload(task), task)
                 else:
                     result = handler(session, task_to_payload(task))
@@ -11268,6 +11280,7 @@ def task_notification_title(task_type: str) -> str:
         "requeue_replacement": "Replacement search",
         "create_pending_playlists": "Create playlist",
         "podcast_scan": "Podcast scan",
+        "analyze_audio": "Audio analysis",
     }.get(task_type, task_type.replace("_", " ").title())
 
 

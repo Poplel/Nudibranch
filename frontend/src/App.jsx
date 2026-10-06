@@ -87,16 +87,23 @@ function toSnapshotItem(item) {
     type: item?._kind === "episode" ? "episode" : "track",
     id: queueItemId(item),
     podcast_id: item?._podcastId || null,
+    // Only a smart-shuffle suggestion carries the flag; omitted (undefined) for everything else.
+    smart: item?._smart ? true : undefined,
   };
+}
+
+/// Shuffle on the wire is a mode string: "off" | "on" | "smart".
+function normalizeShuffle(value) {
+  return value === "on" || value === "smart" ? value : "off";
 }
 
 /// Order and identity only. Two queues with the same key publish the same shared queue.
 function sessionQueueKeyOf(queue) {
-  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}:${queueItemId(item)}`).join("|");
+  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}${item?._smart ? "s" : ""}:${queueItemId(item)}`).join("|");
 }
 
 function snapshotItemsKey(items) {
-  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}:${item.id}`).join("|");
+  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}${item.smart ? "s" : ""}:${item.id}`).join("|");
 }
 
 /// The part of a local queue that is published, and where the current item sits in it.
@@ -348,6 +355,8 @@ function App() {
   // Both are REQUIRED in that body — leaving either out is a 422.
   const [remotePlaybackEnabled, setRemotePlaybackEnabled] = useState(true);
   const [claimTimeoutMinutes, setClaimTimeoutMinutes] = useState(DEFAULT_CLAIM_TIMEOUT_MINUTES);
+  // Smart shuffle inserts one suggested song after every N songs (1-20), per account.
+  const [smartShuffleEvery, setSmartShuffleEvery] = useState(4);
   // Device-local, like iOS — the EQ is a property of these speakers/headphones, not the account.
   const [equalizer, setEqualizer] = useState(readStoredEqualizer);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
@@ -369,6 +378,7 @@ function App() {
   const appRootRef = useRef(null);
   const importUploadXhrRef = useRef(null); // in-flight import upload, so it can be canceled
   const unshuffledQueueRef = useRef(null); // snapshot of queue order before shuffle, to revert
+  const smartPlanTicketRef = useRef(0); // latest smart-shuffle plan request; older replies are dropped
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
   const lastLibraryPollRef = useRef(0); // throttle the heavy /library/tree poll (see interval below)
@@ -427,7 +437,7 @@ function App() {
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
-  const [shuffle, setShuffle] = useState(false);
+  const [shuffle, setShuffle] = useState("off"); // off | on | smart
   const [repeat, setRepeat] = useState("off"); // off | all | one
   const [playerOpen, setPlayerOpen] = useState(false);
   // ⚠ Declared up here with the other player state, not beside its poll further down: `playerDocked`
@@ -545,6 +555,16 @@ function App() {
     if (track._streamPath) return null;
     return `${API_BASE}/library/tracks/${track.id}/lyrics?api_key=${encodeURIComponent(token)}`;
   }, [playerQueue, currentTrackIndex, token]);
+
+  // Smart shuffle: re-plan on every track change while the mode is on. Only a tab that is playing
+  // here gets a currentTrack, so this is the owner by construction. Entering the mode plans
+  // directly from setShuffleState; this covers every change after that (and a mode adopted from a
+  // claimed session).
+  useEffect(() => {
+    if (shuffle !== "smart" || !currentTrack) return;
+    planSmartShuffle();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTrack, shuffle]);
 
   // Podcast resume: when an episode with a saved position becomes current, seek to it once the
   // audio is seekable (retrying until controlRef.seek succeeds after metadata loads).
@@ -699,6 +719,7 @@ function App() {
     setCrossfadeDuration(user.crossfade_duration);
     setRemotePlaybackEnabled(user.remote_playback_enabled);
     setClaimTimeoutMinutes(user.playback_claim_timeout_minutes);
+    setSmartShuffleEvery(user.smart_shuffle_every ?? 4);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -710,7 +731,7 @@ function App() {
 
   useEffect(() => {
     if (!user?.id || !appearanceReady) return;
-    // ⚠️ `remote_playback_enabled` and `playback_claim_timeout_minutes` are REQUIRED by
+    // ⚠️ `remote_playback_enabled`, `playback_claim_timeout_minutes` and `smart_shuffle_every` are REQUIRED by
     // PUT /me/appearance — a body without them is a 422 — so every save carries the whole set.
     const appearance = {
       theme: dark ? "dark" : "light",
@@ -719,6 +740,7 @@ function App() {
       crossfade_duration: crossfadeDuration,
       remote_playback_enabled: remotePlaybackEnabled,
       playback_claim_timeout_minutes: claimTimeoutMinutes,
+      smart_shuffle_every: smartShuffleEvery,
     };
     if (
       user.theme === appearance.theme &&
@@ -726,7 +748,8 @@ function App() {
       user.background_tint === appearance.background_tint &&
       user.crossfade_duration === appearance.crossfade_duration &&
       user.remote_playback_enabled === appearance.remote_playback_enabled &&
-      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes
+      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes &&
+      user.smart_shuffle_every === appearance.smart_shuffle_every
     ) {
       return;
     }
@@ -734,9 +757,9 @@ function App() {
     return () => window.clearTimeout(timeout);
   }, [
     user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration,
-    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes,
+    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes, user?.smart_shuffle_every,
     appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration,
-    remotePlaybackEnabled, claimTimeoutMinutes,
+    remotePlaybackEnabled, claimTimeoutMinutes, smartShuffleEvery,
   ]);
 
   useEffect(() => {
@@ -2289,14 +2312,14 @@ function App() {
     // command) wins, otherwise the current shuffle toggle decides. A shuffled
     // start reorders the new queue and remembers the original order so toggling
     // shuffle back off can revert it — identical to the in-place toggle path.
-    const wantShuffle = opts.shuffle != null ? Boolean(opts.shuffle) : shuffle;
+    const wantShuffle = opts.shuffle != null ? normalizeShuffle(opts.shuffle) : shuffle;
     // keepLead (default true): keep the first track playing first — correct when the
     // user clicked a specific song. Whole-collection plays (Shuffle all / play an
     // album/artist/playlist) pass keepLead:false so the entire list is shuffled and
     // each start picks a fresh random order, including a random first track.
     const keepLead = opts.keepLead !== false;
     let queue = playable;
-    if (wantShuffle && playable.length > 1) {
+    if (wantShuffle !== "off" && playable.length > 1) {
       unshuffledQueueRef.current = [...playable];
       const head = keepLead ? [playable[0]] : [];
       const rest = keepLead ? playable.slice(1) : [...playable];
@@ -2316,7 +2339,7 @@ function App() {
     // "play it there", not "start a second, silent player here" — the same reasoning
     // forwardQueueAddition already applies to Add to Queue / Play Next.
     if (!opts.localOnly && forwardPlayToRemote(queue, wantShuffle)) return;
-    if (opts.shuffle != null) setShuffle(Boolean(opts.shuffle));
+    if (opts.shuffle != null) setShuffle(wantShuffle);
     // A fresh play here makes this tab the account's player. ⚠ Not awaited: audio never waits for
     // the claim, and a claim that fails is retried by the next "playing" report.
     claimFreshSession(queue, 0, wantShuffle);
@@ -2501,7 +2524,7 @@ function App() {
         page += 1;
       }
       if (tracks.length === 0) { notify("Playback", "Your library has no tracks.", "ui_error"); return; }
-      await playTracks(tracks, { shuffle: shuffleAll, keepLead: false });
+      await playTracks(tracks, { shuffle: shuffleAll ? "on" : "off", keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -2598,7 +2621,7 @@ function App() {
       current_index: win.index,
       position_seconds: Math.max(0, positionSeconds || 0),
       playing,
-      shuffle: Boolean(shuffleOn),
+      shuffle: normalizeShuffle(shuffleOn),
       repeat: repeatMode,
     };
   }
@@ -2758,7 +2781,8 @@ function App() {
         /* whatever resolved already still plays */
       }
     }
-    return items.map((item) => {
+    const marked = (row, item) => (row && item.smart ? { ...row, _smart: true } : row);
+    return items.map((item) => marked(((item) => {
       const known = titles.get(item.id);
       if (item.type === "episode") {
         // Built from the ids alone: the stream is the server's relay, so no podcast lookup is needed.
@@ -2784,7 +2808,7 @@ function App() {
       if (fromLibrary) return fromLibrary;
       if (!known) return null;
       return { id: item.id, title: known.title, album_id: known.album_id || undefined, _artist: known.artist || "", _album: "" };
-    });
+    })(item), item));
   }
 
   /// Install a claimed session's queue and play it from where the session was.
@@ -2817,7 +2841,7 @@ function App() {
     // Already in playback order, and the pre-shuffle order was never shared, so there is nothing to
     // restore: set the flag without reshuffling.
     unshuffledQueueRef.current = null;
-    setShuffle(Boolean(data.shuffle));
+    setShuffle(normalizeShuffle(data.shuffle));
     setRepeat(["off", "one", "all"].includes(data.repeat) ? data.repeat : "off");
     setPlayerQueue(tracks);
     setPlayerOpen(true);
@@ -3151,7 +3175,12 @@ function App() {
       }
     }
 
-    return items.map((item) => byId.get(item.id)).filter(Boolean);
+    return items
+      .map((item) => {
+        const row = byId.get(item.id);
+        return row && item.smart ? { ...row, _smart: true } : row;
+      })
+      .filter(Boolean);
   }
 
   async function executeRemoteCommand(cmd) {
@@ -3165,7 +3194,7 @@ function App() {
     // Reconcile shuffle the same way the UI toggle does. For play/resume-with-target
     // the new queue is (re)built, so playTracks owns the shuffle decision; for every
     // other action we reorder the *existing* queue in place via setShuffleState.
-    if (cmd.shuffle != null && !isPlay) setShuffleState(Boolean(cmd.shuffle));
+    if (cmd.shuffle != null && !isPlay) setShuffleState(normalizeShuffle(cmd.shuffle));
     if (action === "pause") return ctl?.pause?.();
     if (action === "stop") return ctl?.stop?.();
     if (action === "next") return playNextTrack();
@@ -3201,7 +3230,7 @@ function App() {
       // localOnly: this session IS the target the command named — it must play locally, not
       // re-forward to whatever session refreshRemoteSessions happens to consider "active" right
       // now (which could even be this same command bouncing back).
-      return playTracks(tracks, { shuffle: cmd.shuffle != null ? Boolean(cmd.shuffle) : undefined, localOnly: true });
+      return playTracks(tracks, { shuffle: cmd.shuffle != null ? normalizeShuffle(cmd.shuffle) : undefined, localOnly: true });
     }
     return undefined;
   }
@@ -3309,6 +3338,7 @@ function App() {
           _albumId: item.album_id || null,
           _kind: item.type === "episode" ? "episode" : "track",
           _podcastId: item.podcast_id || null,
+          _smart: Boolean(item.smart),
           _remoteIndex: at,
         })));
         // Marked with the version it actually returned, which may already be newer than the key.
@@ -3523,7 +3553,7 @@ function App() {
             current_index: 0,
             position_seconds: 0,
             playing: false,
-            shuffle: false,
+            shuffle: "off",
             repeat: "off",
           },
         }),
@@ -3853,48 +3883,98 @@ function App() {
     return next;
   }
 
-  // Reconcile the queue to a desired shuffle state by reordering the queue itself
-  // (not by jumping to random entries). Shared by the UI toggle and remote
-  // commands so shuffle behaves identically regardless of client. Enabling
-  // snapshots the current order and shuffles only the upcoming tracks (the played
-  // ones + the current track stay put). Disabling restores the snapshot order with
-  // already-played tracks dropped.
-  function setShuffleState(desired) {
-    setShuffle((current) => {
-      if (current === desired) return current;
-      if (desired) {
-        setPlayerQueue((queue) => {
-          unshuffledQueueRef.current = [...queue];
-          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
-          const head = idx >= 0 ? queue.slice(0, idx + 1) : [];
-          const tail = idx >= 0 ? queue.slice(idx + 1) : [...queue];
-          for (let i = tail.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [tail[i], tail[j]] = [tail[j], tail[i]];
-          }
-          return [...head, ...tail];
-        });
-      } else {
-        setPlayerQueue((queue) => {
-          const snapshot = unshuffledQueueRef.current;
-          unshuffledQueueRef.current = null;
-          if (!snapshot) return queue;
-          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
-          const playedIds = new Set(idx > 0 ? queue.slice(0, idx).map((track) => track.id) : []);
-          const snapshotIds = new Set(snapshot.map((track) => track.id));
-          // Original order minus what's already been played, then append anything
-          // queued during shuffle that wasn't in the snapshot (and isn't played).
-          const restored = snapshot.filter((track) => !playedIds.has(track.id));
-          const added = queue.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
-          return [...restored, ...added];
-        });
+  // Reconcile the queue to a desired shuffle MODE ("off" | "on" | "smart") by reordering the queue
+  // itself (not by jumping to random entries). Shared by the UI toggle and remote commands so
+  // shuffle behaves identically regardless of client. Turning shuffle on snapshots the current order
+  // and shuffles only the upcoming tracks (the played ones + the current track stay put). Turning it
+  // off restores the snapshot order with already-played tracks dropped. "smart" is "on" plus
+  // suggestion insertion: entering it from "on" keeps the shuffled order and plans; leaving it
+  // removes every smart item except the one playing.
+  function setShuffleState(desiredMode) {
+    const desired = normalizeShuffle(desiredMode);
+    const current = sessionLiveRef.current.shuffle;
+    if (current === desired) return;
+    const wasShuffled = current !== "off";
+    const queue = sessionLiveRef.current.playerQueue;
+    const playingIndex = sessionLiveRef.current.currentTrackIndex;
+    let next = queue;
+    if (desired !== "smart" && current === "smart") {
+      // Leaving smart: drop smart items, but never the one that is playing.
+      next = next.filter((track, i) => !track._smart || i === playingIndex);
+      if (unshuffledQueueRef.current) {
+        unshuffledQueueRef.current = unshuffledQueueRef.current.filter((track) => !track._smart);
       }
-      return desired;
-    });
+    }
+    if (desired !== "off" && !wasShuffled) {
+      unshuffledQueueRef.current = [...next];
+      const idx = next.findIndex((track) => track.id === currentTrack?.id);
+      const head = idx >= 0 ? next.slice(0, idx + 1) : [];
+      const tail = idx >= 0 ? next.slice(idx + 1) : [...next];
+      for (let i = tail.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [tail[i], tail[j]] = [tail[j], tail[i]];
+      }
+      next = [...head, ...tail];
+    } else if (desired === "off" && wasShuffled) {
+      const snapshot = unshuffledQueueRef.current;
+      unshuffledQueueRef.current = null;
+      if (snapshot) {
+        const idx = next.findIndex((track) => track.id === currentTrack?.id);
+        const playedIds = new Set(idx > 0 ? next.slice(0, idx).map((track) => track.id) : []);
+        const snapshotIds = new Set(snapshot.map((track) => track.id));
+        // Original order minus what's already been played, then append anything
+        // queued during shuffle that wasn't in the snapshot (and isn't played).
+        const restored = snapshot.filter((track) => !playedIds.has(track.id));
+        const added = next.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
+        next = [...restored, ...added];
+      }
+    }
+    if (next !== queue) setPlayerQueue(next);
+    sessionLiveRef.current = { ...sessionLiveRef.current, shuffle: desired, playerQueue: next };
+    setShuffle(desired);
+    // Entering smart plans from the effect on [currentTrack, shuffle], once the new queue has landed.
   }
 
+  // off -> on -> smart -> off
   function toggleShuffle() {
-    setShuffleState(!shuffle);
+    setShuffleState(shuffle === "off" ? "on" : shuffle === "on" ? "smart" : "off");
+  }
+
+  /// Ask the server where smart shuffle should add suggestions, and apply them to the local queue.
+  /// Only the device actually playing here does this (the claim holder, or a tab with remote playback
+  /// off); anyone else changes the mode with a `state` command. Failures are silent: smart shuffle
+  /// just inserts nothing this time. The server owns the spacing rule, so this only applies it.
+  async function planSmartShuffle({ queue = sessionLiveRef.current.playerQueue, mode = sessionLiveRef.current.shuffle } = {}) {
+    if (mode !== "smart" || !queue.length) return;
+    const ticket = ++smartPlanTicketRef.current;
+    const key = sessionQueueKeyOf(queue);
+    let anchor = currentTrack ? queue.indexOf(currentTrack) : -1;
+    if (anchor < 0 && currentTrack) anchor = queue.findIndex((track) => track.id === currentTrack.id);
+    if (anchor < 0) return;
+    try {
+      const reply = await api("/player/smart-shuffle/plan", {
+        method: "POST",
+        body: JSON.stringify({
+          items: queue.map((track) => ({ type: track?._kind === "episode" ? "episode" : "track", id: queueItemId(track), smart: track?._smart ? true : undefined })),
+          current_index: anchor,
+        }),
+      });
+      const inserts = (reply?.inserts || []).slice().sort((a, b) => a.index - b.index);
+      if (!inserts.length || ticket !== smartPlanTicketRef.current) return;
+      setPlayerQueue((now) => {
+        // The queue moved while the plan was in flight: indexes no longer line up, so drop it. The
+        // next track change plans again.
+        if (sessionLiveRef.current.shuffle !== "smart" || sessionQueueKeyOf(now) !== key) return now;
+        const out = [...now];
+        for (let i = inserts.length - 1; i >= 0; i--) {
+          const { index, track } = inserts[i];
+          out.splice(Math.min(Math.max(index, 0), out.length), 0, suggestionToQueueTrack(track, token, { smart: true }));
+        }
+        return out;
+      });
+    } catch {
+      /* silent */
+    }
   }
 
   async function playNextTrack() {
@@ -4347,6 +4427,8 @@ function App() {
                 setRemotePlaybackEnabled={setRemotePlaybackEnabled}
                 claimTimeoutMinutes={claimTimeoutMinutes}
                 setClaimTimeoutMinutes={setClaimTimeoutMinutes}
+                smartShuffleEvery={smartShuffleEvery}
+                setSmartShuffleEvery={setSmartShuffleEvery}
                 equalizer={equalizer}
                 setEqualizer={setEqualizer}
                 onSaveSearchThreshold={saveSearchThreshold}
@@ -4410,6 +4492,8 @@ function App() {
                 onInspectorActionsChange={setPlaylistInspectorActions}
                 onRefresh={refreshPlaylists}
                 api={api}
+                apiKey={token}
+                playbackControl={playbackControlRef}
               />
             )}
             {page === "Users" && (
@@ -7393,7 +7477,7 @@ function WishlistQueueView({ items, onApprove, onReject }) {
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onPlayNext, onQueue, onQueuePosition, onInspectorActionsChange, onRefresh, api }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onPlayNext, onQueue, onQueuePosition, onInspectorActionsChange, onRefresh, api, apiKey, playbackControl }) {
   const [pinnedIds, setPinnedIds] = useState(() => new Set());
   useEffect(() => {
     let active = true;
@@ -7608,9 +7692,183 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                   ))}
                 </div>
               ))}
+            {openPlaylists.has(playlist.name) && (
+              <PlaylistSuggestions
+                key={playlist.id}
+                playlist={playlist}
+                api={api}
+                apiKey={apiKey}
+                playbackControl={playbackControl}
+                onAddToPlaylist={onAddToPlaylist}
+              />
+            )}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/* One preview at a time, in a player of its own: never the main player, the queue or /player/status.
+   Starting a preview pauses the main player if it was playing and resuming it is this object's job
+   when the preview stops, finishes or its page goes away. */
+const suggestionPreview = {
+  audio: null,
+  trackId: null,
+  resumeMain: false,
+  control: null,
+  listeners: new Set(),
+  notify() {
+    this.listeners.forEach((listener) => listener(this.trackId));
+  },
+  start(trackId, apiKey, control) {
+    if (!apiKey) return;
+    if (!this.audio) {
+      this.audio = new Audio();
+      this.audio.addEventListener("ended", () => this.stop());
+      this.audio.addEventListener("error", () => this.stop());
+    }
+    this.control = control || this.control;
+    if (this.trackId == null && this.control?.isPlaying?.()) {
+      this.control.pause();
+      this.resumeMain = true;
+    }
+    this.audio.src = `${API_BASE}/library/tracks/${encodeURIComponent(trackId)}/stream?api_key=${encodeURIComponent(apiKey)}`;
+    this.trackId = trackId;
+    this.notify();
+    this.audio.play().catch(() => this.stop());
+  },
+  stop() {
+    if (this.audio) {
+      this.audio.pause();
+      this.audio.removeAttribute("src");
+      this.audio.load();
+    }
+    const resume = this.resumeMain;
+    this.resumeMain = false;
+    this.trackId = null;
+    this.notify();
+    if (resume) this.control?.resume?.();
+  },
+};
+
+/* "Suggested" at the bottom of an open playlist: five library tracks that sound like it, each with a
+   preview and an Add. Failures are silent — the section simply shows nothing. */
+function PlaylistSuggestions({ playlist, api, apiKey, playbackControl, onAddToPlaylist }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [everShown, setEverShown] = useState(false);
+  const [added, setAdded] = useState(() => new Set());
+  const [previewId, setPreviewId] = useState(suggestionPreview.trackId);
+  const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  // Every id shown since the page opened, so Refresh never repeats one.
+  const shownRef = useRef(new Set());
+  const ownedRef = useRef(new Set());
+
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    const listener = (id) => setPreviewId(id);
+    suggestionPreview.listeners.add(listener);
+    const owned = ownedRef.current;
+    return () => {
+      suggestionPreview.listeners.delete(listener);
+      if (suggestionPreview.trackId && owned.has(suggestionPreview.trackId)) suggestionPreview.stop();
+    };
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api("/library/suggestions", {
+        method: "POST",
+        body: JSON.stringify({ playlist_id: playlist.id, exclude_track_ids: [...shownRef.current], limit: 5 }),
+      });
+      const tracks = data?.tracks || [];
+      tracks.forEach((track) => { shownRef.current.add(track.id); ownedRef.current.add(track.id); });
+      if (suggestionPreview.trackId && !tracks.some((track) => track.id === suggestionPreview.trackId) && ownedRef.current.has(suggestionPreview.trackId)) {
+        suggestionPreview.stop();
+      }
+      setRows(tracks);
+      setAdded(new Set());
+      if (tracks.length) setEverShown(true);
+    } catch {
+      /* silent */
+    } finally {
+      setLoading(false);
+    }
+  }, [api, playlist.id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function add(track) {
+    try {
+      await onAddToPlaylist(playlist.id, [track.id]);
+      setAdded((current) => new Set(current).add(track.id));
+    } catch {
+      /* reported by onAddToPlaylist */
+    }
+  }
+
+  if (!online || (!everShown && rows.length === 0)) return null;
+  return (
+    <div className="playlist-suggestions">
+      <div className="tree-toolbar">
+        <strong>Suggested</strong>
+        <button type="button" className="secondary compact" onClick={load} disabled={loading}>
+          <RefreshCw size={13} />
+          Refresh
+        </button>
+      </div>
+      <div className="playlist-track-tree">
+        {rows.map((track) => {
+          const previewing = previewId === track.id;
+          const isAdded = added.has(track.id);
+          return (
+            <div className="tree-action-row library-row-actions" key={track.id}>
+              <div className="track-list-row suggestion-row">
+                <img
+                  className="suggestion-cover"
+                  src={`${API_BASE}/library/albums/${encodeURIComponent(track.album_id)}/cover?api_key=${encodeURIComponent(apiKey || "")}`}
+                  alt=""
+                  loading="lazy"
+                  onError={(event) => { event.currentTarget.style.visibility = "hidden"; }}
+                />
+                <span className="track-list-title">{track.title}</span>
+                <span className="track-list-sub">{track.artist_name}</span>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                title={previewing ? "Stop preview" : "Preview"}
+                aria-label={previewing ? "Stop preview" : "Preview"}
+                onClick={() => (previewing ? suggestionPreview.stop() : suggestionPreview.start(track.id, apiKey, playbackControl?.current))}
+              >
+                {previewing ? <Pause size={15} /> : <Play size={15} />}
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                title={isAdded ? "Added" : "Add to playlist"}
+                aria-label={isAdded ? "Added" : "Add to playlist"}
+                disabled={isAdded}
+                onClick={() => add(track)}
+              >
+                {isAdded ? <Check size={15} /> : <Plus size={15} />}
+              </button>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -8716,6 +8974,24 @@ function albumCoverUrl(album, apiKey) {
   return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
 }
 
+/// A `/library/tracks`-shaped row (as `/library/suggestions` and the smart-shuffle plan return) as a
+/// playable queue entry. The cover is left to `playerCoverUrl`'s album_id fallback.
+function suggestionToQueueTrack(row, apiKey, { smart = false } = {}) {
+  return {
+    id: row.id,
+    title: row.title,
+    album_id: row.album_id,
+    track_number: row.track_number,
+    disc_number: row.disc_number,
+    duration_ms: row.duration_ms,
+    format: row.format,
+    _artist: row.artist_name || "",
+    _album: row.album_title || "",
+    _coverUrl: "",
+    ...(smart ? { _smart: true } : {}),
+  };
+}
+
 function playerCoverUrl(track, apiKey) {
   const c = track?._coverUrl || "";
   if (/^(https?:|data:|blob:)/i.test(c) || c.startsWith(`${API_BASE}/`)) return c;
@@ -9311,7 +9587,8 @@ function actionSummary(automation) {
   }
   if (action_type === "play") {
     const parts = [`Play ${action_config?.target_type || "?"} "${action_config?.target_query || ""}"`];
-    if (action_config?.shuffle) parts.push("shuffle");
+    if (action_config?.shuffle === "on") parts.push("shuffle");
+    if (action_config?.shuffle === "smart") parts.push("smart shuffle");
     if (action_config?.loop && action_config.loop !== "off") parts.push(`loop ${action_config.loop}`);
     return parts.join(", ");
   }
@@ -9347,7 +9624,7 @@ function AutomationsView({ api, notify }) {
   const [playTargetQuery, setPlayTargetQuery] = useState(""); // display label of the selected item
   const [playTargetId, setPlayTargetId] = useState(""); // definitive selection
   const [playLoop, setPlayLoop] = useState("off");
-  const [playShuffle, setPlayShuffle] = useState(false);
+  const [playShuffle, setPlayShuffle] = useState("off");
   const [mediaControl, setMediaControl] = useState("pause");
   const [deviceId, setDeviceId] = useState(""); // "" = any device (broadcast)
   const [sessions, setSessions] = useState([]);
@@ -9403,7 +9680,7 @@ function AutomationsView({ api, notify }) {
     setPlayTargetQuery("");
     setPlayTargetId("");
     setPlayLoop("off");
-    setPlayShuffle(false);
+    setPlayShuffle("off");
     setMediaControl("pause");
     setDeviceId("");
     setTargetSearch("");
@@ -9455,7 +9732,7 @@ function AutomationsView({ api, notify }) {
       setPlayTargetQuery(ac.target_query || "");
       setPlayTargetId(ac.target_id || "");
       setPlayLoop(ac.loop || "off");
-      setPlayShuffle(ac.shuffle || false);
+      setPlayShuffle(normalizeShuffle(ac.shuffle));
     } else if (a.action_type === "media_control") {
       setMediaControl(ac.control || "pause");
     }
@@ -9784,9 +10061,13 @@ function AutomationsView({ api, notify }) {
                         <option value="all">Repeat all</option>
                       </select>
                     </label>
-                    <label className="automation-field automation-field-inline">
+                    <label className="automation-field">
                       <span>Shuffle</span>
-                      <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
+                      <select value={playShuffle} onChange={(e) => setPlayShuffle(e.target.value)}>
+                        <option value="off">Off</option>
+                        <option value="on">Shuffle</option>
+                        <option value="smart">Smart shuffle</option>
+                      </select>
                     </label>
                     <label className="automation-field">
                       <span>Device</span>
@@ -10816,6 +11097,8 @@ function SettingsPanel({
   setRemotePlaybackEnabled,
   claimTimeoutMinutes,
   setClaimTimeoutMinutes,
+  smartShuffleEvery,
+  setSmartShuffleEvery,
   equalizer,
   setEqualizer,
   onSaveSearchThreshold,
@@ -10917,6 +11200,24 @@ function SettingsPanel({
           <button className="secondary compact" onClick={() => setRemotePlaybackEnabled((value) => !value)}>
             {remotePlaybackEnabled ? "On" : "Off"}
           </button>
+        </label>
+        <label className="setting-row">
+          <span>
+            Smart Shuffle
+            <small>Add one suggested song after every {smartShuffleEvery} song{smartShuffleEvery === 1 ? "" : "s"}.</small>
+          </span>
+          <input
+            type="number"
+            min="1"
+            max="20"
+            step="1"
+            value={smartShuffleEvery}
+            onChange={(event) => {
+              const every = Math.round(Number(event.target.value));
+              if (!Number.isFinite(every)) return;
+              setSmartShuffleEvery(Math.max(1, Math.min(20, every)));
+            }}
+          />
         </label>
         <label className="setting-row">
           <span>
@@ -12225,11 +12526,12 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
                   resolve: () => [{ id: p.track_id }],
                 })) : undefined}
               >
+                {/* Tapping the card opens the album; only the Play control (and the context menu) plays. */}
                 <div
-                  className={`home-list-text${p.track_id && onPlayTracks ? " home-list-text-play" : ""}`}
-                  onClick={p.track_id && onPlayTracks ? () => onPlayTracks([recentToTrack(p)]) : undefined}
-                  role={p.track_id && onPlayTracks ? "button" : undefined}
-                  title={p.track_id && onPlayTracks ? "Play" : undefined}
+                  className={`home-list-text${p.album_id && onOpenAlbum ? " home-list-text-play" : ""}`}
+                  onClick={p.album_id && onOpenAlbum ? () => onOpenAlbum({ id: p.album_id, title: p.album, artist_name: p.artist }) : undefined}
+                  role={p.album_id && onOpenAlbum ? "button" : undefined}
+                  title={p.album_id && onOpenAlbum ? "Open album" : undefined}
                 >
                   <span className="home-list-main">{p.title || "Unknown"}</span>
                   <span className="home-list-sub">{p.artist || ""}</span>
@@ -12251,17 +12553,13 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
           </ul>
         );
       case "recently_approved":
-        return home.recently_approved.length === 0 ? (
-          <p className="muted">No approved wishlist items yet.</p>
-        ) : (
-          <ul className="home-list">
-            {home.recently_approved.map((w) => (
-              <li key={w.id}>
-                <span className="home-list-main">{w.track || w.album || w.artist}</span>
-                <span className="home-list-sub">{w.track || w.album ? w.artist : ""}{w.approved_at ? ` · ${fmt(w.approved_at)}` : ""}</span>
-              </li>
+        if (!home.recently_approved?.length) return null;
+        return (
+          <div className="home-album-grid">
+            {home.recently_approved.map((al) => (
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onPlayNext={onPlayAlbumNext} onQueue={onQueueAlbum} onOpen={onOpenAlbum} pinned={pinnedAlbumIds?.has(al.id)} onTogglePin={onTogglePinAlbum} playlists={playlists} onAddToPlaylist={onAddToPlaylist} onResolveTracks={albumTrackRows} />
             ))}
-          </ul>
+          </div>
         );
       default:
         return null;
@@ -13108,7 +13406,7 @@ function AudioPlayer({
   onEnded,
   onSkipBack,
   onSkipForward,
-  shuffle = false,
+  shuffle = "off",
   repeat = "off",
   onToggleShuffle,
   onCycleRepeat,
@@ -13324,7 +13622,7 @@ function AudioPlayer({
   const viewDuration = isRemote ? (remote.duration_seconds || 0) : duration;
   const viewTime = isRemote ? Math.min(remotePosition || 0, viewDuration || Infinity) : currentTime;
   const viewProgress = viewDuration ? (viewTime / viewDuration) * 100 : 0;
-  const viewShuffle = isRemote ? Boolean(remote.shuffle) : shuffle;
+  const viewShuffle = normalizeShuffle(isRemote ? remote.shuffle : shuffle);
   const viewRepeat = isRemote ? (remote.repeat || "off") : repeat;
   const viewQueue = isRemote ? remoteQueue : queue;
   const viewHasContent = isRemote ? true : Boolean(currentTrack);
@@ -13348,7 +13646,8 @@ function AudioPlayer({
   const seekBarProps = isRemote
     ? { onPointerUp: commitRemoteSeek, onKeyUp: commitRemoteSeek, onBlur: commitRemoteSeek }
     : {};
-  const doToggleShuffle = isRemote ? () => onRemoteMode?.({ shuffle: !viewShuffle }) : onToggleShuffle;
+  const nextShuffleMode = viewShuffle === "off" ? "on" : viewShuffle === "on" ? "smart" : "off";
+  const doToggleShuffle = isRemote ? () => onRemoteMode?.({ shuffle: nextShuffleMode }) : onToggleShuffle;
   const doCycleRepeat = isRemote
     ? () => onRemoteMode?.({ loop: viewRepeat === "off" ? "all" : viewRepeat === "all" ? "one" : "off" })
     : onCycleRepeat;
@@ -13380,8 +13679,14 @@ function AudioPlayer({
   }, [isRemote, onRemoteLive]);
 
   const renderShuffle = (size) => (doToggleShuffle ? (
-    <button className={`player-icon-button${viewShuffle ? " active" : ""}`} onClick={doToggleShuffle} title={viewShuffle ? "Shuffle on" : "Shuffle off"}>
+    <button
+      className={`player-icon-button shuffle-button${viewShuffle !== "off" ? " active" : ""}`}
+      onClick={doToggleShuffle}
+      title={viewShuffle === "smart" ? "Smart shuffle" : viewShuffle === "on" ? "Shuffle" : "Shuffle off"}
+      aria-label={viewShuffle === "smart" ? "Smart shuffle" : viewShuffle === "on" ? "Shuffle" : "Shuffle off"}
+    >
       <Shuffle size={size} />
+      {viewShuffle === "smart" && <Sparkles className="shuffle-sparkle" size={Math.max(8, Math.round(size * 0.55))} />}
     </button>
   ) : null);
   const renderRepeat = (size) => (doCycleRepeat ? (
@@ -14089,12 +14394,12 @@ function AudioPlayer({
           >
             {onRemoteQueueJump ? (
               <button className="queue-play-btn" onClick={() => onRemoteQueueJump(track._remoteIndex)}>
-                <strong>{track.title}</strong>
+                <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </button>
             ) : (
               <span className="queue-play-btn is-static">
-                <strong>{track.title}</strong>
+                <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </span>
             )}
@@ -14116,7 +14421,7 @@ function AudioPlayer({
         ].filter(Boolean))}
       >
         <button className={`queue-play-btn${track.id === currentTrack?.id ? " active" : ""}`} onClick={() => onPlayTrack(track)}>
-          <strong>{track.title}</strong>
+          <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
           <small>{track._artist || ""}</small>
         </button>
         {onRemoveFromQueue && (

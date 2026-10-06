@@ -243,6 +243,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
             text("ALTER TABLE users ADD COLUMN remote_playback_enabled BOOLEAN NOT NULL DEFAULT 1")
         )
         session.commit()
+    if "smart_shuffle_every" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN smart_shuffle_every INTEGER NOT NULL DEFAULT 4"))
+        session.commit()
     user_cols2 = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
     if "search_min_confidence" not in user_cols2:
         session.execute(text("ALTER TABLE users ADD COLUMN search_min_confidence FLOAT NOT NULL DEFAULT 0.4"))
@@ -270,6 +273,8 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE mobile_devices ADD COLUMN muted_event_types TEXT NOT NULL DEFAULT ''"))
         session.commit()
     _migrate_player_states_to_sessions(session)
+    _migrate_shuffle_to_mode(session)
+    _migrate_automation_shuffle_to_mode(session)
     auth_cols = {row[1] for row in session.execute(text("PRAGMA table_info(auth_sessions)"))}
     if auth_cols and "client" not in auth_cols:
         # Set at login so a device that has never played still shows correctly in a device picker.
@@ -349,6 +354,47 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _reopen_downloads_finalized_unfetched(session)
     _reset_stale_container_stages(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _migrate_shuffle_to_mode(session: Session) -> None:
+    """`shuffle` was a boolean and is now the mode string "off" | "on" | "smart".
+
+    The physical columns keep their declared BOOLEAN type: SQLite's column affinity there is NUMERIC,
+    which leaves a non-numeric string such as 'off' stored as text, so no table rebuild is needed.
+    Idempotent: only rows still holding 0/1 (or NULL) are touched.
+    """
+    for table in ("session_player_states", "playback_commands", "account_playback_sessions"):
+        cols = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
+        if "shuffle" not in cols:
+            continue
+        session.execute(text(f"UPDATE {table} SET shuffle = 'on' WHERE shuffle IN (1, '1')"))
+        session.execute(
+            text(f"UPDATE {table} SET shuffle = 'off' WHERE shuffle IS NULL OR shuffle NOT IN ('on', 'smart')")
+        )
+    session.commit()
+
+
+def _migrate_automation_shuffle_to_mode(session: Session) -> None:
+    """A `play` automation's `shuffle` config was a boolean; it is now "off" | "on" | "smart"."""
+    cols = {row[1] for row in session.execute(text("PRAGMA table_info(automations)"))}
+    if "action_config" not in cols:
+        return
+    rows = session.execute(
+        text("SELECT id, action_config FROM automations WHERE action_type = 'play' AND action_config LIKE '%shuffle%'")
+    ).all()
+    for automation_id, raw in rows:
+        try:
+            config = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if not isinstance(config, dict) or "shuffle" not in config or config["shuffle"] in ("off", "on", "smart"):
+            continue
+        config["shuffle"] = "on" if config["shuffle"] is True or config["shuffle"] in (1, "1", "true") else "off"
+        session.execute(
+            text("UPDATE automations SET action_config = :config WHERE id = :id"),
+            {"config": json.dumps(config), "id": automation_id},
+        )
+    session.commit()
 
 
 def _drop_columns(session: Session, table: str, columns: list[str]) -> None:

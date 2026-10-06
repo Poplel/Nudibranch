@@ -5279,3 +5279,37 @@ nav button:hover {
   letter-spacing: 0.04em;
   opacity: 0.6;
 }
+
+/* Smart shuffle: the shuffle glyph with a small sparkle badge, tinted like "on" (the .active rule). */
+.player-icon-button.shuffle-button {
+  position: relative;
+}
+
+.player-icon-button.shuffle-button .shuffle-sparkle {
+  position: absolute;
+  top: 2px;
+  right: -3px;
+  pointer-events: none;
+}
+
+/* A song smart shuffle added to the queue. */
+.queue-smart-mark {
+  display: inline-block;
+  margin-right: 4px;
+  vertical-align: -1px;
+  color: var(--accent);
+}
+
+/* Playlist page: the "Suggested" section. */
+.playlist-suggestions {
+  margin: 8px 0 4px;
+}
+
+.suggestion-row .suggestion-cover {
+  grid-row: 1 / span 2;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--soft);
+}

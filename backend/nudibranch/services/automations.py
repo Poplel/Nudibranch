@@ -52,6 +52,7 @@ TOOL_TASK_TYPES = {
 
 MEDIA_CONTROLS = {"pause", "resume", "next", "previous", "stop"}
 LOOP_MODES = {"off", "one", "all"}
+SHUFFLE_MODES = {"off", "on", "smart"}
 TRIGGER_TYPES = {"time", "interval", "webhook", "event", "shortcut"}
 ACTION_TYPES = {"tool", "play", "media_control"}
 NOTIFY_MODES = {"log", "notification", "both"}
@@ -147,7 +148,7 @@ def _run_play(session: Session, owner_id: str, cfg: dict) -> str:
         target_id=target_id,
         target_label=target_label,
         loop=cfg.get("loop") if cfg.get("loop") in LOOP_MODES else "off",
-        shuffle=bool(cfg.get("shuffle")),
+        shuffle=cfg.get("shuffle") if cfg.get("shuffle") in SHUFFLE_MODES else "off",
         status="pending",
     )
     session.add(command)
