@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # similarity (tags, genres, tempo, co-occurrence) works without it.
     listenbrainz_enabled: bool = Field(True, alias="LISTENBRAINZ_ENABLED")
 
+    # Release check: the worker reads the latest GitHub release of this repo and notifies admins
+    # when it is newer than the running version (services/update_check.py). False skips the call.
+    update_check_enabled: bool = Field(True, alias="UPDATE_CHECK_ENABLED")
+    update_check_repo: str = Field("Poplel/Nudibranch", alias="UPDATE_CHECK_REPO")
+
     spotify_client_id: str = Field("", alias="SPOTIFY_CLIENT_ID")
     spotify_client_secret: str = Field("", alias="SPOTIFY_CLIENT_SECRET")
 

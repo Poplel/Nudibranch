@@ -84,8 +84,10 @@ _STAGE_DEFAULT_LABEL: dict[ItemStage, str] = {
     # needs the batch's `flow` to pick "download approval" / "import approval" / "change
     # approval". This entry is only the fallback for a caller that has no flow to give it.
     ItemStage.awaiting_approval: "awaiting approval",
-    ItemStage.approved: "waiting to download",
-    ItemStage.queued: "waiting to download",
+    # Worded by kind in `status_label` ("waiting to download" / "to import" / "to apply"); this is
+    # only the fallback for a caller with no item to ask.
+    ItemStage.approved: "waiting",
+    ItemStage.queued: "waiting",
     ItemStage.downloading: "downloading",
     ItemStage.retrying: "retrying",
     ItemStage.staging: "moving into place",
@@ -311,6 +313,15 @@ _AWAITING_APPROVAL_LABEL_BY_FLOW: dict[ProposalFlow, str] = {
 }
 
 
+# `approved`/`queued` read "waiting to download" only for a download. A metadata change, a file
+# move or an import sitting approved behind the worker said "waiting to download" too, which it
+# never was (the user, 2026-10-07).
+_WAITING_LABEL_BY_KIND: dict[ProposalKind, str] = {
+    ProposalKind.download: "waiting to download",
+    ProposalKind.import_files: "waiting to import",
+}
+
+
 _FIXED_WORD_STAGES = frozenset(
     {ItemStage.approved, ItemStage.queued, ItemStage.downloading, ItemStage.retrying, ItemStage.failed}
 )
@@ -329,12 +340,16 @@ def status_label(
     """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
+    resolved_flow = None if flow is None else flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
     # ⚠️ A row waiting on a human names the gate it waits at, never the worker's free text (§0: "a
     # waiting status must say what is being approved"). A candidate used to read "100% match · same
     # album folder · FLAC" here; clients draw those details from `candidate` themselves.
-    if stage is ItemStage.awaiting_approval and flow is not None:
-        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+    if stage is ItemStage.awaiting_approval and resolved_flow is not None:
         return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
+    if stage in (ItemStage.approved, ItemStage.queued):
+        if resolved_flow is ProposalFlow.download_review:
+            return _WAITING_LABEL_BY_KIND[ProposalKind.download]
+        return _WAITING_LABEL_BY_KIND.get(item.kind, "waiting to apply")
     # ⚠️ In-flight stages always use their own word. The worker's free text for them is transfer
     # plumbing ("download queued in slskd: Initializing (5s)", "needs attention; could not be
     # downloaded automatically") -- jargon in a row (§0), and the pill must say one thing.
