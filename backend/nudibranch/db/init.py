@@ -840,6 +840,17 @@ def _migrate_queue_state_columns(session: Session) -> None:
             text("CREATE INDEX IF NOT EXISTS ix_proposal_items_stage ON proposal_items(stage)")
         )
         session.commit()
+    if item_cols:
+        # The two foreign keys every queue read walks -- a batch's items, an item's children --
+        # were never indexed, so each lookup scanned every proposal item ever created, settled
+        # history included. With a few thousand rows that made the Task Queue take seconds.
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_items_batch_id ON proposal_items(batch_id)")
+        )
+        session.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_proposal_items_parent_id ON proposal_items(parent_id)")
+        )
+        session.commit()
 
     wishlist_cols = {row[1] for row in session.execute(text("PRAGMA table_info(wishlist_items)"))}
     if wishlist_cols and "batch_id" not in wishlist_cols:

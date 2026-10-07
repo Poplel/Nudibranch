@@ -6488,18 +6488,20 @@ def prune_settled_batches(
             # rows at a gate for good: a track whose selected candidate was removed, say.
             has_open_decision = bool(queue_state.open_decision_rows(batch.items))
             if has_open_decision:
-                pass
-            elif actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
-                if any_failed:
-                    batch.status = ProposalStatus.failed
-                else:
-                    batch.status = ProposalStatus.completed
-                    settled.add(batch.id)
-            elif not actionable_items and not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items):
-                if any_failed:
-                    batch.status = ProposalStatus.failed
-                else:
-                    batch.status = ProposalStatus.completed
+                finished = False
+            elif actionable_items:
+                finished = all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items)
+            else:
+                finished = not any(item.selected and item.status in _UI_ACTIVE_ITEM_STATUSES for item in batch.items)
+            if finished:
+                outcome = ProposalStatus.failed if any_failed else ProposalStatus.completed
+                # ⚠️ Assign only on a real change. Re-assigning `failed` to a batch that already is
+                # one still marks it dirty, so every GET committed, and the commit expired every
+                # loaded row -- the whole list then reloaded row by row, which is most of why the
+                # Task Queue loaded so slowly on castiel (2026-10-06).
+                if batch.status is not outcome:
+                    batch.status = outcome
+                if outcome is ProposalStatus.completed:
                     settled.add(batch.id)
         elif batch.kind != ProposalKind.download:
             # An empty non-download batch is an abandoned/failed tool run. DELETED, not marked
@@ -6574,7 +6576,7 @@ def list_approvals(
         statuses = statuses + [ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled]
     query = (
         select(ProposalBatch)
-        .options(selectinload(ProposalBatch.items))
+        .options(selectinload(ProposalBatch.items).selectinload(ProposalItem.children))
         .where(ProposalBatch.status.in_(statuses))
     )
     if flow is not None:
@@ -6601,7 +6603,7 @@ def update_selection(
     _: User = Depends(require_permission(Permission.approvals_manage)),
 ) -> ProposalBatchOut:
     set_selection(session, batch_id, payload.item_ids, payload.selected)
-    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
+    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items).selectinload(ProposalItem.children)).where(ProposalBatch.id == batch_id))
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     return serialize_batch(batch)
@@ -6681,7 +6683,7 @@ def list_requests(
     batches = list(
         session.scalars(
             select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
+            .options(selectinload(ProposalBatch.items).selectinload(ProposalItem.children))
             .where(ProposalBatch.status.in_(statuses))
             .where(ProposalBatch.flow.in_([ProposalFlow.download_review, ProposalFlow.library_review]))
             # (The "/wishlist" exclusion that used to sit here went with the intent batch it hid: a
@@ -6863,7 +6865,7 @@ def reject(
     # Task Queue while it is still running.
     remove_items(session, item_ids, actor_id=user.id, notify_declined=True)
     session.commit()
-    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
+    batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items).selectinload(ProposalItem.children)).where(ProposalBatch.id == batch_id))
     if not batch:
         # The batch was emptied and deleted with its last row. Answer with the shape the clients
         # decode rather than a 404: the removal succeeded, there is simply nothing left of it.
@@ -6958,7 +6960,7 @@ def _serialize_surviving_batches(session: Session, batch_ids: set[str]) -> list[
     batches = list(
         session.scalars(
             select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
+            .options(selectinload(ProposalBatch.items).selectinload(ProposalItem.children))
             .where(ProposalBatch.id.in_(batch_ids))
         )
     )
