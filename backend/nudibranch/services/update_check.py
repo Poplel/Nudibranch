@@ -55,12 +55,17 @@ def latest_release(repo: str) -> dict | None:
     return {"version": tag.lstrip("vV"), "url": url}
 
 
-def check_for_update(session: Session) -> str | None:
-    """Notify admins of a newer release. Returns the version announced, else None."""
+def fetch_latest_release() -> dict | None:
+    """The configured repo's latest release, or None when the check is off. Network only -- the
+    worker runs this in a thread so a slow GitHub never stalls its event loop."""
     settings = get_settings()
     if not settings.update_check_enabled or not settings.update_check_repo.strip():
         return None
-    release = latest_release(settings.update_check_repo.strip())
+    return latest_release(settings.update_check_repo.strip())
+
+
+def check_for_update(session: Session, release: dict | None) -> str | None:
+    """Notify admins when `release` is newer. Returns the version announced, else None."""
     if not release:
         return None
     latest, current = parse_version(release["version"]), parse_version(__version__)

@@ -632,8 +632,12 @@ def prune_orphaned_metadata_items(session: Session, batch_id: str | None = None)
     no longer exists" -- while the user can see the track playing in the library under its new id
     (castiel, 2026-10-07: June "Fill MusicBrainz info" / "Apply ReplayGain" batches for a Lemonade
     and a Treehouse that had since been deleted and re-imported). Nothing can apply them, so they
-    go, through `remove_items` so emptied containers and batches go too. Runs on a worker tick and
-    once more just before a batch executes. Returns how many rows went.
+    go, through `remove_items` so emptied containers and batches go too. Runs on an hourly worker
+    tick and once more just before a batch executes. Returns how many changes were dropped.
+
+    ⚠️ A stale row with rows under it (an album change over its track changes) is NOT removed --
+    `remove_items` takes descendants, and those may still be valid. Its own change is cleared
+    instead, leaving it a plain grouping row.
     """
     query = select(ProposalItem).where(
         ProposalItem.kind == ProposalKind.metadata,
@@ -657,10 +661,40 @@ def prune_orphaned_metadata_items(session: Session, batch_id: str | None = None)
         for target_id, item_ids in by_target.items():
             if target_id not in present:
                 orphaned.extend(item_ids)
-    if orphaned:
-        remove_items(session, orphaned, decline_requests=False)
-        session.commit()
+    if not orphaned:
+        return 0
+    parent_ids = set(
+        session.scalars(select(ProposalItem.parent_id).where(ProposalItem.parent_id.in_(orphaned)).distinct())
+    )
+    leaves = [item_id for item_id in orphaned if item_id not in parent_ids]
+    for item_id in orphaned:
+        if item_id in parent_ids:
+            item = session.get(ProposalItem, item_id)
+            payload = queue_state.payload_of(item)
+            for key in ("target_type", "target_id", "changes"):
+                payload.pop(key, None)
+            item.payload_json = json.dumps(payload)
+            item.old_value = None
+            item.new_value = None
+    session.flush()
+    if leaves:
+        remove_items(session, leaves, decline_requests=False)
+    session.commit()
     return len(orphaned)
+
+
+def _is_work_item(item: ProposalItem) -> bool:
+    """A row that is itself a change, as opposed to an artist/album/track grouping row.
+
+    ⚠️ Not just "has an `action`": a metadata change carries `target_type` and an import-folder
+    file carries `old_value`/`new_value`, neither with an `action`. Testing only `action` made
+    `cleanup_empty_container_items` delete every metadata change in a batch the moment any one row
+    of it was removed (found in review, 2026-10-07).
+    """
+    if item.old_value or item.new_value:
+        return True
+    payload = queue_state.payload_of(item)
+    return bool(payload.get("action") or payload.get("target_type"))
 
 
 def cleanup_empty_container_items(session: Session, batch: ProposalBatch) -> None:
@@ -672,7 +706,7 @@ def cleanup_empty_container_items(session: Session, batch: ProposalBatch) -> Non
         for item in items:
             if item.id in child_parent_ids:
                 continue
-            if item.payload_json and '"action"' in item.payload_json:
+            if _is_work_item(item):
                 continue
             session.delete(item)
             changed = True

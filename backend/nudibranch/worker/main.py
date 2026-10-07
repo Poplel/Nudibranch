@@ -27,7 +27,7 @@ from nudibranch.services.imports import SUPPORTED_AUDIO_EXTENSIONS, discover_imp
 from nudibranch.services.replaygain import measure_track_gain, write_replaygain_tag
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications, queue_group_key, retire_queue_notifications
-from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
+from nudibranch.services.metadata_lookup import album_cover_candidate_urls, parse_track_number, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
 from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, prune_empty_download_dirs, prune_orphaned_metadata_items, remove_rejected_download_files
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
@@ -91,6 +91,9 @@ ANALYSIS_TICK_SECONDS = 30
 # How often the worker asks GitHub whether a newer release is out (services/update_check.py). One
 # unauthenticated request; GitHub allows 60 an hour per IP.
 UPDATE_CHECK_TICK_SECONDS = 6 * 3600
+# Dropping metadata changes whose target left the library. Hourly: it reads every open metadata
+# row, and `run_execute_proposal_batch` prunes its own batch anyway before anything is applied.
+ORPHAN_METADATA_PRUNE_TICK_SECONDS = 3600
 DISK_LOW_FLOOR_BYTES = 5 * 1024**3
 DISK_LOW_FRACTION = 0.05
 DISK_RECOVERY_FACTOR = 1.5
@@ -465,15 +468,9 @@ def add_download_candidate_review_items(
         artist = request.get("artist") or "Unknown Artist"
         album = request_album(request)
         title = request.get("track") or request.get("title") or "Unknown Track"
-        existing = find_library_track(
-            session,
-            artist,
-            album,
-            title,
-            request.get("track_number"),
-            request.get("disc_number"),
-            request.get("musicbrainz_recording_id"),
-        )
+        # Recording id only: a request's track numbers come from Spotify/iTunes editions that
+        # may not number the album the way the library copy does.
+        existing = find_library_track(session, artist, album, title, recording_id=request.get("musicbrainz_recording_id"))
         # A request with no real album (playlist track / single / unknown) just wants the
         # SONG, so skip the download if it already exists under ANY album (matched on
         # artist+title). It still gets added to a playlist from the library copy via the
@@ -1330,11 +1327,7 @@ def fail_linked_wishlist_item(session: Session, item: ProposalItem) -> None:
     wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
-def _as_int(value) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+_MB_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 
 
 def _distinct_position(track: Track, track_number, disc_number, recording_id) -> bool:
@@ -1345,12 +1338,20 @@ def _distinct_position(track: Track, track_number, disc_number, recording_id) ->
     the import skip track 22 as a "duplicate" of track 5 and leave it in staging, where the sweep
     proposed it again after every approval (castiel, 2026-10-07). Only facts both sides have are
     compared, so a file with no track number still matches on title.
+
+    Recording ids count only when both are MusicBrainz ids: the field also holds iTunes ids, which
+    never equal an MB id for the same song. When both are MB ids they decide it either way. Track
+    numbers are compared next, discs only when both sides know them (a missing disc tag is common).
     """
-    if recording_id and track.musicbrainz_recording_id and str(recording_id) != str(track.musicbrainz_recording_id):
+    ours, theirs = str(recording_id or ""), str(track.musicbrainz_recording_id or "")
+    if _MB_ID.match(ours) and _MB_ID.match(theirs):
+        return ours.lower() != theirs.lower()
+    number = parse_track_number(track_number)
+    if number and track.track_number and number != track.track_number:
         return True
-    number = _as_int(track_number)
-    if number and track.track_number:
-        return (number, _as_int(disc_number) or 1) != (track.track_number, track.disc_number or 1)
+    disc = parse_track_number(disc_number)
+    if number and number == track.track_number and disc and track.disc_number and disc != track.disc_number:
+        return True
     return False
 
 
@@ -1466,7 +1467,8 @@ def cleanup_emptied_source_dir(source_dir: Path) -> None:
         current = current.parent
 
 
-def import_file_to_library(session: Session, source_path: Path, target_path: Path, payload: dict) -> None:
+def import_file_to_library(session: Session, source_path: Path, target_path: Path, payload: dict) -> bool:
+    """Import one file. False when it was a duplicate of a library track and nothing was added."""
     metadata = payload.get("metadata", {})
     if not source_path.exists():
         raise FileNotFoundError(f"{source_path} no longer exists")
@@ -1497,16 +1499,25 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
         # staging, the sweep proposed it again after every approval -- an import that "finished"
         # and came straight back. Removals are permanent (there is no trash folder), and only a
         # copy under import/staging/downloads is ever deleted; a library file never is.
+        # Only when the library copy is really there: a row whose file has gone would make this
+        # delete the only copy left.
         settings = get_settings()
         roots = (settings.import_path.resolve(), settings.staging_path.resolve(), settings.downloads_path.resolve())
         resolved = source_path.resolve()
-        if not create_record_only and any(resolved.is_relative_to(root) for root in roots):
+        library_copy = Path(duplicate.path) if duplicate.path else None
+        if (
+            not create_record_only
+            and library_copy is not None
+            and library_copy.is_file()
+            and library_copy.resolve() != resolved
+            and any(resolved.is_relative_to(root) for root in roots)
+        ):
             resolved.unlink()
             cleanup_emptied_source_dir(resolved.parent)
             append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; deleted the duplicate copy")
         else:
             append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
-        return
+        return False
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if target_path.exists() and not create_record_only:
@@ -1544,7 +1555,7 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
 
     existing_track = session.scalar(select(Track).where(Track.path == str(target_path)))
     if existing_track:
-        return
+        return True
 
     track = Track(
         album_id=album.id,
@@ -1563,6 +1574,7 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
     session.flush()
     queue_track_for_enrichment(track.id)
     maybe_queue_slskd_rescan(session)
+    return True
 
 
 def apply_metadata_item(session: Session, item: ProposalItem) -> None:
@@ -7370,7 +7382,7 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
             target_path = Path(suggest_library_path(metadata, downloaded_path))
             known_paths = existing_library_and_proposal_paths(session)
             if str(target_path) not in known_paths and not target_path.exists():
-                import_file_to_library(session, downloaded_path, target_path, {
+                added = import_file_to_library(session, downloaded_path, target_path, {
                     "path": str(downloaded_path),
                     "relative_path": str(downloaded_path.relative_to(settings.downloads_path)),
                     "extension": downloaded_path.suffix.lower(),
@@ -7378,7 +7390,14 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
                     "metadata": metadata,
                     "suggested_library_path": str(target_path),
                 })
+                # A duplicate of a library track still satisfies the request.
                 mark_matching_wishlist_completed(session, metadata)
+            else:
+                added = False
+            if not added:
+                # Nothing was imported, so no "imported" notification pointing at a missing path.
+                append_task_log(session, task, f"yt-dlp: '{query}' already in library, skipping import")
+            else:
                 append_task_log(session, task, f"yt-dlp: '{query}' added to library as '{target_path.name}'")
                 create_notification(
                     session,
@@ -7393,8 +7412,6 @@ def run_ytdlp_download(session: Session, payload: dict, task: Task | None = None
                     enqueue_task(session, "jellyfin_scan", {})
                 flush_import_enrichment(session)
                 imported_to_library = True
-            else:
-                append_task_log(session, task, f"yt-dlp: '{query}' already in library, skipping import")
         except Exception as import_error:  # noqa: BLE001
             append_task_log(session, task, f"yt-dlp: import failed for '{query}': {import_error}", "warning")
     else:
@@ -11138,6 +11155,7 @@ async def worker_loop() -> None:
     last_wishlist_recovery_tick = 0.0
     last_analysis_tick = 0.0
     last_update_check_tick = 0.0
+    last_orphan_prune_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -11243,6 +11261,8 @@ async def worker_loop() -> None:
                     except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
                         session.rollback()
                         write_app_log(f"Reopening settled batches failed: {error}", "warning")
+                    last_wishlist_recovery_tick = time.time()
+                if time.time() - last_orphan_prune_tick > ORPHAN_METADATA_PRUNE_TICK_SECONDS:
                     try:
                         pruned = prune_orphaned_metadata_items(session)
                         if pruned:
@@ -11250,7 +11270,7 @@ async def worker_loop() -> None:
                     except Exception as error:  # noqa: BLE001 - housekeeping must never stop the worker.
                         session.rollback()
                         write_app_log(f"Pruning stale metadata changes failed: {error}", "warning")
-                    last_wishlist_recovery_tick = time.time()
+                    last_orphan_prune_tick = time.time()
                 if time.time() - last_analysis_tick > ANALYSIS_TICK_SECONDS:
                     try:
                         enqueue_analysis_if_needed(session)
@@ -11259,9 +11279,11 @@ async def worker_loop() -> None:
                     last_analysis_tick = time.time()
                 if time.time() - last_update_check_tick > UPDATE_CHECK_TICK_SECONDS:
                     try:
-                        from nudibranch.services.update_check import check_for_update
+                        from nudibranch.services.update_check import check_for_update, fetch_latest_release
 
-                        announced = check_for_update(session)
+                        # The GitHub request runs off the event loop; only the notify touches the DB.
+                        release = await asyncio.to_thread(fetch_latest_release)
+                        announced = check_for_update(session, release)
                         if announced:
                             write_app_log(f"Nudibranch {announced} is available (running {__version__})", "info")
                     except Exception as error:  # noqa: BLE001 - an update check must never stop the worker.
