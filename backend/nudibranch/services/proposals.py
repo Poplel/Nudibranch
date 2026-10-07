@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
 from nudibranch.db.models import (
+    Album,
+    Artist,
     ItemStage,
     Permission,
     TaskStatus,
@@ -16,6 +18,7 @@ from nudibranch.db.models import (
     ProposalKind,
     ProposalStatus,
     Task,
+    Track,
     User,
     WishlistItem,
 )
@@ -616,6 +619,48 @@ def prune_empty_download_dirs(path: Path, stop_at: Path) -> None:
         except OSError:
             return
         current = current.parent
+
+
+_METADATA_TARGET_MODELS = {"artist": Artist, "album": Album, "track": Track}
+
+
+def prune_orphaned_metadata_items(session: Session, batch_id: str | None = None) -> int:
+    """Delete unapplied metadata rows whose artist/album/track has left the library.
+
+    ⚠️ A proposal names its target by row id, and a delete, a replace or a re-import gives the
+    "same" album or track a new id. Left in the queue, such a row could only ever fail with "Track
+    no longer exists" -- while the user can see the track playing in the library under its new id
+    (castiel, 2026-10-07: June "Fill MusicBrainz info" / "Apply ReplayGain" batches for a Lemonade
+    and a Treehouse that had since been deleted and re-imported). Nothing can apply them, so they
+    go, through `remove_items` so emptied containers and batches go too. Runs on a worker tick and
+    once more just before a batch executes. Returns how many rows went.
+    """
+    query = select(ProposalItem).where(
+        ProposalItem.kind == ProposalKind.metadata,
+        ProposalItem.status.in_((ProposalStatus.pending, ProposalStatus.approved)),
+    )
+    if batch_id:
+        query = query.where(ProposalItem.batch_id == batch_id)
+    wanted: dict[str, dict[str, list[str]]] = {}
+    for item in session.scalars(query):
+        payload = queue_state.payload_of(item)
+        target_type, target_id = payload.get("target_type"), payload.get("target_id")
+        if target_type in _METADATA_TARGET_MODELS and target_id:
+            wanted.setdefault(target_type, {}).setdefault(str(target_id), []).append(item.id)
+    orphaned: list[str] = []
+    for target_type, by_target in wanted.items():
+        model = _METADATA_TARGET_MODELS[target_type]
+        ids = list(by_target)
+        present: set[str] = set()
+        for start in range(0, len(ids), 500):
+            present.update(session.scalars(select(model.id).where(model.id.in_(ids[start:start + 500]))))
+        for target_id, item_ids in by_target.items():
+            if target_id not in present:
+                orphaned.extend(item_ids)
+    if orphaned:
+        remove_items(session, orphaned, decline_requests=False)
+        session.commit()
+    return len(orphaned)
 
 
 def cleanup_empty_container_items(session: Session, batch: ProposalBatch) -> None:

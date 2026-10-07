@@ -311,6 +311,15 @@ _AWAITING_APPROVAL_LABEL_BY_FLOW: dict[ProposalFlow, str] = {
 }
 
 
+# `approved`/`queued` read "waiting to download" only for a download. A metadata change, a file
+# move or an import sitting approved behind the worker said "waiting to download" too, which it
+# never was (the user, 2026-10-07).
+_WAITING_LABEL_BY_KIND: dict[ProposalKind, str] = {
+    ProposalKind.download: "waiting to download",
+    ProposalKind.import_files: "waiting to import",
+}
+
+
 _FIXED_WORD_STAGES = frozenset(
     {ItemStage.approved, ItemStage.queued, ItemStage.downloading, ItemStage.retrying, ItemStage.failed}
 )
@@ -335,6 +344,10 @@ def status_label(
     if stage is ItemStage.awaiting_approval and flow is not None:
         resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
         return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
+    if stage in (ItemStage.approved, ItemStage.queued):
+        if flow is not None and _coerce_flow(str(getattr(flow, "value", flow))) is ProposalFlow.download_review:
+            return _WAITING_LABEL_BY_KIND[ProposalKind.download]
+        return _WAITING_LABEL_BY_KIND.get(item.kind, "waiting to apply")
     # ⚠️ In-flight stages always use their own word. The worker's free text for them is transfer
     # plumbing ("download queued in slskd: Initializing (5s)", "needs attention; could not be
     # downloaded automatically") -- jargon in a row (§0), and the pill must say one thing.

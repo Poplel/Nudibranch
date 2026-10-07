@@ -28,7 +28,7 @@ from nudibranch.services.replaygain import measure_track_gain, write_replaygain_
 from nudibranch.services.audio_content import DEAD_AIR_THRESHOLD, measure_silence_fraction
 from nudibranch.services.notifications import create_notification, deliver_apns_notifications, queue_group_key, retire_queue_notifications
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_musicbrainz_ids, search_album_releases, lookup_album_tracks
-from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, prune_empty_download_dirs, remove_rejected_download_files
+from nudibranch.services.proposals import approve_batch, cleanup_empty_container_items, item_ids_with_descendants, prune_empty_download_dirs, prune_orphaned_metadata_items, remove_rejected_download_files
 from nudibranch.services.app_log import write_app_log
 from nudibranch.services.match_tuning import MATCH_TUNING_DEFAULTS, match_tuning
 from nudibranch.services.settings_store import integration_settings, integration_value
@@ -88,6 +88,9 @@ DISK_CHECK_TICK_SECONDS = 600
 # Queue an `analyze_audio` task whenever tracks (or artists) still lack features, so the initial sweep
 # and every later import are covered without hooking each import path.
 ANALYSIS_TICK_SECONDS = 30
+# How often the worker asks GitHub whether a newer release is out (services/update_check.py). One
+# unauthenticated request; GitHub allows 60 an hour per IP.
+UPDATE_CHECK_TICK_SECONDS = 6 * 3600
 DISK_LOW_FLOOR_BYTES = 5 * 1024**3
 DISK_LOW_FRACTION = 0.05
 DISK_RECOVERY_FACTOR = 1.5
@@ -462,7 +465,15 @@ def add_download_candidate_review_items(
         artist = request.get("artist") or "Unknown Artist"
         album = request_album(request)
         title = request.get("track") or request.get("title") or "Unknown Track"
-        existing = find_library_track(session, artist, album, title)
+        existing = find_library_track(
+            session,
+            artist,
+            album,
+            title,
+            request.get("track_number"),
+            request.get("disc_number"),
+            request.get("musicbrainz_recording_id"),
+        )
         # A request with no real album (playlist track / single / unknown) just wants the
         # SONG, so skip the download if it already exists under ANY album (matched on
         # artist+title). It still gets added to a playlist from the library copy via the
@@ -698,8 +709,15 @@ def has_live_descendants(item: ProposalItem) -> bool:
 
 def run_execute_proposal_batch(session: Session, payload: dict, task: Task | None = None) -> dict:
     batch_id = payload["batch_id"]
+    # A change to a row that has since left the library can only fail; drop it first (§44). This
+    # can empty -- and so delete -- the batch, which then has nothing left to run.
+    pruned = prune_orphaned_metadata_items(session, batch_id)
+    if pruned:
+        append_task_log(session, task, f"Dropped {pruned} metadata change(s) for items no longer in the library")
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
+        if pruned:
+            return {"batch_id": batch_id, "skipped": pruned, "errors": []}
         raise ValueError("Proposal batch not found")
     batch.status = ProposalStatus.executing
     append_task_log(session, task, f"Executing proposal batch {batch.title} ({batch.id})")
@@ -1312,11 +1330,44 @@ def fail_linked_wishlist_item(session: Session, item: ProposalItem) -> None:
     wishlist_item.status_changed_at = datetime.now(timezone.utc)
 
 
-def find_library_track(session: Session, artist_name: str, album_title: str, title: str):
+def _as_int(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _distinct_position(track: Track, track_number, disc_number, recording_id) -> bool:
+    """True when `track` is provably a different slot on the album than the one described.
+
+    ⚠️ Title alone is not identity: deluxe editions repeat titles ("I'm Not the Only One" is track 5
+    and, as the "(feat. A$AP Rocky)" version, track 22 of In The Lonely Hour). Matching on title made
+    the import skip track 22 as a "duplicate" of track 5 and leave it in staging, where the sweep
+    proposed it again after every approval (castiel, 2026-10-07). Only facts both sides have are
+    compared, so a file with no track number still matches on title.
+    """
+    if recording_id and track.musicbrainz_recording_id and str(recording_id) != str(track.musicbrainz_recording_id):
+        return True
+    number = _as_int(track_number)
+    if number and track.track_number:
+        return (number, _as_int(disc_number) or 1) != (track.track_number, track.disc_number or 1)
+    return False
+
+
+def find_library_track(
+    session: Session,
+    artist_name: str,
+    album_title: str,
+    title: str,
+    track_number=None,
+    disc_number=None,
+    recording_id: str | None = None,
+):
     """Return an existing library Track with the same artist + album + title, else None.
 
     Matching is case/whitespace-insensitive. A track is only a duplicate when all three match, so
-    the same song on a different album is never treated as a duplicate.
+    the same song on a different album is never treated as a duplicate -- and neither is the same
+    title at another track number or recording on the same album (`_distinct_position`).
     """
     artist_key = normalize_match_text(artist_name)
     album_key = normalize_match_text(album_title)
@@ -1338,6 +1389,7 @@ def find_library_track(session: Session, artist_name: str, album_title: str, tit
             normalize_match_text(album.artist.name) == artist_key
             and normalize_match_text(album.title) == album_key
             and normalize_match_text(track.title) == title_key
+            and not _distinct_position(track, track_number, disc_number, recording_id)
         ):
             return track
     return None
@@ -1431,7 +1483,15 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
     # Never create a 100%-certain duplicate: same artist + album + title already in the library.
     # (The same title on a different album is fine — albums are matched too.) This guards every
     # import/download path. Leave the source file in place so nothing is silently lost.
-    duplicate = find_library_track(session, artist_name, album_title, track_title)
+    duplicate = find_library_track(
+        session,
+        artist_name,
+        album_title,
+        track_title,
+        metadata.get("track_number"),
+        metadata.get("disc_number"),
+        metadata.get("musicbrainz_recording_id"),
+    )
     if duplicate and str(duplicate.path or "") != str(target_path):
         append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
         return
@@ -11065,6 +11125,7 @@ async def worker_loop() -> None:
     last_deletion_prune_tick = 0.0
     last_wishlist_recovery_tick = 0.0
     last_analysis_tick = 0.0
+    last_update_check_tick = 0.0
     while True:
         with SessionLocal() as session:
             task = claim_next_task(session)
@@ -11170,6 +11231,13 @@ async def worker_loop() -> None:
                     except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
                         session.rollback()
                         write_app_log(f"Reopening settled batches failed: {error}", "warning")
+                    try:
+                        pruned = prune_orphaned_metadata_items(session)
+                        if pruned:
+                            write_app_log(f"Dropped {pruned} metadata change(s) for items no longer in the library", "info")
+                    except Exception as error:  # noqa: BLE001 - housekeeping must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Pruning stale metadata changes failed: {error}", "warning")
                     last_wishlist_recovery_tick = time.time()
                 if time.time() - last_analysis_tick > ANALYSIS_TICK_SECONDS:
                     try:
@@ -11177,6 +11245,17 @@ async def worker_loop() -> None:
                     except Exception:  # noqa: BLE001 - never let the analysis tick stop the worker.
                         session.rollback()
                     last_analysis_tick = time.time()
+                if time.time() - last_update_check_tick > UPDATE_CHECK_TICK_SECONDS:
+                    try:
+                        from nudibranch.services.update_check import check_for_update
+
+                        announced = check_for_update(session)
+                        if announced:
+                            write_app_log(f"Nudibranch {announced} is available (running {__version__})", "info")
+                    except Exception as error:  # noqa: BLE001 - an update check must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Update check failed: {type(error).__name__}: {error}", "warning")
+                    last_update_check_tick = time.time()
                 if time.time() - last_deletion_prune_tick > DELETION_PRUNE_TICK_SECONDS:
                     try:
                         cutoff = datetime.now(timezone.utc) - LIBRARY_DELETION_RETENTION
