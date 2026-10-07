@@ -329,14 +329,17 @@ def status_label(
     """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
+    # ⚠️ A row waiting on a human names the gate it waits at, never the worker's free text (§0: "a
+    # waiting status must say what is being approved"). A candidate used to read "100% match · same
+    # album folder · FLAC" here; clients draw those details from `candidate` themselves.
+    if stage is ItemStage.awaiting_approval and flow is not None:
+        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+        return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
     # ⚠️ In-flight stages always use their own word. The worker's free text for them is transfer
     # plumbing ("download queued in slskd: Initializing (5s)", "needs attention; could not be
     # downloaded automatically") -- jargon in a row (§0), and the pill must say one thing.
     if stage not in _FIXED_WORD_STAGES and isinstance(existing, str) and existing.strip():
         return existing.strip()
-    if stage is ItemStage.awaiting_approval and flow is not None:
-        resolved_flow = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
-        return _AWAITING_APPROVAL_LABEL_BY_FLOW.get(resolved_flow, _STAGE_DEFAULT_LABEL[stage])
     return _STAGE_DEFAULT_LABEL.get(stage, stage.value)
 
 
@@ -520,6 +523,31 @@ def request_out(item: ProposalItem, payload: dict, requester_name: str | None = 
     }
 
 
+def open_decision_rows(items: Iterable[ProposalItem]) -> list[ProposalItem]:
+    """Actionable rows still waiting on a human at a gate -- work a batch must never hide.
+
+    ⚠️ The user's rule (2026-09-29): no state in which an entry cannot be seen and addressed. A
+    `pending` actionable row is an open decision when it is **selected** (the choice, waiting for
+    Approve), or when **nothing under its parent is selected** (its track has no choice yet -- the
+    selected candidate was removed, say -- so every alternate is still an option). An unselected
+    alternate beside a selected sibling is only an option for a track that has its answer.
+
+    Every "is this batch finished?" check uses this: finalizing a download batch, settling one for
+    the list, marking one canceled after a removal, and reopening a settled one.
+    """
+    materialized = list(items)
+    chosen_parents = {
+        item.parent_id for item in materialized if item.selected and item.parent_id and is_actionable(item)
+    }
+    return [
+        item
+        for item in materialized
+        if item.status is ProposalStatus.pending
+        and is_actionable(item)
+        and (item.selected or item.parent_id is None or item.parent_id not in chosen_parents)
+    ]
+
+
 def rollup_items(items: Iterable[ProposalItem]) -> list[ProposalItem]:
     """The items that actually represent work, for rollup purposes.
 
@@ -643,6 +671,30 @@ def can_approve(stage: ItemStage, flow: ProposalFlow | str | None = None) -> boo
     return stage in allowed
 
 
+def superseded_download_rows(items: Iterable[ProposalItem]) -> set[str]:
+    """Failed candidates whose track already has another candidate in flight or done.
+
+    One download per track (`retry_items`, `approve_batch`): Retry skips such a track and Approve on
+    such a row answers 409, so offering either button on it is a button that does nothing. Seen
+    live 2026-09-29: four failed alternates of a finished "Cloudbusting" all read Approve + Retry.
+    """
+    materialized = list(items)
+    taken = {
+        item.parent_id
+        for item in materialized
+        if item.parent_id
+        and item.status in {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.completed}
+        and payload_of(item).get("action") in _DOWNLOAD_ACTIONS
+    }
+    return {
+        item.id
+        for item in materialized
+        if item.status is ProposalStatus.failed
+        and item.parent_id in taken
+        and payload_of(item).get("action") in _DOWNLOAD_ACTIONS
+    }
+
+
 def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str | None) -> set[str]:
     """Every id a human could approve, containers resolved from their descendants.
 
@@ -658,6 +710,7 @@ def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str 
         if item.parent_id:
             children.setdefault(item.parent_id, []).append(item)
     approvable: set[str] = set()
+    superseded = superseded_download_rows(materialized)
 
     def visit(item: ProposalItem, seen: frozenset[str]) -> bool:
         if item.id in seen:
@@ -671,7 +724,11 @@ def approvable_item_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str 
             if visit(kid, seen | {item.id}):
                 under = True
         payload = payload_of(item)
-        mine = is_actionable(item, payload) and can_approve(resolve_stage(item, payload), flow)
+        mine = (
+            item.id not in superseded
+            and is_actionable(item, payload)
+            and can_approve(resolve_stage(item, payload), flow)
+        )
         if under or mine:
             approvable.add(item.id)
         return under or mine

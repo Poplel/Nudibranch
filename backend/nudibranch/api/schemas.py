@@ -14,6 +14,10 @@ from nudibranch.db.models import (
 )
 
 
+#: Shuffle on the wire: a mode string everywhere (never a bool).
+ShuffleMode = Literal["off", "on", "smart"]
+
+
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=120)
     password: str = Field(min_length=4, max_length=128)
@@ -44,6 +48,8 @@ class UserOut(BaseModel):
     background_tint: str = "#356df3"
     crossfade_duration: float = 0.5
     remote_playback_enabled: bool = True
+    #: Smart shuffle inserts one suggestion after this many consecutive songs (1-20).
+    smart_shuffle_every: int = 4
     #: Minutes a playback claim survives without playing; 0 = never expires (§31), and is the
     #: default (2026-09-23 -- "Never" is the default for Hand Off After).
     playback_claim_timeout_minutes: int = 0
@@ -149,6 +155,8 @@ class UserAppearanceUpdate(BaseModel):
     #: nothing, while a future default would have switched cross-device playback back on for
     #: someone who turned it off elsewhere.
     remote_playback_enabled: bool
+    #: Smart shuffle spacing: one suggested song after every N songs. Required like the field above.
+    smart_shuffle_every: int = Field(ge=1, le=20)
     #: How long this account's playback claim survives without playing, in MINUTES. 0 = never
     #: expires, and is the default (2026-09-23) -- replaces the old fixed 5-minute
     #: CLAIM_IDLE_TIMEOUT per user (§31).
@@ -170,7 +178,7 @@ class PlayerStateUpdate(BaseModel):
     current_index: int = 0
     position_seconds: int | None = None
     duration_seconds: int | None = None
-    shuffle: bool = False
+    shuffle: ShuffleMode = "off"
     repeat: str = "off"
     # Which client shape is reporting. Coerced rather than rejected: an unrecognised value is a
     # newer or older client, and a status report must never 422 over a cosmetic label.
@@ -768,6 +776,41 @@ class LibraryTrackRow(BaseModel):
     updated_at: str | None = None
 
 
+class SuggestionsRequest(BaseModel):
+    #: Seeds are this playlist's tracks (and they are excluded too). "favorites" is allowed.
+    playlist_id: str | None = None
+    seed_track_ids: list[str] = Field(default_factory=list, max_length=500)
+    exclude_track_ids: list[str] = Field(default_factory=list, max_length=2000)
+    limit: int = Field(default=5, ge=1, le=25)
+
+
+class SuggestionsResponse(BaseModel):
+    tracks: list[LibraryTrackRow] = Field(default_factory=list)
+
+
+class SmartShuffleItem(BaseModel):
+    type: Literal["track", "episode"]
+    id: str
+    smart: bool | None = None
+
+
+class SmartShufflePlanRequest(BaseModel):
+    items: list[SmartShuffleItem] = Field(default_factory=list, max_length=5000)
+    current_index: int = 0
+    #: The player's repeat mode. With "off", a queue about to run out is extended with suggestions.
+    repeat: Literal["off", "one", "all"]
+
+
+class SmartShuffleInsert(BaseModel):
+    #: Position in the array the client sent, before which `track` goes. Apply from last to first.
+    index: int
+    track: LibraryTrackRow
+
+
+class SmartShufflePlanResponse(BaseModel):
+    inserts: list[SmartShuffleInsert] = Field(default_factory=list)
+
+
 class PaginatedArtists(BaseModel):
     items: list[LibraryArtistRow] = Field(default_factory=list)
     total: int = 0
@@ -814,6 +857,8 @@ class PlaybackSnapshotItem(BaseModel):
     # Needed even though the server could look it up: the CLIENT uses it to pick the right podcast
     # bucket in its own store, and a PodcastEpisodePlayback cannot be rebuilt without it.
     podcast_id: str | None = None
+    #: True for a song smart shuffle inserted (None = not smart; dropped by exclude_none storage).
+    smart: bool | None = None
     # Filled in ONLY by `GET /player/sessions/{id}/queue?resolve=true`, for the web client, which has
     # no local library mirror to turn ids into a readable list. Never sent by a client, and never
     # populated on the transfer path — a queue in flight stays ids only.
@@ -828,7 +873,7 @@ class PlaybackSnapshot(BaseModel):
     current_index: int = 0
     position_seconds: float = 0.0
     playing: bool = True
-    shuffle: bool = False
+    shuffle: ShuffleMode = "off"
     repeat: str = "off"
 
 
@@ -895,7 +940,7 @@ class PlayerSessionOut(BaseModel):
     current_index: int = 0
     position_seconds: int | None = None
     duration_seconds: int | None = None
-    shuffle: bool = False
+    shuffle: ShuffleMode = "off"
     repeat: str = "off"
     reported_at: datetime | None = None
     last_used_at: datetime | None = None
@@ -951,7 +996,7 @@ class PlayerCommandCreate(BaseModel):
     target_id: str | None = None
     target_query: str | None = None
     loop: str = "off"
-    shuffle: bool = False
+    shuffle: ShuffleMode = "off"
     device_id: str | None = None
     # action="seek" only.
     position_seconds: int | None = None
@@ -976,7 +1021,7 @@ class PlayerCommandOut(BaseModel):
     # mode on each command it received had its repeat and shuffle silently cleared by a remote pause.
     # `_serialize_command` therefore emits them only for the two actions where they mean something.
     loop: str | None = None
-    shuffle: bool | None = None
+    shuffle: ShuffleMode | None = None
     status: str
     device_id: str | None = None
     position_seconds: int | None = None
@@ -1154,7 +1199,7 @@ class AccountSessionOut(BaseModel):
     current_index: int = 0
     position_seconds: float = 0.0
     position_at: datetime | None = None
-    shuffle: bool = False
+    shuffle: ShuffleMode = "off"
     repeat: str = "off"
     track_id: str | None = None
     episode_id: str | None = None
@@ -1199,7 +1244,7 @@ class SessionEditRequest(BaseModel):
     index: int | None = None
     to_index: int | None = None
     position_seconds: float | None = None
-    shuffle: bool | None = None
+    shuffle: ShuffleMode | None = None
     repeat: str | None = None
     # When set, the edit is refused with 409 if the queue has changed since the caller read it, so an
     # index can never land on the wrong item.

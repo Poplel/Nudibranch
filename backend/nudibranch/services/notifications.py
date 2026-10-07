@@ -25,11 +25,11 @@ import httpx
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy import select
+from sqlalchemy import event, or_, select, update
 from sqlalchemy.orm import Session
 
 from nudibranch.core.config import get_settings
-from nudibranch.db.models import AppSetting, MobileDevice, Notification, NotificationStatus, Permission, User
+from nudibranch.db.models import AppSetting, MobileDevice, Notification, NotificationStatus, Permission, ProposalBatch, User
 
 logger = logging.getLogger("nudibranch.notifications")
 
@@ -174,9 +174,6 @@ def _canonical_push_message(
 _NOTIFICATION_AUDIENCE: dict[str, set[Permission]] = {
     "activity": {Permission.activity_read},
     "task-queue": {Permission.approvals_manage, Permission.wishlist_approve_all},
-    # Legacy target kept only so historical rows still route; nothing new aims here.  The
-    # requester-facing destination is "/requests" below.
-    "downloads": {Permission.approvals_manage},
     "tools": {Permission.tools_manage},
     "library": {Permission.library_view},
     "automations": {Permission.automations_manage},
@@ -278,6 +275,81 @@ def create_notification(
             session.rollback()
             time.sleep(0.25 * (attempt + 1))
     raise RuntimeError("Notification could not be created")
+
+
+def queue_group_key(batch_id: str) -> str:
+    return f"queue:{batch_id}"
+
+
+def retire_queue_notifications(session: Session, batch_id: str) -> int:
+    """Mark a batch's "needs you" rows read for everyone once the need is gone.
+
+    Covers every row about the batch (`_about_batch`), but only the actionable event types -- a finished/"added to your
+    library" row is a result, not a to-do, and stays unread.  `apns_delivered_at` is stamped so a
+    push still waiting to go out for a resolved row never fires.  Does not commit: callers run it
+    inside their own transaction.  A later `notify_approvers` for a new gate rewrites the row and
+    makes it unread again, so calling this before one is safe.
+    """
+    now = datetime.now(timezone.utc)
+    rows = list(
+        session.scalars(
+            select(Notification).where(
+                _about_batch(batch_id),
+                Notification.event_type.in_(_RETIRED_EVENT_TYPES),
+            )
+        )
+    )
+    for row in rows:
+        if row.status == NotificationStatus.unread:
+            row.status = NotificationStatus.read
+        if row.apns_delivered_at is None:
+            row.apns_delivered_at = now
+    return len(rows)
+
+
+_RETIRED_EVENT_TYPES = ("approval_needed", "task_failed")
+
+
+def _about_batch(batch_id: str):
+    """Rows about this batch: either group key it writes under, or a `target_url` naming it.
+
+    ⚠ The target is the part every such row has -- `queue_target` puts `batch=<id>` in each
+    "review in the Task Queue" link -- while the tools' "… review ready" rows carry no group key at
+    all. Matching on the key alone missed every one of them.
+    """
+    return or_(
+        Notification.group_key.in_([queue_group_key(batch_id), f"download:{batch_id}"]),
+        Notification.target_url.like(f"%batch={batch_id}%"),
+    )
+
+
+@event.listens_for(ProposalBatch, "after_delete")
+def _retire_on_batch_delete(_mapper, connection, target: ProposalBatch) -> None:
+    """A deleted batch has nothing left to ask about, wherever it was deleted from.
+
+    ⚠️ Batches are deleted in some twenty places (reject/remove emptying one, a tool re-run
+    discarding its last pending batch, pruning, a check that found nothing) and a per-site call is
+    one the next site forgets -- the reject route was the first to slip through. So this rides on
+    the delete itself, in the same transaction, as plain UPDATEs on the flush's connection.
+    """
+    connection.execute(
+        update(Notification)
+        .where(
+            _about_batch(target.id),
+            Notification.event_type.in_(_RETIRED_EVENT_TYPES),
+            Notification.status == NotificationStatus.unread,
+        )
+        .values(status=NotificationStatus.read)
+    )
+    connection.execute(
+        update(Notification)
+        .where(
+            _about_batch(target.id),
+            Notification.event_type.in_(_RETIRED_EVENT_TYPES),
+            Notification.apns_delivered_at.is_(None),
+        )
+        .values(apns_delivered_at=datetime.now(timezone.utc))
+    )
 
 
 async def deliver_apns_notifications(session: Session) -> int:

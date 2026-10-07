@@ -54,7 +54,6 @@ class ProposalKind(str, enum.Enum):
 
 
 class ProposalStatus(str, enum.Enum):
-    draft = "draft"
     pending = "pending"
     approved = "approved"
     rejected = "rejected"
@@ -160,6 +159,8 @@ class User(Base):
     #: device through the same route (§3/§24), and silently stopping those would be a second,
     #: unasked-for change.
     remote_playback_enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    #: Smart shuffle: one suggested song after every N songs (1-20).
+    smart_shuffle_every: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     #: How long this account's playback claim survives without playing, in MINUTES; 0 = never
     #: expires. Per-user because "how long should my phone keep the session after I pause?" is a
     #: taste question, not a protocol constant. ⚠ It governs the IDLE clock only: a claim whose
@@ -259,7 +260,8 @@ class SessionPlayerState(Base):
     current_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     position_seconds: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[int | None] = mapped_column(Integer)
-    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    #: "off" | "on" | "smart"
+    shuffle: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     # Indexed because reads pick a user's newest report and sort on this column.
     reported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
@@ -335,6 +337,56 @@ class Track(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 
     album: Mapped[Album] = relationship(back_populates="tracks")
+
+
+class TrackFeatures(Base):
+    """Audio analysis per track (BPM, energy, brightness, tag genres, year) for the suggestion engine.
+
+    A row with `error` set marks a track that failed analysis, so it is not retried forever;
+    bumping the worker's ANALYSIS_VERSION retries everything.
+    """
+
+    __tablename__ = "track_features"
+
+    track_id: Mapped[str] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"), primary_key=True)
+    bpm: Mapped[float | None] = mapped_column(Float)
+    energy: Mapped[float | None] = mapped_column(Float)
+    brightness: Mapped[float | None] = mapped_column(Float)
+    #: JSON list of lowercased genre strings from the file's tags.
+    genres: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    year: Mapped[int | None] = mapped_column(Integer)
+    analysis_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    analyzed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class ArtistSimilarity(Base):
+    """Cached MusicBrainz genres and ListenBrainz similar artists for one artist. Never read from a
+    request path's network: the worker fills it, the suggestion engine only reads it."""
+
+    __tablename__ = "artist_similarity"
+
+    artist_id: Mapped[str] = mapped_column(ForeignKey("artists.id", ondelete="CASCADE"), primary_key=True)
+    #: JSON list of lowercased genre names, most-voted first.
+    genres: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    #: JSON list of {mbid, name, score}.
+    similar: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class DiscoverArtistCache(Base):
+    """iTunes artist resolution + album list for the Discover suggestions, keyed by normalized artist
+    name. An unresolved or failed lookup is stored with `itunes_artist_id` null and no albums (and a
+    shorter TTL), so it is not retried on every request."""
+
+    __tablename__ = "discover_artist_cache"
+
+    name_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    itunes_artist_id: Mapped[str | None] = mapped_column(String(64))
+    #: JSON list of iTunes album dicts (`itunes._normalize_album` shape).
+    albums: Mapped[str] = mapped_column(Text, default="[]", nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
 
 
 class LibraryDeletion(Base):
@@ -425,9 +477,12 @@ class WishlistItem(Base):
     artist: Mapped[str] = mapped_column(String(255), nullable=False)
     album: Mapped[str | None] = mapped_column(String(255))
     track: Mapped[str | None] = mapped_column(String(255))
+    #: Where the request was made ("discover", "siri", …), as the client said when creating it.
+    source: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), default="wanted", nullable=False)
-    # Direct link to the proposal batch/item serving this request.  NULL for rows created before
-    # this existed -- those fall through to the legacy JSON-scan path for one release.
+    # Direct link to the proposal batch/item serving this request. Kept pointing at wherever the
+    # request's work lives now (the download batch, then "Add to library"); a pointer whose batch
+    # or item is gone is dropped on the way out (`serialize_wishlist_items`).
     batch_id: Mapped[str | None] = mapped_column(String, index=True)
     item_id: Mapped[str | None] = mapped_column(String)
     # Same denormalized-cache rule as ProposalItem.stage above: plain String on purpose.
@@ -711,7 +766,8 @@ class PlaybackCommand(Base):
     queue_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     queue_to_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     loop: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
-    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    #: "off" | "on" | "smart"
+    shuffle: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     # Only meaningful for action="seek"; the remote scrubber's landing position.
     position_seconds: Mapped[int | None] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False, index=True)
@@ -777,7 +833,8 @@ class AccountPlaybackSession(Base):
     #: When `position_seconds` was true. A viewer of a PLAYING session interpolates from here.
     position_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(String(16), default="stopped", nullable=False)
-    shuffle: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    #: "off" | "on" | "smart"
+    shuffle: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     repeat: Mapped[str] = mapped_column(String(8), default="off", nullable=False)
     track_id: Mapped[str | None] = mapped_column(ForeignKey("tracks.id", ondelete="SET NULL"))
     episode_id: Mapped[str | None] = mapped_column(ForeignKey("episodes.id", ondelete="SET NULL"))

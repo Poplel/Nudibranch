@@ -87,16 +87,23 @@ function toSnapshotItem(item) {
     type: item?._kind === "episode" ? "episode" : "track",
     id: queueItemId(item),
     podcast_id: item?._podcastId || null,
+    // Only a smart-shuffle suggestion carries the flag; omitted (undefined) for everything else.
+    smart: item?._smart ? true : undefined,
   };
+}
+
+/// Shuffle on the wire is a mode string: "off" | "on" | "smart".
+function normalizeShuffle(value) {
+  return value === "on" || value === "smart" ? value : "off";
 }
 
 /// Order and identity only. Two queues with the same key publish the same shared queue.
 function sessionQueueKeyOf(queue) {
-  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}:${queueItemId(item)}`).join("|");
+  return (queue || []).map((item) => `${item?._kind === "episode" ? "e" : "t"}${item?._smart ? "s" : ""}:${queueItemId(item)}`).join("|");
 }
 
 function snapshotItemsKey(items) {
-  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}:${item.id}`).join("|");
+  return (items || []).map((item) => `${item.type === "episode" ? "e" : "t"}${item.smart ? "s" : ""}:${item.id}`).join("|");
 }
 
 /// The part of a local queue that is published, and where the current item sits in it.
@@ -139,6 +146,10 @@ const DEFAULT_CLAIM_TIMEOUT_MINUTES = 0;
 // "Approvals" is gone: other users' wishlist requests now surface inside the Task Queue's
 // Review bucket alongside the candidates they produce, instead of a third, differently-named
 // queue (matches the iOS rebuild -- see CLAUDE-wip-requests-rework.md).
+// Writes the app makes on its own — playback reporting, the command channel, marking the tray
+// read — which must not flash "Working…" at someone who did not ask for anything.
+const BACKGROUND_WRITE_PATHS = ["/player/", "/me/plays", "/notifications/read", "/podcasts/episodes/"];
+
 const navItems = [
   ["Home", House],
   ["Library", Music],
@@ -344,6 +355,8 @@ function App() {
   // Both are REQUIRED in that body — leaving either out is a 422.
   const [remotePlaybackEnabled, setRemotePlaybackEnabled] = useState(true);
   const [claimTimeoutMinutes, setClaimTimeoutMinutes] = useState(DEFAULT_CLAIM_TIMEOUT_MINUTES);
+  // Smart shuffle inserts one suggested song after every N songs (1-20), per account.
+  const [smartShuffleEvery, setSmartShuffleEvery] = useState(4);
   // Device-local, like iOS — the EQ is a property of these speakers/headphones, not the account.
   const [equalizer, setEqualizer] = useState(readStoredEqualizer);
   const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
@@ -365,6 +378,7 @@ function App() {
   const appRootRef = useRef(null);
   const importUploadXhrRef = useRef(null); // in-flight import upload, so it can be canceled
   const unshuffledQueueRef = useRef(null); // snapshot of queue order before shuffle, to revert
+  const smartPlanTicketRef = useRef(0); // latest smart-shuffle plan request; older replies are dropped
   const currentSessionIdRef = useRef(null);
   const remoteExecRef = useRef(null);
   const lastLibraryPollRef = useRef(0); // throttle the heavy /library/tree poll (see interval below)
@@ -423,7 +437,7 @@ function App() {
   const [playerQueue, setPlayerQueue] = useState([]);
   const [currentTrack, setCurrentTrack] = useState(null);
   const [audioUrl, setAudioUrl] = useState("");
-  const [shuffle, setShuffle] = useState(false);
+  const [shuffle, setShuffle] = useState("off"); // off | on | smart
   const [repeat, setRepeat] = useState("off"); // off | all | one
   const [playerOpen, setPlayerOpen] = useState(false);
   // ⚠ Declared up here with the other player state, not beside its poll further down: `playerDocked`
@@ -483,6 +497,7 @@ function App() {
   const [queueOpen, setQueueOpen] = useState(false);
   const [appearanceReady, setAppearanceReady] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [pendingWrites, setPendingWrites] = useState(0);
   const [error, setError] = useState("");
   const syncToastTaskIds = useRef(new Set());
   const checkFileTaskIds = useRef(new Set());
@@ -540,6 +555,17 @@ function App() {
     if (track._streamPath) return null;
     return `${API_BASE}/library/tracks/${track.id}/lyrics?api_key=${encodeURIComponent(token)}`;
   }, [playerQueue, currentTrackIndex, token]);
+
+  // Smart shuffle: re-plan on every track change while the mode is on, and when repeat changes (with
+  // repeat off the server also extends a queue that is about to run out). Only a tab that is playing
+  // here gets a currentTrack, so this is the owner by construction. Entering the mode plans
+  // directly from setShuffleState; this covers every change after that (and a mode adopted from a
+  // claimed session).
+  useEffect(() => {
+    if (shuffle !== "smart" || !currentTrack) return;
+    planSmartShuffle();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentTrack, shuffle, repeat]);
 
   // Podcast resume: when an episode with a saved position becomes current, seek to it once the
   // audio is seekable (retrying until controlRef.seek succeeds after metadata loads).
@@ -694,6 +720,7 @@ function App() {
     setCrossfadeDuration(user.crossfade_duration);
     setRemotePlaybackEnabled(user.remote_playback_enabled);
     setClaimTimeoutMinutes(user.playback_claim_timeout_minutes);
+    setSmartShuffleEvery(user.smart_shuffle_every ?? 4);
     setAppearanceReady(true);
   }, [user?.id]);
 
@@ -705,7 +732,7 @@ function App() {
 
   useEffect(() => {
     if (!user?.id || !appearanceReady) return;
-    // ⚠️ `remote_playback_enabled` and `playback_claim_timeout_minutes` are REQUIRED by
+    // ⚠️ `remote_playback_enabled`, `playback_claim_timeout_minutes` and `smart_shuffle_every` are REQUIRED by
     // PUT /me/appearance — a body without them is a 422 — so every save carries the whole set.
     const appearance = {
       theme: dark ? "dark" : "light",
@@ -714,6 +741,7 @@ function App() {
       crossfade_duration: crossfadeDuration,
       remote_playback_enabled: remotePlaybackEnabled,
       playback_claim_timeout_minutes: claimTimeoutMinutes,
+      smart_shuffle_every: smartShuffleEvery,
     };
     if (
       user.theme === appearance.theme &&
@@ -721,7 +749,8 @@ function App() {
       user.background_tint === appearance.background_tint &&
       user.crossfade_duration === appearance.crossfade_duration &&
       user.remote_playback_enabled === appearance.remote_playback_enabled &&
-      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes
+      user.playback_claim_timeout_minutes === appearance.playback_claim_timeout_minutes &&
+      user.smart_shuffle_every === appearance.smart_shuffle_every
     ) {
       return;
     }
@@ -729,9 +758,9 @@ function App() {
     return () => window.clearTimeout(timeout);
   }, [
     user?.id, user?.theme, user?.accent_color, user?.background_tint, user?.crossfade_duration,
-    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes,
+    user?.remote_playback_enabled, user?.playback_claim_timeout_minutes, user?.smart_shuffle_every,
     appearanceReady, dark, accentColor, backgroundTint, crossfadeDuration,
-    remotePlaybackEnabled, claimTimeoutMinutes,
+    remotePlaybackEnabled, claimTimeoutMinutes, smartShuffleEvery,
   ]);
 
   useEffect(() => {
@@ -756,21 +785,32 @@ function App() {
     return () => { cancelled = true; if (intervalId !== null) clearInterval(intervalId); };
   }, [token, user?.id]);
 
+  // ⚠️ Every action shows "Working…" from the click until the server has answered. It is counted
+  // here, in the one function every request goes through, so no handler can forget it: a slow
+  // server used to make a click look ignored wherever a handler had no busy state of its own.
+  // Reads never count, and neither do the writes the app makes by itself (`BACKGROUND_WRITE_PATHS`).
   const api = useCallback(async (path, options = {}) => {
     const isFormData = options.body instanceof FormData;
-    const response = await fetch(`${API_BASE}${path}`, {
-      ...options,
-      headers: {
-        ...(isFormData ? {} : { "Content-Type": "application/json" }),
-        Authorization: `Bearer ${token}`,
-        ...(options.headers || {}),
-      },
-    });
-    if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
-      throw new Error(body.detail || `${response.status} ${response.statusText}`);
+    const method = (options.method || "GET").toUpperCase();
+    const showsWork = method !== "GET" && !BACKGROUND_WRITE_PATHS.some((prefix) => path.startsWith(prefix));
+    if (showsWork) setPendingWrites((count) => count + 1);
+    try {
+      const response = await fetch(`${API_BASE}${path}`, {
+        ...options,
+        headers: {
+          ...(isFormData ? {} : { "Content-Type": "application/json" }),
+          Authorization: `Bearer ${token}`,
+          ...(options.headers || {}),
+        },
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `${response.status} ${response.statusText}`);
+      }
+      return await response.json();
+    } finally {
+      if (showsWork) setPendingWrites((count) => count - 1);
     }
-    return response.json();
   }, [token]);
 
   async function login(username, password) {
@@ -812,40 +852,58 @@ function App() {
     try {
       const me = await api("/me");
       setUser(me);
-      const [permissionData, libraryTree, taskData, logData, notificationData, wishlistData, requestData, approvalData, playlistData, backupData] = await Promise.all([
-        api("/permissions"),
-        hasPermission(me, "library:view") ? api("/library/tree") : Promise.resolve([]),
-        hasPermission(me, "activity:read") ? api("/tasks") : Promise.resolve([]),
-        hasPermission(me, "activity:read") ? api("/logs") : Promise.resolve([]),
-        api("/notifications"),
-        hasPermission(me, "discover") ? api("/wishlist") : Promise.resolve([]),
+      // Independent fetches: each sets its own state as it lands, so a slow or failing request
+      // (a big /library/tree, /logs, /playlists) never holds up or discards the others. Only
+      // /me, /library/tree and /notifications gate the first paint.
+      const slice = (condition, path, apply) =>
+        (condition ? api(path) : Promise.resolve(null)).then((data) => {
+          if (data !== null) apply(data);
+        });
+      const firstPaint = [
+        slice(hasPermission(me, "library:view"), "/library/tree", (libraryTree) => {
+          setLibrary(libraryTree);
+          lastLibraryPollRef.current = Date.now(); // count this fetch toward the 60s poll throttle
+        }),
+        slice(true, "/notifications", (notificationData) => {
+          setNotifications((current) => mergeTrayNotifications(notificationData, current));
+        }),
+      ];
+      const rest = [
+        slice(true, "/permissions", setPermissionCatalog),
+        slice(hasPermission(me, "activity:read"), "/tasks", (taskData) => {
+          setTasks(taskData);
+          handleCompletedTaskEffects(taskData, { emit: false });
+        }),
+        slice(hasPermission(me, "activity:read"), "/logs", setAppLogs),
+        slice(hasPermission(me, "discover"), "/wishlist", setWishlist),
         // /requests is the requester's own progress feed AND the Task Queue's data source for a
         // wishlist:approve_all holder who lacks approvals:manage (GET /approvals is admin-only).
-        hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all") ? api("/requests") : Promise.resolve([]),
-        hasPermission(me, "approvals:manage") ? api("/approvals") : Promise.resolve([]),
-        hasPermission(me, "playlists:manage") ? api("/playlists") : Promise.resolve([]),
-        hasPermission(me, "tools:manage") ? api("/tools/backups") : Promise.resolve({ backups: [] }),
-      ]);
-      setPermissionCatalog(permissionData);
-      setLibrary(libraryTree);
-      lastLibraryPollRef.current = Date.now(); // count this fetch toward the 60s poll throttle
-      setTasks(taskData);
-      setAppLogs(logData);
-      handleCompletedTaskEffects(taskData, { emit: false });
-      setNotifications((current) => mergeTrayNotifications(notificationData, current));
-      setWishlist(wishlistData);
-      setRequests(requestData);
-      setApprovals(approvalData);
-      setPlaylists(playlistData);
-      setBackups(backupData.backups || []);
-      setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
-      setHomeVersion((v) => v + 1);
-      setRefreshVersion((v) => v + 1);
+        slice(hasPermission(me, "discover") || hasPermission(me, "wishlist:approve_all"), "/requests", setRequests),
+        slice(hasPermission(me, "approvals:manage"), "/approvals", setApprovals),
+        slice(hasPermission(me, "playlists:manage"), "/playlists", (playlistData) => {
+          setPlaylists(playlistData);
+          setFavoriteTrackIds(new Set(favoritePlaylistFrom(playlistData)?.track_ids || []));
+        }),
+        slice(hasPermission(me, "tools:manage"), "/tools/backups", (backupData) => setBackups(backupData.backups || [])),
+      ];
+      const settled = Promise.allSettled([...firstPaint, ...rest]).then((results) => {
+        const authFailure = results.find(
+          (result) =>
+            result.status === "rejected" &&
+            /Invalid API key|Missing API key/.test(result.reason?.message || ""),
+        );
+        if (authFailure) logout();
+        setHomeVersion((v) => v + 1);
+        setRefreshVersion((v) => v + 1);
+      });
+      await Promise.allSettled(firstPaint);
+      setLoading(false);
       if (canManageSettings(me)) {
         refreshIntegrationSettings();
       }
       if (canManageUsers(me)) refreshUsers();
       if (hasPermission(me, "activity:read")) refreshUserPlayback();
+      await settled;
     } catch (refreshError) {
       if (refreshError.message.includes("Invalid API key") || refreshError.message.includes("Missing API key")) {
         logout();
@@ -1224,6 +1282,94 @@ function App() {
     }
   }
 
+  // Where clicking a notification goes: the page its `target_url` names, never just "the app".
+  // ⚠️ The same vocabulary the iOS app reads (`AppNavigation.deepLink`), so the server writes one
+  // target and both clients land in the same place:
+  //   /task-queue?bucket=&batch=   /requests?batch=   /library/albums/<id>   /library/artists/<id>
+  //   /podcasts/<id>   /podcasts/<id>/episodes/<eid>
+  //   /playlists[/<id>|/shares]    /activity   /tools   /automations   /settings?section=
+  // A full http(s) URL (a broadcast's link) opens in a new tab. Anything this user cannot open,
+  // or that has no page here (/player, /notifications), leaves the tray as it is.
+  async function openNotification(notification) {
+    const target = (notification.target_url || "").trim();
+    if (/^https?:\/\//i.test(target)) {
+      window.open(target, "_blank", "noopener");
+      return;
+    }
+    const [path, queryString = ""] = target.split("?");
+    const segments = path.split("/").filter(Boolean);
+    const query = new URLSearchParams(queryString);
+    const go = (label) => {
+      if (!canViewPage(user, label)) return false;
+      setAlbumDetail(null);
+      setArtistDetail(null);
+      setPage(label);
+      setTrayOpen(false);
+      return true;
+    };
+    switch (segments[0]) {
+      case "task-queue": {
+        if (!go("Task Queue")) { go("Wishlist"); break; }
+        const bucket = query.get("bucket");
+        if (["review", "issues", "changes"].includes(bucket)) setQueueBucket(bucket);
+        break;
+      }
+      case "requests":
+      case "wishlist":
+        go("Wishlist");
+        break;
+      case "library": {
+        if (!go("Library")) break;
+        if (segments[1] === "artists" && segments[2]) {
+          try {
+            const data = await api(`/library/albums?artist_id=${encodeURIComponent(segments[2])}&page_size=1`);
+            openArtistDetail({ id: segments[2], name: data?.items?.[0]?.artist_name || "Artist" }, "Library");
+          } catch {
+            // The Library page is already showing; the artist just could not be opened.
+          }
+          break;
+        }
+        if (segments[1] !== "albums" || !segments[2]) break;
+        try {
+          const data = await api(`/library/tracks?album_id=${encodeURIComponent(segments[2])}&page_size=1`);
+          const track = data?.items?.[0];
+          if (track) openAlbumDetail({ id: segments[2], title: track.album_title, artist_name: track.artist_name }, "Library");
+        } catch {
+          // The Library page is already showing; the album just could not be opened.
+        }
+        break;
+      }
+      case "podcasts":
+        if (segments[1] && canViewPage(user, "Podcasts")) {
+          openPodcastDetail({ id: segments[1], episodeId: segments[2] === "episodes" ? segments[3] : null });
+          setTrayOpen(false);
+        } else {
+          go("Podcasts");
+        }
+        break;
+      case "playlists":
+        go("Playlists");
+        break;
+      case "activity":
+        go("Activity");
+        break;
+      case "tools":
+        go("Tools");
+        break;
+      case "automations":
+        go("Automations");
+        break;
+      case "settings":
+        go("Settings");
+        break;
+      case "import":
+        go("Import/Add");
+        break;
+      default:
+        break;
+    }
+  }
+
   async function openNotificationTray(event) {
     const nextOpen = !trayOpen;
     if (nextOpen && event?.currentTarget) {
@@ -1432,6 +1578,12 @@ function App() {
   async function searchDiscover(query) {
     return api(`/discover/search?q=${encodeURIComponent(query)}`);
   }
+
+  // `exclude` = every suggested album id shown since the page opened.
+  const fetchDiscoverSuggestions = useCallback(
+    (exclude) => api(`/discover/suggestions?limit=5&exclude=${encodeURIComponent((exclude || []).join(","))}`),
+    [api],
+  );
 
   async function fetchDiscoverAlbumTracks(albumId) {
     return api(`/discover/album-tracks/${encodeURIComponent(albumId)}`);
@@ -1730,7 +1882,7 @@ function App() {
   }
 
   function openPodcastDetail(podcast) {
-    setPodcastOpenRequest({ id: podcast.id, nonce: Date.now() });
+    setPodcastOpenRequest({ id: podcast.id, episodeId: podcast.episodeId || null, nonce: Date.now() });
     setPage("Podcasts");
   }
 
@@ -2185,14 +2337,14 @@ function App() {
     // command) wins, otherwise the current shuffle toggle decides. A shuffled
     // start reorders the new queue and remembers the original order so toggling
     // shuffle back off can revert it — identical to the in-place toggle path.
-    const wantShuffle = opts.shuffle != null ? Boolean(opts.shuffle) : shuffle;
+    const wantShuffle = opts.shuffle != null ? normalizeShuffle(opts.shuffle) : shuffle;
     // keepLead (default true): keep the first track playing first — correct when the
     // user clicked a specific song. Whole-collection plays (Shuffle all / play an
     // album/artist/playlist) pass keepLead:false so the entire list is shuffled and
     // each start picks a fresh random order, including a random first track.
     const keepLead = opts.keepLead !== false;
     let queue = playable;
-    if (wantShuffle && playable.length > 1) {
+    if (wantShuffle !== "off" && playable.length > 1) {
       unshuffledQueueRef.current = [...playable];
       const head = keepLead ? [playable[0]] : [];
       const rest = keepLead ? playable.slice(1) : [...playable];
@@ -2212,7 +2364,7 @@ function App() {
     // "play it there", not "start a second, silent player here" — the same reasoning
     // forwardQueueAddition already applies to Add to Queue / Play Next.
     if (!opts.localOnly && forwardPlayToRemote(queue, wantShuffle)) return;
-    if (opts.shuffle != null) setShuffle(Boolean(opts.shuffle));
+    if (opts.shuffle != null) setShuffle(wantShuffle);
     // A fresh play here makes this tab the account's player. ⚠ Not awaited: audio never waits for
     // the claim, and a claim that fails is retried by the next "playing" report.
     claimFreshSession(queue, 0, wantShuffle);
@@ -2397,7 +2549,7 @@ function App() {
         page += 1;
       }
       if (tracks.length === 0) { notify("Playback", "Your library has no tracks.", "ui_error"); return; }
-      await playTracks(tracks, { shuffle: shuffleAll, keepLead: false });
+      await playTracks(tracks, { shuffle: shuffleAll ? "on" : "off", keepLead: false });
     } catch (error) {
       notify("Playback failed", error.message, "ui_error");
     }
@@ -2494,7 +2646,7 @@ function App() {
       current_index: win.index,
       position_seconds: Math.max(0, positionSeconds || 0),
       playing,
-      shuffle: Boolean(shuffleOn),
+      shuffle: normalizeShuffle(shuffleOn),
       repeat: repeatMode,
     };
   }
@@ -2654,7 +2806,8 @@ function App() {
         /* whatever resolved already still plays */
       }
     }
-    return items.map((item) => {
+    const marked = (row, item) => (row && item.smart ? { ...row, _smart: true } : row);
+    return items.map((item) => marked(((item) => {
       const known = titles.get(item.id);
       if (item.type === "episode") {
         // Built from the ids alone: the stream is the server's relay, so no podcast lookup is needed.
@@ -2680,7 +2833,7 @@ function App() {
       if (fromLibrary) return fromLibrary;
       if (!known) return null;
       return { id: item.id, title: known.title, album_id: known.album_id || undefined, _artist: known.artist || "", _album: "" };
-    });
+    })(item), item));
   }
 
   /// Install a claimed session's queue and play it from where the session was.
@@ -2713,7 +2866,7 @@ function App() {
     // Already in playback order, and the pre-shuffle order was never shared, so there is nothing to
     // restore: set the flag without reshuffling.
     unshuffledQueueRef.current = null;
-    setShuffle(Boolean(data.shuffle));
+    setShuffle(normalizeShuffle(data.shuffle));
     setRepeat(["off", "one", "all"].includes(data.repeat) ? data.repeat : "off");
     setPlayerQueue(tracks);
     setPlayerOpen(true);
@@ -3047,7 +3200,12 @@ function App() {
       }
     }
 
-    return items.map((item) => byId.get(item.id)).filter(Boolean);
+    return items
+      .map((item) => {
+        const row = byId.get(item.id);
+        return row && item.smart ? { ...row, _smart: true } : row;
+      })
+      .filter(Boolean);
   }
 
   async function executeRemoteCommand(cmd) {
@@ -3061,7 +3219,7 @@ function App() {
     // Reconcile shuffle the same way the UI toggle does. For play/resume-with-target
     // the new queue is (re)built, so playTracks owns the shuffle decision; for every
     // other action we reorder the *existing* queue in place via setShuffleState.
-    if (cmd.shuffle != null && !isPlay) setShuffleState(Boolean(cmd.shuffle));
+    if (cmd.shuffle != null && !isPlay) setShuffleState(normalizeShuffle(cmd.shuffle));
     if (action === "pause") return ctl?.pause?.();
     if (action === "stop") return ctl?.stop?.();
     if (action === "next") return playNextTrack();
@@ -3097,7 +3255,7 @@ function App() {
       // localOnly: this session IS the target the command named — it must play locally, not
       // re-forward to whatever session refreshRemoteSessions happens to consider "active" right
       // now (which could even be this same command bouncing back).
-      return playTracks(tracks, { shuffle: cmd.shuffle != null ? Boolean(cmd.shuffle) : undefined, localOnly: true });
+      return playTracks(tracks, { shuffle: cmd.shuffle != null ? normalizeShuffle(cmd.shuffle) : undefined, localOnly: true });
     }
     return undefined;
   }
@@ -3205,6 +3363,7 @@ function App() {
           _albumId: item.album_id || null,
           _kind: item.type === "episode" ? "episode" : "track",
           _podcastId: item.podcast_id || null,
+          _smart: Boolean(item.smart),
           _remoteIndex: at,
         })));
         // Marked with the version it actually returned, which may already be newer than the key.
@@ -3419,7 +3578,7 @@ function App() {
             current_index: 0,
             position_seconds: 0,
             playing: false,
-            shuffle: false,
+            shuffle: "off",
             repeat: "off",
           },
         }),
@@ -3749,48 +3908,99 @@ function App() {
     return next;
   }
 
-  // Reconcile the queue to a desired shuffle state by reordering the queue itself
-  // (not by jumping to random entries). Shared by the UI toggle and remote
-  // commands so shuffle behaves identically regardless of client. Enabling
-  // snapshots the current order and shuffles only the upcoming tracks (the played
-  // ones + the current track stay put). Disabling restores the snapshot order with
-  // already-played tracks dropped.
-  function setShuffleState(desired) {
-    setShuffle((current) => {
-      if (current === desired) return current;
-      if (desired) {
-        setPlayerQueue((queue) => {
-          unshuffledQueueRef.current = [...queue];
-          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
-          const head = idx >= 0 ? queue.slice(0, idx + 1) : [];
-          const tail = idx >= 0 ? queue.slice(idx + 1) : [...queue];
-          for (let i = tail.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [tail[i], tail[j]] = [tail[j], tail[i]];
-          }
-          return [...head, ...tail];
-        });
-      } else {
-        setPlayerQueue((queue) => {
-          const snapshot = unshuffledQueueRef.current;
-          unshuffledQueueRef.current = null;
-          if (!snapshot) return queue;
-          const idx = queue.findIndex((track) => track.id === currentTrack?.id);
-          const playedIds = new Set(idx > 0 ? queue.slice(0, idx).map((track) => track.id) : []);
-          const snapshotIds = new Set(snapshot.map((track) => track.id));
-          // Original order minus what's already been played, then append anything
-          // queued during shuffle that wasn't in the snapshot (and isn't played).
-          const restored = snapshot.filter((track) => !playedIds.has(track.id));
-          const added = queue.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
-          return [...restored, ...added];
-        });
+  // Reconcile the queue to a desired shuffle MODE ("off" | "on" | "smart") by reordering the queue
+  // itself (not by jumping to random entries). Shared by the UI toggle and remote commands so
+  // shuffle behaves identically regardless of client. Turning shuffle on snapshots the current order
+  // and shuffles only the upcoming tracks (the played ones + the current track stay put). Turning it
+  // off restores the snapshot order with already-played tracks dropped. "smart" is "on" plus
+  // suggestion insertion: entering it from "on" keeps the shuffled order and plans; leaving it
+  // removes every smart item except the one playing.
+  function setShuffleState(desiredMode) {
+    const desired = normalizeShuffle(desiredMode);
+    const current = sessionLiveRef.current.shuffle;
+    if (current === desired) return;
+    const wasShuffled = current !== "off";
+    const queue = sessionLiveRef.current.playerQueue;
+    const playingIndex = sessionLiveRef.current.currentTrackIndex;
+    let next = queue;
+    if (desired !== "smart" && current === "smart") {
+      // Leaving smart: drop smart items, but never the one that is playing.
+      next = next.filter((track, i) => !track._smart || i === playingIndex);
+      if (unshuffledQueueRef.current) {
+        unshuffledQueueRef.current = unshuffledQueueRef.current.filter((track) => !track._smart);
       }
-      return desired;
-    });
+    }
+    if (desired !== "off" && !wasShuffled) {
+      unshuffledQueueRef.current = [...next];
+      const idx = next.findIndex((track) => track.id === currentTrack?.id);
+      const head = idx >= 0 ? next.slice(0, idx + 1) : [];
+      const tail = idx >= 0 ? next.slice(idx + 1) : [...next];
+      for (let i = tail.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [tail[i], tail[j]] = [tail[j], tail[i]];
+      }
+      next = [...head, ...tail];
+    } else if (desired === "off" && wasShuffled) {
+      const snapshot = unshuffledQueueRef.current;
+      unshuffledQueueRef.current = null;
+      if (snapshot) {
+        const idx = next.findIndex((track) => track.id === currentTrack?.id);
+        const playedIds = new Set(idx > 0 ? next.slice(0, idx).map((track) => track.id) : []);
+        const snapshotIds = new Set(snapshot.map((track) => track.id));
+        // Original order minus what's already been played, then append anything
+        // queued during shuffle that wasn't in the snapshot (and isn't played).
+        const restored = snapshot.filter((track) => !playedIds.has(track.id));
+        const added = next.filter((track) => !snapshotIds.has(track.id) && !playedIds.has(track.id));
+        next = [...restored, ...added];
+      }
+    }
+    if (next !== queue) setPlayerQueue(next);
+    sessionLiveRef.current = { ...sessionLiveRef.current, shuffle: desired, playerQueue: next };
+    setShuffle(desired);
+    // Entering smart plans from the effect on [currentTrack, shuffle], once the new queue has landed.
   }
 
+  // off -> on -> smart -> off
   function toggleShuffle() {
-    setShuffleState(!shuffle);
+    setShuffleState(shuffle === "off" ? "on" : shuffle === "on" ? "smart" : "off");
+  }
+
+  /// Ask the server where smart shuffle should add suggestions, and apply them to the local queue.
+  /// Only the device actually playing here does this (the claim holder, or a tab with remote playback
+  /// off); anyone else changes the mode with a `state` command. Failures are silent: smart shuffle
+  /// just inserts nothing this time. The server owns the spacing rule, so this only applies it.
+  async function planSmartShuffle({ queue = sessionLiveRef.current.playerQueue, mode = sessionLiveRef.current.shuffle } = {}) {
+    if (mode !== "smart" || !queue.length) return;
+    const ticket = ++smartPlanTicketRef.current;
+    const key = sessionQueueKeyOf(queue);
+    let anchor = currentTrack ? queue.indexOf(currentTrack) : -1;
+    if (anchor < 0 && currentTrack) anchor = queue.findIndex((track) => track.id === currentTrack.id);
+    if (anchor < 0) return;
+    try {
+      const reply = await api("/player/smart-shuffle/plan", {
+        method: "POST",
+        body: JSON.stringify({
+          items: queue.map((track) => ({ type: track?._kind === "episode" ? "episode" : "track", id: queueItemId(track), smart: track?._smart ? true : undefined })),
+          current_index: anchor,
+          repeat: sessionLiveRef.current.repeat || "off",
+        }),
+      });
+      const inserts = (reply?.inserts || []).slice().sort((a, b) => a.index - b.index);
+      if (!inserts.length || ticket !== smartPlanTicketRef.current) return;
+      setPlayerQueue((now) => {
+        // The queue moved while the plan was in flight: indexes no longer line up, so drop it. The
+        // next track change plans again.
+        if (sessionLiveRef.current.shuffle !== "smart" || sessionQueueKeyOf(now) !== key) return now;
+        const out = [...now];
+        for (let i = inserts.length - 1; i >= 0; i--) {
+          const { index, track } = inserts[i];
+          out.splice(Math.min(Math.max(index, 0), out.length), 0, suggestionToQueueTrack(track, token, { smart: true }));
+        }
+        return out;
+      });
+    } catch {
+      /* silent */
+    }
   }
 
   async function playNextTrack() {
@@ -3978,6 +4188,7 @@ function App() {
             <NotificationTray
               notifications={notifications}
               onClear={clearNotifications}
+              onOpen={openNotification}
               style={{ position: "fixed", top: trayAnchor.top, right: trayAnchor.right }}
             />,
             appRootRef.current
@@ -4102,7 +4313,7 @@ function App() {
           {!(playerOpen || displayedRemote) && (
             <div className="topbar-side topbar-side-right">{topbarUtilityActions}</div>
           )}
-          {loading && <div className="working-indicator" aria-live="polite">Working…</div>}
+          {(loading || pendingWrites > 0) && <div className="working-indicator" aria-live="polite">Working…</div>}
         </header>
 
         <div className={`content-grid${NO_INSPECTOR_PAGES.has(page) ? " no-inspector" : ""}`}>
@@ -4147,7 +4358,7 @@ function App() {
             <>
             <PanelHeader page={page} displayName={user?.display_name} />
             {page === "Home" && (
-              <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} />
+              <HomeView homeLayout={user?.home_layout_web?.rows} onSaveHomeLayout={saveHomeLayoutWeb} api={api} apiKey={token} onPlayAlbum={playAlbumFromHome} onPlayAlbumNext={playAlbumNext} onQueueAlbum={queueAlbumFromHome} onPlayPlaylist={playPlaylistFromHome} onOpenAlbum={(al) => openAlbumDetail(al, "Home")} onPlayArtist={playArtistFromHome} onPlayArtistNext={playArtistNext} pinnedAlbumIds={pinnedAlbumIds} onTogglePinAlbum={toggleAlbumPin} pinnedArtistIds={pinnedArtistIds} onTogglePinArtist={toggleArtistPin} pinnedPodcastIds={pinnedPodcastIds} onTogglePinPodcast={togglePodcastPin} onOpenPodcast={openPodcastDetail} homeVersion={homeVersion} onUnpinPlaylist={unpinPlaylist} onOpenArtist={(ar) => openArtistDetail(ar, "Home")} onQueueArtist={queueArtistFromHome} onPlayTracks={playTracks} onPlayNextTracks={playTracksNext} onQueueTracks={addTracksToPlayerQueue} onPlayAll={() => playAllLibrary(false)} onShuffleAll={() => playAllLibrary(true)} playlists={playlists} onAddToPlaylist={addTracksToPlaylist} canSearchLibrary={canViewPage(user, "Library")} canSearchPlaylists={canViewPage(user, "Playlists")} canSearchPodcasts={canViewPage(user, "Podcasts")} searchThreshold={user?.search_min_confidence ?? 0.4} onOpenPlaylists={() => setPage("Playlists")} />
             )}
             {page === "Library" && (
               <LibraryTree
@@ -4242,6 +4453,8 @@ function App() {
                 setRemotePlaybackEnabled={setRemotePlaybackEnabled}
                 claimTimeoutMinutes={claimTimeoutMinutes}
                 setClaimTimeoutMinutes={setClaimTimeoutMinutes}
+                smartShuffleEvery={smartShuffleEvery}
+                setSmartShuffleEvery={setSmartShuffleEvery}
                 equalizer={equalizer}
                 setEqualizer={setEqualizer}
                 onSaveSearchThreshold={saveSearchThreshold}
@@ -4276,8 +4489,10 @@ function App() {
                 onTabChange={setWishlistTab}
                 onSearch={searchDiscover}
                 onFetchTracks={fetchDiscoverAlbumTracks}
+                onSuggestions={fetchDiscoverSuggestions}
                 onQueue={queueDiscoverDownloads}
                 apiKey={token}
+                playbackControl={playbackControlRef}
                 onAdd={createWishlistItem}
                 onRemove={removeWishlistItem}
                 onRemoveMany={removeWishlistItems}
@@ -4305,6 +4520,8 @@ function App() {
                 onInspectorActionsChange={setPlaylistInspectorActions}
                 onRefresh={refreshPlaylists}
                 api={api}
+                apiKey={token}
+                playbackControl={playbackControlRef}
               />
             )}
             {page === "Users" && (
@@ -4363,6 +4580,7 @@ function App() {
             playlists={playlists}
             queueSelectionCount={queueSelection[queueBucket].size}
             tasks={tasks}
+            onCancelTask={cancelTask}
             downloadProgress={downloadProgressSummary(approvals)}
             importActions={{
               onScan: scanImportFolder,
@@ -4501,7 +4719,7 @@ function LoginScreen({ loading, error, onLogin }) {
   );
 }
 
-function NotificationTray({ notifications, onClear, style }) {
+function NotificationTray({ notifications, onClear, onOpen, style }) {
   return (
     <div className="notification-tray" style={style}>
       <div className="notification-header">
@@ -4520,6 +4738,7 @@ function NotificationTray({ notifications, onClear, style }) {
               tone={notificationSeverity(notification)}
               title={notification.title}
               body={notification.body}
+              onClick={() => onOpen(notification)}
             />
           ))
         )}
@@ -4528,9 +4747,9 @@ function NotificationTray({ notifications, onClear, style }) {
   );
 }
 
-function TrayItem({ title, body, tone = "normal" }) {
+function TrayItem({ title, body, tone = "normal", onClick }) {
   return (
-    <button className={`tray-item ${tone}`}>
+    <button className={`tray-item ${tone}`} onClick={onClick}>
       <span>{title}</span>
       <small>{body}</small>
     </button>
@@ -4550,7 +4769,7 @@ function PanelHeader({ page, displayName }) {
     <div className="panel-header">
       <div>
         <h1>{heading}</h1>
-        <p>{description ?? "Manage this section of Nudibranch."}</p>
+        {description && <p>{description}</p>}
       </div>
     </div>
   );
@@ -4623,6 +4842,7 @@ function formatDurationMs(ms) {
 function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refreshVersion, onInspectorActionsChange, pinnedPodcastIds, onTogglePinPodcast, initialPodcastRequest, onInitialPodcastConsumed }) {
   const [podcasts, setPodcasts] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
+  const [focusEpisodeId, setFocusEpisodeId] = useState(null);
   const [addOpen, setAddOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const selected = (podcasts || []).find((podcast) => podcast.id === selectedId) || null;
@@ -4637,6 +4857,7 @@ function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refres
   useEffect(() => {
     if (!initialPodcastRequest?.id) return;
     setSelectedId(initialPodcastRequest.id);
+    setFocusEpisodeId(initialPodcastRequest.episodeId || null);
     onInitialPodcastConsumed?.();
   }, [initialPodcastRequest?.nonce]);
 
@@ -4732,11 +4953,12 @@ function PodcastsView({ api, apiKey, notify, onPlay, onPlayNext, onQueue, refres
           notify={notify}
           onPlay={onPlay}
           onQueue={onQueue}
-          onBack={() => setSelectedId(null)}
+          onBack={() => { setSelectedId(null); setFocusEpisodeId(null); }}
           onChanged={loadPodcasts}
           onInspectorActionsChange={onInspectorActionsChange}
           pinned={pinnedPodcastIds?.has(selected.id)}
           onTogglePin={onTogglePinPodcast}
+          focusEpisodeId={focusEpisodeId}
         />
         {addOpen && <AddPodcastDialog api={api} submitting={submitting} onClose={() => !submitting && setAddOpen(false)} onSubscribe={subscribe} />}
       </>
@@ -4906,8 +5128,10 @@ function AddPodcastDialog({ api, submitting, onClose, onSubscribe }) {
   return host ? createPortal(dialog, host) : null;
 }
 
-function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, onQueue, onBack, onChanged, onInspectorActionsChange, pinned, onTogglePin }) {
+function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, onQueue, onBack, onChanged, onInspectorActionsChange, pinned, onTogglePin, focusEpisodeId }) {
   const [episodes, setEpisodes] = useState(null);
+  const [flashEpisodeId, setFlashEpisodeId] = useState(null);
+  const focusedRef = useRef(null);
   const [busyId, setBusyId] = useState(null);
   const [openMenu, menuElement] = useMenuHost();
 
@@ -4921,6 +5145,17 @@ function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, o
   }, [api, podcast.id]);
 
   useEffect(() => { loadEpisodes(); }, [loadEpisodes]);
+
+  // Opened from a notification or search on one episode: scroll to it and highlight it briefly.
+  useEffect(() => {
+    if (!focusEpisodeId || !episodes || focusedRef.current === focusEpisodeId) return;
+    if (!episodes.some((e) => e.id === focusEpisodeId)) return;
+    focusedRef.current = focusEpisodeId;
+    setFlashEpisodeId(focusEpisodeId);
+    requestAnimationFrame(() => document.getElementById(`podcast-episode-${focusEpisodeId}`)?.scrollIntoView({ block: "center", behavior: "smooth" }));
+    const t = setTimeout(() => setFlashEpisodeId(null), 2500);
+    return () => clearTimeout(t);
+  }, [focusEpisodeId, episodes]);
 
   const playable = useMemo(
     () => (episodes || []).map((e) => episodeToPlayable(e, podcast, apiKey)),
@@ -5060,7 +5295,7 @@ function PodcastDetailPage({ podcast, api, apiKey, notify, onPlay, onPlayNext, o
             const progress = episode.progress;
             const pct = progress && progress.duration_ms ? Math.min(100, Math.round((progress.position_ms / progress.duration_ms) * 100)) : 0;
             return (
-              <div key={episode.id} className="podcast-episode-row" onContextMenu={(event) => openMenu(event, episodeMenuItems(episode))}>
+              <div key={episode.id} id={`podcast-episode-${episode.id}`} className={`podcast-episode-row${flashEpisodeId === episode.id ? " flash" : ""}`} onContextMenu={(event) => openMenu(event, episodeMenuItems(episode))}>
                 <div className="podcast-episode-main">
                   <div className="podcast-episode-title">
                     {progress?.played && <CheckCircle size={14} className="podcast-played" />}
@@ -6659,7 +6894,7 @@ function ArtistAvatar({ artist }) {
 
 const DISCOVER_ALBUMS_INITIAL = 5;
 
-function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiKey }) {
+function DiscoverView({ user, onSearch, onFetchTracks, onSuggestions, onWishlist, onQueue, apiKey, playbackControl }) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState(null);
   const [searching, setSearching] = useState(false);
@@ -6670,6 +6905,54 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
   const [albumTracksLoading, setAlbumTracksLoading] = useState(() => new Set());
   const canWishlist = hasPermission(user, "discover");
   const canQueue = hasPermission(user, "discover");
+  // "Suggested Albums": albums the library does not have, shown while the search box is empty.
+  // Hidden offline or without `discover`; failures are silent (the section just stays hidden).
+  const [suggested, setSuggested] = useState([]);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  // Every album id shown since the page opened, so Refresh never repeats one.
+  const suggestedShownRef = useRef(new Set());
+
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  const loadSuggestions = useCallback(async () => {
+    if (!onSuggestions || !canWishlist) return;
+    setSuggestLoading(true);
+    try {
+      const data = await onSuggestions([...suggestedShownRef.current]);
+      const albums = data?.albums || [];
+      albums.forEach((album) => suggestedShownRef.current.add(album.id));
+      // An empty refresh keeps the current rows rather than blanking the section.
+      if (albums.length) setSuggested(albums);
+    } catch (_) {
+      /* silent */
+    } finally {
+      setSuggestLoading(false);
+    }
+  }, [onSuggestions, canWishlist]);
+
+  useEffect(() => { loadSuggestions(); }, [loadSuggestions]);
+
+  // Track previews share the playlist suggestions' preview player: one at a time, pausing the main
+  // player and resuming it afterwards. Ids are prefixed so they can never collide with library ids.
+  const [previewId, setPreviewId] = useState(suggestionPreview.trackId);
+  useEffect(() => {
+    const listener = (id) => setPreviewId(id);
+    suggestionPreview.listeners.add(listener);
+    return () => {
+      suggestionPreview.listeners.delete(listener);
+      if (suggestionPreview.trackId?.startsWith("discover:")) suggestionPreview.stop();
+    };
+  }, []);
 
   function artUrl(src) {
     // Discover art comes straight from iTunes as an external URL — no auth needed.
@@ -6736,6 +7019,98 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
     await onWishlist({ kind: "track", artist: album.artist, album: album.title, track: track.title, source: "discover" });
   }
 
+  function renderAlbum(album, depth) {
+    const tracks = albumTracksCache.get(album.id) ?? album.tracks ?? [];
+    const tracksLoading = albumTracksLoading.has(album.id);
+    return (
+      <div key={album.id}>
+        <div className="tree-action-row discover-tree-row">
+          <TreeRow
+            depth={depth}
+            icon={Folder}
+            open={openAlbums.has(album.id)}
+            title={album.title}
+            meta={[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}
+            onToggle={() => {
+              toggleSet(setOpenAlbums, album.id);
+              if (!openAlbums.has(album.id) && tracks.length === 0) loadAlbumTracks(album.id);
+            }}
+          />
+          {album.apple_music_url && (
+            <a
+              className="track-list-sub"
+              href={album.apple_music_url}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Apple Music
+            </a>
+          )}
+          <AlbumResultArt src={artUrl(album.cover_art_url)} />
+          {canWishlist && (
+            <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
+              <Heart size={15} />
+            </button>
+          )}
+          {canQueue && (
+            <button className="row-icon-button" onClick={async () => {
+              // Always fetch the full track list from the API — search results may
+              // contain only a subset of tracks, so never rely on the display cache.
+              let freshTracks = tracks;
+              if (onFetchTracks) {
+                const data = await onFetchTracks(album.id);
+                freshTracks = data.tracks || [];
+                setAlbumTracksCache((prev) => new Map([...prev, [album.id, freshTracks]]));
+              }
+              onQueue(albumRequests({ ...album, tracks: freshTracks }));
+            }} disabled={tracksLoading} title="Queue album">
+              <ListChecks size={15} />
+            </button>
+          )}
+        </div>
+        {openAlbums.has(album.id) && (
+          <>
+            {tracksLoading && (
+              <div className="tree-action-row discover-tree-row">
+                <TreeRow depth={depth + 1} icon={FileAudio} title="Loading tracks…" />
+              </div>
+            )}
+            {tracks.map((track, index) => (
+              <div className="tree-action-row discover-tree-row" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
+                <TreeRow depth={depth + 1} icon={FileAudio} title={`${trackNumberLabel(track)} ${track.title}`} meta={formatDuration(track.length || track.duration_ms)} />
+                {track.preview_url && (() => {
+                  const previewKey = `discover:${track.id || track.preview_url}`;
+                  const previewing = previewId === previewKey;
+                  return (
+                    <button
+                      type="button"
+                      className="row-icon-button"
+                      title={previewing ? "Stop preview" : "Preview"}
+                      aria-label={previewing ? "Stop preview" : "Preview"}
+                      onClick={() => (previewing ? suggestionPreview.stop() : suggestionPreview.startUrl(previewKey, track.preview_url, playbackControl?.current))}
+                    >
+                      {previewing ? <Pause size={15} /> : <Play size={15} />}
+                    </button>
+                  );
+                })()}
+                {canWishlist && (
+                  <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
+                    <Heart size={15} />
+                  </button>
+                )}
+                {canQueue && (
+                  <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks: [track] }))} title="Queue track">
+                    <ListChecks size={15} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div className="discover-view">
       <form className="discover-search" onSubmit={submit}>
@@ -6745,6 +7120,18 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
           {searching ? "Searching" : "Search"}
         </button>
       </form>
+      {online && canWishlist && !query.trim() && suggested.length > 0 && (
+        <div className="tree discover-tree discover-suggested">
+          <div className="tree-toolbar">
+            <strong>Suggested Albums</strong>
+            <button type="button" className="secondary compact" onClick={loadSuggestions} disabled={suggestLoading}>
+              <RefreshCw size={13} />
+              Refresh
+            </button>
+          </div>
+          {suggested.map((album) => renderAlbum(album, 0))}
+        </div>
+      )}
       {!results ? (
         <EmptyState title="Search MusicBrainz" body="Find an artist, album, or track, then add it to your wishlist or task queue." />
       ) : (results.artists || []).length === 0 ? (
@@ -6793,72 +7180,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
                 const visibleAlbums = showAll ? allAlbums : allAlbums.slice(0, DISCOVER_ALBUMS_INITIAL);
                 return (
                   <>
-                    {visibleAlbums.map((album) => {
-                      const tracks = albumTracksCache.get(album.id) ?? album.tracks ?? [];
-                      const tracksLoading = albumTracksLoading.has(album.id);
-                      return (
-                        <div key={album.id}>
-                          <div className="tree-action-row discover-tree-row">
-                            <TreeRow
-                              depth={1}
-                              icon={Folder}
-                              open={openAlbums.has(album.id)}
-                              title={album.title}
-                              meta={[album.date, album.track_count ? `${album.track_count} tracks` : null].filter(Boolean).join(" · ")}
-                              onToggle={() => {
-                                toggleSet(setOpenAlbums, album.id);
-                                if (!openAlbums.has(album.id) && tracks.length === 0) loadAlbumTracks(album.id);
-                              }}
-                            />
-                            <AlbumResultArt src={artUrl(album.cover_art_url)} />
-                            {canWishlist && (
-                              <button className="row-icon-button" onClick={() => addAlbumWishlist(album)} title="Add album to wishlist">
-                                <Heart size={15} />
-                              </button>
-                            )}
-                            {canQueue && (
-                              <button className="row-icon-button" onClick={async () => {
-                                // Always fetch the full track list from the API — search results may
-                                // contain only a subset of tracks, so never rely on the display cache.
-                                let freshTracks = tracks;
-                                if (onFetchTracks) {
-                                  const data = await onFetchTracks(album.id);
-                                  freshTracks = data.tracks || [];
-                                  setAlbumTracksCache((prev) => new Map([...prev, [album.id, freshTracks]]));
-                                }
-                                onQueue(albumRequests({ ...album, tracks: freshTracks }));
-                              }} disabled={tracksLoading} title="Queue album">
-                                <ListChecks size={15} />
-                              </button>
-                            )}
-                          </div>
-                          {openAlbums.has(album.id) && (
-                            <>
-                              {tracksLoading && (
-                                <div className="tree-action-row discover-tree-row">
-                                  <TreeRow depth={2} icon={FileAudio} title="Loading tracks…" />
-                                </div>
-                              )}
-                              {tracks.map((track, index) => (
-                                <div className="tree-action-row discover-tree-row" key={`${track.disc_number || 1}:${track.track_number || index}:${track.title}`}>
-                                  <TreeRow depth={2} icon={FileAudio} title={`${trackNumberLabel(track)} ${track.title}`} meta={formatDuration(track.length || track.duration_ms)} />
-                                  {canWishlist && (
-                                    <button className="row-icon-button" onClick={() => addTrackWishlist(album, track)} title="Add track to wishlist">
-                                      <Heart size={15} />
-                                    </button>
-                                  )}
-                                  {canQueue && (
-                                    <button className="row-icon-button" onClick={() => onQueue(albumRequests({ ...album, tracks: [track] }))} title="Queue track">
-                                      <ListChecks size={15} />
-                                    </button>
-                                  )}
-                                </div>
-                              ))}
-                            </>
-                          )}
-                        </div>
-                      );
-                    })}
+                    {visibleAlbums.map((album) => renderAlbum(album, 1))}
                     {!showAll && allAlbums.length > DISCOVER_ALBUMS_INITIAL && (
                       <div className="tree-action-row discover-tree-row">
                         <button
@@ -6890,7 +7212,7 @@ function DiscoverView({ user, onSearch, onFetchTracks, onWishlist, onQueue, apiK
 // what you already requested. (`[hidden]` needs a `display: none !important` rule in styles.css
 // to beat the panels' own display values.)
 function WishlistWorkspace({
-  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onQueue, apiKey,
+  user, wishlist, wishlistQueue, tab, onTabChange, onSearch, onFetchTracks, onSuggestions, onQueue, apiKey, playbackControl,
   onAdd, onRemove, onRemoveMany, onCancel, onRequestAgain, onSearchAlbums, onLookupAlbum, onInspectorActionsChange,
   onApproveQueue, onRejectQueue,
 }) {
@@ -6940,9 +7262,11 @@ function WishlistWorkspace({
           user={user}
           onSearch={onSearch}
           onFetchTracks={onFetchTracks}
+          onSuggestions={onSuggestions}
           onWishlist={onAdd}
           onQueue={onQueue}
           apiKey={apiKey}
+          playbackControl={playbackControl}
         />
       </div>
       <div className="workspace-tabpanel" hidden={tab !== "requests"}>
@@ -7270,7 +7594,7 @@ function WishlistQueueView({ items, onApprove, onReject }) {
   );
 }
 
-function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onPlayNext, onQueue, onQueuePosition, onInspectorActionsChange, onRefresh, api }) {
+function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, onRename, onDelete, onPlay, onPlayNext, onQueue, onQueuePosition, onInspectorActionsChange, onRefresh, api, apiKey, playbackControl }) {
   const [pinnedIds, setPinnedIds] = useState(() => new Set());
   useEffect(() => {
     let active = true;
@@ -7485,9 +7809,187 @@ function PlaylistsView({ playlists, library, onCreatePlaylist, onAddToPlaylist, 
                   ))}
                 </div>
               ))}
+            {openPlaylists.has(playlist.name) && (
+              <PlaylistSuggestions
+                key={playlist.id}
+                playlist={playlist}
+                api={api}
+                apiKey={apiKey}
+                playbackControl={playbackControl}
+                onAddToPlaylist={onAddToPlaylist}
+              />
+            )}
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/* One preview at a time, in a player of its own: never the main player, the queue or /player/status.
+   Starting a preview pauses the main player if it was playing and resuming it is this object's job
+   when the preview stops, finishes or its page goes away. */
+const suggestionPreview = {
+  audio: null,
+  trackId: null,
+  resumeMain: false,
+  control: null,
+  listeners: new Set(),
+  notify() {
+    this.listeners.forEach((listener) => listener(this.trackId));
+  },
+  start(trackId, apiKey, control) {
+    if (!apiKey) return;
+    this.startUrl(trackId, `${API_BASE}/library/tracks/${encodeURIComponent(trackId)}/stream?api_key=${encodeURIComponent(apiKey)}`, control);
+  },
+  // `src` is any playable URL — a library stream above, or an iTunes 30 s clip on Discover.
+  startUrl(trackId, src, control) {
+    if (!this.audio) {
+      this.audio = new Audio();
+      this.audio.addEventListener("ended", () => this.stop());
+      this.audio.addEventListener("error", () => this.stop());
+    }
+    this.control = control || this.control;
+    if (this.trackId == null && this.control?.isPlaying?.()) {
+      this.control.pause();
+      this.resumeMain = true;
+    }
+    this.audio.src = src;
+    this.trackId = trackId;
+    this.notify();
+    this.audio.play().catch(() => this.stop());
+  },
+  stop() {
+    if (this.audio) {
+      this.audio.pause();
+      this.audio.removeAttribute("src");
+      this.audio.load();
+    }
+    const resume = this.resumeMain;
+    this.resumeMain = false;
+    this.trackId = null;
+    this.notify();
+    if (resume) this.control?.resume?.();
+  },
+};
+
+/* "Suggested" at the bottom of an open playlist: five library tracks that sound like it, each with a
+   preview and an Add. Failures are silent — the section simply shows nothing. */
+function PlaylistSuggestions({ playlist, api, apiKey, playbackControl, onAddToPlaylist }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [everShown, setEverShown] = useState(false);
+  const [added, setAdded] = useState(() => new Set());
+  const [previewId, setPreviewId] = useState(suggestionPreview.trackId);
+  const [online, setOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  // Every id shown since the page opened, so Refresh never repeats one.
+  const shownRef = useRef(new Set());
+  const ownedRef = useRef(new Set());
+
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
+  useEffect(() => {
+    const listener = (id) => setPreviewId(id);
+    suggestionPreview.listeners.add(listener);
+    const owned = ownedRef.current;
+    return () => {
+      suggestionPreview.listeners.delete(listener);
+      if (suggestionPreview.trackId && owned.has(suggestionPreview.trackId)) suggestionPreview.stop();
+    };
+  }, []);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api("/library/suggestions", {
+        method: "POST",
+        body: JSON.stringify({ playlist_id: playlist.id, exclude_track_ids: [...shownRef.current], limit: 5 }),
+      });
+      const tracks = data?.tracks || [];
+      tracks.forEach((track) => { shownRef.current.add(track.id); ownedRef.current.add(track.id); });
+      if (suggestionPreview.trackId && !tracks.some((track) => track.id === suggestionPreview.trackId) && ownedRef.current.has(suggestionPreview.trackId)) {
+        suggestionPreview.stop();
+      }
+      setRows(tracks);
+      setAdded(new Set());
+      if (tracks.length) setEverShown(true);
+    } catch {
+      /* silent */
+    } finally {
+      setLoading(false);
+    }
+  }, [api, playlist.id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  async function add(track) {
+    try {
+      await onAddToPlaylist(playlist.id, [track.id]);
+      setAdded((current) => new Set(current).add(track.id));
+    } catch {
+      /* reported by onAddToPlaylist */
+    }
+  }
+
+  if (!online || (!everShown && rows.length === 0)) return null;
+  return (
+    <div className="playlist-suggestions">
+      <div className="tree-toolbar">
+        <strong>Suggested</strong>
+        <button type="button" className="secondary compact" onClick={load} disabled={loading}>
+          <RefreshCw size={13} />
+          Refresh
+        </button>
+      </div>
+      <div className="playlist-track-tree">
+        {rows.map((track) => {
+          const previewing = previewId === track.id;
+          const isAdded = added.has(track.id);
+          return (
+            <div className="tree-action-row library-row-actions" key={track.id}>
+              <div className="track-list-row suggestion-row">
+                <img
+                  className="suggestion-cover"
+                  src={`${API_BASE}/library/albums/${encodeURIComponent(track.album_id)}/cover?api_key=${encodeURIComponent(apiKey || "")}`}
+                  alt=""
+                  loading="lazy"
+                  onError={(event) => { event.currentTarget.style.visibility = "hidden"; }}
+                />
+                <span className="track-list-title">{track.title}</span>
+                <span className="track-list-sub">{track.artist_name}</span>
+              </div>
+              <button
+                type="button"
+                className="icon-button"
+                title={previewing ? "Stop preview" : "Preview"}
+                aria-label={previewing ? "Stop preview" : "Preview"}
+                onClick={() => (previewing ? suggestionPreview.stop() : suggestionPreview.start(track.id, apiKey, playbackControl?.current))}
+              >
+                {previewing ? <Pause size={15} /> : <Play size={15} />}
+              </button>
+              <button
+                type="button"
+                className="icon-button"
+                title={isAdded ? "Added" : "Add to playlist"}
+                aria-label={isAdded ? "Added" : "Add to playlist"}
+                disabled={isAdded}
+                onClick={() => add(track)}
+              >
+                {isAdded ? <Check size={15} /> : <Plus size={15} />}
+              </button>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -8593,6 +9095,24 @@ function albumCoverUrl(album, apiKey) {
   return `${API_BASE}/library/albums/${album.id}/cover?api_key=${encodeURIComponent(apiKey)}${coverCacheBust ? `&_cb=${coverCacheBust}` : ""}`;
 }
 
+/// A `/library/tracks`-shaped row (as `/library/suggestions` and the smart-shuffle plan return) as a
+/// playable queue entry. The cover is left to `playerCoverUrl`'s album_id fallback.
+function suggestionToQueueTrack(row, apiKey, { smart = false } = {}) {
+  return {
+    id: row.id,
+    title: row.title,
+    album_id: row.album_id,
+    track_number: row.track_number,
+    disc_number: row.disc_number,
+    duration_ms: row.duration_ms,
+    format: row.format,
+    _artist: row.artist_name || "",
+    _album: row.album_title || "",
+    _coverUrl: "",
+    ...(smart ? { _smart: true } : {}),
+  };
+}
+
 function playerCoverUrl(track, apiKey) {
   const c = track?._coverUrl || "";
   if (/^(https?:|data:|blob:)/i.test(c) || c.startsWith(`${API_BASE}/`)) return c;
@@ -8927,7 +9447,7 @@ function TasksView({ tasks, playback, onCancel }) {
                 <small>{taskSummary(task)}</small>
                 <TaskProgress task={task} />
               </button>
-              {["queued", "running"].includes(task.status) && (
+              {taskCancelable(task) && (
                 <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
                   <X size={14} />
                   Cancel
@@ -8944,7 +9464,7 @@ function TasksView({ tasks, playback, onCancel }) {
   );
 }
 
-function ActiveWorkBar({ tasks }) {
+function ActiveWorkBar({ tasks, onCancel }) {
   // One row per kind of work: several "Processing task queue" rows said the same thing over and
   // over. The one furthest along (running, with progress) speaks for the rest.
   const byName = new Map();
@@ -8965,9 +9485,15 @@ function ActiveWorkBar({ tasks }) {
             <strong>{taskDisplayName(task)}</strong>
             <InlineProgress
               value={progress?.percent || 0}
-              label={progress?.message || task.status}
+              label={progress ? progressLabel(progress) : task.status}
               indeterminate={!progress}
             />
+            {onCancel && task.status === "running" && progress?.cancelable && (
+              <button className="secondary compact task-cancel" onClick={() => onCancel(task.id)}>
+                <X size={14} />
+                Cancel
+              </button>
+            )}
           </div>
         );
       })}
@@ -8978,7 +9504,7 @@ function ActiveWorkBar({ tasks }) {
 function TaskProgress({ task }) {
   const progress = taskProgress(task);
   if (!progress) return null;
-  return <InlineProgress value={progress.percent} label={progress.message} />;
+  return <InlineProgress value={progress.percent} label={progressLabel(progress)} />;
 }
 
 function taskDisplayName(task) {
@@ -9182,7 +9708,8 @@ function actionSummary(automation) {
   }
   if (action_type === "play") {
     const parts = [`Play ${action_config?.target_type || "?"} "${action_config?.target_query || ""}"`];
-    if (action_config?.shuffle) parts.push("shuffle");
+    if (action_config?.shuffle === "on") parts.push("shuffle");
+    if (action_config?.shuffle === "smart") parts.push("smart shuffle");
     if (action_config?.loop && action_config.loop !== "off") parts.push(`loop ${action_config.loop}`);
     return parts.join(", ");
   }
@@ -9218,7 +9745,7 @@ function AutomationsView({ api, notify }) {
   const [playTargetQuery, setPlayTargetQuery] = useState(""); // display label of the selected item
   const [playTargetId, setPlayTargetId] = useState(""); // definitive selection
   const [playLoop, setPlayLoop] = useState("off");
-  const [playShuffle, setPlayShuffle] = useState(false);
+  const [playShuffle, setPlayShuffle] = useState("off");
   const [mediaControl, setMediaControl] = useState("pause");
   const [deviceId, setDeviceId] = useState(""); // "" = any device (broadcast)
   const [sessions, setSessions] = useState([]);
@@ -9274,7 +9801,7 @@ function AutomationsView({ api, notify }) {
     setPlayTargetQuery("");
     setPlayTargetId("");
     setPlayLoop("off");
-    setPlayShuffle(false);
+    setPlayShuffle("off");
     setMediaControl("pause");
     setDeviceId("");
     setTargetSearch("");
@@ -9326,7 +9853,7 @@ function AutomationsView({ api, notify }) {
       setPlayTargetQuery(ac.target_query || "");
       setPlayTargetId(ac.target_id || "");
       setPlayLoop(ac.loop || "off");
-      setPlayShuffle(ac.shuffle || false);
+      setPlayShuffle(normalizeShuffle(ac.shuffle));
     } else if (a.action_type === "media_control") {
       setMediaControl(ac.control || "pause");
     }
@@ -9655,9 +10182,13 @@ function AutomationsView({ api, notify }) {
                         <option value="all">Repeat all</option>
                       </select>
                     </label>
-                    <label className="automation-field automation-field-inline">
+                    <label className="automation-field">
                       <span>Shuffle</span>
-                      <input type="checkbox" checked={playShuffle} onChange={(e) => setPlayShuffle(e.target.checked)} />
+                      <select value={playShuffle} onChange={(e) => setPlayShuffle(e.target.value)}>
+                        <option value="off">Off</option>
+                        <option value="on">Shuffle</option>
+                        <option value="smart">Smart shuffle</option>
+                      </select>
                     </label>
                     <label className="automation-field">
                       <span>Device</span>
@@ -10176,7 +10707,7 @@ function Placeholder({ page }) {
     <div className="placeholder">
       <Shield size={28} />
       <h2>{page}</h2>
-      <p>{pageDescriptions[page] ?? "Manage this section of Nudibranch."}</p>
+      {pageDescriptions[page] && <p>{pageDescriptions[page]}</p>}
     </div>
   );
 }
@@ -10564,7 +11095,6 @@ function EqualizerSettings({ equalizer, setEqualizer }) {
           <label className="setting-row">
             <span>
               Enable equalizer
-              <small>Ten-band EQ applied to playback on this device.</small>
             </span>
             <input
               type="checkbox"
@@ -10688,6 +11218,8 @@ function SettingsPanel({
   setRemotePlaybackEnabled,
   claimTimeoutMinutes,
   setClaimTimeoutMinutes,
+  smartShuffleEvery,
+  setSmartShuffleEvery,
   equalizer,
   setEqualizer,
   onSaveSearchThreshold,
@@ -10727,7 +11259,6 @@ function SettingsPanel({
         <label className="setting-row">
           <span>
             Theme
-            <small>Switch between light and dark interface colors.</small>
           </span>
           <button className="secondary compact" onClick={() => setDark((value) => !value)}>
             {dark ? <Sun size={15} /> : <Moon size={15} />}
@@ -10737,21 +11268,19 @@ function SettingsPanel({
         <label className="setting-row">
           <span>
             Accent color
-            <small>Interactive highlights and hover states.</small>
           </span>
           <input type="color" value={accentColor} onChange={(event) => setAccentColor(event.target.value)} />
         </label>
         <label className="setting-row">
           <span>
             Background tint
-            <small>Mixed into the grey interface in light and dark mode.</small>
           </span>
           <input type="color" value={backgroundTint} onChange={(event) => setBackgroundTint(event.target.value)} />
         </label>
         <label className="setting-row crossfade-row">
           <span>
             Crossfade
-            <small>Fade between tracks. {crossfadeDuration === 0 ? "Off" : `${crossfadeDuration.toFixed(1)}s`}</small>
+            <small>{crossfadeDuration === 0 ? "Off" : `${crossfadeDuration.toFixed(1)}s`}</small>
           </span>
           <input
             className="crossfade-slider"
@@ -10767,7 +11296,7 @@ function SettingsPanel({
         <label className="setting-row crossfade-row">
           <span>
             Min match
-            <small>Library search confidence threshold. {Math.round(searchThreshold * 100)}%</small>
+            <small>Library search only. Lower finds looser matches; higher only close ones. {Math.round(searchThreshold * 100)}%</small>
           </span>
           <input
             className="crossfade-slider"
@@ -10792,6 +11321,24 @@ function SettingsPanel({
           <button className="secondary compact" onClick={() => setRemotePlaybackEnabled((value) => !value)}>
             {remotePlaybackEnabled ? "On" : "Off"}
           </button>
+        </label>
+        <label className="setting-row">
+          <span>
+            Smart Shuffle
+            <small>Add one suggested song after every {smartShuffleEvery} song{smartShuffleEvery === 1 ? "" : "s"}.</small>
+          </span>
+          <input
+            type="number"
+            min="1"
+            max="20"
+            step="1"
+            value={smartShuffleEvery}
+            onChange={(event) => {
+              const every = Math.round(Number(event.target.value));
+              if (!Number.isFinite(every)) return;
+              setSmartShuffleEvery(Math.max(1, Math.min(20, every)));
+            }}
+          />
         </label>
         <label className="setting-row">
           <span>
@@ -11074,8 +11621,7 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
       {advancedOpen && (
         <>
           <p className="settings-hint">
-            How Soulseek results are scored and ranked. Higher recall surfaces more candidates for review; everything still goes through the
-            approval queue before downloading. Leave at defaults unless you know what you're tuning.
+            How Soulseek results are scored and ranked. Leave at defaults unless you know what you're doing.
           </p>
           {schema.map((field) => (
             <label className="setting-row integration-row" key={field.name} title={field.help}>
@@ -11160,7 +11706,7 @@ function SlskdReachabilitySettings({ api, notify }) {
           Listen port check
           <small>
             {state?.public_address && state?.port ? `${state.public_address}:${state.port} — ` : ""}
-            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Confirms slskd's own port forward is reachable, end to end."}
+            {state?.checked_at ? `Checked ${fmtTimeAgo(state.checked_at)}` : "Checks slskd's port forward is reachable."}
           </small>
         </span>
         <button className="secondary compact" onClick={checkNow} disabled={checking}>
@@ -11801,7 +12347,7 @@ function resolveHomeOrder(stored) {
   return [...saved, ...HOME_ROW_IDS.filter((id) => !seen.has(id))];
 }
 
-function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onPlayArtistNext, onOpenArtist, onQueueArtist, onPlayTracks, onPlayNextTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, pinnedPodcastIds, onTogglePinPodcast, onOpenPodcast, homeVersion, onUnpinPlaylist, onPlayAll, onShuffleAll, homeLayout, onSaveHomeLayout, playlists, onAddToPlaylist }) {
+function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onPlayPlaylist, onOpenAlbum, onPlayArtist, onPlayArtistNext, onOpenArtist, onQueueArtist, onPlayTracks, onPlayNextTracks, onQueueTracks, pinnedAlbumIds, onTogglePinAlbum, pinnedArtistIds, onTogglePinArtist, pinnedPodcastIds, onTogglePinPodcast, onOpenPodcast, homeVersion, onUnpinPlaylist, onPlayAll, onShuffleAll, homeLayout, onSaveHomeLayout, playlists, onAddToPlaylist, canSearchLibrary, canSearchPlaylists, canSearchPodcasts, searchThreshold, onOpenPlaylists }) {
   // On demand only — a Home row of pinned albums must not fetch a track list per card.
   const albumTrackRows = useCallback(async (album) => {
     const data = await api(`/library/tracks?album_id=${encodeURIComponent(album.id)}&page_size=500`);
@@ -11819,6 +12365,49 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   const [home, setHome] = useState(null);
   const [openMenu, menuElement] = useMenuHost();
   const [order, setOrder] = useState(() => resolveHomeOrder(homeLayout));
+
+  // Global search. Library kinds come from /library/search (one query per kind so a busy kind
+  // cannot crowd out another), playlists match by name over the list the app already holds, and
+  // podcasts/episodes over an index fetched once, the first time search is used.
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchHits, setSearchHits] = useState(null); // null = not searching, or still waiting
+  const [podcastIndex, setPodcastIndex] = useState(null);
+  const podcastIndexRequested = useRef(false);
+  const searchTerm = searchQuery.trim();
+  useEffect(() => {
+    if (!searchTerm) { setSearchHits(null); return; }
+    let active = true;
+    const t = setTimeout(async () => {
+      const kinds = canSearchLibrary ? ["artist", "album", "track"] : [];
+      const lists = await Promise.all(kinds.map(async (kind) => {
+        try {
+          const data = await api(`/library/search?q=${encodeURIComponent(searchTerm)}&types=${kind}&min_confidence=${searchThreshold}&limit=8`);
+          return data?.results || [];
+        } catch { return []; }
+      }));
+      if (active) setSearchHits({ term: searchTerm, library: lists.flat() });
+    }, 250);
+    return () => { active = false; clearTimeout(t); };
+  }, [searchTerm, api, canSearchLibrary, searchThreshold]);
+  useEffect(() => {
+    if (!searchTerm || !canSearchPodcasts || podcastIndexRequested.current) return;
+    podcastIndexRequested.current = true;
+    (async () => {
+      try {
+        const shows = await api("/podcasts");
+        const perShow = await Promise.all((shows || []).map(async (show) => {
+          try {
+            const data = await api(`/podcasts/${encodeURIComponent(show.id)}/episodes?page=1&page_size=200`);
+            return (data?.items || []).map((episode) => ({ episode, podcast: show }));
+          } catch { return []; }
+        }));
+        setPodcastIndex({ shows: shows || [], episodes: perShow.flat() });
+      } catch {
+        setPodcastIndex({ shows: [], episodes: [] });
+      }
+    })();
+  }, [searchTerm, canSearchPodcasts, api]);
+
   const [dragId, setDragId] = useState(null);
   const [dropId, setDropId] = useState(null);
   // Re-resolve when the saved layout arrives (Home can render before /me settles) or changes.
@@ -11856,6 +12445,67 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   if (!home) return <div className="home-view"><p className="muted">Loading…</p></div>;
 
   const fmt = (iso) => (iso ? new Date(iso).toLocaleDateString() : "");
+
+  const searchBar = (
+    <form className="discover-search library-search-bar" onSubmit={(e) => e.preventDefault()}>
+      <Search size={17} />
+      <input
+        type="text"
+        placeholder="Search your library…"
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+      />
+      {searchQuery ? (
+        <button type="button" className="secondary compact" onClick={() => setSearchQuery("")} title="Clear search">
+          ✕
+        </button>
+      ) : (
+        <span />
+      )}
+    </form>
+  );
+
+  function renderSearchResults() {
+    const needle = searchTerm.toLowerCase();
+    const hits = searchHits && searchHits.term === searchTerm ? searchHits.library : null;
+    const matches = (text) => (text || "").toLowerCase().includes(needle);
+    const playlistHits = canSearchPlaylists
+      ? [
+          ...(matches("favorites") ? [{ id: "favorites", name: "Favorites" }] : []),
+          ...(playlists || []).filter((pl) => pl.id !== "favorites" && matches(pl.name)),
+        ].slice(0, 8)
+      : [];
+    const showHits = podcastIndex ? podcastIndex.shows.filter((show) => matches(show.title)).slice(0, 8) : [];
+    const episodeHits = podcastIndex ? podcastIndex.episodes.filter(({ episode }) => matches(episode.title)).slice(0, 8) : [];
+    const groups = [
+      { label: "Artists", rows: (hits || []).filter((x) => x.kind === "artist").map((x) => ({ key: `artist:${x.id}`, name: x.name, open: () => onOpenArtist?.({ id: x.id, name: x.name }) })) },
+      { label: "Albums", rows: (hits || []).filter((x) => x.kind === "album").map((x) => ({ key: `album:${x.id}`, name: x.name, open: () => onOpenAlbum?.({ id: x.id, title: x.name }) })) },
+      { label: "Songs", rows: (hits || []).filter((x) => x.kind === "track").map((x) => ({ key: `track:${x.id}`, name: x.name, open: () => onPlayTracks?.([{ id: x.id, title: x.name }]) })) },
+      { label: "Playlists", rows: playlistHits.map((pl) => ({ key: `playlist:${pl.id}`, name: pl.name, open: () => (onOpenPlaylists ? onOpenPlaylists() : onPlayPlaylist(pl.id)) })) },
+      { label: "Podcasts", rows: showHits.map((show) => ({ key: `podcast:${show.id}`, name: show.title, open: () => onOpenPodcast?.(show) })) },
+      { label: "Episodes", rows: episodeHits.map(({ episode, podcast }) => ({ key: `episode:${episode.id}`, name: episode.title, sub: podcast.title, open: () => onOpenPodcast?.({ id: podcast.id, episodeId: episode.id }) })) },
+    ].filter((group) => group.rows.length > 0);
+    const waiting = hits === null || (canSearchPodcasts && !podcastIndex);
+    return (
+      <div className="tree library-search-results">
+        {groups.length === 0 ? (
+          waiting ? null : <div className="tree-empty-message">No matches</div>
+        ) : (
+          groups.map((group) => (
+            <div key={group.label} className="library-search-group">
+              <div className="library-search-group-label">{group.label}</div>
+              {group.rows.map((row) => (
+                <button key={row.key} type="button" className="library-search-result-row" onClick={row.open}>
+                  <span className="library-search-result-name">{row.name}</span>
+                  {row.sub && <small className="library-search-result-confidence muted">{row.sub}</small>}
+                </button>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    );
+  }
 
   async function playPinnedPodcast(podcast) {
     const data = await api(`/podcasts/${encodeURIComponent(podcast.id)}/episodes?page=1&page_size=500`);
@@ -11997,11 +12647,12 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
                   resolve: () => [{ id: p.track_id }],
                 })) : undefined}
               >
+                {/* Tapping the card opens the album; only the Play control (and the context menu) plays. */}
                 <div
-                  className={`home-list-text${p.track_id && onPlayTracks ? " home-list-text-play" : ""}`}
-                  onClick={p.track_id && onPlayTracks ? () => onPlayTracks([recentToTrack(p)]) : undefined}
-                  role={p.track_id && onPlayTracks ? "button" : undefined}
-                  title={p.track_id && onPlayTracks ? "Play" : undefined}
+                  className={`home-list-text${p.album_id && onOpenAlbum ? " home-list-text-play" : ""}`}
+                  onClick={p.album_id && onOpenAlbum ? () => onOpenAlbum({ id: p.album_id, title: p.album, artist_name: p.artist }) : undefined}
+                  role={p.album_id && onOpenAlbum ? "button" : undefined}
+                  title={p.album_id && onOpenAlbum ? "Open album" : undefined}
                 >
                   <span className="home-list-main">{p.title || "Unknown"}</span>
                   <span className="home-list-sub">{p.artist || ""}</span>
@@ -12023,17 +12674,13 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
           </ul>
         );
       case "recently_approved":
-        return home.recently_approved.length === 0 ? (
-          <p className="muted">No approved wishlist items yet.</p>
-        ) : (
-          <ul className="home-list">
-            {home.recently_approved.map((w) => (
-              <li key={w.id}>
-                <span className="home-list-main">{w.track || w.album || w.artist}</span>
-                <span className="home-list-sub">{w.track || w.album ? w.artist : ""}{w.approved_at ? ` · ${fmt(w.approved_at)}` : ""}</span>
-              </li>
+        if (!home.recently_approved?.length) return null;
+        return (
+          <div className="home-album-grid">
+            {home.recently_approved.map((al) => (
+              <AlbumCard key={al.id} album={al} apiKey={apiKey} onPlay={onPlayAlbum} onPlayNext={onPlayAlbumNext} onQueue={onQueueAlbum} onOpen={onOpenAlbum} pinned={pinnedAlbumIds?.has(al.id)} onTogglePin={onTogglePinAlbum} playlists={playlists} onAddToPlaylist={onAddToPlaylist} onResolveTracks={albumTrackRows} />
             ))}
-          </ul>
+          </div>
         );
       default:
         return null;
@@ -12043,7 +12690,8 @@ function HomeView({ api, apiKey, onPlayAlbum, onPlayAlbumNext, onQueueAlbum, onP
   return (
     <div className="home-view">
       {menuElement}
-      {order.map((id) => {
+      {searchBar}
+      {searchTerm ? renderSearchResults() : order.map((id) => {
         const content = renderRow(id);
         if (content === null) return null;
         return (
@@ -12235,6 +12883,7 @@ function Inspector({
   playlists,
   queueSelectionCount,
   tasks,
+  onCancelTask,
   downloadProgress,
   importActions,
   wishlistActions,
@@ -12483,7 +13132,7 @@ function Inspector({
           <small>{downloadProgress.detail}</small>
         </div>
       )}
-      <ActiveWorkBar tasks={tasks} />
+      <ActiveWorkBar tasks={tasks} onCancel={onCancelTask} />
       {(stats.rows.length > 0 || stats.summary) && (
         <div className="metadata-grid inspector-stats">
           {stats.summary && (
@@ -12878,7 +13527,7 @@ function AudioPlayer({
   onEnded,
   onSkipBack,
   onSkipForward,
-  shuffle = false,
+  shuffle = "off",
   repeat = "off",
   onToggleShuffle,
   onCycleRepeat,
@@ -13094,7 +13743,7 @@ function AudioPlayer({
   const viewDuration = isRemote ? (remote.duration_seconds || 0) : duration;
   const viewTime = isRemote ? Math.min(remotePosition || 0, viewDuration || Infinity) : currentTime;
   const viewProgress = viewDuration ? (viewTime / viewDuration) * 100 : 0;
-  const viewShuffle = isRemote ? Boolean(remote.shuffle) : shuffle;
+  const viewShuffle = normalizeShuffle(isRemote ? remote.shuffle : shuffle);
   const viewRepeat = isRemote ? (remote.repeat || "off") : repeat;
   const viewQueue = isRemote ? remoteQueue : queue;
   const viewHasContent = isRemote ? true : Boolean(currentTrack);
@@ -13118,7 +13767,8 @@ function AudioPlayer({
   const seekBarProps = isRemote
     ? { onPointerUp: commitRemoteSeek, onKeyUp: commitRemoteSeek, onBlur: commitRemoteSeek }
     : {};
-  const doToggleShuffle = isRemote ? () => onRemoteMode?.({ shuffle: !viewShuffle }) : onToggleShuffle;
+  const nextShuffleMode = viewShuffle === "off" ? "on" : viewShuffle === "on" ? "smart" : "off";
+  const doToggleShuffle = isRemote ? () => onRemoteMode?.({ shuffle: nextShuffleMode }) : onToggleShuffle;
   const doCycleRepeat = isRemote
     ? () => onRemoteMode?.({ loop: viewRepeat === "off" ? "all" : viewRepeat === "all" ? "one" : "off" })
     : onCycleRepeat;
@@ -13150,8 +13800,14 @@ function AudioPlayer({
   }, [isRemote, onRemoteLive]);
 
   const renderShuffle = (size) => (doToggleShuffle ? (
-    <button className={`player-icon-button${viewShuffle ? " active" : ""}`} onClick={doToggleShuffle} title={viewShuffle ? "Shuffle on" : "Shuffle off"}>
+    <button
+      className={`player-icon-button shuffle-button${viewShuffle !== "off" ? " active" : ""}`}
+      onClick={doToggleShuffle}
+      title={viewShuffle === "smart" ? "Smart shuffle" : viewShuffle === "on" ? "Shuffle" : "Shuffle off"}
+      aria-label={viewShuffle === "smart" ? "Smart shuffle" : viewShuffle === "on" ? "Shuffle" : "Shuffle off"}
+    >
       <Shuffle size={size} />
+      {viewShuffle === "smart" && <Sparkles className="shuffle-sparkle" size={Math.max(8, Math.round(size * 0.55))} />}
     </button>
   ) : null);
   const renderRepeat = (size) => (doCycleRepeat ? (
@@ -13859,12 +14515,12 @@ function AudioPlayer({
           >
             {onRemoteQueueJump ? (
               <button className="queue-play-btn" onClick={() => onRemoteQueueJump(track._remoteIndex)}>
-                <strong>{track.title}</strong>
+                <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </button>
             ) : (
               <span className="queue-play-btn is-static">
-                <strong>{track.title}</strong>
+                <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
                 <small>{track._artist || ""}</small>
               </span>
             )}
@@ -13886,7 +14542,7 @@ function AudioPlayer({
         ].filter(Boolean))}
       >
         <button className={`queue-play-btn${track.id === currentTrack?.id ? " active" : ""}`} onClick={() => onPlayTrack(track)}>
-          <strong>{track.title}</strong>
+          <strong>{track._smart && <Sparkles className="queue-smart-mark" size={11} aria-label="Added by smart shuffle" />}{track.title}</strong>
           <small>{track._artist || ""}</small>
         </button>
         {onRemoveFromQueue && (
@@ -14985,7 +15641,34 @@ function taskProgress(task) {
     total,
     percent: Number(progress.percent ?? (total ? (current / total) * 100 : 0)),
     message: progress.message || taskSummary({ ...task, result: null }),
+    eta: task.status === "running" ? etaLabel(progress.eta_seconds) : "",
+    cancelable: !!progress.cancelable,
   };
+}
+
+// The worker's time-left estimate for a long scan (`ScanProgress`), in words. Rounded hard on
+// purpose: it is an estimate from the pace so far, and "11 min 42 s" would claim more than that.
+function etaLabel(seconds) {
+  const value = Number(seconds);
+  if (seconds == null || !Number.isFinite(value) || value < 0) return "";
+  if (value < 60) return "less than a minute left";
+  const minutes = Math.round(value / 60);
+  if (minutes < 60) return `about ${minutes} min left`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `about ${hours} h ${rest} min left` : `about ${hours} h left`;
+}
+
+function progressLabel(progress) {
+  return [progress.message, progress.eta].filter(Boolean).join(" · ");
+}
+
+// A queued task is always cancelable: the worker simply never claims it. A running one only
+// stops if its handler checks for the cancel, so the button is offered only where it works.
+function taskCancelable(task) {
+  if (task.status === "queued") return true;
+  if (task.status !== "running") return false;
+  return task.type === "execute_proposal_batch" || !!task.result?.progress?.cancelable;
 }
 
 function proposalTaskSummary(result) {

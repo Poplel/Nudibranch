@@ -171,6 +171,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE wishlist_items ADD COLUMN status_changed_at DATETIME"))
         session.execute(text("UPDATE wishlist_items SET status_changed_at = created_at WHERE status_changed_at IS NULL"))
         session.commit()
+    if "source" not in wishlist_columns:
+        session.execute(text("ALTER TABLE wishlist_items ADD COLUMN source VARCHAR(64) NULL"))
+        session.commit()
     artist_columns = {row[1] for row in session.execute(text("PRAGMA table_info(artists)"))}
     if "cover_path" not in artist_columns:
         session.execute(text("ALTER TABLE artists ADD COLUMN cover_path TEXT"))
@@ -240,6 +243,9 @@ def ensure_lightweight_migrations(session: Session) -> None:
             text("ALTER TABLE users ADD COLUMN remote_playback_enabled BOOLEAN NOT NULL DEFAULT 1")
         )
         session.commit()
+    if "smart_shuffle_every" not in user_columns:
+        session.execute(text("ALTER TABLE users ADD COLUMN smart_shuffle_every INTEGER NOT NULL DEFAULT 4"))
+        session.commit()
     user_cols2 = {row[1] for row in session.execute(text("PRAGMA table_info(users)"))}
     if "search_min_confidence" not in user_cols2:
         session.execute(text("ALTER TABLE users ADD COLUMN search_min_confidence FLOAT NOT NULL DEFAULT 0.4"))
@@ -267,6 +273,8 @@ def ensure_lightweight_migrations(session: Session) -> None:
         session.execute(text("ALTER TABLE mobile_devices ADD COLUMN muted_event_types TEXT NOT NULL DEFAULT ''"))
         session.commit()
     _migrate_player_states_to_sessions(session)
+    _migrate_shuffle_to_mode(session)
+    _migrate_automation_shuffle_to_mode(session)
     auth_cols = {row[1] for row in session.execute(text("PRAGMA table_info(auth_sessions)"))}
     if auth_cols and "client" not in auth_cols:
         # Set at login so a device that has never played still shows correctly in a device picker.
@@ -343,7 +351,50 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _fail_completed_batches_with_failed_items(session)
     _delete_empty_proposal_batches(session)
     _heal_searching_parent_items(session)
+    _reopen_downloads_finalized_unfetched(session)
+    _reset_stale_container_stages(session)
     move_task_result_logs_to_app_log(session)
+
+
+def _migrate_shuffle_to_mode(session: Session) -> None:
+    """`shuffle` was a boolean and is now the mode string "off" | "on" | "smart".
+
+    The physical columns keep their declared BOOLEAN type: SQLite's column affinity there is NUMERIC,
+    which leaves a non-numeric string such as 'off' stored as text, so no table rebuild is needed.
+    Idempotent: only rows still holding 0/1 (or NULL) are touched.
+    """
+    for table in ("session_player_states", "playback_commands", "account_playback_sessions"):
+        cols = {row[1] for row in session.execute(text(f"PRAGMA table_info({table})"))}
+        if "shuffle" not in cols:
+            continue
+        session.execute(text(f"UPDATE {table} SET shuffle = 'on' WHERE shuffle IN (1, '1')"))
+        session.execute(
+            text(f"UPDATE {table} SET shuffle = 'off' WHERE shuffle IS NULL OR shuffle NOT IN ('on', 'smart')")
+        )
+    session.commit()
+
+
+def _migrate_automation_shuffle_to_mode(session: Session) -> None:
+    """A `play` automation's `shuffle` config was a boolean; it is now "off" | "on" | "smart"."""
+    cols = {row[1] for row in session.execute(text("PRAGMA table_info(automations)"))}
+    if "action_config" not in cols:
+        return
+    rows = session.execute(
+        text("SELECT id, action_config FROM automations WHERE action_type = 'play' AND action_config LIKE '%shuffle%'")
+    ).all()
+    for automation_id, raw in rows:
+        try:
+            config = json.loads(raw or "{}")
+        except ValueError:
+            continue
+        if not isinstance(config, dict) or "shuffle" not in config or config["shuffle"] in ("off", "on", "smart"):
+            continue
+        config["shuffle"] = "on" if config["shuffle"] is True or config["shuffle"] in (1, "1", "true") else "off"
+        session.execute(
+            text("UPDATE automations SET action_config = :config WHERE id = :id"),
+            {"config": json.dumps(config), "id": automation_id},
+        )
+    session.commit()
 
 
 def _drop_columns(session: Session, table: str, columns: list[str]) -> None:
@@ -548,6 +599,110 @@ def _drop_empty_rejected_batches(session: Session) -> None:
     session.commit()
 
 
+def _reopen_downloads_finalized_unfetched(session: Session) -> None:
+    """Give back the tracks a finalize marked `completed` although they never downloaded.
+
+    Until 2026-09-29 a download batch was finalized as soon as its manifest had nothing in flight,
+    and finalizing marked every `pending` row `completed` -- including a selected track a Cancel had
+    just put back at Download approval, or one a partial Approve had never reached. The track and
+    its batch vanished from every list (sandalphon: Boards of Canada x10, Daft Punk "Nightvision",
+    Fleetwood Mac "Dreams"). Such a row is recognisable: a selected slskd candidate, `completed`,
+    whose cached stage never got past waiting (a real completion is re-stamped `staging` when its
+    file lands) and which no "Add to library" row came from. It goes back to Download approval with
+    its unused siblings and its ancestors, and its batch is reopened. Idempotent.
+    """
+    rows = session.execute(text(
+        "SELECT i.id, i.parent_id, i.batch_id FROM proposal_items i "
+        "WHERE i.status = 'completed' AND i.kind = 'download' AND i.selected = 1 "
+        "AND i.stage IN ('awaiting_approval', 'queued', 'approved') "
+        "AND i.payload_json LIKE '%\"action\": \"queue_download\"%' "
+        "AND NOT EXISTS (SELECT 1 FROM proposal_items r WHERE r.kind = 'import_files' "
+        "AND r.payload_json LIKE '%\"source_download_item_id\": \"' || i.id || '\"%')"
+    )).all()
+    if not rows:
+        return
+    parents = {row.parent_id for row in rows if row.parent_id}
+    for row in rows:
+        session.execute(
+            text("UPDATE proposal_items SET status = 'pending', stage = 'awaiting_approval' WHERE id = :id"),
+            {"id": row.id},
+        )
+    for parent_id in parents:
+        # The track's alternates were swept to `completed` by the same finalize.
+        session.execute(
+            text(
+                "UPDATE proposal_items SET status = 'pending' WHERE parent_id = :parent AND selected = 0 "
+                "AND status = 'completed' AND stage = 'awaiting_approval'"
+            ),
+            {"parent": parent_id},
+        )
+        # Ancestors (track, album, artist rows) settle with their children; unsettle them.
+        current = parent_id
+        seen: set[str] = set()
+        while current and current not in seen:
+            seen.add(current)
+            session.execute(
+                text("UPDATE proposal_items SET status = 'pending' WHERE id = :id AND status = 'completed'"),
+                {"id": current},
+            )
+            current = session.execute(
+                text("SELECT parent_id FROM proposal_items WHERE id = :id"), {"id": current}
+            ).scalar()
+    for batch_id in {row.batch_id for row in rows}:
+        session.execute(text("UPDATE proposal_batches SET status = 'pending' WHERE id = :id"), {"id": batch_id})
+    session.commit()
+
+
+_IN_FLIGHT_STAGES = ("approved", "queued", "downloading", "retrying", "staging", "verifying", "staged", "importing")
+
+
+def _reset_stale_container_stages(session: Session) -> None:
+    """A waiting grouping row (artist/album/track) must not claim work that is not happening.
+
+    Grouping rows cache a `stage` and free text like any row, refreshed only while downloads run.
+    A `pending` one whose cache still says queued/verifying/staging… with nothing approved or
+    executing beneath it is stale -- the rows `_reopen_downloads_finalized_unfetched` gave back read
+    "waiting to download" and "verifying 0% · 0 of 1 verified" above candidates at Download approval.
+    Such a row goes to `awaiting_approval`, its free text and progress dropped. Idempotent.
+
+    The claim can be the cached `stage`, or -- with no `stage` at all -- the row's leftover
+    `download_progress`/`status` text, which `resolve_stage` falls back to (the Fleetwood Mac rows).
+    Only rows above a candidate that really waits at the gate: a row whose search is still running
+    has no candidates yet and is left alone.
+    """
+    in_flight = ", ".join(f"'{s}'" for s in _IN_FLIGHT_STAGES)
+    rows = session.execute(text(
+        "SELECT id, payload_json FROM proposal_items WHERE status = 'pending' AND kind = 'download' "
+        "AND payload_json NOT LIKE '%\"action\"%' AND (stage IN (" + in_flight + ") OR (stage IS NULL "
+        "AND (payload_json LIKE '%\"download_progress\"%' OR payload_json LIKE '%\"status\"%')))"
+    )).all()
+    beneath = (
+        "WITH RECURSIVE sub(id) AS (SELECT id FROM proposal_items WHERE parent_id = :id "
+        "UNION SELECT p.id FROM proposal_items p JOIN sub ON p.parent_id = sub.id) "
+        "SELECT 1 FROM proposal_items WHERE id IN (SELECT id FROM sub) AND "
+    )
+    for row in rows:
+        live = session.execute(
+            text(beneath + "status IN ('approved', 'executing') LIMIT 1"), {"id": row.id}
+        ).first()
+        waiting = session.execute(
+            text(beneath + "status = 'pending' AND payload_json LIKE '%\"action\"%' LIMIT 1"), {"id": row.id}
+        ).first()
+        if live or not waiting:
+            continue
+        try:
+            payload = json.loads(row.payload_json or "{}")
+        except (ValueError, TypeError):
+            payload = {}
+        payload.pop("status", None)
+        payload.pop("download_progress", None)
+        session.execute(
+            text("UPDATE proposal_items SET stage = 'awaiting_approval', payload_json = :p WHERE id = :id"),
+            {"id": row.id, "p": json.dumps(payload)},
+        )
+    session.commit()
+
+
 def _fail_completed_batches_with_failed_items(session: Session) -> None:
     """Re-mark batches that were stored `completed` although a selected item failed.
 
@@ -577,11 +732,38 @@ def _drop_canceled_leftovers(session: Session) -> None:
     # A `rejected` batch that still has items can only be one of those mislabeled cancels -- a real
     # rejection deletes every item first -- so it goes whole, like a `canceled` one. Items are deleted
     # explicitly because raw SQL here does not rely on SQLite enforcing the ON DELETE CASCADE.
-    session.execute(text(
-        "DELETE FROM proposal_items WHERE status = 'canceled' "
-        "OR batch_id IN (SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected'))"
-    ))
-    session.execute(text("DELETE FROM proposal_batches WHERE status IN ('canceled', 'rejected')"))
+    #
+    # ⚠️ Except what a Remove is still in the middle of (2026-09-29). This runs on EVERY boot, and a
+    # Remove marks rows `canceled` and leaves them for the worker's queued `cancel_download_item`,
+    # which finds the transfer and the partial file through them. Deleting them here -- on a deploy
+    # that lands mid-Remove -- left the transfer running with nothing pointing at it. Rows that task
+    # names, and their batches, are left for it.
+    pending_removals: set[str] = set()
+    for (payload_json,) in session.execute(text(
+        "SELECT payload_json FROM tasks WHERE type = 'cancel_download_item' AND status IN ('queued', 'running')"
+    )):
+        try:
+            pending_removals.update(str(item_id) for item_id in (json.loads(payload_json or "{}").get("item_ids") or []))
+        except (ValueError, TypeError):
+            continue
+    protected_batches = {
+        row[0]
+        for item_id in pending_removals
+        for row in session.execute(text("SELECT batch_id FROM proposal_items WHERE id = :id"), {"id": item_id})
+    }
+    for item_id, status, batch_id, batch_status in session.execute(text(
+        "SELECT i.id, i.status, i.batch_id, b.status FROM proposal_items i "
+        "LEFT JOIN proposal_batches b ON b.id = i.batch_id "
+        "WHERE i.status = 'canceled' OR b.status IN ('canceled', 'rejected')"
+    )).all():
+        if item_id in pending_removals or batch_id in protected_batches:
+            continue
+        session.execute(text("DELETE FROM proposal_items WHERE id = :id"), {"id": item_id})
+    for (batch_id,) in session.execute(text(
+        "SELECT id FROM proposal_batches WHERE status IN ('canceled', 'rejected')"
+    )).all():
+        if batch_id not in protected_batches:
+            session.execute(text("DELETE FROM proposal_batches WHERE id = :id"), {"id": batch_id})
     session.commit()
 
 

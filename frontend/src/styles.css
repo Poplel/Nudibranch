@@ -610,6 +610,10 @@ nav button:hover {
   grid-template-columns: minmax(0, 1fr);
 }
 
+.active-work-item .task-cancel {
+  grid-column: 1 / -1;
+}
+
 .inspector-progress-card {
   display: grid;
   gap: 8px;
@@ -5016,6 +5020,7 @@ nav button:hover {
 .podcast-detail .album-detail-tracks { gap: 0; }
 .podcast-episode-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
 .podcast-episode-row:hover { background: var(--panel-strong); }
+.podcast-episode-row.flash { background: color-mix(in srgb, var(--accent) 22%, transparent); transition: background 0.4s; }
 .podcast-episode-main { min-width: 0; flex: 1 1 auto; display: flex; flex-direction: column; gap: 2px; }
 .podcast-episode-title { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .podcast-episode-title span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -5273,4 +5278,38 @@ nav button:hover {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   opacity: 0.6;
+}
+
+/* Smart shuffle: the shuffle glyph with a small sparkle badge, tinted like "on" (the .active rule). */
+.player-icon-button.shuffle-button {
+  position: relative;
+}
+
+.player-icon-button.shuffle-button .shuffle-sparkle {
+  position: absolute;
+  top: 2px;
+  right: -3px;
+  pointer-events: none;
+}
+
+/* A song smart shuffle added to the queue. */
+.queue-smart-mark {
+  display: inline-block;
+  margin-right: 4px;
+  vertical-align: -1px;
+  color: var(--accent);
+}
+
+/* Playlist page: the "Suggested" section. */
+.playlist-suggestions {
+  margin: 8px 0 4px;
+}
+
+.suggestion-row .suggestion-cover {
+  grid-row: 1 / span 2;
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--soft);
 }

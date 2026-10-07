@@ -2,6 +2,7 @@ import base64
 import hashlib
 import os
 import secrets
+import time
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,11 @@ from nudibranch.api.schemas import (
     PlayEventOut,
     PlayRecordIn,
     SessionRenameRequest,
+    SmartShuffleInsert,
+    SmartShufflePlanRequest,
+    SmartShufflePlanResponse,
+    SuggestionsRequest,
+    SuggestionsResponse,
     DeviceRegistration,
     DiscoverTaskQueueRequest,
     FavoritesOut,
@@ -191,8 +197,9 @@ from nudibranch.services import queue_state
 from nudibranch.services.app_log import tail_app_log, write_app_log
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
+from nudibranch.services.itunes import lookup_track as itunes_lookup_track
 from nudibranch.services.metadata_lookup import album_cover_candidate_urls, artist_image_candidate_urls, lookup_album_tracks, lookup_recording_by_musicbrainz_metadata, search_album_releases
-from nudibranch.services.notifications import create_notification, instance_id, push_identity
+from nudibranch.services.notifications import create_notification, instance_id, push_identity, retire_queue_notifications
 from nudibranch.services.proposals import (
     ApprovalNotPermitted,
     NothingToApprove,
@@ -210,6 +217,8 @@ from nudibranch.services.settings_store import integration_settings, integration
 from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
 from nudibranch.services.search import rebuild_search_index, search_library
+from nudibranch.services.album_suggestions import suggest_albums
+from nudibranch.services.suggestions import plan_smart_shuffle, suggest
 from nudibranch.services.automations import ACTION_TYPES, NOTIFY_MODES, NOTIFY_PRIORITIES, TRIGGER_TYPES, compute_next_run, run_automation
 
 router = APIRouter(prefix="/api/v1")
@@ -876,7 +885,7 @@ def update_own_jellyfin_user(
     # which is what establishes the mirror. Unlinking needs no counterpart: the native rows stay
     # put and simply stop being mirrored.
     if not previously_linked and user.jellyfin_user_id:
-        enqueue_task(session, "migrate_native_playlists_to_jellyfin", {"user_id": user.id})
+        enqueue_task(session, "migrate_native_playlists_to_jellyfin", {"user_id": user.id, "requested_by": user.id})
     return serialize_user(user)
 
 
@@ -932,9 +941,34 @@ def update_own_appearance(
     user.background_tint = payload.background_tint
     user.crossfade_duration = payload.crossfade_duration
     user.remote_playback_enabled = payload.remote_playback_enabled
+    user.smart_shuffle_every = payload.smart_shuffle_every
     user.playback_claim_timeout_minutes = payload.playback_claim_timeout_minutes
     session.commit()
     return serialize_user(load_user(session, user.id))
+
+
+@router.post("/player/smart-shuffle/plan", response_model=SmartShufflePlanResponse, tags=["users"], summary="Plan smart shuffle insertions")
+def smart_shuffle_plan(
+    payload: SmartShufflePlanRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.library_view)),
+) -> SmartShufflePlanResponse:
+    """Where smart shuffle should insert a suggested track into the queue the client sent.
+
+    `inserts[].index` is a position in the SENT array, before which the track goes; the list is
+    ascending and the client applies it from last to first. One song is inserted after every
+    `smart_shuffle_every` consecutive non-smart tracks within 40 items of `current_index`; episodes
+    neither count nor break a run, and an already-spaced queue gets `[]`. With `repeat` off and fewer
+    than 2 tracks after the current one, 10 more are appended at `index == len(items)`.
+    """
+    if len(payload.items) > SESSION_MAX_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Queue exceeds {SESSION_MAX_ITEMS} items")
+    items = [item.model_dump() for item in payload.items]
+    every = max(1, min(20, int(getattr(user, "smart_shuffle_every", 4) or 4)))
+    plan = plan_smart_shuffle(session, user, items, payload.current_index, every, payload.repeat)
+    return SmartShufflePlanResponse(
+        inserts=[SmartShuffleInsert(index=index, track=_library_track_row(track)) for index, track in plan]
+    )
 
 
 @router.post("/player/status", tags=["users"], summary="Update player state", response_model=dict)
@@ -993,7 +1027,7 @@ def update_player_status(
     state.duration_seconds = (
         round(library_ms / 1000) if library_ms else payload.duration_seconds
     )
-    state.shuffle = bool(payload.shuffle)
+    state.shuffle = payload.shuffle
     state.repeat = payload.repeat if payload.repeat in {"off", "one", "all"} else "off"
     if payload.client:
         state.client = payload.client
@@ -1119,7 +1153,7 @@ def list_player_sessions(
                 current_index=state.current_index if state else 0,
                 position_seconds=state.position_seconds if state else None,
                 duration_seconds=state.duration_seconds if state else None,
-                shuffle=state.shuffle if state else False,
+                shuffle=state.shuffle if state else "off",
                 repeat=state.repeat if state else "off",
                 # ⚠ Normalised to aware UTC. SQLite hands these back naive, and a naive timestamp
                 # serialises without an offset — which a strict ISO8601 client decoder rejects,
@@ -1190,7 +1224,7 @@ def create_player_command(
         target_id=target_id,
         target_label=target_label,
         loop=payload.loop if payload.loop in {"off", "one", "all"} else "off",
-        shuffle=bool(payload.shuffle),
+        shuffle=payload.shuffle,
         position_seconds=payload.position_seconds if action == "seek" else None,
         queue_index=payload.queue_index if action in _QUEUE_ACTIONS else None,
         queue_to_index=payload.queue_to_index if action == "move" else None,
@@ -1321,7 +1355,7 @@ def enqueue_on_session(
         target_type="handoff",
         target_id=handoff.id,
         loop=(target_state.repeat if target_state else "off"),
-        shuffle=(target_state.shuffle if target_state else False),
+        shuffle=(target_state.shuffle if target_state else "off"),
         status="pending",
     )
     session.add(command)
@@ -1606,7 +1640,7 @@ def _store_session_queue(row: AccountPlaybackSession, items: list[PlaybackSnapsh
     Ids only: display titles are the viewer's to resolve (from its mirror, or `resolve=true`).
     """
     _validate_session_items(items)
-    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id) for i in items]
+    clean = [PlaybackSnapshotItem(type=i.type, id=i.id, podcast_id=i.podcast_id, smart=i.smart or None) for i in items]
     # exclude_none: every absent title/artist/album_id is ~50 bytes of nulls, which alone pushed a
     # full-size queue past the payload cap.
     encoded = PlaybackSnapshot(items=clean, current_index=0, position_seconds=0.0, playing=False).model_dump_json(exclude_none=True)
@@ -1716,7 +1750,7 @@ def _serialize_account_session(
         current_index=row.current_index or 0,
         position_seconds=float(row.position_seconds or 0.0),
         position_at=as_utc(row.position_at) if row.position_at else None,
-        shuffle=bool(row.shuffle),
+        shuffle=row.shuffle or "off",
         repeat=row.repeat or "off",
         track_id=row.track_id,
         episode_id=row.episode_id,
@@ -1865,7 +1899,7 @@ def claim_account_session(
         _store_session_queue(row, snap.items)
         row.current_index = snap.current_index if snap.items else 0
         row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
-        row.shuffle = bool(snap.shuffle)
+        row.shuffle = snap.shuffle
         row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
     elif previous_owner and row.status == "playing" and row.position_at:
         # Taking a session that is playing right now: resume where it IS, not where it last said.
@@ -1950,7 +1984,7 @@ def publish_account_session_queue(
     row.current_index = snap.current_index if snap.items else 0
     row.position_seconds = max(0.0, float(snap.position_seconds or 0.0))
     row.position_at = now
-    row.shuffle = bool(snap.shuffle)
+    row.shuffle = snap.shuffle
     row.repeat = snap.repeat if snap.repeat in {"off", "one", "all"} else "off"
     row.owner_session_id = origin.id
     row.owner_reported_at = now
@@ -2033,7 +2067,7 @@ def edit_account_session(
         row.position_seconds = min(target, limit) if limit else target
     elif op == "state":
         if payload.shuffle is not None:
-            row.shuffle = bool(payload.shuffle)
+            row.shuffle = payload.shuffle
         if payload.repeat in {"off", "one", "all"}:
             row.repeat = payload.repeat
     else:
@@ -2525,6 +2559,100 @@ def unpin_podcast(
     return list_pinned_podcasts(session, user)
 
 
+def _library_artists_named(session: Session, name: str) -> list[Artist]:
+    """Library artists whose name matches `name` ignoring case and punctuation."""
+    target = normalized_music_name(name)
+    if not target:
+        return []
+    exact = list(session.scalars(select(Artist).where(func.lower(Artist.name) == name.strip().lower())))
+    if exact:
+        return exact
+    token = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip().split(" ")[0]
+    if not token:
+        return []
+    loose = session.scalars(select(Artist).where(func.lower(Artist.name).like(f"%{token}%")).limit(200))
+    return [a for a in loose if normalized_music_name(a.name) == target]
+
+
+def _recently_approved_albums(session: Session, user: User, limit: int = 12) -> list[dict]:
+    """Home's Recently Approved: the caller's `completed` wishlist rows, newest first, resolved to
+    the library album each landed in (deduped by album id).
+
+    The request pipeline records no link to the library rows it created, so resolution is by
+    normalized name: album rows by artist + album, track rows by artist + title (-> that track's
+    album), artist rows by that artist's albums created at/after the request. Unresolvable rows are
+    dropped.
+    """
+    rows = list(
+        session.scalars(
+            select(WishlistItem)
+            .where(WishlistItem.user_id == user.id, WishlistItem.status == "completed")
+            .order_by(WishlistItem.status_changed_at.desc())
+            .limit(60)
+        )
+    )
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(album: Album, row: WishlistItem) -> None:
+        if album.id in seen or len(out) >= limit:
+            return
+        seen.add(album.id)
+        approved = row.status_changed_at
+        out.append({
+            "id": album.id,
+            "title": album.title,
+            "artist": album.artist.name if album.artist else None,
+            "cover_path": album.cover_path,
+            "approved_at": as_utc(approved).isoformat() if approved else None,
+        })
+
+    for row in rows:
+        if len(out) >= limit:
+            break
+        artists = _library_artists_named(session, row.artist or "")
+        if not artists:
+            continue
+        artist_ids = [a.id for a in artists]
+        if row.kind == "album" and row.album and not row.track:
+            want = normalized_music_name(row.album)
+            for album in session.scalars(
+                select(Album).options(selectinload(Album.artist)).where(Album.artist_id.in_(artist_ids))
+            ):
+                if normalized_music_name(album.title) == want:
+                    add(album, row)
+                    break
+        elif row.track:
+            want = normalized_music_name(row.track)
+            want_album = normalized_music_name(row.album) if row.album else None
+            candidates = list(
+                session.scalars(
+                    select(Track)
+                    .join(Album, Track.album_id == Album.id)
+                    .options(selectinload(Track.album).selectinload(Album.artist))
+                    .where(Album.artist_id.in_(artist_ids), func.lower(Track.title).like(f"%{(row.track or '').strip().lower()[:40]}%"))
+                    .limit(50)
+                )
+            )
+            matches = [t for t in candidates if normalized_music_name(t.title) == want]
+            if want_album:
+                preferred = [t for t in matches if normalized_music_name(t.album.title) == want_album]
+                matches = preferred or matches
+            if matches:
+                add(matches[0].album, row)
+        else:
+            since = row.created_at
+            for album in session.scalars(
+                select(Album)
+                .options(selectinload(Album.artist))
+                .where(Album.artist_id.in_(artist_ids))
+                .order_by(Album.created_at.desc())
+            ):
+                if since is None or (album.created_at and as_utc(album.created_at) >= as_utc(since)):
+                    add(album, row)
+    return out
+
+
 @router.get("/me/home", tags=["users"], summary="Home dashboard aggregate", response_model=dict)
 def me_home(
     session: Session = Depends(get_session),
@@ -2560,20 +2688,8 @@ def me_home(
         for al in recent_albums
     ]
 
-    # Recently approved from my wishlist (completed items)
-    approved = list(
-        session.scalars(
-            select(WishlistItem)
-            .where(WishlistItem.user_id == user.id, WishlistItem.status == "completed")
-            .order_by(WishlistItem.status_changed_at.desc())
-            .limit(12)
-        )
-    )
-    recently_approved = [
-        {"id": w.id, "artist": w.artist, "album": w.album, "track": w.track,
-         "approved_at": w.status_changed_at.isoformat() if w.status_changed_at else None}
-        for w in approved
-    ]
+    # Recently approved: my completed wishlist requests, resolved to the library album each landed in.
+    recently_approved = _recently_approved_albums(session, user) if can_view_library else []
 
     # Recent plays — dedupe by track_id, keeping the most-recent occurrence, cap at 12.
     _raw_plays = list_my_plays(limit=100, days=None, session=session, user=user) if can_view_library else []
@@ -3021,6 +3137,19 @@ def library_albums(
     return PaginatedAlbums(items=items, total=total, page=page, page_size=page_size)
 
 
+def _library_track_row(t: Track) -> LibraryTrackRow:
+    return LibraryTrackRow(
+        id=t.id, title=t.title, album_id=t.album_id,
+        album_title=(t.album.title if t.album else ""),
+        artist_id=(t.album.artist_id if t.album else ""),
+        artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
+        track_number=t.track_number, disc_number=t.disc_number,
+        duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
+        replaygain_track_gain=t.replaygain_track_gain,
+        updated_at=_library_iso(t.updated_at),
+    )
+
+
 @router.get("/library/tracks", response_model=PaginatedTracks, tags=["library"], summary="Paginated tracks by bucket")
 def library_tracks(
     bucket: str = Query("all"),
@@ -3048,19 +3177,7 @@ def library_tracks(
     else:
         ordered = stmt.order_by(func.lower(Track.title))
     rows = session.scalars(ordered.offset((page - 1) * page_size).limit(page_size))
-    items = [
-        LibraryTrackRow(
-            id=t.id, title=t.title, album_id=t.album_id,
-            album_title=(t.album.title if t.album else ""),
-            artist_id=(t.album.artist_id if t.album else ""),
-            artist_name=(t.album.artist.name if t.album and t.album.artist else ""),
-            track_number=t.track_number, disc_number=t.disc_number,
-            duration_ms=t.duration_ms, format=t.format, is_lossless=t.is_lossless,
-            replaygain_track_gain=t.replaygain_track_gain,
-            updated_at=_library_iso(t.updated_at),
-        )
-        for t in rows
-    ]
+    items = [_library_track_row(t) for t in rows]
     return PaginatedTracks(items=items, total=total, page=page, page_size=page_size)
 
 
@@ -3106,6 +3223,33 @@ def library_search(
     )
     results = search_library(session, q, kinds=kinds, min_confidence=threshold, limit=limit)
     return SearchResponse(query=q, min_confidence=threshold, results=[SearchResultItem(**r) for r in results])
+
+
+@router.post("/library/suggestions", response_model=SuggestionsResponse, tags=["library"], summary="Suggest library tracks like a set of seeds")
+def library_suggestions(
+    payload: SuggestionsRequest,
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.library_view)),
+) -> SuggestionsResponse:
+    """Library tracks that resemble the seeds (tags, genres, tempo, ListenBrainz where cached).
+
+    With `playlist_id` the seeds are that playlist's tracks and they are excluded as well; that needs
+    `playlists:manage` like every playlist route. To refresh, call again with the ids already shown
+    in `exclude_track_ids`. Every result is a playable library track, in the `/library/tracks` shape.
+    """
+    seeds = list(payload.seed_track_ids)
+    exclude = set(payload.exclude_track_ids)
+    if payload.playlist_id:
+        if not user_has_permission(user, Permission.playlists_manage):
+            raise HTTPException(status_code=403, detail=f"Requires {Permission.playlists_manage.value}")
+        playlist = _native_playlist_query(session, user.id, payload.playlist_id)
+        if not playlist:
+            raise HTTPException(status_code=404, detail="Playlist not found")
+        playlist_track_ids = [pt.track_id for pt in playlist.tracks]
+        seeds = playlist_track_ids + seeds
+        exclude |= set(playlist_track_ids)
+    tracks = suggest(session, user, seeds, exclude, payload.limit)
+    return SuggestionsResponse(tracks=[_library_track_row(t) for t in tracks])
 
 
 @router.post("/library/search/reindex", tags=["library"], summary="Rebuild the search index")
@@ -3393,7 +3537,7 @@ def verify_track_audio(
         title="Audio check complete",
         body=f"{track_label}: {result['message']}",
         event_type="library_audio_check",
-        target_url="/library",
+        target_url=f"/library/albums/{track.album_id}" if track.album_id else "/library",
         user_id=current_user.id,
     )
     session.commit()
@@ -4553,6 +4697,37 @@ def discover_search(
         raise HTTPException(status_code=503, detail="MusicBrainz could not be reached from the server") from error
 
 
+@router.get("/discover/suggestions", tags=["discover"], summary="Suggest albums the library does not have")
+def discover_suggestions(
+    limit: int = Query(5, ge=1, le=25),
+    exclude: str = Query("", description="Comma-separated iTunes album ids already shown"),
+    session: Session = Depends(get_session),
+    user: User = Depends(require_permission(Permission.discover)),
+) -> dict:
+    """Albums by similar artists not in the library, mixed with missing albums from artists the caller
+    already plays. `/discover/search` album shape; refresh by passing every shown id in `exclude`."""
+    skip = {part.strip() for part in exclude.split(",") if part.strip()}
+    return {"albums": suggest_albums(session, user, limit, skip)}
+
+
+@router.get("/discover/lookup", tags=["discover"], summary="Resolve a recognised song to its iTunes album")
+def discover_lookup(
+    itunes_track_id: str = Query("", max_length=40),
+    artist: str = Query("", max_length=180),
+    title: str = Query("", max_length=180),
+    _: User = Depends(require_permission(Permission.discover)),
+) -> dict:
+    """`{"album": <Discover album shape with tracks>, "track_id": "<iTunes track id within it>"}`.
+    An `itunes_track_id` is an exact lookup; otherwise `title` (with `artist` when known) is searched
+    and only a normalized match is accepted. 404 when nothing matches."""
+    if not itunes_track_id.strip() and not title.strip():
+        raise HTTPException(status_code=400, detail="Provide itunes_track_id or title")
+    found = itunes_lookup_track(itunes_track_id, artist, title)
+    if not found:
+        raise HTTPException(status_code=404, detail="No matching song found")
+    return found
+
+
 @router.get("/discover/album-tracks/{album_id}", tags=["discover"], summary="Get tracks for an iTunes album", response_model=dict)
 def discover_album_tracks(
     album_id: str,
@@ -4587,7 +4762,7 @@ def list_wishlist(
     expire_old_terminal_wishlist_items(session, items)
     items = [item for item in items if item.status != "removed" and not terminal_wishlist_expired(item)]
     downloading_ids = downloading_wishlist_ids(session)
-    return [serialize_wishlist_item(item, downloading_ids) for item in items]
+    return serialize_wishlist_items(session, items, downloading_ids)
 
 
 @router.post("/wishlist", response_model=WishlistOut, tags=["wishlist"], summary="Add to wishlist")
@@ -4626,7 +4801,7 @@ def create_wishlist_item(
             album=payload.album,
             track=payload.track,
         )
-        return serialize_wishlist_item(existing)
+        return serialize_wishlist_items(session, [existing])[0]
     # Requesting something again replaces its declined (or failed) row rather than listing it twice.
     for declined in session.scalars(
         select(WishlistItem)
@@ -4638,7 +4813,7 @@ def create_wishlist_item(
         .where(WishlistItem.status.in_(["rejected", "failed"]))
     ):
         session.delete(declined)
-    item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}))
+    item = WishlistItem(user_id=user.id, **payload.model_dump(exclude={"source"}), source=(payload.source or None) and payload.source[:64])
     item.status_changed_at = datetime.now(timezone.utc)
     # Gate 1 (2026-09-23): an approver's own request skips straight to searching, exactly as
     # before. Everyone else's request waits at `requested` until a `wishlist:approve_all` holder
@@ -4668,7 +4843,7 @@ def create_wishlist_item(
         album=item.album,
         track=item.track,
     )
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.delete("/wishlist/{item_id}", response_model=WishlistOut, tags=["wishlist"], summary="Remove from wishlist")
@@ -4690,7 +4865,7 @@ def remove_wishlist_item(
     # whose own row already read Declined, with nothing in any UI able to clear them.
     purge_wishlist_work(session, item, actor_id=user.id)
     session.refresh(item)
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.post("/wishlist/{item_id}/cancel", response_model=WishlistOut, tags=["wishlist"], summary="Stop a request's candidate search")
@@ -4709,7 +4884,7 @@ def cancel_wishlist_search(
     if not item or (not user_has_permission(user, Permission.wishlist_approve_all) and item.user_id != user.id):
         raise HTTPException(status_code=404, detail="Wishlist item not found")
     if wishlist_stage(item) is not ItemStage.searching:
-        return serialize_wishlist_item(item)
+        return serialize_wishlist_items(session, [item])[0]
     stop_wishlist_search_tasks(session, {item.id})
     # Candidates the search already committed go too. `purge_wishlist_work` declines the row on the
     # way (it is shared with Remove), so the gate-1 state is written after it, not before.
@@ -4721,7 +4896,7 @@ def cancel_wishlist_search(
     item.status_changed_at = datetime.now(timezone.utc)
     session.commit()
     session.refresh(item)
-    return serialize_wishlist_item(item)
+    return serialize_wishlist_items(session, [item])[0]
 
 
 @router.get("/wishlist/queue", response_model=list[WishlistOut], tags=["wishlist"], summary="List requests waiting at gate 1")
@@ -4743,7 +4918,7 @@ def list_wishlist_queue(
             .order_by(WishlistItem.created_at.asc())
         )
     )
-    return [serialize_wishlist_item(item) for item in items]
+    return serialize_wishlist_items(session, items)
 
 
 @router.post("/wishlist/queue/approve", response_model=list[WishlistOut], tags=["wishlist"], summary="Approve requests at gate 1")
@@ -4784,7 +4959,7 @@ def approve_wishlist_queue(
             requester_id=item.user_id,
         )
     session.commit()
-    return [serialize_wishlist_item(item) for item in approved]
+    return serialize_wishlist_items(session, approved)
 
 
 @router.post("/wishlist/queue/reject", response_model=list[WishlistOut], tags=["wishlist"], summary="Decline requests at gate 1")
@@ -4820,7 +4995,7 @@ def reject_wishlist_queue(
             item_id=item.id,
             requester_id=item.user_id,
         )
-    return [serialize_wishlist_item(item) for item in rejected]
+    return serialize_wishlist_items(session, rejected)
 
 
 # ── Jellyfin-direct playlist helpers ──────────────────────────────────────────
@@ -5191,6 +5366,7 @@ def _reconcile_playlist(
     merged_local = [track_by_jf_id[jf_id] for jf_id in target if jf_id in track_by_jf_id] + invisible
     if _set_native_tracks(session, playlist, merged_local):
         changed = True
+        session.commit()    # the DELETE above took the write lock; don't hold it across the rename call
 
     # Name: same three-way rule. A rename made here has already been pushed synchronously, so a
     # difference means Jellyfin was renamed — unless the local name also moved off the base, in
@@ -5269,7 +5445,7 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             else:
                 playlist = Playlist(name=jf_name or jf_id, user_id=user.id, jellyfin_playlist_id=jf_id)
                 session.add(playlist)
-                session.flush()
+                session.commit()
             by_jf_id[jf_id] = playlist
             changed = True
         items = fetched.get(jf_id)
@@ -5278,6 +5454,10 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             changed = True
         if discovered and _jf_pull_cover(session, client, playlist):
             changed = True
+        if changed:
+            # Checkpoint after each playlist so the write lock is never held across the next
+            # playlist's Jellyfin calls.
+            session.commit()
 
     # A playlist we hold a Jellyfin id for that Jellyfin no longer lists was deleted over there.
     # (Tombstoned ids were removed from `jf_playlists` above, but no local row can point at one —
@@ -5292,6 +5472,8 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
             removed.add(playlist.id)
             session.delete(playlist)
             changed = True
+    if changed:
+        session.commit()
 
     # Anything local that Jellyfin has never seen goes the other way.
     for playlist in native:
@@ -5304,6 +5486,8 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
     # _reconcile_playlist's add/remove-items calls — but it gets the same three-way merge, so
     # un-favoriting in either client sticks instead of being undone by the other.
     favorites = get_or_create_favorites(session, user.id)
+    if changed:
+        session.commit()
     fav_items = _jf_items(client, f"/Users/{jf_user_id}/Items", {
         "Filters": "IsFavorite", "IncludeItemTypes": "Audio", "Recursive": "true", "Limit": "500",
     })
@@ -5347,12 +5531,22 @@ def _mirror_pull(session: Session, user: User, client: httpx.Client, jf_user_id:
     return changed
 
 
+_JF_PULL_MIN_INTERVAL = 60.0
+_JF_PULL_LAST: dict[str, float] = {}
+
+
 def _sync_playlists(session: Session, user: User) -> None:
     """Run the inbound mirror for a user who has Jellyfin linked. No-op otherwise, which is what
     makes every read route below identical for both kinds of user."""
     client, jf_user_id = _jf_client(session, user)
     if not client:
         return
+    # Per-user throttle: the worker's mirror tick reconciles every 5 min regardless.
+    now = time.monotonic()
+    if now - _JF_PULL_LAST.get(user.id, -_JF_PULL_MIN_INTERVAL) < _JF_PULL_MIN_INTERVAL:
+        client.close()
+        return
+    _JF_PULL_LAST[user.id] = now
     with client:
         try:
             if _mirror_pull(session, user, client, jf_user_id):
@@ -5401,12 +5595,13 @@ def create_playlist(payload: PlaylistCreate, session: Session = Depends(get_sess
         raise HTTPException(status_code=409, detail="A playlist with that name already exists")
     playlist = Playlist(name=name, user_id=user.id, protected=False)
     session.add(playlist)
-    session.flush()
+    # Commit the local row before any Jellyfin call so the write lock is not held across HTTP.
+    session.commit()
     client, jf_user_id = _jf_client(session, user)
     if client:
         with client:
             _mirror_create(session, client, jf_user_id, playlist)
-    session.commit()
+        session.commit()
     return _native_playlist_out(session, playlist)
 
 
@@ -5422,11 +5617,11 @@ def rename_playlist(playlist_id: str, payload: PlaylistUpdate, session: Session 
     if conflict:
         raise HTTPException(status_code=409, detail="A playlist with that name already exists")
     playlist.name = name
+    session.commit()
     client, jf_user_id = _jf_client(session, user)
     if client and playlist.jellyfin_playlist_id:
         with client:
             _mirror_rename(client, jf_user_id, playlist.jellyfin_playlist_id, name)
-    session.commit()
     return _native_playlist_out(session, playlist)
 
 
@@ -5658,7 +5853,8 @@ def add_playlist_tracks(playlist_id: str, payload: PlaylistAddTracks, session: S
     if not playlist:
         raise HTTPException(status_code=404, detail="Playlist not found")
     _add_tracks_to_native_playlist(session, playlist, payload.track_ids)
-    session.flush()
+    # Commit the local change before any Jellyfin call so the write lock is not held across HTTP.
+    session.commit()
     session.refresh(playlist)
     # A track that Jellyfin has never scanned is still added locally and simply isn't mirrored —
     # the old Jellyfin path rejected the whole request with "run a sync first", which made adding
@@ -5683,7 +5879,7 @@ def remove_playlist_track(playlist_id: str, track_id: str, session: Session = De
     for entry in list(playlist.tracks):
         if entry.track_id == track_id:
             session.delete(entry)
-    session.flush()
+    session.commit()
     session.refresh(playlist)
     client, jf_user_id = _jf_client(session, user)
     if client:
@@ -5849,15 +6045,16 @@ def accept_playlist_share(
 
     playlist = Playlist(name=name, user_id=user.id, protected=False)
     session.add(playlist)
-    session.flush()
+    session.commit()
     _add_tracks_to_native_playlist(session, playlist, track_ids)
-    session.flush()
+    session.commit()
     session.refresh(playlist)
 
     client, jf_user_id = _jf_client(session, user)
     if client:
         with client:
             _mirror_create(session, client, jf_user_id, playlist)
+        session.commit()
 
     # Carry the sender's cover over, so a shared playlist arrives looking like the one that was sent.
     source_cover = _playlist_local_cover_path(session, share.source_playlist_id)
@@ -5959,89 +6156,89 @@ def propose_playlist_position(
 @router.post("/tools/jellyfin-scan", response_model=TaskOut, tags=["tools"], summary="Trigger Jellyfin library scan")
 def tool_jellyfin_scan(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "jellyfin_scan", {}))
+    return serialize_task(enqueue_task(session, "jellyfin_scan", {"requested_by": user.id}))
 
 
 @router.post("/tools/rescan-slskd-shares", response_model=TaskOut, tags=["tools"], summary="Rescan Soulseek shares")
 def tool_rescan_slskd_shares(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {}))
+    return serialize_task(enqueue_task(session, "rescan_slskd_shares", {"requested_by": user.id}))
 
 
 @router.post("/tools/remap-tracks", response_model=TaskOut, tags=["tools"], summary="Remap Nudibranch tracks to Jellyfin item IDs")
 def tool_remap_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {}))
+    return serialize_task(enqueue_task(session, "sync_favorites_jellyfin", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-files", response_model=TaskOut, tags=["tools"], summary="Check library files for issues")
 def tool_check_files(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_files", {}))
+    return serialize_task(enqueue_task(session, "check_files", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-duplicates", response_model=TaskOut, tags=["tools"], summary="Check for duplicate files")
 def tool_check_duplicates(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_duplicates", {}))
+    return serialize_task(enqueue_task(session, "check_duplicates", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-lyrics", response_model=TaskOut, tags=["tools"], summary="Check for missing lyrics")
 def tool_check_lyrics(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_lyrics", {}))
+    return serialize_task(enqueue_task(session, "check_lyrics", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-musicbrainz-ids", response_model=TaskOut, tags=["tools"], summary="Fill missing MusicBrainz IDs")
 def tool_check_musicbrainz_ids(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {}))
+    return serialize_task(enqueue_task(session, "check_musicbrainz_ids", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-audio-content", response_model=TaskOut, tags=["tools"], summary="Verify audio matches metadata")
 def tool_check_audio_content(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_audio_content", {}))
+    return serialize_task(enqueue_task(session, "check_audio_content", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-album-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing album art")
 def tool_check_album_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_album_covers", {}))
+    return serialize_task(enqueue_task(session, "check_album_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-artist-covers", response_model=TaskOut, tags=["tools"], summary="Check for missing artist art")
 def tool_check_artist_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_artist_covers", {}))
+    return serialize_task(enqueue_task(session, "check_artist_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/refresh-covers", response_model=TaskOut, tags=["tools"], summary="Re-fetch low-resolution album covers")
 def tool_refresh_covers(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "refresh_covers", {}))
+    return serialize_task(enqueue_task(session, "refresh_covers", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-files/fix", response_model=ProposalBatchOut, tags=["tools"], summary="Apply file check fix")
@@ -6146,49 +6343,49 @@ def propose_check_file_fix(
 @router.post("/tools/check-missing-tracks", response_model=TaskOut, tags=["tools"], summary="Check for missing tracks")
 def tool_check_missing_tracks(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_missing_tracks", {}))
+    return serialize_task(enqueue_task(session, "check_missing_tracks", {"requested_by": user.id}))
 
 
 @router.post("/tools/check-non-lossless", response_model=TaskOut, tags=["tools"], summary="Check for non-lossless files")
 def tool_check_non_lossless(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "check_non_lossless", {}))
+    return serialize_task(enqueue_task(session, "check_non_lossless", {"requested_by": user.id}))
 
 
 @router.post("/tools/apply-replaygain", response_model=TaskOut, tags=["tools"], summary="Measure + apply ReplayGain (review-gated)")
 def tool_apply_replaygain(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "apply_replaygain", {}))
+    return serialize_task(enqueue_task(session, "apply_replaygain", {"requested_by": user.id}))
 
 
 @router.post("/tools/consolidate-folders", response_model=TaskOut, tags=["tools"], summary="Consolidate album folders")
 def tool_consolidate_folders(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "consolidate_folders", {}))
+    return serialize_task(enqueue_task(session, "consolidate_folders", {"requested_by": user.id}))
 
 
 @router.post("/tools/clear-downloads", response_model=TaskOut, tags=["tools"], summary="Clear completed downloads")
 def tool_clear_downloads(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "clear_downloads", {}))
+    return serialize_task(enqueue_task(session, "clear_downloads", {"requested_by": user.id}))
 
 
 @router.post("/tools/backup", response_model=TaskOut, tags=["tools"], summary="Create library backup")
 def tool_backup(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "backup_now", {}))
+    return serialize_task(enqueue_task(session, "backup_now", {"requested_by": user.id}))
 
 
 @router.get("/tools/backups", tags=["tools"], summary="List available backups", response_model=dict)
@@ -6204,9 +6401,9 @@ def list_backups(
 @router.post("/tools/restore-default", response_model=TaskOut, tags=["tools"], summary="Restore from latest backup")
 def tool_restore_default(
     session: Session = Depends(get_session),
-    _: User = Depends(require_permission(Permission.tools_manage)),
+    user: User = Depends(require_permission(Permission.tools_manage)),
 ) -> TaskOut:
-    return serialize_task(enqueue_task(session, "restore_default", {}))
+    return serialize_task(enqueue_task(session, "restore_default", {"requested_by": user.id}))
 
 
 @router.post("/tools/restore-backup", response_model=TaskOut, tags=["tools"], summary="Restore from specific backup")
@@ -6263,8 +6460,18 @@ _UI_SETTLED_ITEM_STATUSES = {
 }
 
 
-def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> list[ProposalBatch]:
+def prune_settled_batches(
+    session: Session, batches: list[ProposalBatch], keep_settled: bool = False
+) -> list[ProposalBatch]:
+    """Settle batches whose work is done, and drop them from the list unless `keep_settled`.
+
+    ⚠️ `keep_settled` is what `include_settled=true` asks for. It used to be ignored here, so a
+    batch that settled in this very call was dropped even when the caller asked to see settled
+    ones -- a finished download batch never appeared in the settled view at all. Deleted (empty)
+    batches are always dropped: there is nothing left to show.
+    """
     settled: set[str] = set()
+    deleted: set[str] = set()
     for batch in batches:
         if batch.items:
             actionable_items = [
@@ -6277,7 +6484,12 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
             # failed and kept in the list, because it belongs in Issues. This used to write
             # `completed` and drop it, which is how every exhausted request vanished from Issues.
             any_failed = any(item.selected and item.status is ProposalStatus.failed for item in batch.items)
-            if actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
+            # ⚠️ Never while a row waits on a human (`queue_state.open_decision_rows`) -- that hid
+            # rows at a gate for good: a track whose selected candidate was removed, say.
+            has_open_decision = bool(queue_state.open_decision_rows(batch.items))
+            if has_open_decision:
+                pass
+            elif actionable_items and all(item.status in _UI_SETTLED_ITEM_STATUSES for item in actionable_items):
                 if any_failed:
                     batch.status = ProposalStatus.failed
                 else:
@@ -6295,15 +6507,20 @@ def prune_settled_batches(session: Session, batches: list[ProposalBatch]) -> lis
             # time used to leave one behind every single time.
             session.delete(batch)
             settled.add(batch.id)
+            deleted.add(batch.id)
         elif batch.created_at and as_utc(batch.created_at) < datetime.now(timezone.utc) - timedelta(minutes=10):
             # An empty DOWNLOAD batch is left alone while fresh — a candidate search commits its
             # batch before attaching items and must not be finalized mid-search — but one older
             # than any plausible in-flight search is dead leftover and goes the same way.
             session.delete(batch)
             settled.add(batch.id)
+            deleted.add(batch.id)
+    for settled_id in settled:
+        retire_queue_notifications(session, settled_id)
     if session.dirty or session.deleted:
         session.commit()
-    return [batch for batch in batches if batch.id not in settled]
+    hidden = deleted if keep_settled else settled
+    return [batch for batch in batches if batch.id not in hidden]
 
 
 def resolve_requester_names(session: Session, batches: list[ProposalBatch]) -> dict[str, str]:
@@ -6369,7 +6586,7 @@ def list_approvals(
             ProposalBatch.items.any(ProposalItem.requester_id == requester)
         )
     batches = list(session.scalars(query.order_by(ProposalBatch.created_at.desc())))
-    batches = prune_settled_batches(session, batches)
+    batches = prune_settled_batches(session, batches, keep_settled=include_settled)
     batches = filter_batches_for_bucket(batches, bucket)
     batches = batches[offset : offset + limit] if limit else batches[offset:]
     names = resolve_requester_names(session, batches)
@@ -6644,7 +6861,7 @@ def reject(
     # ⚠️ Removal CANCELS first (the user's rule, 2026-09-22). `remove_items` stops any live
     # transfer and deletes its partial file before the row goes, so nothing can be removed from the
     # Task Queue while it is still running.
-    remove_items(session, item_ids, actor_id=user.id)
+    remove_items(session, item_ids, actor_id=user.id, notify_declined=True)
     session.commit()
     batch = session.scalar(select(ProposalBatch).options(selectinload(ProposalBatch.items)).where(ProposalBatch.id == batch_id))
     if not batch:
@@ -6714,7 +6931,10 @@ def remove_selected_items(
         if batch:
             _assert_may_remove(batch, user)
     canceled, removed, batch_ids = remove_items(
-        session, [item_id for ids in grouped.values() for item_id in sorted(ids)], actor_id=user.id
+        session,
+        [item_id for ids in grouped.values() for item_id in sorted(ids)],
+        actor_id=user.id,
+        notify_declined=True,
     )
     session.commit()
     return QueueBulkResult(
@@ -6800,6 +7020,10 @@ def get_integrations(
     return _integration_settings_out(integration_settings(session))
 
 
+_CONNECTION_PROBE_TTL = 10.0
+_connection_probe_cache: "tuple[tuple, float, dict] | None" = None
+
+
 @router.get("/settings/connections", tags=["settings"], summary="Live connection status for slskd and Jellyfin")
 def get_connection_status(
     session: Session = Depends(get_session),
@@ -6820,9 +7044,25 @@ def get_connection_status(
     slskd_key = settings.get("slskd_api_key", "")
     jellyfin_url = settings.get("jellyfin_url", "")
     jellyfin_key = settings.get("jellyfin_api_key", "")
+    global _connection_probe_cache
+    cache_key = (slskd_url, slskd_key, jellyfin_url, jellyfin_key)
+    cached = _connection_probe_cache
+    if cached and cached[0] == cache_key and time.monotonic() - cached[1] < _CONNECTION_PROBE_TTL:
+        probes = cached[2]
+    else:
+        # Probe both servers at once so the slower one doesn't add to the other's wait.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slskd_future = pool.submit(probe, slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else None
+            jellyfin_future = pool.submit(probe, jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else None
+            probes = {
+                "slskd": slskd_future.result() if slskd_future else "disabled",
+                "jellyfin": jellyfin_future.result() if jellyfin_future else "disabled",
+            }
+        _connection_probe_cache = (cache_key, time.monotonic(), probes)
     return {
-        "slskd": probe(slskd_url, "/api/v0/application", {"X-API-Key": slskd_key} if slskd_key else {}) if slskd_url else "disabled",
-        "jellyfin": probe(jellyfin_url, "/System/Info", {"X-Emby-Token": jellyfin_key}) if (jellyfin_url and jellyfin_key) else "disabled",
+        **probes,
+        # Read-only: set with LISTENBRAINZ_ENABLED in the server's environment. Not probed.
+        "listenbrainz": "enabled" if get_settings().listenbrainz_enabled else "disabled",
     }
 
 
@@ -7332,6 +7572,7 @@ def serialize_user(user: User) -> UserOut:
         background_tint=user.background_tint or "#356df3",
         crossfade_duration=user.crossfade_duration if user.crossfade_duration is not None else 1.0,
         remote_playback_enabled=bool(getattr(user, "remote_playback_enabled", True)),
+        smart_shuffle_every=int(getattr(user, "smart_shuffle_every", 4) or 4),
         playback_claim_timeout_minutes=int(getattr(user, "playback_claim_timeout_minutes", 0) or 0),
         search_min_confidence=user.search_min_confidence if user.search_min_confidence is not None else 0.4,
         library_page_size=user.library_page_size if user.library_page_size is not None else 100,
@@ -7466,14 +7707,29 @@ def _serialize_command(cmd: PlaybackCommand) -> PlayerCommandOut:
     )
 
 
+_JF_NOW_PLAYING_TTL = 5.0
+_jf_now_playing_cache: tuple[float, list[dict]] | None = None
+
+
 def jellyfin_now_playing(session: Session) -> list[dict]:
+    """Jellyfin /Sessions, cached for 5 s so a polled `/users/playback` never blocks on it."""
+    global _jf_now_playing_cache
+    cached = _jf_now_playing_cache
+    if cached and time.monotonic() - cached[0] < _JF_NOW_PLAYING_TTL:
+        return [dict(item) for item in cached[1]]
+    sessions = _jellyfin_now_playing_fetch(session)
+    _jf_now_playing_cache = (time.monotonic(), sessions)
+    return [dict(item) for item in sessions]
+
+
+def _jellyfin_now_playing_fetch(session: Session) -> list[dict]:
     settings = integration_settings(session)
     jellyfin_url = settings.get("jellyfin_url", "").rstrip("/")
     api_key = settings.get("jellyfin_api_key", "")
     if not jellyfin_url or not api_key:
         return []
     try:
-        response = httpx.get(f"{jellyfin_url}/Sessions", headers={"X-Emby-Token": api_key}, timeout=8)
+        response = httpx.get(f"{jellyfin_url}/Sessions", headers={"X-Emby-Token": api_key}, timeout=3)
         response.raise_for_status()
     except httpx.HTTPError:
         return []
@@ -7565,7 +7821,38 @@ def wishlist_stage(item: WishlistItem, downloading_ids: set[str] | None = None) 
     }.get(status, ItemStage.waiting)
 
 
-def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None = None) -> WishlistOut:
+def serialize_wishlist_items(
+    session: Session, items: list[WishlistItem], downloading_ids: set[str] | None = None
+) -> list[WishlistOut]:
+    """Serialize requests, dropping any `batch_id`/`item_id` whose row no longer exists.
+
+    ⚠️ A request's pointers outlive what they point at: a download batch is finalized and later
+    deleted, a Remove deletes rows, a research retry replaces them. Handing a client a batch id that
+    resolves to nothing sends it to a Task Queue entry that is not there. Checked here, once per
+    response in two queries, rather than at every one of the many places a row can go.
+    """
+    batch_ids = {item.batch_id for item in items if item.batch_id}
+    item_ids = {item.item_id for item in items if item.item_id}
+    live_batches = set(session.scalars(select(ProposalBatch.id).where(ProposalBatch.id.in_(batch_ids)))) if batch_ids else set()
+    live_items = set(session.scalars(select(ProposalItem.id).where(ProposalItem.id.in_(item_ids)))) if item_ids else set()
+    return [
+        serialize_wishlist_item(
+            item,
+            downloading_ids,
+            batch_id=item.batch_id if item.batch_id in live_batches else None,
+            item_id=item.item_id if item.item_id in live_items else None,
+        )
+        for item in items
+    ]
+
+
+def serialize_wishlist_item(
+    item: WishlistItem,
+    downloading_ids: set[str] | None = None,
+    *,
+    batch_id: str | None,
+    item_id: str | None,
+) -> WishlistOut:
     stage = wishlist_stage(item, downloading_ids)
     label = _WISHLIST_STAGE_LABELS.get(stage, stage.value)
     return WishlistOut(
@@ -7576,11 +7863,12 @@ def serialize_wishlist_item(item: WishlistItem, downloading_ids: set[str] | None
         artist=item.artist,
         album=item.album,
         track=item.track,
+        source=item.source,
         stage=stage,
         status_code=stage.value,
         status_label=label,
-        batch_id=item.batch_id,
-        item_id=item.item_id,
+        batch_id=batch_id,
+        item_id=item_id,
         progress=ProgressOut(
             value=100.0 if stage is ItemStage.completed else 0.0,
             label=label,
@@ -7809,6 +8097,7 @@ def serialize_proposal_item(
     flow: ProposalFlow,
     requester_names: dict[str, str] | None = None,
     approvable_ids: set[str] | None = None,
+    superseded_ids: set[str] | None = None,
 ) -> ProposalItemOut:
     """One item, with its stage/bucket/progress/candidate resolved server-side.
 
@@ -7856,7 +8145,7 @@ def serialize_proposal_item(
             if approvable_ids is not None
             else (actionable and queue_state.can_approve(stage, flow))
         ),
-        can_retry=queue_state.can_retry(stage, flow),
+        can_retry=queue_state.can_retry(stage, flow) and item.id not in (superseded_ids or set()),
         can_cancel=queue_state.can_cancel(stage),
     )
 
@@ -7881,6 +8170,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
     # Computed once over the whole batch: a container is approvable only because of what is under
     # it, so this cannot be decided row by row.
     approvable = queue_state.approvable_item_ids(items, flow)
+    superseded = queue_state.superseded_download_rows(items)
     return ProposalBatchOut(
         id=batch.id,
         title=title,
@@ -7895,7 +8185,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         items=[
-            serialize_proposal_item(item, flow, requester_names, approvable)
+            serialize_proposal_item(item, flow, requester_names, approvable, superseded)
             for item in items
         ],
     )
@@ -8114,6 +8404,8 @@ def subscribe_podcast(
     oldest = datetime.min.replace(tzinfo=timezone.utc)
     episodes.sort(key=lambda item: item["published_at"] or oldest, reverse=True)
     podcast_service.upsert_episodes(session, podcast, episodes[:_SUBSCRIBE_INLINE_EPISODES])
+    # Commit before the cover fetch (up to ~25 s of HTTP) so the write lock isn't held across it.
+    session.commit()
     _fetch_podcast_cover_now(podcast)
     session.commit()
     enqueue_task(session, "podcast_scan", {"podcast_id": podcast.id})

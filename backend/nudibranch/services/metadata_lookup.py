@@ -549,6 +549,64 @@ def rank_releases(album: str, releases: list[dict]) -> list[dict]:
     return sorted(releases, key=key)
 
 
+def lookup_recording_length(artist: str, title: str) -> int | None:
+    """MusicBrainz's length for this artist's studio recording of this title, or None when it cannot
+    be said with confidence.
+
+    For a request whose album cannot supply one: none was given, or MusicBrainz does not know it by
+    that name. Without an expected length every candidate scores a neutral duration, so a 26-second
+    remix ranked level with the real recordings (John Cage 4′33″, 2026-09-29).
+
+    ⚠️ Conservative on purpose -- a WRONG expected length is worse than none, because it penalises
+    the right file. Only recordings on an official studio album count (not videos, live cuts,
+    compilations or bootlegs), and only when they agree within 15 s. For a much-recorded song the
+    search's first page is mostly bootlegs and live tapes (Pink Floyd "Dogs": none official in 50),
+    and then this answers None rather than guess. Only the length is returned, never a recording id
+    -- a wrong id would make AcoustID reject the right file.
+    """
+    if not artist or not title:
+        return None
+    response = musicbrainz_get(
+        "https://musicbrainz.org/ws/2/recording/",
+        params={
+            "fmt": "json",
+            "query": f'recording:"{escape_query(title)}" AND artist:"{escape_query(artist)}"',
+            "limit": 50,
+        },
+    )
+    want_title, want_artist = normalize(title), normalize(artist)
+    lengths = sorted(
+        int(recording["length"])
+        for recording in response.json().get("recordings", [])
+        if recording.get("length")
+        and normalize(recording.get("title")) == want_title
+        and want_artist in normalize(artist_credit(recording.get("artist-credit", [])))
+        and _is_studio_album_recording(recording)
+    )
+    if not lengths or lengths[-1] - lengths[0] > 15_000:
+        return None
+    return lengths[len(lengths) // 2]
+
+
+_OTHER_CUT_WORDS = {"live", "video", "demo", "remix", "mix", "edit", "instrumental", "acoustic", "karaoke", "rehearsal"}
+
+
+def _is_studio_album_recording(recording: dict) -> bool:
+    """On an official studio album, and not a music video or a recording described as another cut
+    (live, demo, a mix…). A plain median over everything titled "Cloudbusting" gave 7:01: the live
+    and video versions outnumber the 5:10 album track."""
+    if recording.get("video"):
+        return False
+    if _OTHER_CUT_WORDS & set(normalize(recording.get("disambiguation")).split()):
+        return False
+    return any(
+        str(release.get("status") or "").lower() == "official"
+        and (release.get("release-group") or {}).get("primary-type") == "Album"
+        and not (release.get("release-group") or {}).get("secondary-types")
+        for release in recording.get("releases") or []
+    )
+
+
 def musicbrainz_get(url: str, params: dict | None = None) -> httpx.Response:
     last_error: httpx.HTTPError | None = None
     for attempt in range(1, MUSICBRAINZ_RETRY_COUNT + 1):

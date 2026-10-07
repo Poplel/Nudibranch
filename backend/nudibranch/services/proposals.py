@@ -20,7 +20,7 @@ from nudibranch.db.models import (
     WishlistItem,
 )
 from nudibranch.services import queue_state
-from nudibranch.services.notifications import create_notification
+from nudibranch.services.notifications import create_notification, retire_queue_notifications
 from nudibranch.services.tasks import enqueue_task
 
 
@@ -146,6 +146,9 @@ def approve_batch(
     for item in batch.items:
         if (approved_ids is not None and item.id not in approved_ids) or item.id in failed_download_ids:
             continue
+        # A row a research retry is still searching for is not a choice yet (see `_retry_items`).
+        if item.status is ProposalStatus.pending and item.stage == ItemStage.searching.value:
+            continue
         # ⚠️ `canceled` is deliberately NOT in this set. Approving a batch must not resurrect a
         # track the user explicitly stopped -- that is what makes a cancel stick.
         if item.selected and item.status in {ProposalStatus.pending, ProposalStatus.failed}:
@@ -167,6 +170,8 @@ def approve_batch(
         session.rollback()
         raise NothingToApprove("Nothing in this selection can be approved")
     batch.status = ProposalStatus.approved
+    # The ask is answered; the "needs approval" row must not sit unread (or still be pushed).
+    retire_queue_notifications(session, batch_id)
     session.commit()
     return enqueue_task(session, "execute_proposal_batch", {"batch_id": batch_id})
 
@@ -199,8 +204,15 @@ def download_candidate_rank(item: ProposalItem) -> int:
 
 
 def reject_items(
-    session: Session, batch_id: str, item_ids: list[str] | None, expand_descendants: bool = True
-) -> int:
+    session: Session,
+    batch_id: str,
+    item_ids: list[str] | None,
+    expand_descendants: bool = True,
+    actor_id: str | None = None,
+    decline_requests: bool = True,
+) -> tuple[int, dict[str, list[str]]]:
+    """Delete rows for good, and decline any request left with nothing. Returns (rows removed,
+    per-owner requests declined) -- the caller decides whether to tell them."""
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
@@ -214,40 +226,24 @@ def reject_items(
     else:
         items = list(batch.items)
     rejected_ids = {item.id for item in items}
-    rejected_wishlist_items: dict[str, list[str]] = {}
-    removed_download_files = remove_rejected_download_files(items) + remove_rejected_manifest_downloads(items)
+    # Prefer the real columns; fall back to the payload for rows predating them.
+    # ⚠️ The old condition required BOTH ids from the payload, and the gate-(b) review items
+    # carried neither — so rejecting a staged import silently left the wishlist row reading
+    # "completed" for a file that was just thrown away.
+    wishlist_item_ids: set[str] = set()
     for item in items:
         payload = json.loads(item.payload_json or "{}")
         request_payload = payload.get("request") or {}
-        # Prefer the real columns; fall back to the payload for rows predating them.
-        # ⚠️ The old condition required BOTH ids from the payload, and the gate-(b) review items
-        # carried neither — so rejecting a staged import silently left the wishlist row reading
-        # "completed" for a file that was just thrown away. Requiring only the wishlist id (and
-        # resolving the owner from the row itself) is what closes that.
         wishlist_item_id = (
-            item.wishlist_item_id
-            or payload.get("wishlist_item_id")
-            or request_payload.get("wishlist_item_id")
+            item.wishlist_item_id or payload.get("wishlist_item_id") or request_payload.get("wishlist_item_id")
         )
         if wishlist_item_id:
-            wishlist_item = session.get(WishlistItem, wishlist_item_id)
-            if wishlist_item:
-                owner_id = item.requester_id or payload.get("user_id") or wishlist_item.user_id
-                # Name the REQUEST, once -- not each rejected row. Item titles include the artist and
-                # album containers and every candidate's raw slskd path, which is what the
-                # requester's "Request declined" body used to list.
-                request_name = " – ".join(
-                    part for part in (wishlist_item.artist, wishlist_item.track or wishlist_item.album) if part
-                )
-                names = rejected_wishlist_items.setdefault(owner_id, []) if owner_id else None
-                if names is not None and request_name not in names:
-                    names.append(request_name)
-                wishlist_item.status = "rejected"
-                wishlist_item.stage = "rejected"
-                wishlist_item.status_changed_at = datetime.now(timezone.utc)
-                stop_wishlist_search_tasks(session, {wishlist_item.id})
+            wishlist_item_ids.add(wishlist_item_id)
+    removed_download_files = remove_rejected_download_files(items) + remove_rejected_manifest_downloads(items)
+    for item in items:
         session.delete(item)
     session.flush()
+    declined = _decline_requests_left_empty(session, wishlist_item_ids, set(), actor_id) if decline_requests else {}
 
     if batch:
         session.expire(batch, ["items"])
@@ -255,6 +251,10 @@ def reject_items(
         session.expire(batch, ["items"])
         if not batch.items:
             batch.status = ProposalStatus.rejected
+        # Only once nothing here still waits on a decision: rejecting part of a batch leaves the
+        # rest of the ask standing, and its row must stay unread.
+        if not any(item.status == ProposalStatus.pending for item in batch.items):
+            retire_queue_notifications(session, batch_id)
     session.commit()
     if removed_download_files:
         create_notification(
@@ -264,9 +264,78 @@ def reject_items(
             event_type="tool_completed",
             target_url="/task-queue?bucket=issues",
         )
-    for user_id, titles in rejected_wishlist_items.items():
-        shown = ", ".join(titles[:5])
-        extra = "" if len(titles) <= 5 else f" and {len(titles) - 5} more"
+    return len(rejected_ids), declined
+
+
+def _decline_requests_left_empty(
+    session: Session, wishlist_item_ids: set[str], leaving_ids: set[str], actor_id: str | None
+) -> dict[str, list[str]]:
+    """Decline each request that this removal leaves with no work at all; returns, per owner, the
+    requests to tell them about (never the actor's own).
+
+    ⚠️ Removing a ROW is not declining the REQUEST. Removing one wrong candidate used to decline the
+    whole request -- the requester was told "Request declined" and the row read Declined while four
+    good candidates sat beside the removed one. A request is declined only when nothing of it is
+    left: no row outside `leaving_ids` (rows this same removal is taking) that is not already
+    rejected or canceled. A completed IMPORT row counts as left -- that part is in the library. A
+    completed DOWNLOAD row does not: its file was handed to an "Add to library" row, and removing
+    that one is what leaves the request with nothing (seen live: requests kept reading "staged"
+    after their staged files were removed).
+    """
+    now = datetime.now(timezone.utc)
+    declined: set[str] = set()
+    names_by_owner: dict[str, list[str]] = {}
+    for wishlist_item_id in wishlist_item_ids:
+        wishlist_item = session.get(WishlistItem, wishlist_item_id)
+        if not wishlist_item or wishlist_item.status in {"rejected", "removed", "completed"}:
+            continue
+        remaining = session.scalar(
+            select(ProposalItem.id)
+            .where(ProposalItem.wishlist_item_id == wishlist_item_id)
+            .where(ProposalItem.id.not_in(leaving_ids) if leaving_ids else True)
+            .where(ProposalItem.status.not_in([ProposalStatus.rejected, ProposalStatus.canceled]))
+            .where(~((ProposalItem.kind == ProposalKind.download) & (ProposalItem.status == ProposalStatus.completed)))
+            .limit(1)
+        )
+        if remaining:
+            continue
+        wishlist_item.status = "rejected"
+        wishlist_item.stage = "rejected"
+        wishlist_item.status_changed_at = now
+        declined.add(wishlist_item.id)
+        if wishlist_item.user_id and wishlist_item.user_id != actor_id:
+            name = " – ".join(part for part in (wishlist_item.artist, wishlist_item.track or wishlist_item.album) if part)
+            names = names_by_owner.setdefault(wishlist_item.user_id, [])
+            if name not in names:
+                names.append(name)
+    # A declined request must not keep searching for itself behind the decision.
+    stop_wishlist_search_tasks(session, declined)
+    session.flush()
+    return names_by_owner
+
+
+def decline_linked_wishlist_items(
+    session: Session, items: list[ProposalItem], leaving_ids: set[str], actor_id: str | None = None
+) -> dict[str, list[str]]:
+    """Decline the requests behind these live rows that the removal leaves with nothing, before the
+    rows themselves are cancelled (they are deleted later, by the worker).
+
+    ⚠️ Load-bearing for "remove implies cancel": the worker's `reset_canceled_wishlist_items` sends
+    an emptied request back to `requested` (gate 1), which is wrong for a removal -- a removed
+    request should stay declined, not reappear waiting for re-approval. It skips rows that are
+    already `rejected`/`removed`, so declining them BEFORE the removal-cancel step is what stops a
+    removed request coming back to life a second later.
+    """
+    return _decline_requests_left_empty(
+        session, {item.wishlist_item_id for item in items if item.wishlist_item_id}, leaving_ids, actor_id
+    )
+
+
+def notify_declined_requests(session: Session, names_by_owner: dict[str, list[str]]) -> None:
+    """One "Request declined" row per requester -- the same row `reject_items` sends."""
+    for user_id, names in names_by_owner.items():
+        shown = ", ".join(names[:5])
+        extra = "" if len(names) <= 5 else f" and {len(names) - 5} more"
         create_notification(
             session,
             title="Request declined",
@@ -276,38 +345,17 @@ def reject_items(
             user_id=user_id,
             group_key=f"wishlist-decision:wishlist_denied:{user_id}",
         )
-    return len(rejected_ids)
-
-
-def decline_linked_wishlist_items(session: Session, items: list[ProposalItem]) -> None:
-    """Mark the requests behind these items declined, without deleting anything.
-
-    ⚠️ Load-bearing for "remove implies cancel": the worker's `reset_canceled_wishlist_items` sends
-    an emptied request back to `requested` (gate 1), which is wrong for a removal -- a removed
-    request should stay declined, not reappear waiting for re-approval. It skips rows that are
-    already `rejected`/`removed`, so declining them BEFORE the removal-cancel step is what stops a
-    removed request coming back to life a second later.
-    """
-    now = datetime.now(timezone.utc)
-    declined: set[str] = set()
-    for item in items:
-        if not item.wishlist_item_id:
-            continue
-        wishlist_item = session.get(WishlistItem, item.wishlist_item_id)
-        if not wishlist_item or wishlist_item.status in {"rejected", "removed", "completed"}:
-            continue
-        wishlist_item.status = "rejected"
-        wishlist_item.stage = "rejected"
-        wishlist_item.status_changed_at = now
-        declined.add(wishlist_item.id)
-    # A declined request must not keep searching for itself behind the decision.
-    stop_wishlist_search_tasks(session, declined)
-    session.flush()
 
 
 def _is_live_download_leaf(item: ProposalItem) -> bool:
-    """A row with real work behind it: a transfer to stop, or a staged file to delete."""
-    if item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}:
+    """A row with real work behind it: a transfer to stop, or a staged file to delete.
+
+    ⚠️ A `pending` candidate is not one: it was never approved, so there is no transfer and no file,
+    and it is simply deleted. Treating it as live sent it down the cancel-then-delete path, whose
+    "nothing live left" check then settled -- and the worker deleted -- the whole batch, taking
+    every other candidate for the track with it.
+    """
+    if item.status in {ProposalStatus.pending, ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}:
         return False
     payload = json.loads(item.payload_json or "{}")
     if payload.get("action") in {"queue_download", "queue_ytdlp_download"}:
@@ -316,7 +364,11 @@ def _is_live_download_leaf(item: ProposalItem) -> bool:
 
 
 def remove_items(
-    session: Session, item_ids: list[str], actor_id: str | None = None
+    session: Session,
+    item_ids: list[str],
+    actor_id: str | None = None,
+    notify_declined: bool = False,
+    decline_requests: bool = True,
 ) -> tuple[int, int, set[str]]:
     """Remove an arbitrary set of rows, from any batches. Returns (canceled, removed, batch_ids).
 
@@ -335,6 +387,13 @@ def remove_items(
             by_batch.setdefault(item.batch_id, set()).add(item.id)
     canceled_total = 0
     removed_total = 0
+    declined_by_owner: dict[str, list[str]] = {}
+    # Everything this call takes, across batches -- a request is only declined if none of it is left.
+    leaving: set[str] = set()
+    for batch_id, ids in by_batch.items():
+        batch = session.get(ProposalBatch, batch_id)
+        if batch:
+            leaving |= item_ids_with_descendants(batch.items, ids)
     for batch_id, ids in by_batch.items():
         batch = session.get(ProposalBatch, batch_id)
         if not batch:
@@ -347,8 +406,9 @@ def remove_items(
         # deleted it — pressing Remove again (or a stale bulk selection) must not snatch it away
         # and leave the transfer running with nothing pointing at it.
         live_ids |= {item.id for item in targets if item.status is ProposalStatus.canceled}
-        if live:
-            decline_linked_wishlist_items(session, live)
+        if live and decline_requests:
+            for owner_id, names in decline_linked_wishlist_items(session, live, leaving, actor_id).items():
+                declined_by_owner.setdefault(owner_id, []).extend(n for n in names if n not in declined_by_owner.get(owner_id, []))
             # ⚠️ NOT `cancel_items` (2026-09-23): that function now hands a stopped download BACK
             # to gate (a), keeping the row -- exactly wrong for a Remove, which must delete it for
             # good. `_mark_items_canceled_for_removal` is the old terminal-`canceled` marking that
@@ -374,7 +434,13 @@ def remove_items(
         if remaining:
             # Already expanded to descendants above, so `reject_items` must not expand again: the
             # set it is given is exactly the set that goes.
-            removed_total += reject_items(session, batch_id, remaining, expand_descendants=False)
+            removed, declined = reject_items(
+                session, batch_id, remaining, expand_descendants=False, actor_id=actor_id,
+                decline_requests=decline_requests,
+            )
+            removed_total += removed
+            for owner_id, names in declined.items():
+                declined_by_owner.setdefault(owner_id, []).extend(n for n in names if n not in declined_by_owner.get(owner_id, []))
         # An emptied batch is debris -- nothing can be done to it and no UI can clear it. (Rows the
         # cancel above left behind are still there until the worker has stopped their transfers; it
         # deletes the batch with them.)
@@ -382,6 +448,9 @@ def remove_items(
         if not batch.items:
             session.delete(batch)
             session.flush()
+    if notify_declined and declined_by_owner:
+        # `create_notification` commits, so this goes last, once every removal above is written.
+        notify_declined_requests(session, declined_by_owner)
     return canceled_total, removed_total, set(by_batch)
 
 
@@ -403,7 +472,8 @@ def purge_wishlist_work(session: Session, wishlist_item: WishlistItem, actor_id:
     if not item_ids:
         session.commit()
         return 0
-    canceled, removed, _ = remove_items(session, item_ids, actor_id)
+    # Never declines: Delete takes the request away itself, and a search Cancel puts it back at gate 1.
+    canceled, removed, _ = remove_items(session, item_ids, actor_id, decline_requests=False)
     session.commit()
     return canceled + removed
 
@@ -725,12 +795,17 @@ def _mark_items_canceled_for_removal(
     # A batch with nothing live left is finished, not pending forever. `canceled`, not `rejected` --
     # rejected means an approver declined the request, which is not what happened here, and this
     # value is transient anyway: the worker deletes the batch outright once it has emptied it.
-    if cancelled and all(
+    # ⚠️ ...and only then: a track whose removed row leaves alternates behind still has an open
+    # decision (`queue_state.open_decision_rows`), and a batch marked canceled here is deleted by
+    # the worker with everything still in it.
+    if cancelled and not queue_state.open_decision_rows(batch.items) and all(
         item.status in {ProposalStatus.completed, ProposalStatus.rejected, ProposalStatus.canceled}
         or not item.selected
         for item in _leaf_download_items(batch, None, include_staged=True)
     ):
         batch.status = ProposalStatus.canceled
+    if cancelled:
+        retire_queue_notifications(session, batch_id)
     session.commit()
     if cancelled:
         enqueue_task(session, "cancel_download_item", {"item_ids": cancelled, "delete_rows": True})
@@ -796,6 +871,7 @@ def cancel_items(session: Session, batch_id: str, item_ids: list[str] | None, ac
             wishlist_item.status = "review"
             wishlist_item.stage = ItemStage.awaiting_approval.value
             wishlist_item.status_changed_at = now
+    retire_queue_notifications(session, batch_id)
     session.commit()
     # The slow half: stop the real slskd/yt-dlp transfer and delete the partial file. This needs
     # the row to still exist -- it looks up the manifest/transfer entry by item id -- which is
@@ -921,12 +997,22 @@ def _retry_items(
         payload.pop("failed_candidates", None)
         payload.pop("auto_retry_exhausted", None)
         payload.pop("retry_reason", None)
-        payload["status"] = "retrying"
-        target.payload_json = json.dumps(payload)
         # `research` re-enters gate (a): it throws away the candidates and searches again, so a
         # human picks from the new ones. It must NOT auto-approve.
-        target.status = ProposalStatus.pending if effective_mode == "research" else ProposalStatus.approved
-        target.stage = "awaiting_approval" if effective_mode == "research" else "retrying"
+        #
+        # ⚠️ Until the worker has run that search, this row IS the search -- `searching`, not
+        # `awaiting_approval`. It used to read `awaiting_approval` (+ "retrying" text), which made
+        # the candidate that had just failed approvable again: Approve re-downloaded it, and the
+        # worker then deleted the row mid-transfer when its research landed.
+        if effective_mode == "research":
+            payload["status"] = "finding candidates"
+            target.status = ProposalStatus.pending
+            target.stage = ItemStage.searching.value
+        else:
+            payload["status"] = "retrying"
+            target.status = ProposalStatus.approved
+            target.stage = ItemStage.retrying.value
+        target.payload_json = json.dumps(payload)
         # The retried row becomes the track's only selected row, so the track reads as this
         # attempt rather than the worst of the failed ones beside it.
         for sibling in siblings:
@@ -937,8 +1023,8 @@ def _retry_items(
         if target.wishlist_item_id:
             wishlist_item = session.get(WishlistItem, target.wishlist_item_id)
             if wishlist_item:
-                wishlist_item.status = "review" if effective_mode == "research" else "downloading"
-                wishlist_item.stage = "awaiting_approval" if effective_mode == "research" else "retrying"
+                wishlist_item.status = "searching" if effective_mode == "research" else "downloading"
+                wishlist_item.stage = ItemStage.searching.value if effective_mode == "research" else ItemStage.retrying.value
                 wishlist_item.status_changed_at = datetime.now(timezone.utc)
     if retried:
         # Revive the ancestor chain. `cancel_items` settles containers when everything beneath them

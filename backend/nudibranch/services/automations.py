@@ -52,6 +52,7 @@ TOOL_TASK_TYPES = {
 
 MEDIA_CONTROLS = {"pause", "resume", "next", "previous", "stop"}
 LOOP_MODES = {"off", "one", "all"}
+SHUFFLE_MODES = {"off", "on", "smart"}
 TRIGGER_TYPES = {"time", "interval", "webhook", "event", "shortcut"}
 ACTION_TYPES = {"tool", "play", "media_control"}
 NOTIFY_MODES = {"log", "notification", "both"}
@@ -147,7 +148,7 @@ def _run_play(session: Session, owner_id: str, cfg: dict) -> str:
         target_id=target_id,
         target_label=target_label,
         loop=cfg.get("loop") if cfg.get("loop") in LOOP_MODES else "off",
-        shuffle=bool(cfg.get("shuffle")),
+        shuffle=cfg.get("shuffle") if cfg.get("shuffle") in SHUFFLE_MODES else "off",
         status="pending",
     )
     session.add(command)
@@ -212,7 +213,23 @@ def run_automation(session: Session, automation: Automation, trigger_source: str
     except Exception:
         pass
 
-    if automation.notify_mode in ("notification", "both"):
+    if status == "error":
+        # A failure is always worth knowing, whatever notify_mode says -- a silent automation
+        # that stopped working is invisible otherwise.  Owner only; admins if it has none.
+        try:
+            create_notification(
+                session,
+                title=f"Automation failed: {automation.name}",
+                body="Its last run failed. Check its settings.",
+                event_type="automation_failed",
+                target_url="/automations",
+                user_id=automation.owner_id,
+                deliver_apns=True,
+                group_key=f"automation:{automation.id}",
+            )
+        except Exception:
+            pass
+    elif automation.notify_mode in ("notification", "both"):
         try:
             create_notification(
                 session,

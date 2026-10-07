@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     slskd_api_key: str = Field("", alias="SLSKD_API_KEY")
     acoustid_api_key: str = Field("", alias="ACOUSTID_API_KEY")
 
+    # ListenBrainz similar-artists enrichment for suggestions. False skips the call entirely; local
+    # similarity (tags, genres, tempo, co-occurrence) works without it.
+    listenbrainz_enabled: bool = Field(True, alias="LISTENBRAINZ_ENABLED")
+
     spotify_client_id: str = Field("", alias="SPOTIFY_CLIENT_ID")
     spotify_client_secret: str = Field("", alias="SPOTIFY_CLIENT_SECRET")
 
