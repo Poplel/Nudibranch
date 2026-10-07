@@ -7,7 +7,7 @@ on:
       - nightly
     # Releases: a v* tag publishes that version and moves :latest, which production pulls.
     tags:
-      - "v*"
+      - "V*"
   workflow_dispatch:
 
 permissions:
