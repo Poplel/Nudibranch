@@ -1480,9 +1480,9 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
     album_title = metadata.get("album") or "Unknown Album"
     track_title = metadata.get("title") or target_path.stem
 
-    # Never create a 100%-certain duplicate: same artist + album + title already in the library.
-    # (The same title on a different album is fine — albums are matched too.) This guards every
-    # import/download path. Leave the source file in place so nothing is silently lost.
+    # Never create a 100%-certain duplicate: same artist + album + title (and track number /
+    # recording, when both sides know them) already in the library. This guards every
+    # import/download path.
     duplicate = find_library_track(
         session,
         artist_name,
@@ -1493,7 +1493,19 @@ def import_file_to_library(session: Session, source_path: Path, target_path: Pat
         metadata.get("musicbrainz_recording_id"),
     )
     if duplicate and str(duplicate.path or "") != str(target_path):
-        append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
+        # ⚠️ The duplicate copy is deleted, not left where it is (the user, 2026-10-07). Left in
+        # staging, the sweep proposed it again after every approval -- an import that "finished"
+        # and came straight back. Removals are permanent (there is no trash folder), and only a
+        # copy under import/staging/downloads is ever deleted; a library file never is.
+        settings = get_settings()
+        roots = (settings.import_path.resolve(), settings.staging_path.resolve(), settings.downloads_path.resolve())
+        resolved = source_path.resolve()
+        if not create_record_only and any(resolved.is_relative_to(root) for root in roots):
+            resolved.unlink()
+            cleanup_emptied_source_dir(resolved.parent)
+            append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; deleted the duplicate copy")
+        else:
+            append_task_log(session, None, f"{track_title}: already in {artist_name} / {album_title}; skipping duplicate import")
         return
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
