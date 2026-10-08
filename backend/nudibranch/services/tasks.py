@@ -44,20 +44,28 @@ def task_result(task: Task) -> dict | None:
     return json.loads(task.result_json)
 
 
-def claim_next_task(session: Session, lease_seconds: int = 300) -> Task | None:
+def claim_next_task(
+    session: Session,
+    lease_seconds: int = 300,
+    *,
+    only_types: frozenset[str] | None = None,
+    exclude_types: frozenset[str] | None = None,
+) -> Task | None:
+    """Claim the oldest runnable task. The type filters split the queue between worker lanes, and
+    the lanes' sets must partition it exactly, so no task is claimed by two lanes or by none."""
     worker_id = socket.gethostname()
     now = datetime.now(timezone.utc)
-    candidate = session.scalar(
-        select(Task)
-        .where(
-            or_(
-                Task.status == TaskStatus.queued,
-                and_(Task.status == TaskStatus.running, Task.lease_until < now),
-            )
+    query = select(Task).where(
+        or_(
+            Task.status == TaskStatus.queued,
+            and_(Task.status == TaskStatus.running, Task.lease_until < now),
         )
-        .order_by(Task.created_at.asc())
-        .limit(1)
     )
+    if only_types is not None:
+        query = query.where(Task.type.in_(only_types))
+    if exclude_types is not None:
+        query = query.where(Task.type.not_in(exclude_types))
+    candidate = session.scalar(query.order_by(Task.created_at.asc()).limit(1))
     if not candidate:
         return None
 

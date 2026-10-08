@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -66,6 +67,13 @@ DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 # at all (nothing even trying to dispatch it) means every normal recovery path already failed.
 STUCK_DOWNLOAD_ITEM_MINUTES = 30
 MAX_TASK_ATTEMPTS = 4
+#: Task types the search lane runs, on its own thread beside the main lane. A candidate search is
+#: almost all waiting on Soulseek, and one album can take a quarter of an hour. On a single lane it
+#: held up every other search and the download scan behind it, so finished transfers sat unimported
+#: and the one download slot sat idle (castiel, 2026-10-08). Searches only create pending candidate
+#: batches and never touch the download manifest, which stays the main lane's alone.
+SEARCH_LANE_TASK_TYPES = frozenset({"search_wishlist_item", "search_candidates"})
+SEARCH_LANE_IDLE_SECONDS = 2
 AUTOMATION_TICK_SECONDS = 30
 PENDING_PLAYLIST_TICK_SECONDS = 45
 # How often every Jellyfin-linked user's playlists are reconciled in the background, so a
@@ -4929,6 +4937,25 @@ def existing_library_and_proposal_paths(session: Session) -> set[str]:
     return paths
 
 
+#: A request in one of these states no longer wants its search: removed, declined, or sent back to
+#: gate 1 by `POST /wishlist/{id}/cancel`.
+WITHDRAWN_WISHLIST_STATUSES = frozenset({"removed", "rejected", "canceled", "requested"})
+
+
+def wishlist_search_withdrawn(session: Session, requests: list[dict]) -> bool:
+    """True once every request this search serves has been withdrawn, so it can stop early.
+
+    A request rejected four minutes into a fifteen-minute album search used to search the rest of
+    the album anyway, holding the search lane the whole time (castiel, 2026-10-08). A tool search
+    with no wishlist rows behind it is never withdrawn this way.
+    """
+    wishlist_item_ids = {request.get("wishlist_item_id") for request in requests}
+    if not wishlist_item_ids or None in wishlist_item_ids:
+        return False
+    statuses = session.scalars(select(WishlistItem.status).where(WishlistItem.id.in_(wishlist_item_ids))).all()
+    return all(status in WITHDRAWN_WISHLIST_STATUSES for status in statuses)
+
+
 def process_wishlist_request_items(session: Session, requests: list[dict], task: Task | None = None) -> None:
     """Turn download REQUEST PAYLOADS into a real candidate batch.
 
@@ -4960,6 +4987,9 @@ def process_wishlist_request_items(session: Session, requests: list[dict], task:
     shared_artist_items: dict[str, ProposalItem] = {}
     shared_album_items: dict[tuple[str, str], ProposalItem] = {}
     for (album_workflow, artist, album), album_requests in grouped.items():
+        if wishlist_search_withdrawn(session, album_requests):
+            append_task_log(session, task, f"{artist} / {album}: request withdrawn; not searching it")
+            continue
         shared_batch = create_album_download_candidate_batch(
             session, artist, album, album_requests, task, workflow=album_workflow, existing_batch=shared_batch,
             batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
@@ -4970,7 +5000,7 @@ def process_wishlist_request_items(session: Session, requests: list[dict], task:
         # showed for Radiohead / In Rainbows.
         advance_wishlist_rows_to_review(session, wishlist_item_ids, shared_batch)
         session.commit()
-    if shared_batch is not None:
+    if shared_batch is not None and not wishlist_search_withdrawn(session, requests):
         subject = batch_subject(shared_batch)
         track_count = sum(1 for item in shared_batch.items if not item.children)
         # The requester gets their own row, at a screen they can actually open.  Before this they
@@ -5123,6 +5153,9 @@ def create_album_download_candidate_batch(
         session.flush()
         track_items.append((request, track_item.id, track_title))
     session.commit()
+    if wishlist_search_withdrawn(session, requests):
+        append_task_log(session, task, f"{artist} / {album}: request withdrawn; stopping the candidate search", "warning")
+        return batch
 
     slskd_tracks = 0
     retry_tracks = 0
@@ -5273,6 +5306,13 @@ def create_album_download_candidate_batch(
                 session.commit()
                 if task is not None:
                     update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
+                if wishlist_search_withdrawn(session, requests):
+                    # Only searches not yet started can be cancelled; the executor waits out the
+                    # one in flight, which is at most `SLSKD_TRACK_SEARCH_WORKERS` of them.
+                    for pending in futures:
+                        pending.cancel()
+                    append_task_log(session, task, f"{artist} / {album}: request withdrawn; stopping the candidate search", "warning")
+                    break
     session.flush()
     append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing fallback or attention")
     return batch
@@ -10403,7 +10443,7 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
     # ⚠️ Cancelled while it ran (`POST /wishlist/{id}/cancel` sent it back to gate 1, or it was
     # removed): the search could not see that mid-flight, so throw away what it just produced.
     session.refresh(wishlist_item)
-    if wishlist_item.status in {"requested", "removed", "rejected"}:
+    if wishlist_item.status in WITHDRAWN_WISHLIST_STATUSES:
         discard_unapproved_search_results(session, wishlist_item.id)
         session.commit()
         return {"searched": 0, "reason": f"canceled while searching ({wishlist_item.status})"}
@@ -11116,6 +11156,86 @@ def check_mount_writability(session: Session) -> None:
     session.commit()
 
 
+def run_claimed_task(session: Session, task: Task) -> None:
+    """Run one claimed task to its end state. Both worker lanes run their tasks through this."""
+    if task.attempts >= MAX_TASK_ATTEMPTS:
+        append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
+        fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
+        return
+
+    try:
+        handler = TASK_HANDLERS.get(task.type)
+        if not handler:
+            raise ValueError(f"No handler registered for task type {task.type}")
+        append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
+        if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan", "analyze_audio"}:
+            result = handler(session, task_to_payload(task), task)
+        else:
+            result = handler(session, task_to_payload(task))
+        session.refresh(task)
+        if task.status == TaskStatus.canceled:
+            # A cancelled scan keeps what it found (`ScanProgress`), so its proposals and
+            # notification have to be committed here: nothing else on this path does.
+            session.commit()
+            append_task_log(session, task, f"{task.type} canceled", "warning")
+            return
+        completed_with_item_failures = bool(result.get("completed_with_item_failures"))
+        if result.get("errors") and not completed_with_item_failures:
+            append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
+            task.status = TaskStatus.failed
+            task.result_json = json.dumps(result)
+            task.error = result["errors"][0]
+            task.lease_until = None
+            session.commit()
+        else:
+            append_task_log(
+                session,
+                task,
+                f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}",
+                "warning" if completed_with_item_failures else "info",
+            )
+            complete_task(session, task, result)
+            if task.type == "jellyfin_scan":
+                queue_automation_event(session, "scan_complete")
+            if task.type == "ytdlp_download" and result.get("imported"):
+                queue_automation_event(session, "download_complete")
+            fire_queued_automation_events(session)
+    except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
+        try:
+            session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
+        except Exception:  # noqa: BLE001
+            pass
+        discard_queued_automation_events(session)
+        append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
+        try:
+            create_notification(
+                session,
+                title=f"{task_notification_title(task.type)} couldn’t finish",
+                body="Nudibranch could not finish this task. Open Activity for details.",
+                event_type="task_failed",
+                target_url="/activity",
+            )
+            fail_task(session, task, str(error))
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(error, (SystemExit, KeyboardInterrupt)):
+            raise  # only exit the process for fatal OS signals
+
+
+def search_lane_loop() -> None:
+    """The search lane: claims only `SEARCH_LANE_TASK_TYPES`, one at a time, on its own session."""
+    while True:
+        try:
+            with SessionLocal() as session:
+                task = claim_next_task(session, only_types=SEARCH_LANE_TASK_TYPES)
+                if task is not None:
+                    run_claimed_task(session, task)
+                    continue
+        except Exception as error:  # noqa: BLE001 - the lane must outlive any one bad tick.
+            write_app_log(f"Search lane tick failed: {type(error).__name__}: {error}", "error")
+        time.sleep(SEARCH_LANE_IDLE_SECONDS)
+
+
 async def worker_loop() -> None:
     write_app_log(f"Worker starting (version {__version__})")
     with SessionLocal() as session:
@@ -11143,6 +11263,9 @@ async def worker_loop() -> None:
             # Log only: a restart is routine, and nobody can act on "your tasks were requeued".
             write_app_log(f"Resumed interrupted work: {recovered} task(s) interrupted by a restart were requeued to continue.", event_type="task_started")
 
+    # Started after recovery, so it only ever sees a queue the startup sweeps have finished with.
+    threading.Thread(target=search_lane_loop, name="search-lane", daemon=True).start()
+
     last_download_scan = 0.0
     last_download_scan_summary = ""
     last_download_scan_log = 0.0
@@ -11158,7 +11281,7 @@ async def worker_loop() -> None:
     last_orphan_prune_tick = 0.0
     while True:
         with SessionLocal() as session:
-            task = claim_next_task(session)
+            task = claim_next_task(session, exclude_types=SEARCH_LANE_TASK_TYPES)
             if not task:
                 if time.time() - last_download_scan > DOWNLOAD_SCAN_INTERVAL_SECONDS:
                     try:
@@ -11321,68 +11444,7 @@ async def worker_loop() -> None:
                 await asyncio.sleep(2)
                 continue
 
-            if task.attempts >= MAX_TASK_ATTEMPTS:
-                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
-                fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
-                continue
-
-            try:
-                handler = TASK_HANDLERS.get(task.type)
-                if not handler:
-                    raise ValueError(f"No handler registered for task type {task.type}")
-                append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan", "analyze_audio"}:
-                    result = handler(session, task_to_payload(task), task)
-                else:
-                    result = handler(session, task_to_payload(task))
-                session.refresh(task)
-                if task.status == TaskStatus.canceled:
-                    # A cancelled scan keeps what it found (`ScanProgress`), so its proposals and
-                    # notification have to be committed here: nothing else on this path does.
-                    session.commit()
-                    append_task_log(session, task, f"{task.type} canceled", "warning")
-                    continue
-                completed_with_item_failures = bool(result.get("completed_with_item_failures"))
-                if result.get("errors") and not completed_with_item_failures:
-                    append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
-                    task.status = TaskStatus.failed
-                    task.result_json = json.dumps(result)
-                    task.error = result["errors"][0]
-                    task.lease_until = None
-                    session.commit()
-                else:
-                    append_task_log(
-                        session,
-                        task,
-                        f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}",
-                        "warning" if completed_with_item_failures else "info",
-                    )
-                    complete_task(session, task, result)
-                    if task.type == "jellyfin_scan":
-                        queue_automation_event(session, "scan_complete")
-                    if task.type == "ytdlp_download" and result.get("imported"):
-                        queue_automation_event(session, "download_complete")
-                    fire_queued_automation_events(session)
-            except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
-                try:
-                    session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
-                except Exception:  # noqa: BLE001
-                    pass
-                discard_queued_automation_events(session)
-                append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
-                try:
-                    create_notification(
-                        session,
-                        title=f"{task_notification_title(task.type)} couldn’t finish",
-                        body="Nudibranch could not finish this task. Open Activity for details.",
-                        event_type="task_failed",
-                        target_url="/activity",
-                    )
-                    fail_task(session, task, str(error))
-                except Exception:  # noqa: BLE001
-                    pass
-                if isinstance(error, (SystemExit, KeyboardInterrupt)):
-                    raise  # only exit the process for fatal OS signals
+            run_claimed_task(session, task)
 
 
 def task_notification_title(task_type: str) -> str:
