@@ -10676,8 +10676,16 @@ def run_search_alternatives(session: Session, payload: dict, task: Task | None =
             track_payload.pop("finding_alternatives", None)
             if found:
                 batch = session.get(ProposalBatch, batch_id)
+                if from_issues:
+                    # The failed candidate must not stay the selected one, or Approve would fetch
+                    # the file that just failed again. The best new one is preselected instead;
+                    # nothing downloads until someone approves it.
+                    for leaf in track.children:
+                        if leaf.status is ProposalStatus.failed:
+                            leaf.selected = False
                 add_download_candidate_items(
-                    session, batch, track, request, download_query(request), found, select_first=False, start_index=next_index
+                    session, batch, track, request, download_query(request), found,
+                    select_first=from_issues, start_index=next_index,
                 )
                 track_payload.pop("no_alternatives", None)
                 track_payload["status"] = "needs attention" if from_issues else "candidates ready"

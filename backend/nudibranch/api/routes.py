@@ -7965,6 +7965,7 @@ def serialize_proposal_item(
     approvable_ids: set[str] | None = None,
     superseded_ids: set[str] | None = None,
     alternatives_track_ids: set[str] | None = None,
+    failed_track_ids: set[str] | None = None,
 ) -> ProposalItemOut:
     """One item, with its stage/bucket/progress/candidate resolved server-side.
 
@@ -8000,7 +8001,14 @@ def serialize_proposal_item(
         stage=stage,
         status_code=stage.value,
         status_label=queue_state.status_label(item, stage, payload, flow),
-        bucket=queue_state.bucket_for(flow, stage),
+        # A candidate under a failed track waits in Issues with it -- the alternatives found after a
+        # failure would otherwise sit in Review while their track sat in Issues.
+        bucket=(
+            QueueBucket.issues
+            if failed_track_ids and item.parent_id in failed_track_ids
+            and payload.get("action") in {"queue_download", "queue_ytdlp_download"}
+            else queue_state.bucket_for(flow, stage)
+        ),
         action=payload.get("action") or None,
         actionable=actionable,
         progress=ProgressOut(**queue_state.item_progress(item, stage, payload, flow)),
@@ -8046,6 +8054,10 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
     approvable = queue_state.approvable_item_ids(items, flow)
     superseded = queue_state.superseded_download_rows(items)
     alternatives = queue_state.alternatives_track_ids(items, flow, batch.status)
+    failed_tracks = {
+        item.id for item in items
+        if queue_state.resolve_stage(item, queue_state.payload_of(item)) in (ItemStage.failed, ItemStage.canceled)
+    }
     return ProposalBatchOut(
         id=batch.id,
         title=title,
@@ -8060,7 +8072,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         items=[
-            serialize_proposal_item(item, flow, requester_names, approvable, superseded, alternatives)
+            serialize_proposal_item(item, flow, requester_names, approvable, superseded, alternatives, failed_tracks)
             for item in items
         ],
     )
