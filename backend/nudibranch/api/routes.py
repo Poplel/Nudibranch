@@ -195,6 +195,11 @@ from nudibranch.services.imports import discover_import_files, read_audio_metada
 from nudibranch.services import podcasts as podcast_service
 from nudibranch.services import queue_state
 from nudibranch.services.app_log import tail_app_log, write_app_log
+from nudibranch.services.wishlist_state import (
+    downloading_wishlist_ids,
+    reconcile_stale_approved_wishlist_items,
+    terminal_wishlist_expired,
+)
 from nudibranch.services.itunes import album_tracks as itunes_album_tracks
 from nudibranch.services.itunes import discover_music
 from nudibranch.services.itunes import lookup_track as itunes_lookup_track
@@ -4754,14 +4759,13 @@ def list_wishlist(
     session: Session = Depends(get_session),
     user: User = Depends(require_permission(Permission.discover)),
 ) -> list[WishlistOut]:
-    reconcile_stale_approved_wishlist_items(session, user)
+    # A read: the reconcile and expiry writes this used to do run on the worker's recovery tick.
     query = select(WishlistItem).options(selectinload(WishlistItem.user))
     if not user_has_permission(user, Permission.wishlist_approve_all):
         query = query.where(WishlistItem.user_id == user.id)
     items = list(session.scalars(query.order_by(WishlistItem.created_at.desc())))
-    expire_old_terminal_wishlist_items(session, items)
     items = [item for item in items if item.status != "removed" and not terminal_wishlist_expired(item)]
-    downloading_ids = downloading_wishlist_ids(session)
+    downloading_ids = downloading_wishlist_ids(session, {item.id for item in items})
     return serialize_wishlist_items(session, items, downloading_ids)
 
 
@@ -4780,7 +4784,7 @@ def create_wishlist_item(
         album=payload.album,
         track=payload.track,
     )
-    reconcile_stale_approved_wishlist_items(session, user)
+    reconcile_stale_approved_wishlist_items(session, None if user_has_permission(user, Permission.wishlist_approve_all) else user.id)
     existing = session.scalar(
         select(WishlistItem)
         .where(WishlistItem.user_id == user.id)
@@ -6728,6 +6732,7 @@ def list_requests(
         for item in serialized.items:
             item.can_approve = False
             item.can_retry = False
+            item.can_find_alternatives = False
         out.append(serialized)
     return out
 
@@ -7882,147 +7887,6 @@ def serialize_wishlist_item(
     )
 
 
-def terminal_wishlist_expired(item: WishlistItem) -> bool:
-    # "rejected" deliberately never expires: a declined request stays on the requester's list until
-    # they remove it or request it again (which replaces it -- see create_wishlist_item).
-    if item.status not in {"completed", "removed"}:
-        return False
-    changed_at = item.status_changed_at or item.created_at
-    if changed_at.tzinfo is None:
-        changed_at = changed_at.replace(tzinfo=timezone.utc)
-    return changed_at < datetime.now(timezone.utc) - timedelta(hours=48)
-
-
-def expire_old_terminal_wishlist_items(session: Session, items: list[WishlistItem]) -> None:
-    expired = [item for item in items if terminal_wishlist_expired(item)]
-    for item in expired:
-        session.delete(item)
-    if expired:
-        session.commit()
-
-
-def reconcile_stale_approved_wishlist_items(session: Session, user: User) -> None:
-    # Look at non-terminal items: complete any whose download finished, and demote stale
-    # "approved" ones (abandoned downloads) back to "wanted".
-    query = select(WishlistItem).where(WishlistItem.status.in_(["approved", "wanted", "review"]))
-    if not user_has_permission(user, Permission.wishlist_approve_all):
-        query = query.where(WishlistItem.user_id == user.id)
-    items = list(session.scalars(query))
-    if not items:
-        return
-    active_ids = active_wishlist_download_ids(session)
-    # A download that finished is no longer "active", so without this branch the demotion below
-    # would read it as an abandoned download and knock it back to "wanted". But a completed
-    # DOWNLOAD only means the file reached staging (gate a) -- it is NOT in the library yet, so
-    # this must land on "staged", never "completed": `complete_linked_wishlist_item` is the one
-    # place "completed" is written, and only at the real library import. Keyed on the exact
-    # wishlist_item_id carried by the download item, so it works even when
-    # mark_matching_wishlist_completed missed it on fuzzy metadata (deluxe titles, feat., quotes).
-    completed_ids = completed_wishlist_download_ids(session)
-    changed = False
-    now = datetime.now(timezone.utc)
-    for item in items:
-        if item.id in completed_ids:
-            if item.status not in {"staged", "completed"}:
-                item.status = "staged"
-                item.stage = ItemStage.staged.value
-                item.status_changed_at = now
-                changed = True
-            continue
-        # Only "approved" (a download was queued) demotes when its download is gone; genuine
-        # "wanted"/"review" items are left untouched.
-        if item.status == "approved" and item.id not in active_ids:
-            item.status = "wanted"
-            item.status_changed_at = now
-            changed = True
-    if changed:
-        session.commit()
-
-
-def completed_wishlist_download_ids(session: Session) -> set[str]:
-    """Wishlist item ids whose linked download ProposalItem has completed -- i.e. downloaded and
-    verified into staging. ⚠️ NOT "in the library": that needs gate (b) too, so callers must land
-    this on "staged", never "completed" (see `reconcile_stale_approved_wishlist_items`).
-
-    Only count ACTUAL download leaves (queue_download / queue_ytdlp_download). A completed
-    `wishlist_request` item just means the candidate search ran — search_candidates marks the
-    intent batch (and its per-track leaves, which carry wishlist_item_id) completed once the
-    search finishes, NOT once anything is fetched. Counting those wrongly marked every album
-    "completed" the moment its search ended, so albums slskd couldn't seed (whose yt-dlp
-    fallback was never selected/downloaded) silently vanished from the wishlist with 0 tracks.
-    """
-    ids: set[str] = set()
-    batches = list(
-        session.scalars(
-            select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
-            .where(ProposalBatch.kind == ProposalKind.download)
-        )
-    )
-    for batch in batches:
-        for item in batch.items:
-            if item.kind != ProposalKind.download or item.status != ProposalStatus.completed:
-                continue
-            payload = json.loads(item.payload_json or "{}")
-            if payload.get("action") not in {"queue_download", "queue_ytdlp_download"}:
-                continue
-            request = payload.get("request") or {}
-            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
-            if wishlist_item_id:
-                ids.add(wishlist_item_id)
-    return ids
-
-
-def active_wishlist_download_ids(session: Session) -> set[str]:
-    active_ids: set[str] = set()
-    batches = list(
-        session.scalars(
-            select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
-            .where(ProposalBatch.kind == ProposalKind.download)
-            .where(ProposalBatch.flow == ProposalFlow.download_review)
-            .where(ProposalBatch.status.in_([ProposalStatus.pending, ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.failed]))
-        )
-    )
-    for batch in batches:
-        for item in batch.items:
-            if item.kind != ProposalKind.download or item.status in (queue_state.SETTLED_ITEM_STATUSES | {ProposalStatus.failed}):
-                continue
-            payload = json.loads(item.payload_json or "{}")
-            # queue_download = slskd; queue_ytdlp_download = the YouTube fallback retry. Both
-            # keep the wishlist item "active" so it isn't demoted to wanted while downloading.
-            if payload.get("action") not in {"queue_download", "queue_ytdlp_download"} or payload.get("auto_retry_exhausted"):
-                continue
-            request = payload.get("request") or {}
-            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
-            if wishlist_item_id:
-                active_ids.add(wishlist_item_id)
-    return active_ids
-
-
-def downloading_wishlist_ids(session: Session) -> set[str]:
-    """Wishlist items whose linked Soulseek download is actively executing right now."""
-    ids: set[str] = set()
-    batches = list(
-        session.scalars(
-            select(ProposalBatch)
-            .options(selectinload(ProposalBatch.items))
-            .where(ProposalBatch.kind == ProposalKind.download)
-            .where(ProposalBatch.status.in_([ProposalStatus.approved, ProposalStatus.executing]))
-        )
-    )
-    for batch in batches:
-        for item in batch.items:
-            if item.kind != ProposalKind.download or item.status != ProposalStatus.executing:
-                continue
-            payload = json.loads(item.payload_json or "{}")
-            request = payload.get("request") or {}
-            wishlist_item_id = request.get("wishlist_item_id") or payload.get("wishlist_item_id")
-            if wishlist_item_id:
-                ids.add(wishlist_item_id)
-    return ids
-
-
 def load_user(session: Session, user_id: str) -> User:
     user = session.scalar(select(User).options(selectinload(User.permissions)).where(User.id == user_id))
     if not user:
@@ -8100,6 +7964,8 @@ def serialize_proposal_item(
     requester_names: dict[str, str] | None = None,
     approvable_ids: set[str] | None = None,
     superseded_ids: set[str] | None = None,
+    alternatives_track_ids: set[str] | None = None,
+    failed_track_ids: set[str] | None = None,
 ) -> ProposalItemOut:
     """One item, with its stage/bucket/progress/candidate resolved server-side.
 
@@ -8135,7 +8001,14 @@ def serialize_proposal_item(
         stage=stage,
         status_code=stage.value,
         status_label=queue_state.status_label(item, stage, payload, flow),
-        bucket=queue_state.bucket_for(flow, stage),
+        # A candidate under a failed track waits in Issues with it -- the alternatives found after a
+        # failure would otherwise sit in Review while their track sat in Issues.
+        bucket=(
+            QueueBucket.issues
+            if failed_track_ids and item.parent_id in failed_track_ids
+            and payload.get("action") in {"queue_download", "queue_ytdlp_download"}
+            else queue_state.bucket_for(flow, stage)
+        ),
         action=payload.get("action") or None,
         actionable=actionable,
         progress=ProgressOut(**queue_state.item_progress(item, stage, payload, flow)),
@@ -8149,6 +8022,13 @@ def serialize_proposal_item(
         ),
         can_retry=queue_state.can_retry(stage, flow) and item.id not in (superseded_ids or set()),
         can_cancel=queue_state.can_cancel(stage),
+        can_find_alternatives=bool(
+            alternatives_track_ids
+            and (
+                item.id in alternatives_track_ids
+                or (item.parent_id in alternatives_track_ids and payload.get("action") in {"queue_download", "queue_ytdlp_download"})
+            )
+        ),
     )
 
 
@@ -8173,6 +8053,11 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
     # it, so this cannot be decided row by row.
     approvable = queue_state.approvable_item_ids(items, flow)
     superseded = queue_state.superseded_download_rows(items)
+    alternatives = queue_state.alternatives_track_ids(items, flow, batch.status)
+    failed_tracks = {
+        item.id for item in items
+        if queue_state.resolve_stage(item, queue_state.payload_of(item)) in (ItemStage.failed, ItemStage.canceled)
+    }
     return ProposalBatchOut(
         id=batch.id,
         title=title,
@@ -8187,7 +8072,7 @@ def serialize_batch(batch: ProposalBatch, requester_names: dict[str, str] | None
         created_at=batch.created_at,
         updated_at=batch.updated_at,
         items=[
-            serialize_proposal_item(item, flow, requester_names, approvable, superseded)
+            serialize_proposal_item(item, flow, requester_names, approvable, superseded, alternatives, failed_tracks)
             for item in items
         ],
     )

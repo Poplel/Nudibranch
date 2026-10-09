@@ -117,14 +117,17 @@ def search_slskd_detailed(
                 diagnostics["file_count"] = int_value(payload.get("fileCount") or payload.get("FileCount"))
                 diagnostics["payload_shape"] = payload_shape(payload)
             diagnostics.update(search_diagnostics(payload))
-            diagnostics["response_growth"] = len(responses) - last_response_count
             candidates = extract_candidates(responses, query)
             folder_candidates = extract_folder_candidates(responses, query)
-            if len(responses) == last_response_count:
+            # slskd's own responseCount counts too: it grows while bodies are still unserved, so a
+            # window ends once neither number has moved for two polls, not only when bodies stop.
+            seen_count = max(len(responses), int_value(diagnostics.get("response_count")) or 0)
+            diagnostics["response_growth"] = seen_count - last_response_count
+            if seen_count == last_response_count:
                 settled_polls += 1
             else:
                 settled_polls = 0
-            last_response_count = len(responses)
+            last_response_count = seen_count
             search_done = bool(diagnostics.get("is_complete")) or search_state_is_complete(diagnostics.get("state"))
             # If slskd's state reports responses but GET /responses hasn't served them yet, don't
             # conclude "complete, no results" — keep polling (bounded) so the bodies can arrive.

@@ -4,8 +4,10 @@ import json
 import re
 import shutil
 import subprocess
+import threading
 import time
 import unicodedata
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -36,9 +38,20 @@ from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services import content_verify
 from nudibranch.services.content_verify import verify_audio_content
 from nudibranch.services.slskd import cancel_slskd_download, state_flags, download_transfers, queue_slskd_download, rescan_slskd_shares, search_slskd_detailed, transfer_state_category
+from nudibranch.services.download_manifest import (
+    find_download_manifest_entry as _find_download_manifest_entry,
+    load_download_manifest,
+    manifest_entries_for_items,
+    prune_finished_manifest_entries,
+    record_download_manifest_entry,
+    remote_basename,
+    remove_download_manifest_entry,
+    update_download_manifest_entry,
+)
+from nudibranch.services.wishlist_state import expire_old_terminal_wishlist_items, reconcile_stale_approved_wishlist_items
 from nudibranch.services.slskd_reachability import run_slskd_reachability_check, should_run_download_failure_check, store_slskd_check_result
 from nudibranch.worker.audio_analysis import enqueue_analysis_if_needed, run_analyze_audio
-from nudibranch.services.tasks import ScanProgress, append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
+from nudibranch.services.tasks import ScanProgress, task_wake_mark, append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
 MAX_DOWNLOAD_AUTO_RETRIES = 5
@@ -66,6 +79,17 @@ DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 # at all (nothing even trying to dispatch it) means every normal recovery path already failed.
 STUCK_DOWNLOAD_ITEM_MINUTES = 30
 MAX_TASK_ATTEMPTS = 4
+#: Task types the search lane runs, on its own thread beside the main lane. A candidate search is
+#: almost all waiting on Soulseek, and one album can take a quarter of an hour. On a single lane it
+#: held up every other search and the download scan behind it, so finished transfers sat unimported
+#: and the one download slot sat idle (castiel, 2026-10-08). Searches only create pending candidate
+#: batches and never touch the download manifest, which stays the main lane's alone.
+SEARCH_LANE_TASK_TYPES = frozenset({"search_wishlist_item", "search_candidates", "search_alternatives"})
+SEARCH_LANE_IDLE_SECONDS = 2
+#: How often an idle lane glances at the task wake file (`enqueue_task` touches it).
+TASK_WAKE_POLL_SECONDS = 0.25
+#: Search-lane threads. Each has its own session and they share `claim_next_task`'s atomic UPDATE.
+SEARCH_LANE_THREADS = 2
 AUTOMATION_TICK_SECONDS = 30
 PENDING_PLAYLIST_TICK_SECONDS = 45
 # How often every Jellyfin-linked user's playlists are reconciled in the background, so a
@@ -253,7 +277,11 @@ DOWNLOAD_SLOT_PENDING_RECORD_SECONDS = 30
 # more and let the user reject. Trust is anchored on title + duration, not on the artist appearing in
 # the (often artist-less) remote folder path. The exact numbers live in services/match_tuning.py and
 # are admin-editable in Settings → Download matching.
-SLSKD_TRACK_SEARCH_WORKERS = 1
+SLSKD_TRACK_SEARCH_WORKERS = 3
+#: A track's search yields ONE candidate (the first lossless above threshold, else the best lossy).
+#: More are searched for only on demand or after a failure (`search_alternatives`).
+CANDIDATES_PER_TRACK = 1
+ALTERNATIVES_PER_SEARCH = 5
 SLSKD_TRACK_QUERY_LIMIT = 6
 SLSKD_ALBUM_SEARCH_TIMEOUT_SECONDS = 15
 SLSKD_ALBUM_SEARCH_BUFFER_SECONDS = 8
@@ -551,7 +579,7 @@ def add_download_candidate_review_items(
                 completed += 1
                 continue
             query = download_query(request)
-            candidates = candidates_from_folder_pools(pools, request, limit=5)
+            candidates = candidates_from_folder_pools(pools, request, limit=CANDIDATES_PER_TRACK)
             if candidates:
                 add_download_candidate_items(session, batch, track_item, request, query, candidates)
                 candidates_added += len(candidates)
@@ -583,7 +611,7 @@ def add_download_candidate_review_items(
                 # its own search now (was gated to single-track / non-lossless albums and dead-ended the
                 # rest straight to YouTube).
                 set_item_payload_status(track_item, "searching track candidates")
-                missing_track_jobs.append((request, track_item, query, 5))
+                missing_track_jobs.append((request, track_item, query, CANDIDATES_PER_TRACK))
             completed += 1
             if task is not None:
                 update_task_progress(session, task, completed, total_tracks, f"Prepared candidates for {track_title}")
@@ -654,10 +682,10 @@ def add_track_search_candidate_items(
                 continue
             candidates = result.get("candidates") or []
             if candidates:
-                add_download_candidate_items(session, batch, track_item, request, query, candidates[:5])
-                added += len(candidates[:5])
+                add_download_candidate_items(session, batch, track_item, request, query, candidates[:CANDIDATES_PER_TRACK])
+                added += len(candidates[:CANDIDATES_PER_TRACK])
                 set_candidate_parent_stage(track_item, ItemStage.awaiting_approval)
-                append_task_log(session, task, f"{track_title}: {len(candidates[:5])} track candidate(s) ready")
+                append_task_log(session, task, f"{track_title}: {len(candidates[:CANDIDATES_PER_TRACK])} track candidate(s) ready")
             else:
                 rate_limited = bool(result.get("diagnostics", {}).get("rate_limited"))
                 status = "slskd rate limited; no candidate yet" if rate_limited else "no slskd candidates found"
@@ -914,7 +942,7 @@ def run_execute_proposal_batch(session: Session, payload: dict, task: Task | Non
             errors.append(f"Download search: {error}")
             finish_progress_step("Download candidate search failed")
 
-    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest(session))}
     for item in direct_download_items:
         if skip_unchanged(item):
             continue
@@ -1689,8 +1717,10 @@ def queue_slskd_download_with_candidate_fallbacks(session: Session, item: Propos
         label = candidate.get("filename") or candidate_item.title
         try:
             append_task_log(session, task, f"{item.title}: queueing candidate {label}")
+            # Release SQLite's write lock first: manifest writes take it, and this slskd call must not hold it.
+            session.commit()
             result = queue_slskd_download(slskd_url, api_key, candidate)
-            record_download_manifest_entry(request, candidate, item)
+            record_download_manifest_entry(session, request, candidate, item)
             set_download_item_status(item, "queued in slskd; waiting for transfer state")
             if candidate_item.id != item.id:
                 candidate_item.status = ProposalStatus.executing
@@ -1821,131 +1851,8 @@ def create_download_retry_import_batch(session: Session, requests: list[dict]) -
         run_propose_import(session, {"files": [], "download_requests": unique_requests})
 
 
-def download_manifest_path() -> Path:
-    # Internal worker state — keep it on the local config volume, not the (NAS) downloads share,
-    # so frequent rewrites never hit share permission/latency issues.
-    return get_settings().config_path / ".nudibranch-downloads.json"
-
-
-def legacy_download_manifest_path() -> Path:
-    return get_settings().downloads_path / ".nudibranch-downloads.json"
-
-
-def load_download_manifest() -> list[dict]:
-    path = download_manifest_path()
-    if not path.exists():
-        # One-time migration from the old location in the downloads folder.
-        legacy = legacy_download_manifest_path()
-        if legacy.exists():
-            try:
-                payload = json.loads(legacy.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                return []
-            if isinstance(payload, list):
-                save_download_manifest(payload)
-                return payload
-        return []
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    return payload if isinstance(payload, list) else []
-
-
-def save_download_manifest(entries: list[dict]) -> None:
-    path = download_manifest_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def record_download_manifest_entry(request: dict, candidate: dict, item: ProposalItem) -> None:
-    if not request or not candidate:
-        return
-    filename = str(candidate.get("filename") or "")
-    entries = load_download_manifest()
-    entries = [
-        entry
-        for entry in entries
-        if not (
-            entry.get("batch_id") == item.batch_id
-            and entry.get("item_id") == item.id
-            and entry.get("status") not in DOWNLOAD_MANIFEST_FINISHED_STATUSES
-        )
-    ]
-    entries.append(
-        {
-            "batch_id": item.batch_id,
-            "item_id": item.id,
-            "parent_id": item.parent_id,
-            "request": request,
-            "candidate": {
-                "username": candidate.get("username"),
-                "filename": filename,
-                "folder": candidate.get("folder"),
-            },
-            "basename": remote_basename(filename),
-            "initialized_at": datetime.now(timezone.utc).isoformat(),
-            "queued_at": datetime.now(timezone.utc).isoformat(),
-            "status": "queued",
-        }
-    )
-    save_download_manifest(entries[-500:])
-
-
-def remote_basename(filename: str) -> str:
-    return str(filename or "").replace("\\", "/").rsplit("/", 1)[-1].casefold()
-
-
-def find_download_manifest_entry(file_path: Path) -> dict | None:
-    basename = file_path.name.casefold()
-    candidates = [
-        entry
-        for entry in load_download_manifest()
-        if entry.get("status") in (DOWNLOAD_MANIFEST_ACTIVE_STATUSES | {"rejected"})
-    ]
-    for entry in candidates:
-        if entry.get("basename") == basename:
-            return entry
-    normalized_path = str(file_path).replace("\\", "/").casefold()
-    for entry in candidates:
-        filename = str((entry.get("candidate") or {}).get("filename") or "").replace("\\", "/").casefold()
-        if filename and normalized_path.endswith(filename):
-            return entry
-    return None
-
-
-def update_download_manifest_entry(target: dict, status: str, **fields: object) -> None:
-    entries = load_download_manifest()
-    for entry in entries:
-        if entry == target or same_manifest_entry(entry, target):
-            if target.get("item_id"):
-                entry["item_id"] = target["item_id"]
-            if target.get("parent_id"):
-                entry["parent_id"] = target["parent_id"]
-            entry["status"] = status
-            entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
-            entry.update(fields)
-            break
-    save_download_manifest(entries)
-
-
-def remove_download_manifest_entry(target: dict) -> None:
-    save_download_manifest([entry for entry in load_download_manifest() if entry != target and not same_manifest_entry(entry, target)])
-
-
-def same_manifest_entry(entry: dict, target: dict) -> bool:
-    # Match on either item_id: after reconciliation the manifest holds the NEW id, but callers
-    # that carry _original_item_id still need to find that entry.
-    target_item_ids = {v for v in [target.get("item_id"), target.get("_original_item_id")] if v}
-    return bool(
-        target_item_ids
-        and entry.get("batch_id") == target.get("batch_id")
-        and entry.get("item_id") in target_item_ids
-        and entry.get("basename")
-        and entry.get("basename") == target.get("basename")
-    )
+def find_download_manifest_entry(session: Session, file_path: Path) -> dict | None:
+    return _find_download_manifest_entry(session, file_path, DOWNLOAD_MANIFEST_ACTIVE_STATUSES)
 
 
 def download_staging_root(batch_id: str | None = None) -> Path:
@@ -1968,7 +1875,7 @@ def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, f
     except ValueError:
         in_staging = False
     if in_staging:
-        update_download_manifest_entry(entry, "staged", path=str(file_path), staged_at=datetime.now(timezone.utc).isoformat())
+        update_download_manifest_entry(session, entry, "staged", path=str(file_path), staged_at=datetime.now(timezone.utc).isoformat())
         entry.update({"status": "staged", "path": str(file_path)})
         item = session.get(ProposalItem, entry.get("item_id"))
         set_download_item_status(item, "downloaded; ready to add to library", stage="staging", progress=100)
@@ -1976,8 +1883,10 @@ def stage_downloaded_file(session: Session, batch: ProposalBatch, entry: dict, f
     staging_root.mkdir(parents=True, exist_ok=True)
     destination = unique_destination(staging_root / safe_filename(file_path).name)
     append_task_log(session, None, f"{entry_download_label(entry)}: moving completed download to staging: {destination.name}")
+    # Release SQLite's write lock first: manifest writes take it, and this move (often a cross-volume copy) must not hold it.
+    session.commit()
     shutil.move(str(file_path), str(destination))
-    update_download_manifest_entry(
+    update_download_manifest_entry(session, 
         entry,
         "staged",
         path=str(destination),
@@ -2062,21 +1971,21 @@ def surface_unclaimed_audio_files(session: Session, force: bool = False) -> int:
     known = existing_library_and_proposal_paths(session)
     live_paths = {
         str(entry.get("path"))
-        for entry in load_download_manifest()
-        if entry.get("path") and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES
+        for entry in load_download_manifest(session, statuses=DOWNLOAD_MANIFEST_ACTIVE_STATUSES)
+        if entry.get("path")
     }
     review: LibraryReviewBuilder | None = None
     surfaced = 0
     for root, file_path in candidates:
         if str(file_path) in known or str(file_path) in live_paths:
             continue
-        entry = find_download_manifest_entry(file_path)
+        entry = find_download_manifest_entry(session, file_path)
         if entry:
             # A transfer the download loop still owns -- or one already rejected, whose file goes.
             if entry.get("status") == "rejected" and root == downloads_root:
                 try:
                     file_path.unlink()
-                    update_download_manifest_entry(entry, "rejected_removed")
+                    update_download_manifest_entry(session, entry, "rejected_removed")
                 except OSError as error:
                     append_task_log(session, None, f"{file_path.name}: failed to remove rejected download: {error}", "warning")
             continue
@@ -2115,9 +2024,9 @@ def surface_unclaimed_audio_files(session: Session, force: bool = False) -> int:
 
 def import_manifest_download_batches(session: Session, minimum_age_seconds: int) -> dict:
     entries_by_batch: dict[str, list[dict]] = {}
-    for entry in load_download_manifest():
+    for entry in load_download_manifest(session, statuses=DOWNLOAD_MANIFEST_ACTIVE_STATUSES):
         batch_id = entry.get("batch_id")
-        if batch_id and entry.get("status") in DOWNLOAD_MANIFEST_ACTIVE_STATUSES:
+        if batch_id:
             entries_by_batch.setdefault(batch_id, []).append(entry)
     # ⚠️ 2026-09-23 (A.3): this used to require `status == executing`, so a batch sitting at
     # `pending`/`approved`/`failed` whose selected download item has NO manifest entry at all (the
@@ -2196,6 +2105,8 @@ def verify_staged_download_content(
         return True
     request = entry.get("request") or {}
     label = entry_download_label(entry)
+    # Release SQLite's write lock first: manifest writes take it, and this fingerprint and lookup must not hold it.
+    session.commit()
     try:
         verdict = verify_audio_content(
             Path(file_path),
@@ -2209,12 +2120,12 @@ def verify_staged_download_content(
         )
     except Exception as error:  # noqa: BLE001 - never let verification crash the import sweep.
         append_task_log(session, None, f"{label}: content verification errored ({error}); accepting the download", "warning")
-        update_download_manifest_entry(entry, entry.get("status") or "staged", content_checked=True)
+        update_download_manifest_entry(session, entry, entry.get("status") or "staged", content_checked=True)
         entry["content_checked"] = True
         return True
 
     if not verdict["replace"]:
-        update_download_manifest_entry(entry, entry.get("status") or "staged", content_checked=True)
+        update_download_manifest_entry(session, entry, entry.get("status") or "staged", content_checked=True)
         entry["content_checked"] = True
         append_task_log(session, None, f"{label}: download content check — {verdict['log']}")
         return True
@@ -2272,7 +2183,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
     cancel_unapproved_download_entries(session, [entry for entry in entries if entry.get("item_id") not in expected_item_ids])
     entries = [entry for entry in entries if entry.get("item_id") in expected_item_ids]
     entries = defer_excess_download_slot_entries(session, batch, entries)
-    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest())}
+    download_slot_tracker = {"available": download_slots_available(session, load_download_manifest(session))}
     manifest_item_ids = {entry.get("item_id") for entry in entries}
 
     staged_entries: list[tuple[dict, Path]] = []
@@ -2322,7 +2233,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
 
         transfer = transfer_lookup.get(manifest_entry_key(entry))
         if entry.get("status") not in DOWNLOAD_MANIFEST_STAGING_STATUSES:
-            apply_transfer_path_to_manifest(entry, transfer)
+            apply_transfer_path_to_manifest(session, entry, transfer)
 
         file_path, wait_status = manifest_entry_file_path(entry, minimum_age_seconds)
 
@@ -2337,7 +2248,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
                 if item:
                     item.status = ProposalStatus.failed
                 set_download_item_status(item, "needs attention")
-                update_download_manifest_entry(entry, "failed", retry_reason=f"staging failed: {error}")
+                update_download_manifest_entry(session, entry, "failed", retry_reason=f"staging failed: {error}")
                 append_task_log(session, None, f"{entry_download_label(entry)}: failed to move download to staging: {error}", "error")
                 delete_stale_download_file(entry)
                 continue
@@ -2370,7 +2281,7 @@ def process_download_manifest_batch(session: Session, batch: ProposalBatch, entr
             continue
         if transfer_error_message and not transfer:
             wait_status = f"{transfer_error_message}; {wait_status}"
-        update_manifest_transfer_tracking(entry, transfer)
+        update_manifest_transfer_tracking(session, entry, transfer)
         progress_state = transfer_progress_state(entry, transfer, wait_status)
         set_download_item_status(
             item,
@@ -2461,7 +2372,7 @@ def reconcile_manifest_entries_to_selected_items(session: Session, batch: Propos
         selected_item.title = manifest_item.title
         selected_item.new_value = manifest_item.new_value
         selected_item.payload_json = manifest_item.payload_json
-        update_download_manifest_entry(patched, entry.get("status") or "queued")
+        update_download_manifest_entry(session, patched, entry.get("status") or "queued")
         reconciled.append(patched)
         changed = True
     if changed:
@@ -2488,7 +2399,7 @@ def cancel_unapproved_download_entries(session: Session, dropped_entries: list[d
             if transfer is not None:
                 cancel_existing_slskd_transfer(session, transfer, item, "download no longer approved")
         delete_stale_download_file(entry)
-        remove_download_manifest_entry(entry)
+        remove_download_manifest_entry(session, entry)
 
 
 def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, entries: list[dict]) -> list[dict]:
@@ -2521,7 +2432,7 @@ def defer_excess_download_slot_entries(session: Session, batch: ProposalBatch, e
         session.commit()
         if not item or not cancel_existing_slskd_transfer(session, transfer, item, reason):
             continue
-        remove_download_manifest_entry(entry)
+        remove_download_manifest_entry(session, entry)
         set_download_item_status(item, "waiting to download")
         append_task_log(session, None, f"{entry_download_label(entry)}: deferred queued slskd transfer because {reason}")
         deferred.add(id(entry))
@@ -2663,8 +2574,8 @@ def reconnect_existing_slskd_transfer(session: Session, item: ProposalItem) -> b
     # those fall through to a fresh download instead.
     if not transfer or transfer_is_failed(transfer) or transfer_is_complete_or_finishing(transfer):
         return False
-    record_download_manifest_entry(request, candidate, item)
-    update_manifest_transfer_tracking(entry, transfer)
+    record_download_manifest_entry(session, request, candidate, item)
+    update_manifest_transfer_tracking(session, entry, transfer)
     set_download_item_status(item, transfer_wait_status(entry, transfer, "reconnected to existing slskd transfer"))
     item.status = ProposalStatus.executing
     append_task_log(session, None, f"{item.title}: existing slskd transfer found; queue record recreated without requeueing")
@@ -2677,6 +2588,8 @@ def slskd_download_transfer_list(session: Session) -> tuple[list[dict], str | No
     api_key = settings.get("slskd_api_key", "")
     if not slskd_url or not api_key:
         return [], "slskd settings are missing"
+    # Release SQLite's write lock first: manifest writes take it, and this slskd call must not hold it.
+    session.commit()
     try:
         return download_transfers(slskd_url, api_key), None
     except Exception as error:  # noqa: BLE001 - folder scans can still catch completed files.
@@ -2761,7 +2674,7 @@ def normalize_remote_path(value: object) -> str:
     return str(value or "").replace("\\", "/").casefold()
 
 
-def apply_transfer_path_to_manifest(entry: dict, transfer: dict | None) -> None:
+def apply_transfer_path_to_manifest(session: Session, entry: dict, transfer: dict | None) -> None:
     if not transfer or entry.get("path"):
         return
     local_path = transfer.get("local_path")
@@ -2770,7 +2683,7 @@ def apply_transfer_path_to_manifest(entry: dict, transfer: dict | None) -> None:
     path = Path(local_path)
     if not path.is_absolute():
         path = get_settings().downloads_path / path
-    update_download_manifest_entry(entry, entry.get("status") or "queued", path=str(path))
+    update_download_manifest_entry(session, entry, entry.get("status") or "queued", path=str(path))
     entry["path"] = str(path)
 
 
@@ -2981,7 +2894,7 @@ def active_download_slot_count(session: Session, entries: list[dict]) -> int:
     for entry in slot_entries:
         transfer = transfer_lookup.get(manifest_entry_key(entry))
         if transfer:
-            update_manifest_transfer_tracking(entry, transfer)
+            update_manifest_transfer_tracking(session, entry, transfer)
             if transfer_holds_download_slot(transfer):
                 active += 1
             continue
@@ -3037,7 +2950,7 @@ def defer_download_for_slot(
     failed_candidates: list[dict],
     retry_count: int,
 ) -> bool:
-    update_download_manifest_entry(
+    update_download_manifest_entry(session, 
         entry,
         "retrying",
         retry_count=retry_count,
@@ -3087,8 +3000,8 @@ def queue_existing_retry_candidate(
             item.new_value = candidate_item.new_value
             item.status = ProposalStatus.executing
             candidate_item.status = ProposalStatus.executing
-            record_download_manifest_entry(request, candidate, item)
-            update_download_manifest_entry(
+            record_download_manifest_entry(session, request, candidate, item)
+            update_download_manifest_entry(session, 
                 {
                     "batch_id": item.batch_id,
                     "item_id": item.id,
@@ -3193,14 +3106,13 @@ def retry_download_entry(
         return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
     settle_replaced_candidate_item(session, item, current_candidate)
     retry_count += 1
-    request = {**(entry.get("request") or {}), "ignored_candidates": failed_candidates, "multiple_candidates": True}
     append_task_log(session, None, f"{item.title}: {reason}; trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", "warning")
     set_download_item_status(item, f"trying another candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
     payload = json.loads(item.payload_json or "{}")
     payload["auto_retry_exhausted"] = False
     item.payload_json = json.dumps(payload)
     item.status = ProposalStatus.executing
-    update_download_manifest_entry(
+    update_download_manifest_entry(session, 
         entry,
         "retrying",
         retry_count=retry_count,
@@ -3215,98 +3127,12 @@ def retry_download_entry(
     )
     if queue_existing_retry_candidate(session, item, entry, retry_count, failed_candidates, reason, available_slots=available_slots):
         return True
-    try:
-        search_result = search_slskd_for_request(session, request, limit=8)
-        candidates = filter_ignored_candidates(search_result.get("candidates") or [], failed_candidates)
-    except Exception as error:  # noqa: BLE001 - keep the failed row visible with a useful reason.
-        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
-            return exhaust_download_retries(session, item, entry, f"replacement search failed: {error}", failed_candidates, retry_count)
-        update_download_manifest_entry(
-            entry,
-            "retrying",
-            retry_count=retry_count,
-            failed_candidates=failed_candidates[-25:],
-            retry_reason=f"replacement search failed: {error}",
-            queued_at=datetime.now(timezone.utc).isoformat(),
-        )
-        item.status = ProposalStatus.executing
-        set_download_item_status(item, f"replacement search failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", stage="retrying")
-        append_task_log(session, None, f"{item.title}: replacement search failed and will retry: {error}", "warning")
-        return True
-    if not candidates:
-        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
-            return exhaust_download_retries(session, item, entry, "no replacement candidates were found", failed_candidates, retry_count)
-        update_download_manifest_entry(
-            entry,
-            "retrying",
-            retry_count=retry_count,
-            failed_candidates=failed_candidates[-25:],
-            retry_reason="no replacement candidates were found",
-            queued_at=datetime.now(timezone.utc).isoformat(),
-        )
-        item.status = ProposalStatus.executing
-        set_download_item_status(item, f"no replacement candidate yet; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
-        return True
-    candidate = candidates[0]
-    payload = json.loads(item.payload_json or "{}")
-    payload.update(
-        {
-            "action": "queue_download",
-            "request": entry.get("request") or payload.get("request") or {},
-            "candidate": candidate,
-            "failed_candidates": failed_candidates[-25:],
-            "status": f"replacement candidate found; queueing ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})",
-            "auto_retry_exhausted": False,
-        }
-    )
-    item.payload_json = json.dumps(payload)
-    item.title = f"slskd: {candidate.get('filename') or download_query(payload['request'])}"
-    item.new_value = candidate.get("username")
-    item.status = ProposalStatus.executing
-    if not download_slot_available(available_slots):
+    if existing_retry_candidate_items(session, item, failed_candidates):
+        # An untried candidate is still there; it is only waiting for a free download slot.
         return defer_download_for_slot(session, item, entry, reason, failed_candidates, retry_count)
-    try:
-        settings = integration_settings(session)
-        queue_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), candidate)
-        consume_download_slot(available_slots)
-        record_download_manifest_entry(entry.get("request") or {}, candidate, item)
-        update_download_manifest_entry(
-            {
-                "batch_id": item.batch_id,
-                "item_id": item.id,
-                "basename": remote_basename(candidate.get("filename") or ""),
-            },
-            "queued",
-            retry_count=retry_count,
-            failed_candidates=failed_candidates[-25:],
-            queued_at=datetime.now(timezone.utc).isoformat(),
-            initialized_at=datetime.now(timezone.utc).isoformat(),
-        )
-        set_download_item_status(item, f"queued in slskd: replacement candidate ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})")
-        append_task_log(session, None, f"{item.title}: replacement candidate queued after {reason}")
-        return True
-    except Exception as error:  # noqa: BLE001 - immediately try again on the next scan without duplicating rows.
-        failed_candidates.append(
-            {
-                "username": candidate.get("username"),
-                "filename": candidate.get("filename"),
-                "reason": str(error),
-            }
-        )
-        if retry_count >= MAX_DOWNLOAD_AUTO_RETRIES:
-            return exhaust_download_retries(session, item, entry, f"replacement queue failed: {error}", failed_candidates, retry_count)
-        update_download_manifest_entry(
-            entry,
-            "retrying",
-            retry_count=retry_count,
-            failed_candidates=failed_candidates[-25:],
-            retry_reason=f"replacement queue failed: {error}",
-            queued_at=datetime.now(timezone.utc).isoformat(),
-        )
-        item.status = ProposalStatus.executing
-        set_download_item_status(item, f"replacement queue failed; retrying automatically ({retry_count}/{MAX_DOWNLOAD_AUTO_RETRIES})", stage="retrying")
-        append_task_log(session, None, f"{item.title}: replacement candidate failed to queue: {error}", "warning")
-        return True
+    # Nothing untried is left: skip this track into Issues and let the exhaust path look for
+    # alternatives. The batch carries on without it.
+    return exhaust_download_retries(session, item, entry, "no other candidate was left to try", failed_candidates, retry_count)
 
 
 def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item: ProposalItem, reason: str) -> bool:
@@ -3317,6 +3143,8 @@ def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item
     if not transfer_id or not username:
         return False
     settings = integration_settings(session)
+    # Release SQLite's write lock first: manifest writes take it, and this slskd call must not hold it.
+    session.commit()
     try:
         if cancel_slskd_download(settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), username, transfer_id, remove=True):
             append_task_log(session, None, f"{item.title}: cancelled previous slskd transfer before retrying: {reason}", "warning")
@@ -3324,6 +3152,33 @@ def cancel_existing_slskd_transfer(session: Session, transfer: dict | None, item
     except Exception as error:  # noqa: BLE001 - retry can still proceed if slskd already removed the record.
         append_task_log(session, None, f"{item.title}: could not cancel previous slskd transfer before retrying: {error}", "warning")
     return False
+
+
+def queue_auto_alternatives(session: Session, item: ProposalItem) -> None:
+    """Queue the one automatic alternatives search for a track that just failed (decision 3).
+
+    Skipped when an untried candidate is still pending beside it, or when this track already had
+    its automatic search -- after that the user triggers any further one from the picker. Whatever
+    it finds lands unselected, so nothing downloads until someone approves a candidate.
+    """
+    track = item.parent
+    if track is None or track.kind != ProposalKind.download:
+        return
+    if any(
+        sibling.status is ProposalStatus.pending and json.loads(sibling.payload_json or "{}").get("action") == "queue_download"
+        for sibling in track.children
+    ):
+        return
+    payload = json.loads(track.payload_json or "{}")
+    if payload.get("auto_alternatives_searched"):
+        return
+    payload["auto_alternatives_searched"] = True
+    payload["finding_alternatives"] = True
+    payload["status"] = "finding candidates"
+    track.payload_json = json.dumps(payload)
+    track.stage = ItemStage.searching.value
+    session.commit()
+    enqueue_task(session, "search_alternatives", {"track_id": track.id, "automatic": True})
 
 
 def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, reason: str, failed_candidates: list[dict], retry_count: int) -> bool:
@@ -3336,7 +3191,7 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
     payload["failed_candidates"] = failed_candidates[-25:]
     item.payload_json = json.dumps(payload)
     item.status = ProposalStatus.failed
-    update_download_manifest_entry(
+    update_download_manifest_entry(session, 
         entry,
         "failed",
         retry_count=retry_count,
@@ -3360,6 +3215,7 @@ def exhaust_download_retries(session: Session, item: ProposalItem, entry: dict, 
             return False
         except Exception as error:  # noqa: BLE001 - fall through to a needs-attention notice.
             append_task_log(session, None, f"{label}: could not queue YouTube fallback: {error}", "error")
+    queue_auto_alternatives(session, item)
     # Nothing else is going to move this track forward -- sync the linked wishlist row now,
     # rather than leaving it on whatever live-looking stage it last cached.
     fail_linked_wishlist_item(session, item)
@@ -3571,7 +3427,7 @@ def candidate_identity(candidate: dict) -> tuple[str, str]:
     )
 
 
-def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> None:
+def update_manifest_transfer_tracking(session: Session, entry: dict, transfer: dict | None) -> None:
     if not transfer:
         return
     percent = transfer.get("percent")
@@ -3600,7 +3456,7 @@ def update_manifest_transfer_tracking(entry: dict, transfer: dict | None) -> Non
         fields["last_transfer_percent"] = bounded
         if last_percent is None or abs(last_percent - bounded) >= 0.5:
             fields["last_transfer_progress_at"] = now
-    update_download_manifest_entry(entry, manifest_status, **fields)
+    update_download_manifest_entry(session, entry, manifest_status, **fields)
     entry.update({"status": manifest_status, **fields})
 
 
@@ -3711,6 +3567,8 @@ def update_download_container_statuses(batch: ProposalBatch) -> None:
         leaves = selected_action_descendants(item)
         if not leaves:
             continue
+        if json.loads(item.payload_json or "{}").get("finding_alternatives"):
+            continue  # the alternatives search owns this track row until it finishes
         statuses = [
             json.loads(leaf.payload_json or "{}").get("status")
             or (leaf.status.value if hasattr(leaf.status, "value") else str(leaf.status))
@@ -3836,7 +3694,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
             entry,
             item,
             verification["message"],
-            available_slots={"available": download_slots_available(session, load_download_manifest())},
+            available_slots={"available": download_slots_available(session, load_download_manifest(session))},
         )
         if retry_started:
             batch.status = ProposalStatus.executing
@@ -3851,7 +3709,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
             )
             session.commit()
             return True
-    update_download_manifest_entry(entry, "failed", path=str(file_path), metadata=verification.get("metadata"), retry_reason=verification["message"])
+    update_download_manifest_entry(session, entry, "failed", path=str(file_path), metadata=verification.get("metadata"), retry_reason=verification["message"])
     if item:
         item.status = ProposalStatus.failed
         set_download_item_status(item, "needs attention")
@@ -3870,7 +3728,7 @@ def handle_download_mismatch(session: Session, batch: ProposalBatch, entry: dict
 
 
 def handle_download_verification_issue(session: Session, batch: ProposalBatch, entry: dict, file_path: Path, message: str, verification: dict) -> None:
-    update_download_manifest_entry(entry, "queued", path=str(file_path), verification_error=message, metadata=verification.get("metadata"))
+    update_download_manifest_entry(session, entry, "queued", path=str(file_path), verification_error=message, metadata=verification.get("metadata"))
     item = session.get(ProposalItem, entry.get("item_id"))
     if item:
         item.status = ProposalStatus.failed
@@ -3949,7 +3807,7 @@ def cleanup_orphaned_download_manifest_entries(session: Session) -> int:
     every other batch's transfer with nothing to ever free it.
     """
     orphaned = []
-    for entry in load_download_manifest():
+    for entry in load_download_manifest(session, statuses=DOWNLOAD_SLOT_STATUSES | {"retrying", "rejected", "rejected_removed"}):
         batch_id = entry.get("batch_id")
         if not batch_id:
             continue
@@ -3978,7 +3836,7 @@ def watchdog_stuck_download_items(session: Session) -> int:
     concrete stall found live has its own fix elsewhere; this is only the catch-all for whatever
     isn't covered by those.
     """
-    manifest = load_download_manifest()
+    manifest = load_download_manifest(session)
     # ⚠️ Downloads run one at a time, so an item waiting its turn has no manifest entry for as long
     # as the queue ahead of it takes -- an album's last track can wait well past the bound. Only
     # count time while nothing is transferring or being checked: that holder has its own, much
@@ -4179,7 +4037,7 @@ def present_staged_downloads_for_library_review(session: Session, batch: Proposa
             )
             created += 1
         # The download is done; the review task now owns the staged file.
-        update_download_manifest_entry(entry, "completed", path=str(staged_path))
+        update_download_manifest_entry(session, entry, "completed", path=str(staged_path))
         if source_item and source_item.wishlist_item_id:
             # Downloaded and verified, but NOT in the library until gate (b) is approved. Calling
             # this "completed" here is precisely the bug where a rejected import still read as done.
@@ -4929,6 +4787,25 @@ def existing_library_and_proposal_paths(session: Session) -> set[str]:
     return paths
 
 
+#: A request in one of these states no longer wants its search: removed, declined, or sent back to
+#: gate 1 by `POST /wishlist/{id}/cancel`.
+WITHDRAWN_WISHLIST_STATUSES = frozenset({"removed", "rejected", "canceled", "requested"})
+
+
+def wishlist_search_withdrawn(session: Session, requests: list[dict]) -> bool:
+    """True once every request this search serves has been withdrawn, so it can stop early.
+
+    A request rejected four minutes into a fifteen-minute album search used to search the rest of
+    the album anyway, holding the search lane the whole time (castiel, 2026-10-08). A tool search
+    with no wishlist rows behind it is never withdrawn this way.
+    """
+    wishlist_item_ids = {request.get("wishlist_item_id") for request in requests}
+    if not wishlist_item_ids or None in wishlist_item_ids:
+        return False
+    statuses = session.scalars(select(WishlistItem.status).where(WishlistItem.id.in_(wishlist_item_ids))).all()
+    return all(status in WITHDRAWN_WISHLIST_STATUSES for status in statuses)
+
+
 def process_wishlist_request_items(session: Session, requests: list[dict], task: Task | None = None) -> None:
     """Turn download REQUEST PAYLOADS into a real candidate batch.
 
@@ -4960,6 +4837,9 @@ def process_wishlist_request_items(session: Session, requests: list[dict], task:
     shared_artist_items: dict[str, ProposalItem] = {}
     shared_album_items: dict[tuple[str, str], ProposalItem] = {}
     for (album_workflow, artist, album), album_requests in grouped.items():
+        if wishlist_search_withdrawn(session, album_requests):
+            append_task_log(session, task, f"{artist} / {album}: request withdrawn; not searching it")
+            continue
         shared_batch = create_album_download_candidate_batch(
             session, artist, album, album_requests, task, workflow=album_workflow, existing_batch=shared_batch,
             batch_title=title_prefix, artist_items=shared_artist_items, album_items=shared_album_items,
@@ -4970,7 +4850,7 @@ def process_wishlist_request_items(session: Session, requests: list[dict], task:
         # showed for Radiohead / In Rainbows.
         advance_wishlist_rows_to_review(session, wishlist_item_ids, shared_batch)
         session.commit()
-    if shared_batch is not None:
+    if shared_batch is not None and not wishlist_search_withdrawn(session, requests):
         subject = batch_subject(shared_batch)
         track_count = sum(1 for item in shared_batch.items if not item.children)
         # The requester gets their own row, at a screen they can actually open.  Before this they
@@ -5123,6 +5003,9 @@ def create_album_download_candidate_batch(
         session.flush()
         track_items.append((request, track_item.id, track_title))
     session.commit()
+    if wishlist_search_withdrawn(session, requests):
+        append_task_log(session, task, f"{artist} / {album}: request withdrawn; stopping the candidate search", "warning")
+        return batch
 
     slskd_tracks = 0
     retry_tracks = 0
@@ -5180,7 +5063,7 @@ def create_album_download_candidate_batch(
             continue
         query = download_query(request)
         set_item_payload_status(track_item, f"searching {track_title}")
-        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=5) if folder_pools else []
+        folder_candidates = candidates_from_folder_pools(folder_pools, request, limit=CANDIDATES_PER_TRACK) if folder_pools else []
         require_lossless = bool(request.get("require_lossless"))
         has_lossless = any(candidate.get("quality") == "lossless" for candidate in folder_candidates)
         if folder_candidates and (has_lossless or not require_lossless):
@@ -5203,7 +5086,7 @@ def create_album_download_candidate_batch(
             need = "no lossless match" if (folder_candidates and require_lossless) else f"no match{in_folders}"
             set_item_payload_status(track_item, "searching individual track")
             append_task_log(session, task, f"{track_title}: {need}; searching for the individual track by name")
-            search_jobs.append((request, track_item.id, track_title, query, 5, folder_candidates))
+            search_jobs.append((request, track_item.id, track_title, query, CANDIDATES_PER_TRACK, folder_candidates))
         session.commit()
 
     if search_jobs:
@@ -5238,7 +5121,7 @@ def create_album_download_candidate_batch(
                 known = {candidate_identity(candidate) for candidate in (search_result["candidates"] or [])}
                 merged = list(search_result["candidates"] or []) + [c for c in (fallback_candidates or []) if candidate_identity(c) not in known]
                 merged.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
-                candidates = merged[:5]
+                candidates = merged[:CANDIDATES_PER_TRACK]
                 diagnostic_lines.append(slskd_diagnostic_body(query, search_result["diagnostics"]))
                 if candidates and not request.get("multiple_candidates") and not folder_pool:
                     folder_pool = download_folder_pool(candidates[0])
@@ -5273,6 +5156,13 @@ def create_album_download_candidate_batch(
                 session.commit()
                 if task is not None:
                     update_task_progress(session, task, completed_tracks, total_tracks, f"Prepared download candidate for {track_title}")
+                if wishlist_search_withdrawn(session, requests):
+                    # Only searches not yet started can be cancelled; the executor waits out the
+                    # one in flight, which is at most `SLSKD_TRACK_SEARCH_WORKERS` of them.
+                    for pending in futures:
+                        pending.cancel()
+                    append_task_log(session, task, f"{artist} / {album}: request withdrawn; stopping the candidate search", "warning")
+                    break
     session.flush()
     append_task_log(session, task, f"{artist} / {album}: candidate search finished with {slskd_tracks} slskd track(s) and {retry_tracks} track(s) needing fallback or attention")
     return batch
@@ -5314,16 +5204,27 @@ def set_candidate_parent_stage(item: ProposalItem, stage: ItemStage, status: str
             item.payload_json = json.dumps(payload)
 
 
-def add_download_candidate_items(session: Session, batch: ProposalBatch, track_item: ProposalItem, request: dict, query: str, candidates: list[dict]) -> None:
+def add_download_candidate_items(
+    session: Session,
+    batch: ProposalBatch,
+    track_item: ProposalItem,
+    request: dict,
+    query: str,
+    candidates: list[dict],
+    *,
+    select_first: bool = True,
+    start_index: int = 0,
+) -> None:
     requester_id, wishlist_item_id = request_owner(request)
-    for index, candidate in enumerate(candidates):
+    for offset, candidate in enumerate(candidates):
+        index = start_index + offset
         session.add(
             ProposalItem(
                 batch_id=batch.id,
                 parent_id=track_item.id,
                 title=f"slskd: {candidate.get('filename') or query}",
                 kind=ProposalKind.download,
-                selected=index == 0,
+                selected=select_first and offset == 0,
                 old_value=query,
                 new_value=candidate.get("username"),
                 requester_id=requester_id,
@@ -5398,7 +5299,7 @@ def create_download_candidate_batch(session: Session, request: dict) -> None:
     track_parent = add_download_tree_parents(session, batch, request, query)
     set_item_payload_status(track_parent, f"searching {query}")
     session.commit()
-    search_result = search_slskd_for_request(session, request, limit=4 if request.get("multiple_candidates") else 1)
+    search_result = search_slskd_for_request(session, request, limit=CANDIDATES_PER_TRACK)
     candidates = search_result["candidates"]
     diagnostics = search_result["diagnostics"]
     if not candidates:
@@ -5514,7 +5415,8 @@ def set_download_item_status(
     progress_payload = download_progress_payload(status, stage=stage, progress=progress, indeterminate=indeterminate)
     set_item_payload_status(item, status, progress_payload)
     cache_item_stage(item, progress_payload.get("stage"))
-    if item.parent and item.parent.kind == ProposalKind.download:
+    # A track whose alternatives search is running keeps its "finding candidates" row.
+    if item.parent and item.parent.kind == ProposalKind.download and not json.loads(item.parent.payload_json or "{}").get("finding_alternatives"):
         set_item_payload_status(item.parent, status, progress_payload)
         item.parent.status = ProposalStatus.executing
         # ⚠️ The parent's cache too. Copying payload + status up without it left track rows reading
@@ -5680,8 +5582,6 @@ def search_album_folder_pools(session: Session, artist: str, album: str, request
                     f"complete={diagnostics.get('is_complete')})"
                 ),
             )
-            if not diagnostics.get("responses"):
-                append_task_log(session, task, f"slskd album search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}", "warning")
         except Exception as error:
             append_task_log(session, task, f"slskd album search failed: {query}: {error}", "warning")
             continue
@@ -6148,6 +6048,10 @@ def candidates_from_folder_pools(pools: list[dict], request: dict, limit: int = 
         candidate["album_folder_rank"] = pool_index
         collected.append(candidate)
     collected.sort(key=lambda candidate: slskd_candidate_sort_key(candidate, require_lossless=bool(request.get("require_lossless"))), reverse=True)
+    if limit == CANDIDATES_PER_TRACK:
+        # One candidate per track: a lossless copy beats a lossy one with a slightly higher score.
+        lossless = [candidate for candidate in collected if candidate.get("quality") == "lossless"]
+        return (lossless or collected)[:limit]
     return collected[:limit]
 
 
@@ -6457,8 +6361,16 @@ def slskd_candidate_sort_key(candidate: dict, require_lossless: bool = False) ->
     return (confidence, quality_score, free_slots, upload_speed, -queue_length, size)
 
 
-def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1) -> dict:
+def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request: dict, limit: int = 1, stop_at_lossless: bool = True) -> dict:
+    """Search a track across its query variants.
+
+    `stop_at_lossless` (the default) is the first-candidate rule: the first variant that yields a
+    lossless file above the match threshold ends the search; if none does, every variant runs and
+    the single best lossy result is kept. The alternatives search turns it off and takes the first
+    variant that finds anything, since it only wants more options.
+    """
     attempted = []
+    best_lossy: dict | None = None
     query_logs = []
     rate_limited = False
     raw_ignored_candidates = request.get("ignored_candidates") or []
@@ -6511,7 +6423,9 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
         result["diagnostics"]["queries"] = attempted.copy()
         result["diagnostics"]["query_logs"] = query_logs
         result["diagnostics"]["rate_limited"] = rate_limited
-        result["candidates"], rejected = rank_slskd_candidates_for_request(result.get("candidates") or [], request, ignored_candidates, limit)
+        ranked, rejected = rank_slskd_candidates_for_request(result.get("candidates") or [], request, ignored_candidates, max(limit, 50))
+        lossless = [candidate for candidate in ranked if candidate.get("quality") == "lossless"]
+        result["candidates"] = (lossless or ranked)[:limit] if stop_at_lossless else ranked[:limit]
         if rejected:
             result["diagnostics"]["rejected_candidates"] = rejected
         result["diagnostics"]["ignored_candidates"] = len(ignored_candidates)
@@ -6526,12 +6440,19 @@ def search_slskd_for_request_with_settings(slskd_url: str, api_key: str, request
                 f"complete={diagnostics.get('is_complete')})"
             ),
         )
-        if not diagnostics.get("responses"):
-            query_logs.append(f"slskd track search response shape for {query}: {diagnostics.get('payload_shape') or 'unknown'}")
         for rejected_line in rejected:
             query_logs.append(f"slskd candidate rejected: {rejected_line}")
         if result["candidates"]:
-            return result
+            if not stop_at_lossless or lossless:
+                return result
+            # Lossy only: keep the best one seen and let the next variant look for a lossless copy.
+            if best_lossy is None or slskd_candidate_sort_key(result["candidates"][0]) > slskd_candidate_sort_key(best_lossy["candidates"][0]):
+                best_lossy = result
+    if best_lossy is not None:
+        best_lossy["diagnostics"]["queries"] = attempted
+        best_lossy["diagnostics"]["query_logs"] = query_logs
+        best_lossy["diagnostics"]["rate_limited"] = rate_limited
+        return best_lossy
     last_result["diagnostics"]["queries"] = attempted
     last_result["diagnostics"]["query_logs"] = query_logs
     last_result["diagnostics"]["rate_limited"] = rate_limited
@@ -9827,8 +9748,6 @@ def run_clear_downloads(session: Session, payload: dict, task: Task | None = Non
     if task is not None:
         update_task_progress(session, task, 0, 1, "Scanning downloads folder")
     root.mkdir(parents=True, exist_ok=True)
-    manifest_path = download_manifest_path().resolve()
-    append_task_log(session, task, f"Keeping download manifest at {manifest_path}")
     removed_files = 0
     removed_dirs = 0
     scanned = 0
@@ -9859,10 +9778,6 @@ def run_clear_downloads(session: Session, payload: dict, task: Task | None = Non
     for index, path in enumerate(paths, start=1):
         scanned += 1
         try:
-            if path.resolve() == manifest_path:
-                skipped += 1
-                append_task_log(session, task, f"Skipped download manifest {path}")
-                continue
             if path.is_file():
                 path.unlink()
                 removed_files += 1
@@ -10403,7 +10318,7 @@ def run_search_wishlist_item(session: Session, payload: dict, task: Task | None 
     # ⚠️ Cancelled while it ran (`POST /wishlist/{id}/cancel` sent it back to gate 1, or it was
     # removed): the search could not see that mid-flight, so throw away what it just produced.
     session.refresh(wishlist_item)
-    if wishlist_item.status in {"requested", "removed", "rejected"}:
+    if wishlist_item.status in WITHDRAWN_WISHLIST_STATUSES:
         discard_unapproved_search_results(session, wishlist_item.id)
         session.commit()
         return {"searched": 0, "reason": f"canceled while searching ({wishlist_item.status})"}
@@ -10540,10 +10455,6 @@ def recover_stuck_wishlist_searches(session: Session) -> int:
     return healed
 
 
-def _manifest_entries_for_items(item_ids: set[str]) -> list[dict]:
-    return [entry for entry in load_download_manifest() if str(entry.get("item_id") or "") in item_ids]
-
-
 def run_cancel_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Stop the real transfer behind a cancelled item.
 
@@ -10568,7 +10479,7 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
     if not item_ids:
         return {"canceled": 0}
     delete_rows = bool(payload.get("delete_rows"))
-    entries = _manifest_entries_for_items(item_ids)
+    entries = manifest_entries_for_items(session, item_ids)
     transfers, _ = slskd_transfer_lookup(session, entries) if entries else ({}, None)
     removed = 0
     stopped = 0
@@ -10587,7 +10498,7 @@ def run_cancel_download_item(session: Session, payload: dict, task: Task | None 
                 Path(str(path)).unlink(missing_ok=True)
             except OSError as error:
                 append_task_log(session, task, f"Could not remove canceled partial {path}: {error}", "warning")
-        remove_download_manifest_entry(entry)
+        remove_download_manifest_entry(session, entry)
         removed += 1
 
     if not delete_rows:
@@ -10712,6 +10623,91 @@ def reset_canceled_wishlist_items(session: Session, wishlist_item_ids: set[str])
         session.flush()
 
 
+def run_search_alternatives(session: Session, payload: dict, task: Task | None = None) -> dict:
+    """Add up to ALTERNATIVES_PER_SEARCH new unselected candidates to one track (decisions 2 and 3).
+
+    Keeps every existing candidate, leaves out every file already listed or failed for the track,
+    and takes the first query variant that finds anything (no first-lossless stop). The track
+    returns to where it was: Download approval, or Issues when its candidates had failed. Never
+    touches the download manifest beyond reading `failed_candidates`.
+    """
+    track_id = str(payload.get("track_id") or "")
+    track = session.get(ProposalItem, track_id) if track_id else None
+    if track is None:
+        return {"found": 0, "reason": "track is gone"}
+    leaves = [child for child in track.children if json.loads(child.payload_json or "{}").get("action") in {"queue_download", "queue_ytdlp_download"}]
+    from_issues = any(leaf.status is ProposalStatus.failed for leaf in leaves)
+    request: dict | None = None
+    ignored: list[dict] = []
+    next_index = 0
+    for leaf in sorted(leaves, key=download_candidate_index):
+        leaf_payload = json.loads(leaf.payload_json or "{}")
+        request = request or (leaf_payload.get("request") if isinstance(leaf_payload.get("request"), dict) else None)
+        candidate = leaf_payload.get("candidate")
+        if isinstance(candidate, dict) and candidate:
+            ignored.append(candidate)
+        ignored.extend(c for c in (leaf_payload.get("failed_candidates") or []) if isinstance(c, dict))
+        if download_candidate_index(leaf) < 9999:
+            next_index = max(next_index, download_candidate_index(leaf) + 1)
+    if leaves:
+        for entry in manifest_entries_for_items(session, {leaf.id for leaf in leaves}):
+            ignored.extend(manifest_failed_candidates(entry))
+    if request is None:
+        track_payload = json.loads(track.payload_json or "{}")
+        request = {"artist": track_payload.get("artist"), "album": track_payload.get("album"), "track": track_payload.get("track") or track.title}
+    request = {**request, "ignored_candidates": ignored, "multiple_candidates": True}
+    batch_id = track.batch_id
+    configure_match_tuning(session)
+    settings = integration_settings(session)
+    session.commit()  # no write lock held across the slow search
+    found: list[dict] = []
+    try:
+        result = search_slskd_for_request_with_settings(
+            settings.get("slskd_url", ""), settings.get("slskd_api_key", ""), request, ALTERNATIVES_PER_SEARCH, stop_at_lossless=False
+        )
+        for line in result.get("diagnostics", {}).get("query_logs") or []:
+            append_task_log(session, task, line)
+        found = filter_ignored_candidates(result.get("candidates") or [], ignored)[:ALTERNATIVES_PER_SEARCH]
+    finally:
+        session.rollback()
+        track = session.get(ProposalItem, track_id)
+        if track is not None:
+            track_payload = json.loads(track.payload_json or "{}")
+            track_payload.pop("finding_alternatives", None)
+            if found:
+                batch = session.get(ProposalBatch, batch_id)
+                if from_issues:
+                    # The failed candidate must not stay the selected one, or Approve would fetch
+                    # the file that just failed again. The best new one is preselected instead;
+                    # nothing downloads until someone approves it.
+                    for leaf in track.children:
+                        if leaf.status is ProposalStatus.failed:
+                            leaf.selected = False
+                add_download_candidate_items(
+                    session, batch, track, request, download_query(request), found,
+                    select_first=from_issues, start_index=next_index,
+                )
+                track_payload.pop("no_alternatives", None)
+                track_payload["status"] = "needs attention" if from_issues else "candidates ready"
+                append_task_log(session, task, f"{track.title}: {len(found)} more candidate(s) found")
+            elif from_issues:
+                track_payload["no_alternatives"] = True
+                track_payload["status"] = "needs attention"
+            else:
+                track_payload["status"] = "no other source found"
+            track.stage = (ItemStage.failed if from_issues else ItemStage.awaiting_approval).value
+            track.payload_json = json.dumps(track_payload)
+            session.commit()
+    return {"found": len(found), "track_id": track_id}
+
+
+def download_candidate_index(item: ProposalItem) -> int:
+    try:
+        return int(json.loads(item.payload_json or "{}").get("candidate_index", 9999))
+    except (TypeError, ValueError):
+        return 9999
+
+
 def run_retry_download_item(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Put a failed download back in flight.
 
@@ -10726,7 +10722,7 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
     if not item_ids:
         return {"retried": 0}
 
-    entries = _manifest_entries_for_items(item_ids)
+    entries = manifest_entries_for_items(session, item_ids)
     transfers, _ = slskd_transfer_lookup(session, entries) if entries else ({}, None)
     for entry in entries:
         item = session.get(ProposalItem, entry.get("item_id"))
@@ -10744,7 +10740,7 @@ def run_retry_download_item(session: Session, payload: dict, task: Task | None =
                 Path(str(path)).unlink(missing_ok=True)
             except OSError:
                 pass
-        remove_download_manifest_entry(entry)
+        remove_download_manifest_entry(session, entry)
 
     retried = 0
     for item_id in item_ids:
@@ -10979,6 +10975,10 @@ def wake_devices_for_new_episode(session: Session, podcast: Podcast, episode: Ep
         write_app_log(f"Podcast wake push failed: {podcast.title}", "warning")
 
 
+#: Feeds fetched at once by `run_podcast_scan`.
+PODCAST_FETCH_WORKERS = 4
+
+
 def run_podcast_scan(session: Session, payload: dict, task: Task | None = None) -> dict:
     """Refresh subscribed feeds and announce whatever is new.
 
@@ -10997,41 +10997,67 @@ def run_podcast_scan(session: Session, payload: dict, task: Task | None = None) 
     total = len(podcasts) or 1
     scanned = 0
     added = 0
-    for index, podcast in enumerate(podcasts):
-        if task:
-            update_task_progress(session, task, index, total, f"Scanning {podcast.title}")
+
+    def fetch_one(feed_url: str, etag: str | None, last_modified: str | None):
+        # Runs in the pool: network and parse only. Every DB write stays on the calling thread.
+        validators: dict = {}
         try:
-            feed = podcast_service.fetch_feed(podcast.feed_url)
-            podcast_service.upsert_podcast(session, podcast.feed_url, feed)
-            created = podcast_service.upsert_episodes(session, podcast, podcast_service.parse_episodes(feed))
-            # Newest first, so a feed that adds several at once announces them in publish order.
-            new_episodes = sorted(
-                created,
-                key=lambda episode: episode.published_at or datetime.min.replace(tzinfo=timezone.utc),
-                reverse=True,
-            )
+            return podcast_service.fetch_feed(feed_url, etag=etag, last_modified=last_modified, validators_out=validators), validators, None
+        except Exception as error:  # noqa: BLE001 - reported per feed below.
+            return None, validators, error
+
+    with ThreadPoolExecutor(max_workers=PODCAST_FETCH_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_one, podcast.feed_url, podcast.etag, podcast.last_modified): podcast
+            for podcast in podcasts
+        }
+        for index, future in enumerate(as_completed(futures)):
+            podcast = futures[future]
+            feed, validators, fetch_error = future.result()
+            if task:
+                update_task_progress(session, task, index, total, f"Scanning {podcast.title}")
+            if fetch_error is None and feed is None:
+                # 304: the feed has not changed since the last scan.
+                podcast.last_scanned_at = datetime.now(timezone.utc)
+                podcast.last_error = None
+                session.commit()
+                scanned += 1
+                continue
+            try:
+                if fetch_error is not None:
+                    raise fetch_error
+                podcast_service.upsert_podcast(session, podcast.feed_url, feed)
+                podcast.etag = validators.get("etag")
+                podcast.last_modified = validators.get("last_modified")
+                created = podcast_service.upsert_episodes(session, podcast, podcast_service.parse_episodes(feed))
+                # Newest first, so a feed that adds several at once announces them in publish order.
+                new_episodes = sorted(
+                    created,
+                    key=lambda episode: episode.published_at or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True,
+                )
+                session.commit()
+            except Exception as error:  # noqa: BLE001 - one bad feed must not fail the whole scan.
+                session.rollback()
+                podcast.last_error = str(error)[:500]
+                podcast.last_scanned_at = datetime.now(timezone.utc)
+                session.commit()
+                write_app_log(f"Podcast scan failed for {podcast.title}: {error}", "warning")
+                continue
+            scanned += 1
+            # A podcast otherwise shows no artwork until something else happens to fetch it; every
+            # scan — including the one subscribing enqueues immediately — backfills it.
+            ensure_podcast_cover(session, podcast)
             session.commit()
-        except Exception as error:  # noqa: BLE001 - one bad feed must not fail the whole scan.
-            session.rollback()
-            podcast.last_error = str(error)[:500]
-            podcast.last_scanned_at = datetime.now(timezone.utc)
-            session.commit()
-            write_app_log(f"Podcast scan failed for {podcast.title}: {error}", "warning")
-            continue
-        scanned += 1
-        # A podcast otherwise shows no artwork until something else happens to fetch it; every
-        # scan — including the one subscribing enqueues immediately — backfills it.
-        ensure_podcast_cover(session, podcast)
-        session.commit()
-        if not new_episodes:
-            continue
-        added += len(new_episodes)
-        queue_automation_event(session, "podcast_episode_added")
-        for episode in new_episodes:
-            notify_podcast_subscribers(session, podcast, episode)
-        # One silent wake per podcast rather than per episode (it points at the newest), and each
-        # device reconciles its whole download window when it lands.
-        wake_devices_for_new_episode(session, podcast, new_episodes[0])
+            if not new_episodes:
+                continue
+            added += len(new_episodes)
+            queue_automation_event(session, "podcast_episode_added")
+            for episode in new_episodes:
+                notify_podcast_subscribers(session, podcast, episode)
+            # One silent wake per podcast rather than per episode (it points at the newest), and each
+            # device reconciles its whole download window when it lands.
+            wake_devices_for_new_episode(session, podcast, new_episodes[0])
     return {"scanned": scanned, "added": added}
 
 
@@ -11063,6 +11089,7 @@ TASK_HANDLERS = {
     "restore_backup": run_restore_backup,
     "clear_downloads": run_clear_downloads,
     "search_candidates": run_search_candidates,
+    "search_alternatives": run_search_alternatives,
     "search_wishlist_item": run_search_wishlist_item,
     "cancel_download_item": run_cancel_download_item,
     "retry_download_item": run_retry_download_item,
@@ -11116,6 +11143,169 @@ def check_mount_writability(session: Session) -> None:
     session.commit()
 
 
+def run_claimed_task(session: Session, task: Task) -> None:
+    """Run one claimed task to its end state. Both worker lanes run their tasks through this."""
+    if task.attempts >= MAX_TASK_ATTEMPTS:
+        append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
+        fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
+        return
+
+    try:
+        handler = TASK_HANDLERS.get(task.type)
+        if not handler:
+            raise ValueError(f"No handler registered for task type {task.type}")
+        append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
+        with DOWNLOAD_LOCK if task_holds_download_lock(session, task) else nullcontext():
+            if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "search_alternatives", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan", "analyze_audio"}:
+                result = handler(session, task_to_payload(task), task)
+            else:
+                result = handler(session, task_to_payload(task))
+        session.refresh(task)
+        if task.status == TaskStatus.canceled:
+            # A cancelled scan keeps what it found (`ScanProgress`), so its proposals and
+            # notification have to be committed here: nothing else on this path does.
+            session.commit()
+            append_task_log(session, task, f"{task.type} canceled", "warning")
+            return
+        completed_with_item_failures = bool(result.get("completed_with_item_failures"))
+        if result.get("errors") and not completed_with_item_failures:
+            append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
+            task.status = TaskStatus.failed
+            task.result_json = json.dumps(result)
+            task.error = result["errors"][0]
+            task.lease_until = None
+            session.commit()
+        else:
+            append_task_log(
+                session,
+                task,
+                f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}",
+                "warning" if completed_with_item_failures else "info",
+            )
+            complete_task(session, task, result)
+            if task.type == "jellyfin_scan":
+                queue_automation_event(session, "scan_complete")
+            if task.type == "ytdlp_download" and result.get("imported"):
+                queue_automation_event(session, "download_complete")
+            fire_queued_automation_events(session)
+    except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
+        try:
+            session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
+        except Exception:  # noqa: BLE001
+            pass
+        discard_queued_automation_events(session)
+        append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
+        try:
+            create_notification(
+                session,
+                title=f"{task_notification_title(task.type)} couldn’t finish",
+                body="Nudibranch could not finish this task. Open Activity for details.",
+                event_type="task_failed",
+                target_url="/activity",
+            )
+            fail_task(session, task, str(error))
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(error, (SystemExit, KeyboardInterrupt)):
+            raise  # only exit the process for fatal OS signals
+
+
+def search_lane_loop() -> None:
+    """The search lane: claims only `SEARCH_LANE_TASK_TYPES`, one at a time, on its own session."""
+    while True:
+        # Read before claiming, so a task queued between the claim and the wait still wakes us.
+        wake_mark = task_wake_mark()
+        try:
+            with SessionLocal() as session:
+                task = claim_next_task(session, only_types=SEARCH_LANE_TASK_TYPES)
+                if task is not None:
+                    run_claimed_task(session, task)
+                    continue
+        except Exception as error:  # noqa: BLE001 - the lane must outlive any one bad tick.
+            write_app_log(f"Search lane tick failed: {type(error).__name__}: {error}", "error")
+        deadline = time.monotonic() + SEARCH_LANE_IDLE_SECONDS
+        while time.monotonic() < deadline and task_wake_mark() == wake_mark:
+            time.sleep(TASK_WAKE_POLL_SECONDS)
+
+
+#: Serializes everything that touches downloads or the manifest: the download lane's tick, and the
+#: main lane's tasks that start, cancel, retry or clear downloads. Reentrant, because those tasks
+#: call helpers that take it again. The search lane never takes it and never touches the manifest.
+DOWNLOAD_LOCK = threading.RLock()
+#: Task types that always hold DOWNLOAD_LOCK on the main lane. `execute_proposal_batch` joins them
+#: only when its batch is a download batch (see `task_holds_download_lock`).
+DOWNLOAD_LOCKED_TASK_TYPES = frozenset({"cancel_download_item", "retry_download_item", "clear_downloads", "requeue_replacement", "ytdlp_download"})
+
+
+def task_holds_download_lock(session: Session, task: Task) -> bool:
+    if task.type in DOWNLOAD_LOCKED_TASK_TYPES:
+        return True
+    if task.type != "execute_proposal_batch":
+        return False
+    batch = session.get(ProposalBatch, task_to_payload(task).get("batch_id"))
+    return batch is not None and batch.kind == ProposalKind.download
+
+
+def run_download_tick(session: Session, state: dict) -> None:
+    """One pass of the download scan: import finished downloads and sweep the stale ones."""
+    try:
+        scan_result = import_completed_downloads(session)
+        if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
+            summary = f"{scan_result.get('waiting', 0)}:{scan_result.get('ready', 0)}:{scan_result.get('failed', 0)}"
+            # Log only when the picture changes — otherwise a persistent
+            # "1 needing attention" logs every scan tick forever.
+            if summary != state.get("summary"):
+                append_task_log(
+                    session,
+                    None,
+                    f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
+                )
+                state["summary"] = summary
+        else:
+            state["summary"] = ""
+        cleanup_orphaned_download_batches(session)
+        # A.2: never let a manifest entry for a gone/settled batch keep holding the
+        # single global download slot or just sit there forever.
+        cleanup_orphaned_download_manifest_entries(session)
+        # A: last-resort watchdog for a download item stuck with nothing dispatching it.
+        watchdog_stuck_download_items(session)
+        if scan_result.get("imported"):
+            queue_automation_event(session, "download_complete")
+        session.commit()
+        fire_queued_automation_events(session)
+    except Exception as error:  # noqa: BLE001 - a scan tick should never stop the lane.
+        session.rollback()
+        discard_queued_automation_events(session)
+        write_app_log(f"Download scan failed: {type(error).__name__}: {error}", "error")
+        create_notification(
+            session,
+            title="Download check needs attention",
+            body="Nudibranch could not check active downloads. Open Activity for details.",
+            event_type="task_failed",
+            target_url="/activity",
+            deliver_apns=False,
+            group_key="system:download-scan",
+        )
+
+
+def download_lane_loop() -> None:
+    """The download lane: the scan that imports finished transfers, on its own timer.
+
+    It used to run in the main lane's idle branch, so a long task there (a 5-minute batch execute)
+    left finished downloads unimported and the download slot idle.
+    """
+    state: dict = {}
+    while True:
+        started = time.time()
+        try:
+            with SessionLocal() as session:
+                with DOWNLOAD_LOCK:
+                    run_download_tick(session, state)
+        except Exception as error:  # noqa: BLE001 - the lane must outlive any one bad tick.
+            write_app_log(f"Download lane tick failed: {type(error).__name__}: {error}", "error")
+        time.sleep(max(0.0, DOWNLOAD_SCAN_INTERVAL_SECONDS - (time.time() - started)))
+
+
 async def worker_loop() -> None:
     write_app_log(f"Worker starting (version {__version__})")
     with SessionLocal() as session:
@@ -11143,9 +11333,11 @@ async def worker_loop() -> None:
             # Log only: a restart is routine, and nobody can act on "your tasks were requeued".
             write_app_log(f"Resumed interrupted work: {recovered} task(s) interrupted by a restart were requeued to continue.", event_type="task_started")
 
-    last_download_scan = 0.0
-    last_download_scan_summary = ""
-    last_download_scan_log = 0.0
+    # Started after recovery, so it only ever sees a queue the startup sweeps have finished with.
+    for lane_index in range(SEARCH_LANE_THREADS):
+        threading.Thread(target=search_lane_loop, name=f"search-lane-{lane_index + 1}", daemon=True).start()
+    threading.Thread(target=download_lane_loop, name="download-lane", daemon=True).start()
+
     last_automation_tick = 0.0
     last_disk_check_tick = 0.0
     last_pending_playlist_tick = 0.0
@@ -11157,49 +11349,10 @@ async def worker_loop() -> None:
     last_update_check_tick = 0.0
     last_orphan_prune_tick = 0.0
     while True:
+        wake_mark = task_wake_mark()  # before claiming, so a task queued during the idle ticks wakes us
         with SessionLocal() as session:
-            task = claim_next_task(session)
+            task = claim_next_task(session, exclude_types=SEARCH_LANE_TASK_TYPES)
             if not task:
-                if time.time() - last_download_scan > DOWNLOAD_SCAN_INTERVAL_SECONDS:
-                    try:
-                        scan_result = import_completed_downloads(session)
-                        if scan_result.get("waiting") or scan_result.get("ready") or scan_result.get("failed"):
-                            summary = f"{scan_result.get('waiting', 0)}:{scan_result.get('ready', 0)}:{scan_result.get('failed', 0)}"
-                            # Log only when the picture changes — otherwise a persistent
-                            # "1 needing attention" logs every scan tick (every ~2 min) forever.
-                            if summary != last_download_scan_summary:
-                                append_task_log(
-                                    session,
-                                    None,
-                                    f"Download scan checked {scan_result.get('waiting', 0)} active or queued download(s), {scan_result.get('ready', 0)} staged or verified, {scan_result.get('failed', 0)} needing attention",
-                                )
-                                last_download_scan_summary = summary
-                        else:
-                            last_download_scan_summary = ""
-                        cleanup_orphaned_download_batches(session)
-                        # A.2: never let a manifest entry for a gone/settled batch keep holding the
-                        # single global download slot or just sit there forever.
-                        cleanup_orphaned_download_manifest_entries(session)
-                        # A: last-resort watchdog for a download item stuck with nothing dispatching it.
-                        watchdog_stuck_download_items(session)
-                        if scan_result.get("imported"):
-                            queue_automation_event(session, "download_complete")
-                        session.commit()
-                        fire_queued_automation_events(session)
-                    except Exception as error:  # noqa: BLE001 - idle scans should never stop the worker.
-                        session.rollback()
-                        discard_queued_automation_events(session)
-                        write_app_log(f"Download scan failed: {type(error).__name__}: {error}", "error")
-                        create_notification(
-                            session,
-                            title="Download check needs attention",
-                            body="Nudibranch could not check active downloads. Open Activity for details.",
-                            event_type="task_completed",
-                            target_url="/activity",
-                            deliver_apns=False,
-                            group_key="system:download-scan",
-                        )
-                    last_download_scan = time.time()
                 if time.time() - last_disk_check_tick > DISK_CHECK_TICK_SECONDS:
                     try:
                         check_disk_space(session)
@@ -11261,6 +11414,13 @@ async def worker_loop() -> None:
                     except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
                         session.rollback()
                         write_app_log(f"Reopening settled batches failed: {error}", "warning")
+                    # Moved off `GET /wishlist`, which used to do both of these on every read.
+                    try:
+                        reconcile_stale_approved_wishlist_items(session)
+                        expire_old_terminal_wishlist_items(session)
+                    except Exception as error:  # noqa: BLE001 - never let recovery stop the worker.
+                        session.rollback()
+                        write_app_log(f"Wishlist reconcile failed: {error}", "warning")
                     last_wishlist_recovery_tick = time.time()
                 if time.time() - last_orphan_prune_tick > ORPHAN_METADATA_PRUNE_TICK_SECONDS:
                     try:
@@ -11303,6 +11463,14 @@ async def worker_loop() -> None:
                         session.rollback()
                         write_app_log(f"Deletion tombstone prune failed: {error}", "warning")
                     try:
+                        pruned = prune_finished_manifest_entries(session)
+                        session.commit()
+                        if pruned:
+                            write_app_log(f"Pruned {pruned} finished download manifest entries", "info")
+                    except Exception as error:  # noqa: BLE001 - pruning must never stop the worker.
+                        session.rollback()
+                        write_app_log(f"Download manifest prune failed: {error}", "warning")
+                    try:
                         expire_stale_handoffs(session)
                         session.commit()
                     except Exception as error:  # noqa: BLE001 - housekeeping must never stop the worker.
@@ -11318,71 +11486,12 @@ async def worker_loop() -> None:
                 except Exception as error:  # noqa: BLE001 - push delivery must never stop the worker.
                     session.rollback()
                     write_app_log(f"Push delivery sweep failed: {error}", "warning")
-                await asyncio.sleep(2)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and task_wake_mark() == wake_mark:
+                    await asyncio.sleep(TASK_WAKE_POLL_SECONDS)
                 continue
 
-            if task.attempts >= MAX_TASK_ATTEMPTS:
-                append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
-                fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
-                continue
-
-            try:
-                handler = TASK_HANDLERS.get(task.type)
-                if not handler:
-                    raise ValueError(f"No handler registered for task type {task.type}")
-                append_task_log(session, task, f"{task.type} started: {task.payload_json or '{}'}")
-                if task.type in {"propose_import", "execute_proposal_batch", "clear_downloads", "check_missing_tracks", "check_non_lossless", "check_lyrics", "check_musicbrainz_ids", "check_audio_content", "check_album_covers", "check_artist_covers", "search_candidates", "consolidate_folders", "enrich_imports", "apply_replaygain", "refresh_covers", "podcast_scan", "analyze_audio"}:
-                    result = handler(session, task_to_payload(task), task)
-                else:
-                    result = handler(session, task_to_payload(task))
-                session.refresh(task)
-                if task.status == TaskStatus.canceled:
-                    # A cancelled scan keeps what it found (`ScanProgress`), so its proposals and
-                    # notification have to be committed here: nothing else on this path does.
-                    session.commit()
-                    append_task_log(session, task, f"{task.type} canceled", "warning")
-                    continue
-                completed_with_item_failures = bool(result.get("completed_with_item_failures"))
-                if result.get("errors") and not completed_with_item_failures:
-                    append_task_log(session, task, f"{task.type} failed with {len(result.get('errors') or [])} error(s): {result['errors'][0]}", "error")
-                    task.status = TaskStatus.failed
-                    task.result_json = json.dumps(result)
-                    task.error = result["errors"][0]
-                    task.lease_until = None
-                    session.commit()
-                else:
-                    append_task_log(
-                        session,
-                        task,
-                        f"{task.type} completed: {json.dumps(result, sort_keys=True)[:1200]}",
-                        "warning" if completed_with_item_failures else "info",
-                    )
-                    complete_task(session, task, result)
-                    if task.type == "jellyfin_scan":
-                        queue_automation_event(session, "scan_complete")
-                    if task.type == "ytdlp_download" and result.get("imported"):
-                        queue_automation_event(session, "download_complete")
-                    fire_queued_automation_events(session)
-            except BaseException as error:  # noqa: BLE001 - worker must persist task failures, including CancelledError/SystemExit.
-                try:
-                    session.rollback()  # rollback FIRST — a failed flush expires the task object, so accessing task.id in append_task_log would raise PendingRollbackError without this
-                except Exception:  # noqa: BLE001
-                    pass
-                discard_queued_automation_events(session)
-                append_task_log(session, task, f"{task.type} failed unexpectedly: {type(error).__name__}: {error}", "error")
-                try:
-                    create_notification(
-                        session,
-                        title=f"{task_notification_title(task.type)} couldn’t finish",
-                        body="Nudibranch could not finish this task. Open Activity for details.",
-                        event_type="task_failed",
-                        target_url="/activity",
-                    )
-                    fail_task(session, task, str(error))
-                except Exception:  # noqa: BLE001
-                    pass
-                if isinstance(error, (SystemExit, KeyboardInterrupt)):
-                    raise  # only exit the process for fatal OS signals
+            run_claimed_task(session, task)
 
 
 def task_notification_title(task_type: str) -> str:

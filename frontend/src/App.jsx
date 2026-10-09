@@ -1555,7 +1555,8 @@ function App() {
   }
 
   // mode: "next_candidate" (try the next ranked source) | "same_candidate" | "research" (discard
-  // candidates and search again -- re-enters the approval gate, never auto-starts a download).
+  // candidates and search again -- re-enters the approval gate, never auto-starts a download) |
+  // "alternatives" (keep the candidates and search for more, which land unselected).
   async function retryApprovalItems(items, mode = "next_candidate") {
     setLoading(true);
     try {
@@ -1566,7 +1567,7 @@ function App() {
           body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), mode }),
         });
       }
-      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : "Trying the next candidate." });
+      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : mode === "alternatives" ? "Finding more candidates." : "Trying the next candidate." });
       await Promise.all([refreshApprovals(), refreshRequests()]);
     } catch (retryError) {
       notify("Retry failed", retryError.message, "ui_error");
@@ -6623,6 +6624,12 @@ function ApprovalNode({
             title={ownsPicker ? "Hide candidates" : "Choose candidate"}
           >
             {ownsPicker ? <ChevronUp size={14} /> : <Pencil size={14} />}
+          </button>
+        )}
+        {/* No alternates to pick from: the same button asks the server to search for some. */}
+        {leafDownloadCandidate && !hasAlternateCandidates && item.can_find_alternatives && onRetry && (
+          <button className="row-icon-button" onClick={() => onRetry([item], "alternatives")} title="Choose candidate">
+            <Pencil size={14} />
           </button>
         )}
         {/* Cancel — stop this now, the request survives (not destructive). Retry — two of the
@@ -15706,10 +15713,17 @@ function buildLiveLog(tasks, appLogs) {
   return [...taskEntries, ...appLogEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+// Severity comes from the event type the server chose, not from the wording: matching "failed" in
+// the text painted "37 passed, 0 failed" red, and "missing" turned every missing-tracks check amber.
+const ERROR_NOTIFICATION_EVENTS = new Set(["task_failed", "playlist_import_failed", "automation_failed", "slskd_unreachable"]);
+const WARNING_NOTIFICATION_EVENTS = new Set(["task_warning", "server_alert", "wishlist_denied"]);
+
 function notificationSeverity(notification) {
-  const text = `${notification.title || ""} ${notification.body || ""} ${notification.event_type || ""}`.toLowerCase();
-  if (text.includes("failed") || text.includes("first failure") || /[1-9]\d*\s+errors?/.test(text)) return "error";
-  if (text.includes("warning") || text.includes("missing")) return "warning";
+  const eventType = notification.event_type || "";
+  if (ERROR_NOTIFICATION_EVENTS.has(eventType)) return "error";
+  if (WARNING_NOTIFICATION_EVENTS.has(eventType)) return "warning";
+  // A finished batch where some items failed is a partial success, not a failure.
+  if (/\b[1-9]\d*\s+(failed|errors?)\b/i.test(notification.body || "")) return "warning";
   if (notification.status === "unread") return "info";
   return "normal";
 }

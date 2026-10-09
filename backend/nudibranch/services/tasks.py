@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import time
 from datetime import datetime, timezone
@@ -6,8 +7,33 @@ from datetime import datetime, timezone
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
+from nudibranch.core.config import get_settings
 from nudibranch.db.models import ProposalBatch, ProposalStatus, Task, TaskStatus
 from nudibranch.services.app_log import write_app_log
+
+
+def task_wake_path():
+    return get_settings().config_path / ".nudibranch-task-wake"
+
+
+def task_wake_mark() -> int:
+    """The wake file's mtime (ns), 0 when it does not exist. A change means a task was queued."""
+    try:
+        return task_wake_path().stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def touch_task_wake() -> None:
+    """Tell the worker lanes (a different process) that a task was just queued. Best effort: a
+    lane that misses it still finds the task on its next idle poll."""
+    try:
+        path = task_wake_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+        os.utime(path, None)
+    except OSError:
+        pass
 
 
 def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
@@ -31,6 +57,7 @@ def enqueue_task(session: Session, task_type: str, payload: dict) -> Task:
     session.add(task)
     session.commit()
     session.refresh(task)
+    touch_task_wake()
     return task
 
 
@@ -44,20 +71,28 @@ def task_result(task: Task) -> dict | None:
     return json.loads(task.result_json)
 
 
-def claim_next_task(session: Session, lease_seconds: int = 300) -> Task | None:
+def claim_next_task(
+    session: Session,
+    lease_seconds: int = 300,
+    *,
+    only_types: frozenset[str] | None = None,
+    exclude_types: frozenset[str] | None = None,
+) -> Task | None:
+    """Claim the oldest runnable task. The type filters split the queue between worker lanes, and
+    the lanes' sets must partition it exactly, so no task is claimed by two lanes or by none."""
     worker_id = socket.gethostname()
     now = datetime.now(timezone.utc)
-    candidate = session.scalar(
-        select(Task)
-        .where(
-            or_(
-                Task.status == TaskStatus.queued,
-                and_(Task.status == TaskStatus.running, Task.lease_until < now),
-            )
+    query = select(Task).where(
+        or_(
+            Task.status == TaskStatus.queued,
+            and_(Task.status == TaskStatus.running, Task.lease_until < now),
         )
-        .order_by(Task.created_at.asc())
-        .limit(1)
     )
+    if only_types is not None:
+        query = query.where(Task.type.in_(only_types))
+    if exclude_types is not None:
+        query = query.where(Task.type.not_in(exclude_types))
+    candidate = session.scalar(query.order_by(Task.created_at.asc()).limit(1))
     if not candidate:
         return None
 

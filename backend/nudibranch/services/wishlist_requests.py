@@ -29,6 +29,17 @@ def normalized_music_name(value: str | None) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
 
+#: Titles MusicBrainz carries for a track before it is announced ("Track 2", "[untitled]", "TBA").
+#: Searching Soulseek for them finds nothing, at about a minute a track (castiel, 2026-10-08: an
+#: album released the next day, 14 of its 15 tracks "Track N").
+#: A bare "Untitled" is left alone: it is a real song title often enough.
+_PLACEHOLDER_TITLE = re.compile(r"track\s*\d+|\[untitled\]|tba|tbc|tbd|\?+", re.IGNORECASE)
+
+
+def is_placeholder_title(title: str | None) -> bool:
+    return bool(_PLACEHOLDER_TITLE.fullmatch((title or "").strip()))
+
+
 def _album_tracks(artist: str, album: str, cache: dict[tuple[str, str], dict | None]) -> dict | None:
     key = (artist, album)
     if key not in cache:
@@ -80,7 +91,7 @@ def build_request_payloads(
     if item.kind == "album" and item.album and not item.track:
         record = _album_tracks(item.artist, item.album, cache)
         for track in (record or {}).get("tracks", []) or []:
-            if not track.get("title"):
+            if not track.get("title") or is_placeholder_title(track.get("title")):
                 continue
             payloads.append(_track_payload(record or {}, track, item.artist, item.album))
 

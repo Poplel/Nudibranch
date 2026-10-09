@@ -175,16 +175,34 @@ def _curl_reason(stderr: bytes | None, returncode: int) -> str:
     return "the feed host refused the request"
 
 
-def fetch_feed(url: str) -> feedparser.FeedParserDict:
+def fetch_feed(
+    url: str,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    validators_out: dict | None = None,
+) -> feedparser.FeedParserDict | None:
     """Fetch + parse a podcast feed.
 
     Raises `FeedFetchError` with a human-readable reason on any hard network/HTTP failure; a
     malformed-but-served feed still parses (feedparser is lenient) and is validated by callers.
+
+    With `etag` / `last_modified` from the previous fetch it sends a conditional GET and returns
+    None on a 304 (nothing changed). The new validators are written into `validators_out`. The
+    curl fallback is never conditional.
     """
     headers = {"User-Agent": _USER_AGENT, "Accept": _FEED_ACCEPT}
+    conditional: dict[str, str] = {}
+    if etag:
+        conditional["If-None-Match"] = etag
+    if last_modified:
+        conditional["If-Modified-Since"] = last_modified
+    headers.update(conditional)
     try:
         with httpx.Client(follow_redirects=True, timeout=_FEED_TIMEOUT, headers=headers, proxy=_proxy_url()) as client:
             response = client.get(url)
+            if response.status_code == 304 and conditional:
+                return None
             if response.status_code in _BLOCK_STATUSES:
                 # Escalate only on a status meaning the host is filtering clients — never on a 404
                 # or a 5xx. First a browser header set in-process (fixes hosts that check only the
@@ -193,7 +211,9 @@ def fetch_feed(url: str) -> feedparser.FeedParserDict:
                     f"Feed host returned {response.status_code}; retrying as a browser: {url}",
                     "warning",
                 )
-                response = client.get(url, headers=browser_headers(url, _FEED_ACCEPT))
+                response = client.get(url, headers={**browser_headers(url, _FEED_ACCEPT), **conditional})
+                if response.status_code == 304 and conditional:
+                    return None
                 if response.status_code in _BLOCK_STATUSES:
                     write_app_log(
                         f"Feed host still returned {response.status_code}; falling back to curl: {url}",
@@ -202,6 +222,9 @@ def fetch_feed(url: str) -> feedparser.FeedParserDict:
                     return _parse_feed_bytes(_fetch_via_curl(url))
             response.raise_for_status()
             content = response.content
+            if validators_out is not None:
+                validators_out["etag"] = response.headers.get("ETag")
+                validators_out["last_modified"] = response.headers.get("Last-Modified")
     except httpx.TimeoutException as error:
         raise FeedFetchError("the feed host took too long to respond") from error
     except httpx.HTTPStatusError as error:

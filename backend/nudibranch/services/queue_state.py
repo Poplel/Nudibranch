@@ -58,7 +58,7 @@ _PAYLOAD_STAGE_TO_ITEM_STAGE: dict[str, ItemStage] = {
     "canceled": ItemStage.canceled,
 }
 
-# Download-manifest statuses (.nudibranch-downloads.json) onto ItemStage.  The manifest itself is
+# Download-manifest statuses (`download_manifest_entries`) onto ItemStage.  The manifest itself is
 # never read by the API -- the worker mirrors it into ProposalItem.stage -- but the mapping lives
 # here so there is exactly one translation table.
 MANIFEST_STATUS_TO_STAGE: dict[str, ItemStage] = {
@@ -340,6 +340,9 @@ def status_label(
     """
     data = payload if payload is not None else payload_of(item)
     existing = data.get("status")
+    # A track whose alternatives search came back empty: the one fixed-word stage that says why.
+    if stage is ItemStage.failed and data.get("no_alternatives"):
+        return "no other source found"
     resolved_flow = None if flow is None else flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
     # ⚠️ A row waiting on a human names the gate it waits at, never the worker's free text (§0: "a
     # waiting status must say what is being approved"). A candidate used to read "100% match · same
@@ -766,3 +769,29 @@ def can_retry(stage: ItemStage, flow: ProposalFlow | str | None) -> bool:
     """Retry restarts a download, so it exists only on the download gate."""
     resolved = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
     return resolved is ProposalFlow.download_review and stage in (ItemStage.failed, ItemStage.canceled)
+
+
+def alternatives_track_ids(items: Iterable[ProposalItem], flow: ProposalFlow | str | None, batch_status: ProposalStatus | None = None) -> set[str]:
+    """Ids of the track rows an alternatives search may run for.
+
+    A download track whose batch sits at Download approval or in Issues, that is not already being
+    searched, and none of whose candidates is approved, executing or done (one download per track).
+    """
+    resolved = flow if isinstance(flow, ProposalFlow) else _coerce_flow(flow)
+    if resolved is not ProposalFlow.download_review:
+        return set()
+    materialized = list(items)
+    if resolve_batch_stage(materialized, batch_status) not in (ItemStage.awaiting_approval, ItemStage.failed):
+        return set()
+    candidates_by_parent: dict[str, list[ProposalItem]] = {}
+    for item in materialized:
+        if item.parent_id and payload_of(item).get("action") in _DOWNLOAD_ACTIONS:
+            candidates_by_parent.setdefault(item.parent_id, []).append(item)
+    taken = {ProposalStatus.approved, ProposalStatus.executing, ProposalStatus.completed}
+    return {
+        item.id
+        for item in materialized
+        if item.id in candidates_by_parent
+        and resolve_stage(item) is not ItemStage.searching
+        and not any(candidate.status in taken for candidate in candidates_by_parent[item.id])
+    }
