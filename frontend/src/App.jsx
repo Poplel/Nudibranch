@@ -11373,6 +11373,7 @@ function SettingsPanel({
         </label>
       </section>
       <EqualizerSettings equalizer={equalizer} setEqualizer={setEqualizer} />
+      {canManageSettings(user) && <ServerHealthSettings api={api} notify={notify} />}
       {canManageSettings(user) && (
         <section className="settings-section">
           <h2>Integrations</h2>
@@ -11477,7 +11478,6 @@ function SettingsPanel({
           onSaveIntegrations={onSaveIntegrations}
         />
       )}
-      {canManageSettings(user) && <SlskdReachabilitySettings api={api} notify={notify} />}
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
@@ -11665,7 +11665,139 @@ function MatchTuningSettings({ api, notify, integrationDraft, setIntegrationDraf
 // GET/POST /settings/slskd/port-check (services/slskd_reachability.py). The check runs on the
 // worker -- its identity step can take up to ~90s -- so "Check now" enqueues it and this polls
 // GET until `checking` goes false, same shape as the podcast "Check for new" button.
-function SlskdReachabilitySettings({ api, notify }) {
+// Settings → Server (`GET /server/health`): whether the worker is alive and what each lane is
+// doing, the queue, library size, disk, and the last day and week of activity. Polls every 15s
+// while Settings is open; the numbers are cheap counts plus the worker's heartbeat file.
+const SERVER_FOLDER_LABELS = { library: "Library", downloads: "Downloads", staging: "Staging", import: "Import", podcasts: "Podcasts", backups: "Backups" };
+
+function laneLabel(name) {
+  if (name === "main") return "Main lane";
+  if (name === "download") return "Download lane";
+  const match = /^search-(\d+)$/.exec(name);
+  return match ? `Search lane ${match[1]}` : name;
+}
+
+function fmtUptime(isoString) {
+  if (!isoString) return "—";
+  const seconds = Math.max(0, Math.floor((Date.now() - new Date(isoString).getTime()) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${minutes}m`;
+  return `${minutes}m`;
+}
+
+function fmtListeningTime(seconds) {
+  const hours = Math.floor((seconds || 0) / 3600);
+  if (hours >= 48) return `${Math.floor(hours / 24)} days`;
+  return `${hours} hours`;
+}
+
+function ServerHealthSettings({ api, notify }) {
+  const [health, setHealth] = useState(null);
+  const [failed, setFailed] = useState(false);
+  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
+  useEffect(() => {
+    let active = true;
+    const load = () => {
+      api("/server/health")
+        .then((data) => { if (active && data) { setHealth(data); setFailed(false); } })
+        .catch(() => { if (active) setFailed(true); });
+      api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { active = false; clearInterval(id); };
+  }, [api]);
+
+  // Answered by the API itself, so they still show when the health call fails.
+  const connectionRows = (
+    <>
+      <h3>Connections</h3>
+      {[["Jellyfin", connections.jellyfin], ["slskd", connections.slskd]].map(([label, status]) => (
+        <label className="setting-row" key={label}>
+          <span>{label}</span>
+          <strong style={connectionStyle(status)}>{connectionLabel(status)}</strong>
+        </label>
+      ))}
+      <SlskdReachabilityRows api={api} notify={notify} />
+    </>
+  );
+  if (!health) {
+    return (
+      <section className="settings-section">
+        <h2>Server</h2>
+        <p className="settings-hint">{failed ? "Server status unavailable." : "Loading…"}</p>
+        {connectionRows}
+      </section>
+    );
+  }
+  const { worker, queue, library, storage, activity } = health;
+  const ok = "#37c871";
+  const bad = "#ff5a5a";
+  const [day, week] = activity;
+  const row = (label, value, color, hint) => (
+    <label className="setting-row" key={label}>
+      <span>{label}{hint && <small>{hint}</small>}</span>
+      <strong style={color ? { color } : undefined}>{value}</strong>
+    </label>
+  );
+  return (
+    <section className="settings-section">
+      <h2>Server</h2>
+      {row("Version", health.version, undefined, `API up ${fmtUptime(health.api_started_at)}`)}
+      {row(
+        "Worker",
+        worker.running ? "Running" : "Not running",
+        worker.running ? ok : bad,
+        worker.running ? `Up ${fmtUptime(worker.started_at)}${worker.version && worker.version !== health.version ? ` · version ${worker.version}` : ""}` : worker.beat_at ? `Last seen ${fmtTimeAgo(worker.beat_at)}` : "No heartbeat yet",
+      )}
+      {worker.running && worker.lanes.map((lane) => row(
+        laneLabel(lane.name),
+        lane.state === "running" ? (lane.task_label || "Working") : "Idle",
+        lane.state === "running" ? undefined : "var(--muted)",
+        lane.state === "running" ? `For ${fmtUptime(lane.since)}` : lane.last_scan_at ? `Checked ${fmtTimeAgo(lane.last_scan_at)}` : undefined,
+      ))}
+      {row("Queue", `${queue.queued} waiting · ${queue.running} running`, undefined, queue.oldest_queued_at ? `Oldest waiting ${fmtTimeAgo(queue.oldest_queued_at)}` : undefined)}
+
+      <h3>Library</h3>
+      {row("Artists", library.artists.toLocaleString())}
+      {row("Albums", library.albums.toLocaleString())}
+      {row("Tracks", library.tracks.toLocaleString(), undefined, `${library.lossless_tracks.toLocaleString()} lossless · ${fmtListeningTime(library.duration_seconds)}`)}
+      {row("Podcasts", library.podcasts.toLocaleString(), undefined, `${library.podcast_episodes.toLocaleString()} episodes`)}
+
+      <h3>Activity</h3>
+      {[
+        ["Tracks added", "tracks_added"],
+        ["Downloads", "downloads_completed"],
+        ["Failed downloads", "downloads_failed"],
+        ["Searches", "searches"],
+        ["Tasks finished", "tasks_completed"],
+        ["Failed tasks", "tasks_failed"],
+      ].map(([label, key]) => row(label, `${day[key]} in 24 h · ${week[key]} in 7 days`, key.endsWith("failed") && day[key] > 0 ? bad : undefined))}
+
+      <h3>Storage</h3>
+      {storage.folders.map((folder) => row(
+        SERVER_FOLDER_LABELS[folder.name] || folder.name,
+        folder.size_bytes == null ? "Measuring…" : formatBytes(folder.size_bytes),
+        undefined,
+        folder.free_bytes != null ? `${formatBytes(folder.free_bytes)} free of ${formatBytes(folder.total_bytes)}` : undefined,
+      ))}
+      {row("Database", formatBytes(storage.database_bytes))}
+      {row("Logs", formatBytes(storage.log_bytes))}
+      {row(
+        "Last backup",
+        storage.last_backup ? fmtTimeAgo(storage.last_backup.created_at) : "None",
+        storage.last_backup ? undefined : "var(--muted)",
+        storage.last_backup ? `${formatBytes(storage.last_backup.size_bytes)} · ${storage.backup_count} kept` : undefined,
+      )}
+      {connectionRows}
+    </section>
+  );
+}
+
+function SlskdReachabilityRows({ api, notify }) {
   const [state, setState] = useState(null);
   const pollRef = useRef(null);
 
@@ -11706,8 +11838,8 @@ function SlskdReachabilitySettings({ api, notify }) {
   const checking = !!state?.checking;
 
   return (
-    <section className="settings-section">
-      <h2>Soulseek reachability</h2>
+    <>
+      <h3>Soulseek reachability</h3>
       <label className="setting-row">
         <span>
           Listen port check
@@ -11741,7 +11873,7 @@ function SlskdReachabilitySettings({ api, notify }) {
           )}
         </label>
       ))}
-    </section>
+    </>
   );
 }
 
@@ -12849,32 +12981,6 @@ async function collectDroppedItems(dataTransfer) {
   return Array.from(dataTransfer?.files || []).map((file) => ({ file, path: file.name }));
 }
 
-function ConnectionsStatus({ api, user }) {
-  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
-  useEffect(() => {
-    let active = true;
-    const load = () => api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
-    load();
-    const id = setInterval(load, 20000);
-    return () => { active = false; clearInterval(id); };
-  }, []);
-  return (
-    <div className="inspector-section">
-      <div className="inspector-section-label">Status</div>
-      <div className="status-list">
-        <span>User</span>
-        <strong>{user?.display_name || "Signed in"}</strong>
-        <span>API</span>
-        <strong style={{ color: "#37c871" }}>Connected</strong>
-        <span>slskd</span>
-        <strong style={connectionStyle(connections.slskd)}>{connectionLabel(connections.slskd)}</strong>
-        <span>Jellyfin</span>
-        <strong style={connectionStyle(connections.jellyfin)}>{connectionLabel(connections.jellyfin)}</strong>
-      </div>
-    </div>
-  );
-}
-
 function Inspector({
   page,
   mobileOpen,
@@ -13131,7 +13237,6 @@ function Inspector({
           </button>
         </div>
       )}
-      {page === "Tools" && <ConnectionsStatus api={api} user={user} />}
       {downloadProgress && (
         <div className="inspector-progress-card">
           <strong>Downloads</strong>
@@ -15832,7 +15937,7 @@ function toggleSet(setter, value) {
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
-  const units = ["B", "KB", "MB", "GB"];
+  const units = ["B", "KB", "MB", "GB", "TB"];
   const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }

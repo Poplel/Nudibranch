@@ -2862,6 +2862,15 @@ nav button:hover {
   font-size: 15px;
 }
 
+.settings-section h3:not([class]) {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .settings-footer {
   padding: 10px 2px 0;
   color: var(--muted);

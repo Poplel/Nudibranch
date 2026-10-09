@@ -133,6 +133,7 @@ def record_download_manifest_entry(session: Session, request: dict, candidate: d
                     "queued_at": now,
                 }
             ),
+            status_changed_at=datetime.now(timezone.utc),
             created_at=datetime.now(timezone.utc),
             updated_at=datetime.now(timezone.utc),
         )
@@ -174,7 +175,10 @@ def update_download_manifest_entry(session: Session, target: dict, status: str, 
     for key in ("batch_id", "item_id", "parent_id", "basename"):
         if key in fields:
             columns[key] = fields.pop(key)
-    data["status_changed_at"] = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
+    if status != row.status:
+        columns["status_changed_at"] = now
+    data["status_changed_at"] = now.isoformat()
     data.update(fields)
     session.execute(update(M).where(M.id == row.id).values(**columns, data=json.dumps(data)))
 
@@ -196,4 +200,4 @@ def remove_manifest_entries_for_items(session: Session, item_ids: set[str]) -> i
 
 def prune_finished_manifest_entries(session: Session) -> int:
     cutoff = datetime.now(timezone.utc) - FINISHED_RETENTION
-    return session.execute(delete(M).where(M.status.in_(list(FINISHED_STATUSES))).where(M.updated_at < cutoff)).rowcount or 0
+    return session.execute(delete(M).where(M.status.in_(list(FINISHED_STATUSES))).where(M.status_changed_at < cutoff)).rowcount or 0

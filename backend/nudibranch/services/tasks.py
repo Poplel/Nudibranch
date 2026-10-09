@@ -12,6 +12,14 @@ from nudibranch.db.models import ProposalBatch, ProposalStatus, Task, TaskStatus
 from nudibranch.services.app_log import write_app_log
 
 
+#: Task types the search lane runs, on its own thread beside the main lane. A candidate search is
+#: almost all waiting on Soulseek, and one album can take a quarter of an hour. On a single lane it
+#: held up every other search and the download scan behind it, so finished transfers sat unimported
+#: and the one download slot sat idle (castiel, 2026-10-08). Searches only create pending candidate
+#: batches and never touch the download manifest, which stays the main lane's alone.
+SEARCH_LANE_TASK_TYPES = frozenset({"search_wishlist_item", "search_candidates", "search_alternatives"})
+
+
 def task_wake_path():
     return get_settings().config_path / ".nudibranch-task-wake"
 

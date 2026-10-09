@@ -521,6 +521,83 @@ class ServerAddressesOut(BaseModel):
     secondary: str | None = None
 
 
+class WorkerLaneOut(BaseModel):
+    name: str  # main, search-1, search-2, download
+    state: str  # idle | running
+    since: datetime
+    task_id: str | None = None
+    task_type: str | None = None
+    task_label: str | None = None
+    last_scan_at: datetime | None = None  # download lane only
+
+
+class WorkerHealthOut(BaseModel):
+    running: bool  # false when the heartbeat is missing or more than 45 s old
+    version: str | None = None
+    started_at: datetime | None = None
+    beat_at: datetime | None = None
+    lanes: list[WorkerLaneOut] = []
+
+
+class QueueHealthOut(BaseModel):
+    queued: int
+    running: int
+    oldest_queued_at: datetime | None = None
+
+
+class LibraryStatsOut(BaseModel):
+    artists: int
+    albums: int
+    tracks: int
+    lossless_tracks: int
+    duration_seconds: int
+    podcasts: int
+    podcast_episodes: int
+
+
+class StorageFolderOut(BaseModel):
+    name: str
+    path: str
+    size_bytes: int | None = None  # null until the worker's first measurement
+    free_bytes: int | None = None
+    total_bytes: int | None = None
+
+
+class BackupOut(BaseModel):
+    name: str
+    created_at: datetime
+    size_bytes: int
+
+
+class StorageHealthOut(BaseModel):
+    database_bytes: int
+    log_bytes: int
+    folders: list[StorageFolderOut]
+    folders_measured_at: datetime | None = None
+    backup_count: int
+    last_backup: BackupOut | None = None
+
+
+class ActivityWindowOut(BaseModel):
+    hours: int
+    tasks_completed: int
+    tasks_failed: int
+    searches: int
+    downloads_completed: int
+    downloads_failed: int
+    tracks_added: int
+
+
+class ServerHealthOut(BaseModel):
+    version: str
+    api_started_at: datetime
+    worker: WorkerHealthOut
+    queue: QueueHealthOut
+    library: LibraryStatsOut
+    storage: StorageHealthOut
+    activity: list[ActivityWindowOut]  # the last 24 hours, then the last 7 days
+
+
 class SlskdPortCheckStep(BaseModel):
     key: str
     label: str

@@ -697,6 +697,9 @@ class DownloadManifestEntry(Base):
     status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
     basename: Mapped[str | None] = mapped_column(String(512), index=True)
     data: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    # When `status` last changed: what "finished this week" means for Settings → Server and for
+    # the prune. `updated_at` is not that: the 1.3.1 import stamped every row with its own time.
+    status_changed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
 
