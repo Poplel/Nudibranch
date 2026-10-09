@@ -51,7 +51,8 @@ from nudibranch.services.download_manifest import (
 from nudibranch.services.wishlist_state import expire_old_terminal_wishlist_items, reconcile_stale_approved_wishlist_items
 from nudibranch.services.slskd_reachability import run_slskd_reachability_check, should_run_download_failure_check, store_slskd_check_result
 from nudibranch.worker.audio_analysis import enqueue_analysis_if_needed, run_analyze_audio
-from nudibranch.services.tasks import ScanProgress, task_wake_mark, append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
+from nudibranch.services.server_health import HEARTBEAT
+from nudibranch.services.tasks import SEARCH_LANE_TASK_TYPES, ScanProgress, task_wake_mark, append_task_log, claim_next_task, complete_task, discard_pending_batches, enqueue_task, fail_task, recover_orphaned_tasks, task_to_payload, update_task_progress
 
 
 MAX_DOWNLOAD_AUTO_RETRIES = 5
@@ -79,12 +80,6 @@ DOWNLOAD_SCAN_INTERVAL_SECONDS = 3
 # at all (nothing even trying to dispatch it) means every normal recovery path already failed.
 STUCK_DOWNLOAD_ITEM_MINUTES = 30
 MAX_TASK_ATTEMPTS = 4
-#: Task types the search lane runs, on its own thread beside the main lane. A candidate search is
-#: almost all waiting on Soulseek, and one album can take a quarter of an hour. On a single lane it
-#: held up every other search and the download scan behind it, so finished transfers sat unimported
-#: and the one download slot sat idle (castiel, 2026-10-08). Searches only create pending candidate
-#: batches and never touch the download manifest, which stays the main lane's alone.
-SEARCH_LANE_TASK_TYPES = frozenset({"search_wishlist_item", "search_candidates", "search_alternatives"})
 SEARCH_LANE_IDLE_SECONDS = 2
 #: How often an idle lane glances at the task wake file (`enqueue_task` touches it).
 TASK_WAKE_POLL_SECONDS = 0.25
@@ -8178,7 +8173,7 @@ def check_slskd_after_download_failure(session: Session) -> None:
         title="Soulseek may be unreachable",
         body=detail,
         event_type="slskd_unreachable",
-        target_url="/settings?section=integrations",
+        target_url="/settings?section=server",
     )
 
 
@@ -11145,6 +11140,15 @@ def check_mount_writability(session: Session) -> None:
 
 def run_claimed_task(session: Session, task: Task) -> None:
     """Run one claimed task to its end state. Both worker lanes run their tasks through this."""
+    lane = lane_name()
+    HEARTBEAT.lane_running(lane, task, task_notification_title(task.type))
+    try:
+        _run_claimed_task(session, task)
+    finally:
+        HEARTBEAT.lane_idle(lane)
+
+
+def _run_claimed_task(session: Session, task: Task) -> None:
     if task.attempts >= MAX_TASK_ATTEMPTS:
         append_task_log(session, task, f"{task.type} exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS}); marking failed", "error")
         fail_task(session, task, f"exceeded maximum retry attempts ({MAX_TASK_ATTEMPTS})")
@@ -11210,8 +11214,17 @@ def run_claimed_task(session: Session, task: Task) -> None:
             raise  # only exit the process for fatal OS signals
 
 
+def lane_name() -> str:
+    """The lane the calling thread is, as Settings → Server names it: main, search-N or download."""
+    name = threading.current_thread().name
+    if name == "MainThread":
+        return "main"
+    return name.removesuffix("-lane").replace("-lane-", "-")
+
+
 def search_lane_loop() -> None:
     """The search lane: claims only `SEARCH_LANE_TASK_TYPES`, one at a time, on its own session."""
+    HEARTBEAT.lane_idle(lane_name())
     while True:
         # Read before claiming, so a task queued between the claim and the wait still wakes us.
         wake_mark = task_wake_mark()
@@ -11301,6 +11314,7 @@ def download_lane_loop() -> None:
             with SessionLocal() as session:
                 with DOWNLOAD_LOCK:
                     run_download_tick(session, state)
+            HEARTBEAT.lane_scanned("download")
         except Exception as error:  # noqa: BLE001 - the lane must outlive any one bad tick.
             write_app_log(f"Download lane tick failed: {type(error).__name__}: {error}", "error")
         time.sleep(max(0.0, DOWNLOAD_SCAN_INTERVAL_SECONDS - (time.time() - started)))
@@ -11333,6 +11347,8 @@ async def worker_loop() -> None:
             # Log only: a restart is routine, and nobody can act on "your tasks were requeued".
             write_app_log(f"Resumed interrupted work: {recovered} task(s) interrupted by a restart were requeued to continue.", event_type="task_started")
 
+    HEARTBEAT.lane_idle("main")
+    HEARTBEAT.start()
     # Started after recovery, so it only ever sees a queue the startup sweeps have finished with.
     for lane_index in range(SEARCH_LANE_THREADS):
         threading.Thread(target=search_lane_loop, name=f"search-lane-{lane_index + 1}", daemon=True).start()

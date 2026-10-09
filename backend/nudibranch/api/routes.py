@@ -24,6 +24,7 @@ from nudibranch.api.schemas import (
     CancelRequest,
     NotificationReadRequest,
     ServerAddressesOut,
+    ServerHealthOut,
     RetryRequest,
     CoverFromURLRequest,
     AlbumLookupRequest,
@@ -218,6 +219,7 @@ from nudibranch.services.proposals import (
 )
 from nudibranch.services.acoustid import audio_matches_claim
 from nudibranch.services.match_tuning import match_tuning, match_tuning_schema, update_match_tuning
+from nudibranch.services.server_health import server_health
 from nudibranch.services.settings_store import integration_settings, integration_value, update_integration_settings
 from nudibranch.services.slskd_reachability import load_last_slskd_check
 from nudibranch.services.tasks import cancel_task, enqueue_task, task_result, task_to_payload
@@ -7232,6 +7234,16 @@ def update_server_addresses(
         primary=values.get("server_primary_address") or None,
         secondary=values.get("server_secondary_address") or None,
     )
+
+
+@router.get("/server/health", tags=["system"], summary="Worker, queue, library, storage and activity stats", response_model=ServerHealthOut)
+def get_server_health(
+    session: Session = Depends(get_session),
+    _: User = Depends(require_permission(Permission.settings_manage)),
+) -> dict:
+    """Settings → Server. Cheap: counts plus the worker's heartbeat file, which also carries the
+    folder sizes the worker measures every 15 minutes, so no request ever walks the library."""
+    return server_health(session)
 
 
 @router.get("/ping", tags=["system"], summary="Reachability and identity probe", response_model=dict)
