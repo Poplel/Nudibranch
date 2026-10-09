@@ -15706,10 +15706,17 @@ function buildLiveLog(tasks, appLogs) {
   return [...taskEntries, ...appLogEntries].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 }
 
+// Severity comes from the event type the server chose, not from the wording: matching "failed" in
+// the text painted "37 passed, 0 failed" red, and "missing" turned every missing-tracks check amber.
+const ERROR_NOTIFICATION_EVENTS = new Set(["task_failed", "playlist_import_failed", "automation_failed", "slskd_unreachable"]);
+const WARNING_NOTIFICATION_EVENTS = new Set(["task_warning", "server_alert", "wishlist_denied"]);
+
 function notificationSeverity(notification) {
-  const text = `${notification.title || ""} ${notification.body || ""} ${notification.event_type || ""}`.toLowerCase();
-  if (text.includes("failed") || text.includes("first failure") || /[1-9]\d*\s+errors?/.test(text)) return "error";
-  if (text.includes("warning") || text.includes("missing")) return "warning";
+  const eventType = notification.event_type || "";
+  if (ERROR_NOTIFICATION_EVENTS.has(eventType)) return "error";
+  if (WARNING_NOTIFICATION_EVENTS.has(eventType)) return "warning";
+  // A finished batch where some items failed is a partial success, not a failure.
+  if (/\b[1-9]\d*\s+(failed|errors?)\b/i.test(notification.body || "")) return "warning";
   if (notification.status === "unread") return "info";
   return "normal";
 }
