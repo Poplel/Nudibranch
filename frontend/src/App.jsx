@@ -1555,7 +1555,8 @@ function App() {
   }
 
   // mode: "next_candidate" (try the next ranked source) | "same_candidate" | "research" (discard
-  // candidates and search again -- re-enters the approval gate, never auto-starts a download).
+  // candidates and search again -- re-enters the approval gate, never auto-starts a download) |
+  // "alternatives" (keep the candidates and search for more, which land unselected).
   async function retryApprovalItems(items, mode = "next_candidate") {
     setLoading(true);
     try {
@@ -1566,7 +1567,7 @@ function App() {
           body: JSON.stringify({ item_ids: batchItems.map((item) => item.id), mode }),
         });
       }
-      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : "Trying the next candidate." });
+      setToast({ title: "Retrying", body: mode === "research" ? "Searching again." : mode === "alternatives" ? "Finding more candidates." : "Trying the next candidate." });
       await Promise.all([refreshApprovals(), refreshRequests()]);
     } catch (retryError) {
       notify("Retry failed", retryError.message, "ui_error");
@@ -6623,6 +6624,12 @@ function ApprovalNode({
             title={ownsPicker ? "Hide candidates" : "Choose candidate"}
           >
             {ownsPicker ? <ChevronUp size={14} /> : <Pencil size={14} />}
+          </button>
+        )}
+        {/* No alternates to pick from: the same button asks the server to search for some. */}
+        {leafDownloadCandidate && !hasAlternateCandidates && item.can_find_alternatives && onRetry && (
+          <button className="row-icon-button" onClick={() => onRetry([item], "alternatives")} title="Choose candidate">
+            <Pencil size={14} />
           </button>
         )}
         {/* Cancel — stop this now, the request survives (not destructive). Retry — two of the

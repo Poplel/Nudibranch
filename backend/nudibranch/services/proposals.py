@@ -23,6 +23,7 @@ from nudibranch.db.models import (
     WishlistItem,
 )
 from nudibranch.services import queue_state
+from nudibranch.services.download_manifest import load_download_manifest, update_download_manifest_entry
 from nudibranch.services.notifications import create_notification, retire_queue_notifications
 from nudibranch.services.tasks import enqueue_task
 
@@ -242,7 +243,7 @@ def reject_items(
         )
         if wishlist_item_id:
             wishlist_item_ids.add(wishlist_item_id)
-    removed_download_files = remove_rejected_download_files(items) + remove_rejected_manifest_downloads(items)
+    removed_download_files = remove_rejected_download_files(items) + remove_rejected_manifest_downloads(session, items)
     for item in items:
         session.delete(item)
     session.flush()
@@ -558,36 +559,17 @@ def remove_rejected_download_files(items: list[ProposalItem]) -> int:
     return removed
 
 
-def remove_rejected_manifest_downloads(items: list[ProposalItem]) -> int:
+def remove_rejected_manifest_downloads(session: Session, items: list[ProposalItem]) -> int:
     rejected_item_ids = {item.id for item in items}
     if not rejected_item_ids:
         return 0
-    settings = get_settings()
-    downloads_root = settings.downloads_path.resolve()
-    # Use the config-volume path (current location after migration); fall back to the legacy
-    # downloads-folder path so rejections still work if the manifest hasn't been migrated yet.
-    manifest_path = settings.config_path / ".nudibranch-downloads.json"
-    if not manifest_path.exists():
-        manifest_path = settings.downloads_path / ".nudibranch-downloads.json"
-    if not manifest_path.exists():
-        return 0
-    try:
-        entries = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return 0
-    if not isinstance(entries, list):
-        return 0
+    downloads_root = get_settings().downloads_path.resolve()
     removed = 0
-    changed = False
-    for entry in entries:
-        if entry.get("item_id") not in rejected_item_ids or entry.get("status") == "rejected":
+    for entry in load_download_manifest(session, item_ids=rejected_item_ids):
+        if entry.get("status") == "rejected":
             continue
-        entry["status"] = "rejected"
-        entry["status_changed_at"] = datetime.now(timezone.utc).isoformat()
-        changed = True
+        update_download_manifest_entry(session, entry, "rejected")
         removed += remove_manifest_entry_file(entry, downloads_root)
-    if changed:
-        manifest_path.write_text(json.dumps(entries, indent=2), encoding="utf-8")
     return removed
 
 
@@ -756,7 +738,8 @@ def _stop_feeding_tasks(session: Session, batch: ProposalBatch, wishlist_item_id
     a cancelled 154-item batch grew to 569 items, 68 of them still live.
     """
     stopped = 0
-    feeders = ("search_wishlist_item", "search_candidates", "execute_proposal_batch")
+    feeders = ("search_wishlist_item", "search_candidates", "search_alternatives", "execute_proposal_batch")
+    batch_item_ids = {item.id for item in batch.items}
     tasks = list(
         session.scalars(
             select(Task).where(
@@ -770,7 +753,7 @@ def _stop_feeding_tasks(session: Session, batch: ProposalBatch, wishlist_item_id
             payload = json.loads(task.payload_json or "{}")
         except (ValueError, TypeError):
             continue
-        targets_batch = payload.get("batch_id") == batch.id
+        targets_batch = payload.get("batch_id") == batch.id or payload.get("track_id") in batch_item_ids
         targets_wishlist = payload.get("wishlist_item_id") in wishlist_item_ids
         if not (targets_batch or targets_wishlist):
             continue
@@ -1020,6 +1003,33 @@ def retry_items(session: Session, batch_id: str, item_ids: list[str] | None, mod
     return _retry_items(session, batch_id, item_ids, mode)[0]
 
 
+def _find_alternatives(session: Session, batch: ProposalBatch, item_ids: list[str] | None) -> tuple[list[str], list[Task]]:
+    """Start an alternatives search for each track the ids resolve to (track or candidate rows).
+
+    The current candidates stay; the worker adds up to 5 new unselected ones. Nothing downloads.
+    """
+    flow = batch.flow if isinstance(batch.flow, ProposalFlow) else ProposalFlow.library_change
+    eligible = queue_state.alternatives_track_ids(batch.items, flow, batch.status)
+    by_id = {item.id: item for item in batch.items}
+    track_ids: list[str] = []
+    for leaf in _leaf_download_items(batch, item_ids):
+        if leaf.parent_id in eligible and leaf.parent_id not in track_ids:
+            track_ids.append(leaf.parent_id)
+    if not track_ids:
+        raise ValueError("Nothing here can look for other candidates")
+    for track_id in track_ids:
+        track = by_id[track_id]
+        payload = json.loads(track.payload_json or "{}")
+        payload["status"] = "finding candidates"
+        payload["finding_alternatives"] = True
+        payload.pop("no_alternatives", None)
+        track.payload_json = json.dumps(payload)
+        track.stage = ItemStage.searching.value
+    session.commit()
+    tasks = [enqueue_task(session, "search_alternatives", {"track_id": track_id}) for track_id in track_ids]
+    return track_ids, tasks
+
+
 def _retry_items(
     session: Session, batch_id: str, item_ids: list[str] | None, mode: str = "next_candidate"
 ) -> tuple[list[str], list[Task]]:
@@ -1027,8 +1037,10 @@ def _retry_items(
     batch = session.get(ProposalBatch, batch_id)
     if not batch:
         raise ValueError("Proposal batch not found")
-    if mode not in {"next_candidate", "same_candidate", "research"}:
+    if mode not in {"next_candidate", "same_candidate", "research", "alternatives"}:
         raise ValueError(f"Unknown retry mode: {mode}")
+    if mode == "alternatives":
+        return _find_alternatives(session, batch, item_ids)
     targets = _leaf_download_items(batch, item_ids)
     retried: list[str] = []
     tasks: list[Task] = []
@@ -1076,6 +1088,10 @@ def _retry_items(
         payload.pop("failed_candidates", None)
         payload.pop("auto_retry_exhausted", None)
         payload.pop("retry_reason", None)
+        if target.parent is not None:
+            parent_payload = json.loads(target.parent.payload_json or "{}")
+            if parent_payload.pop("no_alternatives", None):
+                target.parent.payload_json = json.dumps(parent_payload)
         # `research` re-enters gate (a): it throws away the candidates and searches again, so a
         # human picks from the new ones. It must NOT auto-approve.
         #

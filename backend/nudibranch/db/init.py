@@ -354,6 +354,12 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _reopen_downloads_finalized_unfetched(session)
     _reset_stale_container_stages(session)
     move_task_result_logs_to_app_log(session)
+    _migrate_download_manifest_file(session)
+    podcast_validator_cols = {row[1] for row in session.execute(text("PRAGMA table_info(podcasts)"))}
+    for column in ("etag", "last_modified"):
+        if column not in podcast_validator_cols:
+            session.execute(text(f"ALTER TABLE podcasts ADD COLUMN {column} TEXT NULL"))
+            session.commit()
 
 
 def _migrate_shuffle_to_mode(session: Session) -> None:
@@ -1249,3 +1255,48 @@ def move_task_result_logs_to_app_log(session: Session) -> None:
         changed = True
     if changed:
         session.commit()
+
+
+def _migrate_download_manifest_file(session: Session) -> None:
+    """Import `.nudibranch-downloads.json` into `download_manifest_entries`, once.
+
+    Reads the config copy, or the old copy in the downloads folder when the config one is missing,
+    and renames the file to `.migrated` so it is never read again. Entries go in their file order.
+    """
+    from nudibranch.db.models import DownloadManifestEntry
+
+    settings = get_settings()
+    path = settings.config_path / ".nudibranch-downloads.json"
+    if not path.exists():
+        path = settings.downloads_path / ".nudibranch-downloads.json"
+    if not path.exists():
+        return
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        entries = []
+    if not isinstance(entries, list):
+        entries = []
+    imported = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        rest = {key: value for key, value in entry.items() if key not in {"id", "batch_id", "item_id", "parent_id", "status", "basename"}}
+        session.add(
+            DownloadManifestEntry(
+                batch_id=entry.get("batch_id"),
+                item_id=entry.get("item_id"),
+                parent_id=entry.get("parent_id"),
+                status=str(entry.get("status") or "queued"),
+                basename=entry.get("basename"),
+                data=json.dumps(rest),
+            )
+        )
+        imported += 1
+    session.commit()
+    try:
+        path.rename(path.with_name(path.name + ".migrated"))
+    except OSError as error:
+        # Left in place it would import twice next boot; say so rather than hide it.
+        write_app_log(f"Download manifest imported but {path} could not be renamed: {error}", "warning")
+    write_app_log(f"Moved {imported} download manifest entr{'y' if imported == 1 else 'ies'} into the database")

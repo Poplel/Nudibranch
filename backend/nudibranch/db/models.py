@@ -679,6 +679,28 @@ class ProposalItem(Base):
     children: Mapped[list["ProposalItem"]] = relationship(back_populates="parent", cascade="all, delete-orphan")
 
 
+class DownloadManifestEntry(Base):
+    """One slskd download the worker is tracking (queued -> downloading -> staged -> completed).
+
+    Replaced `.nudibranch-downloads.json`: a file rewritten whole on every update, with no way to
+    ask "which entries belong to these items" without reading all of it. Columns are what the
+    worker filters on; `data` holds the rest of the entry dict (request, candidate, timestamps,
+    retry bookkeeping, paths). Finished rows are pruned after a week.
+    """
+
+    __tablename__ = "download_manifest_entries"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uuid_str)
+    batch_id: Mapped[str | None] = mapped_column(String, index=True)
+    item_id: Mapped[str | None] = mapped_column(String, index=True)
+    parent_id: Mapped[str | None] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False, index=True)
+    basename: Mapped[str | None] = mapped_column(String(512), index=True)
+    data: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False)
+
+
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -900,6 +922,10 @@ class Podcast(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    # Validators from the feed's last 200, sent back as If-None-Match / If-Modified-Since so an
+    # unchanged feed answers 304 and is skipped.
+    etag: Mapped[str | None] = mapped_column(Text)
+    last_modified: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow, nullable=False, index=True)
 

@@ -345,6 +345,9 @@ class ProposalItemOut(BaseModel):
     request: RequestRefOut | None = None
     can_approve: bool = False
     can_retry: bool = False
+    # True on a download track, and on each of its candidates, when a search for more candidates
+    # may be started (`POST /approvals/{id}/retry` with mode "alternatives").
+    can_find_alternatives: bool = False
     can_cancel: bool = False
 
 
@@ -377,6 +380,8 @@ class RetryRequest(BaseModel):
     # next_candidate: try the next ranked source. same_candidate: the same one again (a transient
     # network failure). research: discard the candidates and search afresh -- this re-enters the
     # approval gate rather than auto-starting, so a retry can never become a silent download.
+    # alternatives: keep the current candidates and search for up to 5 more as unselected siblings
+    # (item_ids are track or candidate rows; the response's retried_item_ids are the track ids).
     mode: str = "next_candidate"
 
 
