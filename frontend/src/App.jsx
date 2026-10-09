@@ -11373,7 +11373,7 @@ function SettingsPanel({
         </label>
       </section>
       <EqualizerSettings equalizer={equalizer} setEqualizer={setEqualizer} />
-      {canManageSettings(user) && <ServerHealthSettings api={api} />}
+      {canManageSettings(user) && <ServerHealthSettings api={api} notify={notify} />}
       {canManageSettings(user) && (
         <section className="settings-section">
           <h2>Integrations</h2>
@@ -11478,7 +11478,6 @@ function SettingsPanel({
           onSaveIntegrations={onSaveIntegrations}
         />
       )}
-      {canManageSettings(user) && <SlskdReachabilitySettings api={api} notify={notify} />}
       <SessionsPanel api={api} notify={notify} />
       {user?.is_admin && <SecuritySettings api={api} notify={notify} />}
       <footer className="settings-footer">
@@ -11695,24 +11694,42 @@ function fmtListeningTime(seconds) {
   return `${hours} hours`;
 }
 
-function ServerHealthSettings({ api }) {
+function ServerHealthSettings({ api, notify }) {
   const [health, setHealth] = useState(null);
   const [failed, setFailed] = useState(false);
+  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
   useEffect(() => {
     let active = true;
-    const load = () => api("/server/health")
-      .then((data) => { if (active && data) { setHealth(data); setFailed(false); } })
-      .catch(() => { if (active) setFailed(true); });
+    const load = () => {
+      api("/server/health")
+        .then((data) => { if (active && data) { setHealth(data); setFailed(false); } })
+        .catch(() => { if (active) setFailed(true); });
+      api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
+    };
     load();
     const id = setInterval(load, 15000);
     return () => { active = false; clearInterval(id); };
   }, [api]);
 
+  // Answered by the API itself, so they still show when the health call fails.
+  const connectionRows = (
+    <>
+      <h3>Connections</h3>
+      {[["Jellyfin", connections.jellyfin], ["slskd", connections.slskd]].map(([label, status]) => (
+        <label className="setting-row" key={label}>
+          <span>{label}</span>
+          <strong style={connectionStyle(status)}>{connectionLabel(status)}</strong>
+        </label>
+      ))}
+      <SlskdReachabilityRows api={api} notify={notify} />
+    </>
+  );
   if (!health) {
     return (
       <section className="settings-section">
         <h2>Server</h2>
         <p className="settings-hint">{failed ? "Server status unavailable." : "Loading…"}</p>
+        {connectionRows}
       </section>
     );
   }
@@ -11775,11 +11792,12 @@ function ServerHealthSettings({ api }) {
         storage.last_backup ? undefined : "var(--muted)",
         storage.last_backup ? `${formatBytes(storage.last_backup.size_bytes)} · ${storage.backup_count} kept` : undefined,
       )}
+      {connectionRows}
     </section>
   );
 }
 
-function SlskdReachabilitySettings({ api, notify }) {
+function SlskdReachabilityRows({ api, notify }) {
   const [state, setState] = useState(null);
   const pollRef = useRef(null);
 
@@ -11820,8 +11838,8 @@ function SlskdReachabilitySettings({ api, notify }) {
   const checking = !!state?.checking;
 
   return (
-    <section className="settings-section">
-      <h2>Soulseek reachability</h2>
+    <>
+      <h3>Soulseek reachability</h3>
       <label className="setting-row">
         <span>
           Listen port check
@@ -11855,7 +11873,7 @@ function SlskdReachabilitySettings({ api, notify }) {
           )}
         </label>
       ))}
-    </section>
+    </>
   );
 }
 
@@ -12963,32 +12981,6 @@ async function collectDroppedItems(dataTransfer) {
   return Array.from(dataTransfer?.files || []).map((file) => ({ file, path: file.name }));
 }
 
-function ConnectionsStatus({ api, user }) {
-  const [connections, setConnections] = useState({ slskd: "checking", jellyfin: "checking" });
-  useEffect(() => {
-    let active = true;
-    const load = () => api("/settings/connections").then((data) => { if (active && data) setConnections(data); }).catch(() => {});
-    load();
-    const id = setInterval(load, 20000);
-    return () => { active = false; clearInterval(id); };
-  }, []);
-  return (
-    <div className="inspector-section">
-      <div className="inspector-section-label">Status</div>
-      <div className="status-list">
-        <span>User</span>
-        <strong>{user?.display_name || "Signed in"}</strong>
-        <span>API</span>
-        <strong style={{ color: "#37c871" }}>Connected</strong>
-        <span>slskd</span>
-        <strong style={connectionStyle(connections.slskd)}>{connectionLabel(connections.slskd)}</strong>
-        <span>Jellyfin</span>
-        <strong style={connectionStyle(connections.jellyfin)}>{connectionLabel(connections.jellyfin)}</strong>
-      </div>
-    </div>
-  );
-}
-
 function Inspector({
   page,
   mobileOpen,
@@ -13245,7 +13237,6 @@ function Inspector({
           </button>
         </div>
       )}
-      {page === "Tools" && <ConnectionsStatus api={api} user={user} />}
       {downloadProgress && (
         <div className="inspector-progress-card">
           <strong>Downloads</strong>

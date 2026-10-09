@@ -7038,7 +7038,7 @@ def get_connection_status(
     session: Session = Depends(get_session),
     _: User = Depends(get_current_user),
 ) -> dict:
-    """Probe the configured slskd/Jellyfin servers so the Settings → Status panel can show whether
+    """Probe the configured slskd/Jellyfin servers so Settings → Server can show whether
     they're reachable. Short timeouts; any non-2xx/3xx or exception is reported as 'error'."""
     settings = integration_settings(session)
 

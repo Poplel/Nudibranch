@@ -354,6 +354,8 @@ def ensure_lightweight_migrations(session: Session) -> None:
     _reopen_downloads_finalized_unfetched(session)
     _reset_stale_container_stages(session)
     move_task_result_logs_to_app_log(session)
+    # Column first: the file import below fills it, so an install skipping 1.3.1 gets real times.
+    _add_manifest_status_changed_at(session)
     _migrate_download_manifest_file(session)
     podcast_validator_cols = {row[1] for row in session.execute(text("PRAGMA table_info(podcasts)"))}
     for column in ("etag", "last_modified"):
@@ -1257,6 +1259,37 @@ def move_task_result_logs_to_app_log(session: Session) -> None:
         session.commit()
 
 
+def _add_manifest_status_changed_at(session: Session) -> None:
+    """Promote `status_changed_at` from each manifest row's JSON to a column, once.
+
+    Rows imported from the 1.3.1 file all carry the import's time in `updated_at`, so counting or
+    pruning by it made a month of downloads look finished that day. The JSON copy holds the real
+    time; a row without one falls back to `updated_at`.
+    """
+    cols = {row[1] for row in session.execute(text("PRAGMA table_info(download_manifest_entries)"))}
+    if not cols or "status_changed_at" in cols:
+        return
+    session.execute(text("ALTER TABLE download_manifest_entries ADD COLUMN status_changed_at DATETIME NULL"))
+    rows = session.execute(text("SELECT id, data, updated_at FROM download_manifest_entries")).all()
+    for row_id, raw, updated_at in rows:
+        try:
+            stamp = (json.loads(raw or "{}") or {}).get("status_changed_at")
+            changed = datetime.fromisoformat(stamp) if stamp else None
+        except (ValueError, TypeError, AttributeError):
+            changed = None
+        if changed is not None:
+            changed = changed.astimezone(timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
+        session.execute(
+            text("UPDATE download_manifest_entries SET status_changed_at = :changed WHERE id = :id"),
+            {"changed": changed or updated_at, "id": row_id},
+        )
+    session.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_download_manifest_entries_status_changed_at "
+        "ON download_manifest_entries (status_changed_at)"
+    ))
+    session.commit()
+
+
 def _migrate_download_manifest_file(session: Session) -> None:
     """Import `.nudibranch-downloads.json` into `download_manifest_entries`, once.
 
@@ -1282,6 +1315,10 @@ def _migrate_download_manifest_file(session: Session) -> None:
         if not isinstance(entry, dict):
             continue
         rest = {key: value for key, value in entry.items() if key not in {"id", "batch_id", "item_id", "parent_id", "status", "basename"}}
+        try:
+            changed = datetime.fromisoformat(rest["status_changed_at"]).astimezone(timezone.utc)
+        except (KeyError, TypeError, ValueError):
+            changed = datetime.now(timezone.utc)
         session.add(
             DownloadManifestEntry(
                 batch_id=entry.get("batch_id"),
@@ -1290,6 +1327,7 @@ def _migrate_download_manifest_file(session: Session) -> None:
                 status=str(entry.get("status") or "queued"),
                 basename=entry.get("basename"),
                 data=json.dumps(rest),
+                status_changed_at=changed,
             )
         )
         imported += 1

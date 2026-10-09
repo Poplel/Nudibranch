@@ -274,7 +274,7 @@ def _activity(session: Session, hours: int) -> dict:
     def downloads(status: str) -> int:
         return session.scalar(
             select(func.count(DownloadManifestEntry.id))
-            .where(DownloadManifestEntry.status == status, DownloadManifestEntry.updated_at >= since)
+            .where(DownloadManifestEntry.status == status, DownloadManifestEntry.status_changed_at >= since)
         ) or 0
 
     return {
